@@ -19,6 +19,75 @@ Interoperability is achieved **only through standard Bluetooth audio profiles**.
 
 ---
 
+## Quick Start
+
+### Prerequisites
+
+- [ESP-IDF v5.5+](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/get-started/)
+- ESP32-S3-DevKitC-1-N8R8 (must have PSRAM)
+- USB-C cable
+- [Audio Hardware Wiring Guide](docs/wiring.md)
+
+### Build
+
+```bash
+# Activate ESP-IDF environment
+source ~/esp/esp-idf/export.sh
+
+# Build firmware
+cd omi
+idf.py build
+```
+
+### Flash
+
+```bash
+# Find your serial port
+ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
+
+# Flash firmware (replace PORT with your device)
+idf.py -p /dev/ttyACM0 flash
+```
+
+### Monitor Serial Output
+
+```bash
+# Option 1: Using idf.py (interactive, requires TTY)
+idf.py -p /dev/ttyACM0 monitor
+
+# Option 2: Using stty + cat (non-interactive)
+stty -F /dev/ttyACM0 115200 raw -echo && cat /dev/ttyACM0
+
+# Option 3: Flash and monitor combined
+idf.py -p /dev/ttyACM0 flash monitor
+```
+
+**Exit monitor:** `Ctrl+]`
+
+### Expected Boot Log
+
+```
+I (xxx) omi: ========================================
+I (xxx) omi: OMI - Open Motorcycle Intercom
+I (xxx) omi: Boot time: 0 ms
+I (xxx) omi: Opus version: libopus x.x.x
+I (xxx) omi: Free heap: 275432 bytes
+I (xxx) omi: ========================================
+I (xxx) audio: Initializing audio subsystem
+I (xxx) audio: Audio task heartbeat: loops=0, encoded=0, decoded=0
+```
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Permission denied on serial port | `sudo usermod -a -G dialout $USER` then log out/in |
+| Device not found | Use a data cable (not charge-only), try different USB port |
+| Garbage characters in monitor | Wrong baud rate, use 115200 |
+| PSRAM not detected | Ensure you have the N8R8 variant board |
+
+---
+
 ## Why
 
 - Cardo/Sena mesh protocols are proprietary and closed
