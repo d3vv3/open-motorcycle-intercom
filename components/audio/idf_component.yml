@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+## https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/tools/idf-component-manager.html
+
+dependencies:
+  78/esp-opus:
+    version: "^1.0.0"
