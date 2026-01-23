@@ -69,36 +69,112 @@ flash_board() {
     print_msg "✓ $board_name flashed successfully" "$COLOR_GREEN"
 }
 
+# Function to reset a board via RTS/DTR toggle
+reset_board() {
+    local port=$1
+    local board_name=$2
+    
+    print_msg "Resetting $board_name ($port)..." "$COLOR_YELLOW"
+    
+    # Use python to toggle DTR which triggers ESP32 reset
+    python3 -c "
+import serial
+import time
+try:
+    s = serial.Serial('$port', $BAUD_RATE)
+    s.dtr = False
+    s.rts = True
+    time.sleep(0.1)
+    s.dtr = False
+    s.rts = False
+    time.sleep(0.1)
+    s.close()
+except Exception as e:
+    pass  # Ignore errors, board may still reset
+" 2>/dev/null || true
+    
+    print_msg "✓ $board_name reset" "$COLOR_GREEN"
+}
+
+# Function to reset both boards
+reset_both() {
+    print_msg "Resetting both boards..." "$COLOR_CYAN"
+    reset_board "$BOARD1_PORT" "Board 1"
+    reset_board "$BOARD2_PORT" "Board 2"
+    sleep 1  # Give boards time to reboot
+}
+
 # Function to monitor both boards
 monitor_both() {
+    local skip_reset=${1:-false}
+    
     print_msg "Starting dual monitor (Ctrl+C to exit)..." "$COLOR_CYAN"
     echo ""
     
-    # Kill any existing cat processes on these ports
+    # Kill any existing monitor processes on these ports
     pkill -f "cat $BOARD1_PORT" 2>/dev/null || true
     pkill -f "cat $BOARD2_PORT" 2>/dev/null || true
     
-    # Reset serial ports
-    stty -F "$BOARD1_PORT" "$BAUD_RATE" raw -echo 2>/dev/null || true
-    stty -F "$BOARD2_PORT" "$BAUD_RATE" raw -echo 2>/dev/null || true
+    # Reset both boards before monitoring (unless skipped)
+    if [ "$skip_reset" != "true" ]; then
+        reset_both
+    fi
     
-    # Monitor both boards with colored output
+    # Use a named pipe approach for more reliable serial monitoring
+    # This handles device disconnects/reconnects better
+    
+    local tmp_dir=$(mktemp -d)
+    local fifo1="$tmp_dir/board1"
+    local fifo2="$tmp_dir/board2"
+    mkfifo "$fifo1" "$fifo2"
+    
+    # Cleanup function
+    cleanup() {
+        kill $cat_pid1 $cat_pid2 $read_pid1 $read_pid2 2>/dev/null || true
+        rm -rf "$tmp_dir"
+        exit 0
+    }
+    trap cleanup INT TERM EXIT
+    
+    # Start serial readers that auto-reconnect
+    (
+        while true; do
+            if [ -e "$BOARD1_PORT" ]; then
+                stty -F "$BOARD1_PORT" "$BAUD_RATE" raw -echo 2>/dev/null || true
+                cat "$BOARD1_PORT" 2>/dev/null
+            fi
+            sleep 0.5
+        done
+    ) > "$fifo1" &
+    cat_pid1=$!
+    
+    (
+        while true; do
+            if [ -e "$BOARD2_PORT" ]; then
+                stty -F "$BOARD2_PORT" "$BAUD_RATE" raw -echo 2>/dev/null || true
+                cat "$BOARD2_PORT" 2>/dev/null
+            fi
+            sleep 0.5
+        done
+    ) > "$fifo2" &
+    cat_pid2=$!
+    
+    # Read from FIFOs and colorize output
     (
         while IFS= read -r line; do
             echo -e "${COLOR_BLUE}[BOARD1]${COLOR_RESET} $line"
-        done < "$BOARD1_PORT"
+        done < "$fifo1"
     ) &
-    local pid1=$!
+    read_pid1=$!
     
     (
         while IFS= read -r line; do
             echo -e "${COLOR_GREEN}[BOARD2]${COLOR_RESET} $line"
-        done < "$BOARD2_PORT"
+        done < "$fifo2"
     ) &
-    local pid2=$!
+    read_pid2=$!
     
-    # Wait for Ctrl+C
-    trap "kill $pid1 $pid2 2>/dev/null; exit 0" INT TERM
+    # Wait for any child to exit (shouldn't happen normally)
     wait
 }
 
@@ -112,7 +188,9 @@ show_usage() {
     echo "  flash     - Flash both boards (no build)"
     echo "  flash1    - Flash board 1 only"
     echo "  flash2    - Flash board 2 only"
-    echo "  monitor   - Monitor both boards"
+    echo "  monitor   - Reset and monitor both boards"
+    echo "  monitor-no-reset - Monitor without resetting"
+    echo "  reset     - Reset both boards"
     echo "  help      - Show this help"
     echo ""
     echo "Configuration:"
@@ -139,7 +217,7 @@ main() {
             flash_board "$BOARD2_PORT" "Board 2"
             echo ""
             sleep 2  # Give boards time to boot
-            monitor_both
+            monitor_both "true"  # Skip reset since flash already resets
             ;;
         
         build)
@@ -170,6 +248,16 @@ main() {
         monitor)
             check_devices
             monitor_both
+            ;;
+        
+        monitor-no-reset)
+            check_devices
+            monitor_both "true"
+            ;;
+        
+        reset)
+            check_devices
+            reset_both
             ;;
         
         help|--help|-h)
