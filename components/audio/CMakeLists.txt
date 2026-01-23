@@ -6,4 +6,9 @@ idf_component_register(
         driver
         freertos
         log
+        esp_adc
+        78__esp-opus
+    PRIV_REQUIRES
+        soc
+        hal
 )

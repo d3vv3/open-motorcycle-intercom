@@ -3,7 +3,7 @@
  * @brief OMI - Open Motorcycle Intercom
  *
  * Main entry point for the ESP32-S3 firmware.
- * Phase 1: Hardware validation tests.
+ * Phase 1: Audio pipeline with loopback (ADC -> HPF -> Opus -> I2S)
  */
 
 #include <inttypes.h>
@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 
+#include "audio.h"
 #include "hwtest.h"
 #include "nvs_flash.h"
 
@@ -52,42 +53,109 @@ void app_main(void)
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "OMI - Open Motorcycle Intercom");
-    ESP_LOGI(TAG, "Hardware Validation Mode");
+    ESP_LOGI(TAG, "Phase 1: Audio Pipeline Loopback");
+    ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "Boot time: %" PRId64 " ms", boot_time);
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
     ESP_LOGI(TAG, "========================================");
 
-    // Initialize NVS
+    /* Initialize NVS */
     ESP_ERROR_CHECK(init_nvs());
     ESP_LOGI(TAG, "[%" PRId64 " ms] NVS initialized", get_time_ms());
 
-    // Wait a moment before starting tests
+    /* Initialize audio subsystem */
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Starting hardware tests in 2 seconds...");
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    esp_err_t ret = audio_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "System halted");
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
 
-    // Test 1: Speaker (1kHz tone)
+    /* Start audio pipeline */
     ESP_LOGI(TAG, "");
-    hwtest_speaker();
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Starting audio loopback...");
+    ESP_LOGI(TAG, "Speak into the microphone - you should hear your voice with ~20-50ms delay");
+    ESP_LOGI(TAG, "");
 
-    // Test 2: Microphone (ADC readings)
-    ESP_LOGI(TAG, "");
-    hwtest_mic();
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    ret = audio_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start audio: %s", esp_err_to_name(ret));
+        audio_deinit();
+        ESP_LOGE(TAG, "System halted");
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
 
-    // Test 3: Loopback (10 seconds)
+    ESP_LOGI(TAG, "Audio pipeline running!");
     ESP_LOGI(TAG, "");
-    hwtest_loopback(10);
-
+    ESP_LOGI(TAG, "=== Phase 1 Exit Criteria ===");
+    ESP_LOGI(TAG, "1. Latency must be < 50 ms");
+    ESP_LOGI(TAG, "2. No audio glitches over 30 minutes");
+    ESP_LOGI(TAG, "3. Encode time: 5-10 ms");
+    ESP_LOGI(TAG, "4. Decode time: 5-8 ms");
     ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Monitor the audio stats logs every 10 seconds");
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "All hardware tests complete!");
-    ESP_LOGI(TAG, "========================================");
 
-    // Idle
+    /* Main loop - log system health every 60 seconds */
+    int64_t last_health_check = get_time_ms();
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+
+        int64_t now_ms = get_time_ms();
+        if ((now_ms - last_health_check) >= 60000) {
+            audio_stats_t stats;
+            audio_get_stats(&stats);
+
+            uint32_t free_heap = esp_get_free_heap_size();
+            uint32_t min_heap = esp_get_minimum_free_heap_size();
+
+            ESP_LOGI(TAG, "=== System Health ===");
+            ESP_LOGI(TAG, "  Uptime: %" PRId64 " seconds", (now_ms - boot_time) / 1000);
+            ESP_LOGI(TAG, "  Free heap: %lu bytes (min: %lu)", free_heap, min_heap);
+            ESP_LOGI(TAG, "  Audio loops: %lu", stats.task_loops);
+            ESP_LOGI(TAG, "  Phase 1 Status:");
+
+            if (stats.latency_ms_avg < 50) {
+                ESP_LOGI(TAG, "    ✓ Latency < 50ms (avg: %lu ms)", stats.latency_ms_avg);
+            } else {
+                ESP_LOGW(TAG, "    ✗ Latency >= 50ms (avg: %lu ms) - FAILS EXIT CRITERIA",
+                         stats.latency_ms_avg);
+            }
+
+            if (stats.glitches_detected == 0) {
+                ESP_LOGI(TAG, "    ✓ No glitches detected");
+            } else {
+                ESP_LOGW(TAG, "    ! %lu glitches detected", stats.glitches_detected);
+            }
+
+            if (stats.encode_time_us_avg >= 5000 && stats.encode_time_us_avg <= 10000) {
+                ESP_LOGI(TAG, "    ✓ Encode time in range (avg: %lu us)", stats.encode_time_us_avg);
+            } else {
+                ESP_LOGI(TAG, "    i Encode time: %lu us (expected 5000-10000)",
+                         stats.encode_time_us_avg);
+            }
+
+            if (stats.decode_time_us_avg >= 5000 && stats.decode_time_us_avg <= 8000) {
+                ESP_LOGI(TAG, "    ✓ Decode time in range (avg: %lu us)", stats.decode_time_us_avg);
+            } else {
+                ESP_LOGI(TAG, "    i Decode time: %lu us (expected 5000-8000)",
+                         stats.decode_time_us_avg);
+            }
+
+            ESP_LOGI(TAG, "");
+
+            last_health_check = now_ms;
+        }
     }
+
+    /* Cleanup (unreachable in normal operation) */
+    audio_stop();
+    audio_deinit();
 }
