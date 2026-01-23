@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "esp_adc/adc_continuous.h"
@@ -118,6 +119,22 @@ static int16_t s_lpf_prev = 0;     /* Previous sample for LPF */
 static int16_t s_pcm_input[AUDIO_FRAME_SAMPLES];
 static int16_t s_pcm_output[AUDIO_FRAME_SAMPLES];
 static uint8_t s_opus_buffer[MAX_OPUS_PACKET_SIZE];
+
+/* Phase 2: Mesh mode support */
+static audio_tx_cb_t s_tx_callback = NULL;
+static QueueHandle_t s_rx_queue = NULL;
+
+#define AUDIO_RX_QUEUE_SIZE 8
+
+/**
+ * @brief RX frame queue item
+ */
+typedef struct {
+    uint8_t data[MAX_OPUS_PACKET_SIZE];
+    uint16_t len;
+    uint8_t source_id;
+    int64_t timestamp_us;
+} audio_rx_item_t;
 
 /* ============================================================================
  * Private Function Prototypes
@@ -612,40 +629,76 @@ static void audio_task(void *arg)
                     if (encode_time > s_stats.encode_time_us_max) {
                         s_stats.encode_time_us_max = encode_time;
                     }
+
+                    /* Mesh mode: Send to TX callback instead of loopback */
+                    if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
+                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, frame_start_us);
+                    }
                 } else {
                     ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(opus_bytes));
                 }
             } else {
-                /* VOX inactive - send silence frame */
-                memset(s_opus_buffer, 0, MAX_OPUS_PACKET_SIZE);
+                /* VOX inactive - no transmission */
                 opus_bytes = 0;
             }
 
             /* ================================================================
-             * STEP 5: Opus Decode (loopback)
+             * STEP 5: Get audio for playback
+             * In loopback mode: decode our own encoded audio
+             * In mesh mode: decode from RX queue (received from other nodes)
              * ================================================================ */
             int samples_decoded = 0;
-            if (opus_bytes > 0) {
-                int64_t decode_start = esp_timer_get_time();
+            bool have_audio_to_play = false;
 
-                samples_decoded = opus_decode(s_opus_decoder, s_opus_buffer, opus_bytes,
-                                              s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
+            if (s_config.mode == AUDIO_MODE_LOOPBACK) {
+                /* Loopback: decode our own audio */
+                if (opus_bytes > 0) {
+                    int64_t decode_start = esp_timer_get_time();
 
-                int64_t decode_time = esp_timer_get_time() - decode_start;
+                    samples_decoded = opus_decode(s_opus_decoder, s_opus_buffer, opus_bytes,
+                                                  s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
 
-                if (samples_decoded == AUDIO_FRAME_SAMPLES) {
-                    s_stats.frames_decoded++;
-                    decode_time_sum += decode_time;
-                    s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
-                    if (decode_time > s_stats.decode_time_us_max) {
-                        s_stats.decode_time_us_max = decode_time;
+                    int64_t decode_time = esp_timer_get_time() - decode_start;
+
+                    if (samples_decoded == AUDIO_FRAME_SAMPLES) {
+                        s_stats.frames_decoded++;
+                        decode_time_sum += decode_time;
+                        s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
+                        if (decode_time > s_stats.decode_time_us_max) {
+                            s_stats.decode_time_us_max = decode_time;
+                        }
+                        have_audio_to_play = true;
+                    } else {
+                        ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                     }
-                } else {
-                    ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
-                    memset(s_pcm_output, 0, AUDIO_FRAME_SAMPLES * sizeof(int16_t));
                 }
             } else {
-                /* No encoded data - output silence */
+                /* Mesh mode: check RX queue for incoming audio */
+                audio_rx_item_t rx_item;
+                if (s_rx_queue != NULL && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
+                    int64_t decode_start = esp_timer_get_time();
+
+                    samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
+                                                  s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
+
+                    int64_t decode_time = esp_timer_get_time() - decode_start;
+
+                    if (samples_decoded == AUDIO_FRAME_SAMPLES) {
+                        s_stats.frames_decoded++;
+                        decode_time_sum += decode_time;
+                        s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
+                        if (decode_time > s_stats.decode_time_us_max) {
+                            s_stats.decode_time_us_max = decode_time;
+                        }
+                        have_audio_to_play = true;
+                    } else {
+                        ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
+                    }
+                }
+            }
+
+            if (!have_audio_to_play) {
+                /* No audio to play - output silence */
                 memset(s_pcm_output, 0, AUDIO_FRAME_SAMPLES * sizeof(int16_t));
             }
 
@@ -895,9 +948,65 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* TODO: Phase 2 - Implement RX queue and jitter buffer */
-    (void)source_id;
-    return ESP_ERR_NOT_SUPPORTED;
+    if (s_config.mode != AUDIO_MODE_MESH) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_rx_queue == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (frame->len > MAX_OPUS_PACKET_SIZE) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    audio_rx_item_t rx_item;
+    memcpy(rx_item.data, frame->data, frame->len);
+    rx_item.len = frame->len;
+    rx_item.source_id = source_id;
+    rx_item.timestamp_us = frame->timestamp_ms * 1000;
+
+    if (xQueueSend(s_rx_queue, &rx_item, 0) != pdTRUE) {
+        s_stats.frames_dropped++;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t audio_register_tx_callback(audio_tx_cb_t cb)
+{
+    s_tx_callback = cb;
+    return ESP_OK;
+}
+
+esp_err_t audio_set_mode(audio_mode_t mode)
+{
+    if (s_running) {
+        ESP_LOGE(TAG, "Cannot change mode while running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_config.mode = mode;
+
+    /* Create RX queue for mesh mode */
+    if (mode == AUDIO_MODE_MESH && s_rx_queue == NULL) {
+        s_rx_queue = xQueueCreate(AUDIO_RX_QUEUE_SIZE, sizeof(audio_rx_item_t));
+        if (s_rx_queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create RX queue");
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "Audio mode set to MESH");
+    } else if (mode == AUDIO_MODE_LOOPBACK) {
+        ESP_LOGI(TAG, "Audio mode set to LOOPBACK");
+    }
+
+    return ESP_OK;
+}
+
+audio_mode_t audio_get_mode(void)
+{
+    return s_config.mode;
 }
 
 esp_err_t audio_get_stats(audio_stats_t *stats)

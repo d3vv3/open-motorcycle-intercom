@@ -96,6 +96,26 @@ typedef struct {
     }
 
 /**
+ * @brief Audio operating mode
+ */
+typedef enum {
+    AUDIO_MODE_LOOPBACK = 0, /**< Phase 1: Local loopback for testing */
+    AUDIO_MODE_MESH,         /**< Phase 2+: Send/receive via mesh */
+} audio_mode_t;
+
+/**
+ * @brief Callback for encoded audio frames (TX)
+ *
+ * Called when an Opus-encoded frame is ready to be transmitted.
+ * The callback should queue the frame for mesh transmission.
+ *
+ * @param data Opus-encoded audio data
+ * @param len Length of encoded data (typically 20-40 bytes)
+ * @param timestamp_us Capture timestamp in microseconds
+ */
+typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, int64_t timestamp_us);
+
+/**
  * @brief Audio configuration parameters
  */
 typedef struct {
@@ -109,6 +129,7 @@ typedef struct {
     audio_vox_config_t vox_config; /**< VOX detection configuration */
     bool enable_hpf;               /**< Enable high-pass filter */
     float hpf_cutoff_hz;           /**< HPF cutoff frequency (default: 120 Hz) */
+    audio_mode_t mode;             /**< Operating mode (default: LOOPBACK) */
 } audio_config_t;
 
 /**
@@ -126,6 +147,7 @@ typedef struct {
         .vox_config = AUDIO_VOX_CONFIG_DEFAULT(),                                                  \
         .enable_hpf = true,                                                                        \
         .hpf_cutoff_hz = 80.0f,                                                                    \
+        .mode = AUDIO_MODE_LOOPBACK,                                                               \
     }
 
 /**
@@ -215,6 +237,30 @@ esp_err_t audio_get_tx_frame(audio_frame_t *frame, uint32_t timeout_ms);
  * @note TODO: Phase 1 - Implement jitter buffer and Opus decoding
  */
 esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id);
+
+/**
+ * @brief Register callback for encoded TX frames (mesh mode)
+ *
+ * In mesh mode, this callback is called for each encoded audio frame.
+ * The callback should send the frame to the mesh for transmission.
+ *
+ * @param cb Callback function (NULL to disable)
+ * @return ESP_OK on success
+ */
+esp_err_t audio_register_tx_callback(audio_tx_cb_t cb);
+
+/**
+ * @brief Set audio operating mode
+ * @param mode AUDIO_MODE_LOOPBACK or AUDIO_MODE_MESH
+ * @return ESP_OK on success
+ */
+esp_err_t audio_set_mode(audio_mode_t mode);
+
+/**
+ * @brief Get current audio operating mode
+ * @return Current mode
+ */
+audio_mode_t audio_get_mode(void);
 
 /**
  * @brief Get audio statistics
