@@ -60,3 +60,15 @@ The MAX98357A is a mono I2S Class-D amplifier. It connects to the ESP32-S3 via t
 
 Connect SPK+ and SPK- to your speaker. Speaker impedance should be 4-8 Ohms,
 and the speaker should be 0.5W to 3W for best results.
+
+### PCM5102A 3.5mm Audio Jack (Alternative Speaker Output)
+
+| PCM5102A            | ESP32-S3 |
+| ------------------- | -------- |
+| **BCK**             | GPIO4    |
+| **LCK (LRCK / WS)** | GPIO5    |
+| **DIN**             | GPIO7    |
+| **VIN**             | **3.3V** |
+| **GND**             | GND      |
+
+**Note:** Code changes required to switch from MAX98357A to PCM5102A.
