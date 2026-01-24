@@ -20,6 +20,7 @@
 #include "audio.h"
 #include "mesh.h"
 #include "nvs_flash.h"
+#include "power.h"
 
 static const char *TAG = "omi";
 
@@ -123,6 +124,9 @@ static void mesh_state_callback(mesh_state_t old_state, mesh_state_t new_state)
         uint8_t node_id = mesh_get_node_id();
         int8_t slot = mesh_get_slot();
 
+        /* Phase 3: Transition power state to MESH_IDLE */
+        power_set_state(POWER_STATE_MESH_IDLE);
+
         ESP_LOGI(TAG, "=== Mesh Active ===");
         ESP_LOGI(TAG, "  Role: %s", role == MESH_ROLE_COORDINATOR ? "COORDINATOR" : "PARTICIPANT");
         ESP_LOGI(TAG, "  Node ID: %u", node_id);
@@ -169,9 +173,17 @@ void app_main(void)
     ESP_ERROR_CHECK(init_nvs());
     ESP_LOGI(TAG, "[%" PRId64 " ms] NVS initialized", get_time_ms());
 
+    /* Initialize power management (Phase 3) */
+    esp_err_t ret = power_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize power management: %s", esp_err_to_name(ret));
+        goto error_halt;
+    }
+    ESP_LOGI(TAG, "[%" PRId64 " ms] Power management initialized", get_time_ms());
+
     /* Initialize audio subsystem */
     ESP_LOGI(TAG, "");
-    esp_err_t ret = audio_init();
+    ret = audio_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
         goto error_halt;

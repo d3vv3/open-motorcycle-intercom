@@ -25,6 +25,9 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 
+#include "audio.h"
+#include "power.h"
+
 static const char *TAG = "mesh";
 
 /* ============================================================================
@@ -430,10 +433,8 @@ uint8_t mesh_get_node_count(void)
     }
     xSemaphoreGive(s_peer_mutex);
 
-    /* Include self if active */
-    if (s_state == MESH_STATE_ACTIVE) {
-        count++;
-    }
+    /* Note: Self is already included in s_peers array (added when becoming
+     * coordinator or receiving JOIN_ACK), so we don't add +1 here. */
 
     return count;
 }
@@ -756,6 +757,9 @@ static void frame_timer_callback(void *arg)
     s_frame_counter++;
     s_frame_start_us = esp_timer_get_time();
 
+    /* Wake radio for this frame's activity (Phase 3 power management) */
+    power_radio_slot_start();
+
     /* Coordinator sends SYNC every N frames */
     if (s_role == MESH_ROLE_COORDINATOR) {
         if ((s_frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0) {
@@ -770,6 +774,9 @@ static void frame_timer_callback(void *arg)
         /* A more sophisticated implementation would use a high-res timer */
         send_audio_in_slot();
     }
+
+    /* Allow radio to sleep after TX/RX window (Phase 3 power management) */
+    power_radio_slot_end();
 }
 
 /* ============================================================================
@@ -874,6 +881,9 @@ static void handle_packet(const mesh_rx_item_t *rx)
                 mesh_peer_info_t peer_info = s_peers[i].info;
                 s_peers[i].info.active = false;
                 s_peer_count--;
+
+                /* Play leave notification */
+                audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
 
                 if (s_peer_cb) {
                     s_peer_cb(&peer_info, false);
@@ -995,6 +1005,9 @@ static void handle_join_packet(const mesh_rx_item_t *rx)
 
             ESP_LOGI(TAG, "Assigned node_id=%d, slot=%d to " MACSTR, new_id, new_slot,
                      MAC2STR(rx->src_mac));
+
+            /* Play join notification */
+            audio_play_notification(AUDIO_NOTIFY_PEER_JOIN);
 
             if (s_peer_cb) {
                 s_peer_cb(&s_peers[i].info, true);
@@ -1374,6 +1387,9 @@ static void check_peer_timeouts(void)
                 s_peers[i].info.active = false;
                 s_peer_count--;
                 s_stats.node_timeouts++;
+
+                /* Play leave notification */
+                audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
 
                 if (s_peer_cb) {
                     s_peer_cb(&peer_info, false);

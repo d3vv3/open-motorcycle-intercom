@@ -269,6 +269,29 @@ audio_mode_t audio_get_mode(void);
  */
 esp_err_t audio_get_stats(audio_stats_t *stats);
 
+/* ============================================================================
+ * Notification Sounds
+ * ============================================================================ */
+
+/**
+ * @brief Notification sound types
+ */
+typedef enum {
+    AUDIO_NOTIFY_PEER_JOIN,  /**< Peer joined: low-high ascending beeps */
+    AUDIO_NOTIFY_PEER_LEAVE, /**< Peer left: high-low descending beeps */
+} audio_notify_t;
+
+/**
+ * @brief Play a notification sound
+ *
+ * Generates a notification tone through the speaker.
+ * Non-blocking - queues the sound for playback.
+ *
+ * @param type Type of notification sound
+ * @return ESP_OK on success
+ */
+esp_err_t audio_play_notification(audio_notify_t type);
+
 #ifdef __cplusplus
 }
 #endif

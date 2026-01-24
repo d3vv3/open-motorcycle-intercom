@@ -8,6 +8,7 @@ idf_component_register(
         log
         esp_adc
         78__esp-opus
+        power
     PRIV_REQUIRES
         soc
         hal

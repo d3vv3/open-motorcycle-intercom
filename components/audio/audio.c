@@ -22,6 +22,7 @@
 
 #include "hal/adc_types.h"
 #include "opus.h"
+#include "power.h"
 #include "soc/soc.h"
 
 static const char *TAG = "audio";
@@ -482,6 +483,7 @@ static bool vox_process(vox_state_t *state, const int16_t *samples, size_t count
         if (!state->active) {
             state->active = true;
             state->activation_count++;
+            power_notify_voice_start(); /* Phase 3: Notify power manager */
             ESP_LOGD(TAG, "VOX activated (RMS: %.4f)", rms);
         }
         state->hangover_counter = VOX_HANGOVER_FRAMES;
@@ -491,6 +493,7 @@ static bool vox_process(vox_state_t *state, const int16_t *samples, size_t count
             state->hangover_counter--;
         } else if (state->active) {
             state->active = false;
+            power_notify_voice_end(); /* Phase 3: Notify power manager */
             ESP_LOGD(TAG, "VOX deactivated");
         }
     }
@@ -1016,5 +1019,89 @@ esp_err_t audio_get_stats(audio_stats_t *stats)
     }
 
     *stats = s_stats;
+    return ESP_OK;
+}
+
+/* ============================================================================
+ * Notification Sounds
+ * ============================================================================ */
+
+/**
+ * @brief Generate a sine wave tone into a buffer
+ *
+ * @param buffer Output buffer for PCM samples
+ * @param samples Number of samples to generate
+ * @param freq_hz Tone frequency in Hz
+ * @param sample_rate Sample rate in Hz
+ * @param amplitude Amplitude (0.0-1.0)
+ */
+static void generate_tone(int16_t *buffer, size_t samples, float freq_hz, uint32_t sample_rate,
+                          float amplitude)
+{
+    for (size_t i = 0; i < samples; i++) {
+        float t = (float)i / (float)sample_rate;
+        float value = amplitude * sinf(2.0f * M_PI * freq_hz * t);
+        buffer[i] = (int16_t)(value * 32767.0f);
+    }
+}
+
+esp_err_t audio_play_notification(audio_notify_t type)
+{
+    if (!s_initialized || s_tx_chan == NULL) {
+        ESP_LOGW(TAG, "Audio not initialized, cannot play notification");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Tone configuration */
+    const float FREQ_LOW = 440.0f;    /* A4 - lower beep */
+    const float FREQ_HIGH = 880.0f;   /* A5 - higher beep */
+    const size_t BEEP_SAMPLES = 1600; /* 100ms @ 16kHz */
+    const size_t GAP_SAMPLES = 400;   /* 25ms gap between beeps */
+    const float AMPLITUDE = 0.3f;     /* 30% volume to avoid clipping */
+
+    /* Allocate buffer for both beeps + gap */
+    size_t total_samples = BEEP_SAMPLES * 2 + GAP_SAMPLES;
+    int16_t *buffer = malloc(total_samples * sizeof(int16_t));
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate notification buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Generate the beeps based on notification type */
+    float freq1, freq2;
+    if (type == AUDIO_NOTIFY_PEER_JOIN) {
+        /* Ascending: low then high */
+        freq1 = FREQ_LOW;
+        freq2 = FREQ_HIGH;
+        ESP_LOGI(TAG, "Playing peer JOIN notification (low-high)");
+    } else {
+        /* Descending: high then low */
+        freq1 = FREQ_HIGH;
+        freq2 = FREQ_LOW;
+        ESP_LOGI(TAG, "Playing peer LEAVE notification (high-low)");
+    }
+
+    /* First beep */
+    generate_tone(buffer, BEEP_SAMPLES, freq1, s_config.sample_rate, AMPLITUDE);
+
+    /* Gap (silence) */
+    memset(buffer + BEEP_SAMPLES, 0, GAP_SAMPLES * sizeof(int16_t));
+
+    /* Second beep */
+    generate_tone(buffer + BEEP_SAMPLES + GAP_SAMPLES, BEEP_SAMPLES, freq2, s_config.sample_rate,
+                  AMPLITUDE);
+
+    /* Write to I2S (blocking) */
+    size_t bytes_written = 0;
+    esp_err_t ret =
+        i2s_channel_write(s_tx_chan, buffer, total_samples * sizeof(int16_t), &bytes_written, 500);
+
+    free(buffer);
+
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to play notification: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     return ESP_OK;
 }

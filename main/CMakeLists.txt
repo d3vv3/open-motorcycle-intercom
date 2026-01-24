@@ -5,6 +5,7 @@ idf_component_register(
         audio
         mesh
         hwtest
+        power
         esp_timer
         nvs_flash
 )

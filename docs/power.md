@@ -18,13 +18,17 @@ Power is a **first-class design constraint**. Any feature that breaks the power 
 
 ### Power Budget Summary
 
-| Mode | Target Average Power |
-|----|---------------------|
-| Active voice | ≤150 mW |
-| Idle mesh | ≤40 mW |
-| Standby | ≤5 mW |
+| Mode | Target | Phase 3 Measured (ESP32-S3) |
+|----|---------------------|-----------------------------|
+| Active voice | ≤150 mW | ~190 mW (57mA @ 3.3V) |
+| Mesh idle | ≤40 mW | ~190 mW (57mA @ 3.3V) |
+| Standby | ≤5 mW | TBD |
+| Deep sleep | <10 µA | TBD |
 
-These targets are achievable with disciplined radio scheduling.
+> [!NOTE]
+> Phase 3 measurements show ESP32-S3 WiFi always-listening mode draws ~57mA
+> regardless of traffic. The ≤40mW mesh idle target requires aggressive
+> duty cycling (Phase 6 with nRF54) or protocol-level sleep scheduling.
 
 ---
 
@@ -112,8 +116,8 @@ Characteristics:
 - VOX monitoring
 
 Typical power:
-- ESP32-S3: ~30–50 mW
-- nRF54: ~10–20 mW
+- ESP32-S3: ~190 mW (57mA @ 3.3V) — **Phase 3 measured**
+- nRF54: ~10–20 mW (target for Phase 6)
 
 ---
 
