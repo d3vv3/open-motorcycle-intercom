@@ -230,6 +230,9 @@ void app_main(void)
         goto error_halt;
     }
 
+    /* Play startup sound (after I2S TX is enabled) */
+    audio_play_notification(AUDIO_NOTIFY_STARTUP);
+
 #if ENABLE_MESH_MODE
     /* Start mesh networking */
     ESP_LOGI(TAG, "Starting mesh networking...");

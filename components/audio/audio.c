@@ -268,10 +268,12 @@ static esp_err_t i2s_init_channels(const audio_config_t *config)
     }
 
     /* I2S Standard Mode Configuration */
+    /* Note: Use STEREO slot mode for PCM5102A DAC compatibility -
+     * PCM5102A expects standard stereo I2S frames even for mono audio */
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(config->sample_rate),
         .slot_cfg =
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg =
             {
                 .mclk = I2S_GPIO_UNUSED,
@@ -1053,50 +1055,85 @@ esp_err_t audio_play_notification(audio_notify_t type)
     }
 
     /* Tone configuration */
-    const float FREQ_LOW = 440.0f;    /* A4 - lower beep */
-    const float FREQ_HIGH = 880.0f;   /* A5 - higher beep */
+    const float FREQ_C4 = 261.63f;    /* C4 */
+    const float FREQ_E4 = 329.63f;    /* E4 */
+    const float FREQ_G4 = 392.00f;    /* G4 */
+    const float FREQ_LOW = 440.0f;    /* A4 */
+    const float FREQ_HIGH = 880.0f;   /* A5 */
     const size_t BEEP_SAMPLES = 1600; /* 100ms @ 16kHz */
     const size_t GAP_SAMPLES = 400;   /* 25ms gap between beeps */
-    const float AMPLITUDE = 0.3f;     /* 30% volume to avoid clipping */
+    const float AMPLITUDE = 0.3f;     /* 30% volume */
 
-    /* Allocate buffer for both beeps + gap */
-    size_t total_samples = BEEP_SAMPLES * 2 + GAP_SAMPLES;
-    int16_t *buffer = malloc(total_samples * sizeof(int16_t));
-    if (buffer == NULL) {
+    size_t mono_samples;
+    size_t num_tones;
+    float freqs[3];
+
+    /* Configure tones based on notification type */
+    if (type == AUDIO_NOTIFY_STARTUP) {
+        /* 3-tone ascending arpeggio: C-E-G */
+        num_tones = 3;
+        freqs[0] = FREQ_C4;
+        freqs[1] = FREQ_E4;
+        freqs[2] = FREQ_G4;
+        mono_samples = (BEEP_SAMPLES * 3) + (GAP_SAMPLES * 2);
+        ESP_LOGI(TAG, "Playing STARTUP notification (C-E-G)");
+    } else if (type == AUDIO_NOTIFY_PEER_JOIN) {
+        /* 2-tone ascending: low-high */
+        num_tones = 2;
+        freqs[0] = FREQ_LOW;
+        freqs[1] = FREQ_HIGH;
+        mono_samples = (BEEP_SAMPLES * 2) + GAP_SAMPLES;
+        ESP_LOGI(TAG, "Playing peer JOIN notification (low-high)");
+    } else {
+        /* 2-tone descending: high-low */
+        num_tones = 2;
+        freqs[0] = FREQ_HIGH;
+        freqs[1] = FREQ_LOW;
+        mono_samples = (BEEP_SAMPLES * 2) + GAP_SAMPLES;
+        ESP_LOGI(TAG, "Playing peer LEAVE notification (high-low)");
+    }
+
+    /* Allocate mono buffer */
+    int16_t *mono_buffer = malloc(mono_samples * sizeof(int16_t));
+    if (mono_buffer == NULL) {
         ESP_LOGE(TAG, "Failed to allocate notification buffer");
         return ESP_ERR_NO_MEM;
     }
 
-    /* Generate the beeps based on notification type */
-    float freq1, freq2;
-    if (type == AUDIO_NOTIFY_PEER_JOIN) {
-        /* Ascending: low then high */
-        freq1 = FREQ_LOW;
-        freq2 = FREQ_HIGH;
-        ESP_LOGI(TAG, "Playing peer JOIN notification (low-high)");
-    } else {
-        /* Descending: high then low */
-        freq1 = FREQ_HIGH;
-        freq2 = FREQ_LOW;
-        ESP_LOGI(TAG, "Playing peer LEAVE notification (high-low)");
+    /* Generate tones with gaps */
+    size_t offset = 0;
+    for (size_t t = 0; t < num_tones; t++) {
+        generate_tone(mono_buffer + offset, BEEP_SAMPLES, freqs[t], s_config.sample_rate,
+                      AMPLITUDE);
+        offset += BEEP_SAMPLES;
+        if (t < num_tones - 1) {
+            memset(mono_buffer + offset, 0, GAP_SAMPLES * sizeof(int16_t));
+            offset += GAP_SAMPLES;
+        }
     }
 
-    /* First beep */
-    generate_tone(buffer, BEEP_SAMPLES, freq1, s_config.sample_rate, AMPLITUDE);
+    /* Convert to stereo (interleaved L-R samples) for PCM5102A */
+    size_t stereo_samples = mono_samples * 2;
+    int16_t *stereo_buffer = malloc(stereo_samples * sizeof(int16_t));
+    if (stereo_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate stereo buffer");
+        free(mono_buffer);
+        return ESP_ERR_NO_MEM;
+    }
 
-    /* Gap (silence) */
-    memset(buffer + BEEP_SAMPLES, 0, GAP_SAMPLES * sizeof(int16_t));
+    /* Duplicate mono samples to both L and R channels */
+    for (size_t i = 0; i < mono_samples; i++) {
+        stereo_buffer[i * 2] = mono_buffer[i];     /* Left */
+        stereo_buffer[i * 2 + 1] = mono_buffer[i]; /* Right */
+    }
+    free(mono_buffer);
 
-    /* Second beep */
-    generate_tone(buffer + BEEP_SAMPLES + GAP_SAMPLES, BEEP_SAMPLES, freq2, s_config.sample_rate,
-                  AMPLITUDE);
-
-    /* Write to I2S (blocking) */
+    /* Write stereo buffer to I2S (blocking) */
     size_t bytes_written = 0;
-    esp_err_t ret =
-        i2s_channel_write(s_tx_chan, buffer, total_samples * sizeof(int16_t), &bytes_written, 500);
+    esp_err_t ret = i2s_channel_write(s_tx_chan, stereo_buffer, stereo_samples * sizeof(int16_t),
+                                      &bytes_written, 500);
 
-    free(buffer);
+    free(stereo_buffer);
 
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to play notification: %s", esp_err_to_name(ret));

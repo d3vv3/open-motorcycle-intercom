@@ -277,6 +277,7 @@ esp_err_t audio_get_stats(audio_stats_t *stats);
  * @brief Notification sound types
  */
 typedef enum {
+    AUDIO_NOTIFY_STARTUP,    /**< Startup: 3-tone ascending arpeggio */
     AUDIO_NOTIFY_PEER_JOIN,  /**< Peer joined: low-high ascending beeps */
     AUDIO_NOTIFY_PEER_LEAVE, /**< Peer left: high-low descending beeps */
 } audio_notify_t;
