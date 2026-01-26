@@ -119,6 +119,7 @@ static int16_t s_lpf_prev = 0;     /* Previous sample for LPF */
 /* Audio buffers */
 static int16_t s_pcm_input[AUDIO_FRAME_SAMPLES];
 static int16_t s_pcm_output[AUDIO_FRAME_SAMPLES];
+static int16_t s_pcm_stereo[AUDIO_FRAME_SAMPLES * 2]; /* Stereo output for I2S */
 static uint8_t s_opus_buffer[MAX_OPUS_PACKET_SIZE];
 
 /* Phase 2: Mesh mode support */
@@ -709,12 +710,19 @@ static void audio_task(void *arg)
 
             /* ================================================================
              * STEP 6: Write to I2S (speaker)
+             * Convert mono to stereo for PCM5102A/MAX98357A compatibility
              * ================================================================ */
-            size_t bytes_written = 0;
-            ret = i2s_channel_write(s_tx_chan, s_pcm_output, AUDIO_FRAME_SAMPLES * sizeof(int16_t),
-                                    &bytes_written, portMAX_DELAY);
+            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+                s_pcm_stereo[i * 2] = s_pcm_output[i];     /* Left */
+                s_pcm_stereo[i * 2 + 1] = s_pcm_output[i]; /* Right */
+            }
 
-            if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * sizeof(int16_t)) {
+            size_t bytes_written = 0;
+            ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
+                                    AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
+                                    portMAX_DELAY);
+
+            if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t)) {
                 ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
                 s_stats.glitches_detected++;
             }
