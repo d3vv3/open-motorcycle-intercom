@@ -585,8 +585,8 @@ static void audio_task(void *arg)
                     int32_t avg = sum / (int32_t)valid_samples;
 
                     /* Convert 12-bit unsigned (0-4095) to 16-bit signed */
-                    /* Center around 2048, moderate gain (12x) with 2.5dB attenuation */
-                    int16_t sample = (int16_t)((avg - 2048) * 12);
+                    /* Center around 2048, gain (8x) for MAX9814 with 12dB atten */
+                    int16_t sample = (int16_t)((avg - 2048) * 8);
 
                     /* DC blocker - removes DC offset drift (critical for ADC) */
                     s_dc_estimate = s_dc_estimate * 0.999f + (float)sample * 0.001f;

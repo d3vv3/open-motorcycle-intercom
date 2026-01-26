@@ -4,22 +4,34 @@
 
 ### Current Implementation: Analog Microphone via TRRS (ADC)
 
-This configuration uses an **analog electret microphone** (like a standard headset mic) connected through the ESP32-S3's ADC:
+This configuration uses an **analog electret microphone**
+(like a standard headset mic)
+connected through the ESP32-S3
+using the MAX 9814 microphone amplifier module.
 
-```
-ESP32 3.3V ---- 2.2kΩ ---- TRRS Sleeve (MIC) ----|| 1uF ----> ESP32 ADC1 (GPIO1)
-ESP32 ADC1 (GPIO1) ---- 22kΩ ---- GND
-ESP32 ADC1 (GPIO1) ---- 100kΩ ---- ESP32 3.3V
-ESP32 ADC1 (GPIO1) ---- 100nF ---- TRRS Tip (MIC BIAS)
+| MAX9814 Pin | ESP32-S3                                |
+| ----------- | --------------------------------------- |
+| VDD         | 3.3V                                    |
+| GND         | GND                                     |
+| OUT         | GPIO1 (ADC)                             |
+| AR          | Leave floating (default attack/release) |
+| GAIN        |VDD (40dB), GND (50dB) or floating (60dB)|
 
-TRRS Ring2 (GND) ------------> ESP32 GND
-```
+3.5mm TRS JACK CONNECTIONS:
+| TRRS   | MAX9814 |
+|--------|---------|
+| TIP    | MIC+     |
+| RING1  | (NC)    |
+| RING2  | (NC)    |
+| SLEEVE | GND     |
+
+> Ring 1, Ring 2 or Tip can be used for MIC+ depending on the TRRS implementation.
 
 **ADC Configuration:**
 - Channel: ADC1_CHANNEL_0 (GPIO1)
 - Sample rate: 16 kHz
 - Bit width: 12-bit (ESP32-S3 native)
-- Attenuation: **2.5dB** (0-1.1V range) -> Matches 0.6V bias point
+- Attenuation: **2.5dB**
 
 ### Alternative: I2S Digital Microphone (INMP441)
 

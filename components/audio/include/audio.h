@@ -73,7 +73,7 @@ typedef struct {
     {                                                                                              \
         .adc_channel = 0, /* ADC1_CHANNEL_0 = GPIO1 */                                             \
         .adc_unit = 1,    /* ADC_UNIT_1 */                                                         \
-        .adc_atten = 1,   /* ADC_ATTEN_DB_2_5 - better SNR with 0.6V bias divider */               \
+        .adc_atten = 3,   /* ADC_ATTEN_DB_12 - full 3.3V range for MAX9814 active mic */           \
     }
 
 /**

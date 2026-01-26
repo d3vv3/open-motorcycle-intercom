@@ -297,7 +297,8 @@ esp_err_t hwtest_loopback(uint32_t duration_sec)
     int64_t end_time =
         (duration_sec > 0) ? start_time + ((int64_t)duration_sec * 1000000) : INT64_MAX;
 
-    int16_t buffer[64];
+    int16_t mono_buffer[64];
+    int16_t stereo_buffer[128]; /* Stereo output for I2S */
     size_t bytes_written;
 
     while (esp_timer_get_time() < end_time) {
@@ -305,12 +306,19 @@ esp_err_t hwtest_loopback(uint32_t duration_sec)
         for (int i = 0; i < 64; i++) {
             int raw;
             adc_oneshot_read(adc_handle, MIC_ADC_CHANNEL, &raw);
-            /* Convert 12-bit unsigned to 16-bit signed, centered */
-            buffer[i] = (int16_t)((raw - 2048) * 16);
+            /* Convert 12-bit unsigned to 16-bit signed, centered - gain (8x) */
+            mono_buffer[i] = (int16_t)((raw - 2048) * 8);
+        }
+
+        /* Convert to stereo */
+        for (int i = 0; i < 64; i++) {
+            stereo_buffer[i * 2] = mono_buffer[i];     /* Left */
+            stereo_buffer[i * 2 + 1] = mono_buffer[i]; /* Right */
         }
 
         /* Write to speaker */
-        i2s_channel_write(tx_chan, buffer, sizeof(buffer), &bytes_written, portMAX_DELAY);
+        i2s_channel_write(tx_chan, stereo_buffer, sizeof(stereo_buffer), &bytes_written,
+                          portMAX_DELAY);
     }
 
     /* Cleanup */
