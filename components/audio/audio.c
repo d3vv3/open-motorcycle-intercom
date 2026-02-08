@@ -1092,13 +1092,28 @@ esp_err_t audio_play_notification(audio_notify_t type)
         freqs[1] = FREQ_HIGH;
         mono_samples = (BEEP_SAMPLES * 2) + GAP_SAMPLES;
         ESP_LOGI(TAG, "Playing peer JOIN notification (low-high)");
-    } else {
+    } else if (type == AUDIO_NOTIFY_PEER_LEAVE) {
         /* 2-tone descending: high-low */
         num_tones = 2;
         freqs[0] = FREQ_HIGH;
         freqs[1] = FREQ_LOW;
         mono_samples = (BEEP_SAMPLES * 2) + GAP_SAMPLES;
         ESP_LOGI(TAG, "Playing peer LEAVE notification (high-low)");
+    } else if (type == AUDIO_NOTIFY_MESH_ENABLED) {
+        /* Single beep: mid-frequency */
+        num_tones = 1;
+        freqs[0] = FREQ_E4;
+        mono_samples = BEEP_SAMPLES;
+        ESP_LOGI(TAG, "Playing MESH ENABLED notification (single beep)");
+    } else if (type == AUDIO_NOTIFY_MESH_DISABLED) {
+        /* Single beep: lower frequency */
+        num_tones = 1;
+        freqs[0] = FREQ_C4;
+        mono_samples = BEEP_SAMPLES;
+        ESP_LOGI(TAG, "Playing MESH DISABLED notification (single beep)");
+    } else {
+        ESP_LOGW(TAG, "Unknown notification type: %d", type);
+        return ESP_ERR_INVALID_ARG;
     }
 
     /* Allocate mono buffer */

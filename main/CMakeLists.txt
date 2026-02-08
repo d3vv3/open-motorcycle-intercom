@@ -6,6 +6,7 @@ idf_component_register(
         mesh
         hwtest
         power
+        button
         esp_timer
         nvs_flash
 )

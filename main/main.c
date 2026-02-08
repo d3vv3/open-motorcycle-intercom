@@ -18,6 +18,7 @@
 #include "esp_timer.h"
 
 #include "audio.h"
+#include "button.h"
 #include "mesh.h"
 #include "nvs_flash.h"
 #include "power.h"
@@ -32,6 +33,12 @@ static const char *TAG = "omi";
  * @brief Set to true to enable mesh mode, false for local loopback testing
  */
 #define ENABLE_MESH_MODE 1
+
+/* ============================================================================
+ * State
+ * ============================================================================ */
+
+static bool s_mesh_active = false;
 
 /* ============================================================================
  * Utility Functions
@@ -148,6 +155,38 @@ static void mesh_peer_callback(const mesh_peer_info_t *peer, bool joined)
     }
 }
 
+/**
+ * @brief Callback for button long press - toggles mesh on/off
+ */
+static void button_long_press_callback(int gpio)
+{
+    ESP_LOGI(TAG, "Button long press detected on GPIO %d - toggling mesh", gpio);
+
+    if (s_mesh_active) {
+        /* Disable mesh */
+        ESP_LOGI(TAG, "Disabling mesh networking...");
+        esp_err_t ret = mesh_stop();
+        if (ret == ESP_OK) {
+            s_mesh_active = false;
+            audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
+            ESP_LOGI(TAG, "Mesh disabled");
+        } else {
+            ESP_LOGE(TAG, "Failed to stop mesh: %s", esp_err_to_name(ret));
+        }
+    } else {
+        /* Enable mesh */
+        ESP_LOGI(TAG, "Enabling mesh networking...");
+        esp_err_t ret = mesh_start();
+        if (ret == ESP_OK) {
+            s_mesh_active = true;
+            audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+            ESP_LOGI(TAG, "Mesh enabled");
+        } else {
+            ESP_LOGE(TAG, "Failed to start mesh: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
 /* ============================================================================
  * Main Application
  * ============================================================================ */
@@ -181,6 +220,15 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "[%" PRId64 " ms] Power management initialized", get_time_ms());
 
+    /* Initialize button handler */
+    ESP_LOGI(TAG, "");
+    ret = button_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize button: %s", esp_err_to_name(ret));
+        goto error_halt;
+    }
+    ESP_LOGI(TAG, "[%" PRId64 " ms] Button handler initialized", get_time_ms());
+
     /* Initialize audio subsystem */
     ESP_LOGI(TAG, "");
     ret = audio_init();
@@ -212,6 +260,9 @@ void app_main(void)
     mesh_register_audio_callback(mesh_audio_callback);
     mesh_register_state_callback(mesh_state_callback);
     mesh_register_peer_callback(mesh_peer_callback);
+
+    /* Register button callback for mesh toggle */
+    button_register_long_press_callback(button_long_press_callback);
 #endif
 
     /* Start audio pipeline */
@@ -234,16 +285,9 @@ void app_main(void)
     audio_play_notification(AUDIO_NOTIFY_STARTUP);
 
 #if ENABLE_MESH_MODE
-    /* Start mesh networking */
-    ESP_LOGI(TAG, "Starting mesh networking...");
-    ESP_LOGI(TAG, "Scanning for existing mesh (2 seconds)...");
+    /* Mesh networking - starts disabled, enabled by holding boot button for 2 seconds */
+    ESP_LOGI(TAG, "Mesh networking ready (hold boot button for 2s to enable)");
     ESP_LOGI(TAG, "");
-
-    ret = mesh_start();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start mesh: %s", esp_err_to_name(ret));
-        goto error_halt;
-    }
 #endif
 
     ESP_LOGI(TAG, "System running!");
