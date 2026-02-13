@@ -21,7 +21,12 @@
 #include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
+
+#include "sdkconfig.h"
+
+#ifdef CONFIG_ESP_WIFI_ENABLED
 #include "esp_wifi.h"
+#endif
 
 static const char *TAG = "power";
 
@@ -282,7 +287,9 @@ void power_radio_slot_start(void)
 
     if (!s_radio_active) {
         /* Wake radio from power save */
+#ifdef CONFIG_ESP_WIFI_ENABLED
         esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
         s_radio_active = true;
         s_stats.radio_duty_cycles++;
         ESP_LOGD(TAG, "Radio: ON (slot start)");
@@ -311,7 +318,9 @@ void power_radio_slot_end(void)
 
     /* Only put radio to sleep in MESH_IDLE state */
     if (s_state == POWER_STATE_MESH_IDLE && s_radio_active) {
+#ifdef CONFIG_ESP_WIFI_ENABLED
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+#endif
         s_radio_active = false;
         ESP_LOGD(TAG, "Radio: SLEEP (slot end)");
     }
@@ -431,10 +440,14 @@ static esp_err_t configure_wifi_power_save(bool aggressive)
 {
     (void)aggressive; /* Ignored - always use PS_NONE for reliability */
 
+#ifdef CONFIG_ESP_WIFI_ENABLED
     esp_err_t ret = esp_wifi_set_ps(WIFI_PS_NONE);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to set WiFi PS mode: %s", esp_err_to_name(ret));
     }
-
     return ret;
+#else
+    /* No WiFi - nRF52840 handles radio */
+    return ESP_OK;
+#endif
 }

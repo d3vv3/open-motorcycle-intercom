@@ -84,3 +84,43 @@ and the speaker should be 0.5W to 3W for best results.
 | **GND**             | GND      |
 
 **Note:** Code changes required to switch from MAX98357A to PCM5102A.
+
+
+## nRF52840 Mesh Radio (XIAO)
+
+The Seeed XIAO nRF52840 handles mesh networking via ESB (Enhanced ShockBurst).
+Audio packets received from the mesh are sent to ESP32-S3 via SPI for mixing.
+
+### SPI Connection
+
+The nRF52840 is the SPI **master** and the ESP32-S3 is the SPI **slave**.
+The master polls the slave every 5 ms with a full-duplex 256-byte transaction.
+
+| XIAO nRF52840 | ESP32-S3 | Function |
+|---------------|----------|----------|
+| **Pin 6** (P1.11 / MOSI) | **GPIO10** | nRF MOSI -> ESP MOSI |
+| **Pin 7** (P1.12 / MISO) | **GPIO9**  | ESP MISO -> nRF MISO |
+| **Pin 8** (P1.13 / SCK)  | **GPIO11** | SPI Clock |
+| **Pin 9** (P1.14 / CS)   | **GPIO12** | Chip Select (active low) |
+| **GND** | **GND** | Common ground |
+
+**SPI Configuration:** Mode 0 (CPOL=0, CPHA=0), 4 MHz, MSB first
+
+### Wiring Diagram
+
+```
+ESP32-S3                    XIAO nRF52840
+┌──────────┐                ┌──────────┐
+│          │                │          │
+│   GPIO10 ├────────────────┤ Pin 6    │  (MOSI)
+│   GPIO9  ├────────────────┤ Pin 7    │  (MISO)
+│   GPIO11 ├────────────────┤ Pin 8    │  (SCK)
+│   GPIO12 ├────────────────┤ Pin 9    │  (CS)
+│          │                │          │
+│   GND    ├────────────────┤ GND      │
+│          │                │          │
+└──────────┘                └──────────┘
+```
+
+> **Note:** Both boards run at 3.3V logic, no level shifter needed.
+

@@ -1,0 +1,63 @@
+/**
+ * @file esb_radio.h
+ * @brief ESB Radio Driver for OMI Mesh
+ */
+
+#ifndef OMI_ESB_RADIO_H
+#define OMI_ESB_RADIO_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+/**
+ * @brief Callback for received ESB packets
+ */
+typedef void (*esb_rx_callback_t)(const uint8_t *data, uint8_t len, const uint8_t *src_addr,
+                                  int8_t rssi);
+
+/**
+ * @brief Initialize ESB radio
+ * @param channel RF channel (0-100)
+ * @return 0 on success, negative error code on failure
+ */
+int esb_radio_init(uint8_t channel);
+
+/**
+ * @brief Deinitialize ESB radio
+ */
+void esb_radio_deinit(void);
+
+/**
+ * @brief Set RX callback
+ */
+void esb_radio_set_rx_callback(esb_rx_callback_t cb);
+
+/**
+ * @brief Send packet via ESB (broadcast)
+ * @param data Packet data
+ * @param len Data length (max 252 bytes)
+ * @return 0 on success
+ */
+int esb_radio_send(const uint8_t *data, uint8_t len);
+
+/**
+ * @brief Send packet to specific address
+ */
+int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len);
+
+/**
+ * @brief Start RX mode
+ */
+int esb_radio_start_rx(void);
+
+/**
+ * @brief Stop RX mode
+ */
+void esb_radio_stop_rx(void);
+
+/**
+ * @brief Get local ESB address
+ */
+void esb_radio_get_address(uint8_t *addr);
+
+#endif /* OMI_ESB_RADIO_H */

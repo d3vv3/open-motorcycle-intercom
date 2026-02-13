@@ -24,7 +24,7 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
 
-# WiFi/ESP-NOW (required for mesh in Phase 1-2)
+# WiFi/ESP-NOW (required for mesh)
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
@@ -33,16 +33,11 @@ CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 CONFIG_ESPNOW_ENABLE=y
 
-# Bluetooth Classic (required for HFP gateway)
-CONFIG_BT_ENABLED=y
-CONFIG_BT_CLASSIC_ENABLED=y
-CONFIG_BT_A2DP_ENABLE=y
-CONFIG_BT_SPP_ENABLED=n
-CONFIG_BT_HFP_ENABLE=y
-CONFIG_BT_HFP_AG_ENABLE=y
+# Bluetooth - disabled for now (will re-enable for HFP gateway later)
+CONFIG_BT_ENABLED=n
 
-# BLE - disable to save memory (not needed for OMI)
-CONFIG_BT_BLE_ENABLED=n
+# UART Bridge to nRF52840 (for future use)
+CONFIG_UART_ISR_IN_IRAM=y
 
 # Power management - enable for battery optimization
 CONFIG_PM_ENABLE=y

@@ -1,0 +1,57 @@
+/* SPDX-License-Identifier: MIT */
+/* XIAO nRF52840 Device Tree Overlay for OMI Mesh */
+
+/ {
+    chosen {
+        zephyr,console = &cdc_acm_uart0;
+        zephyr,shell-uart = &cdc_acm_uart0;
+    };
+};
+
+&zephyr_udc0 {
+    cdc_acm_uart0: cdc_acm_uart0 {
+        compatible = "zephyr,cdc-acm-uart";
+        label = "CDC_ACM_0";
+    };
+};
+
+/* SPI pin configuration for ESP32-S3 bridge
+ * XIAO Pin 6 (P1.11) = MOSI  (nRF sends -> ESP32 MOSI/GPIO10)
+ * XIAO Pin 7 (P1.12) = MISO  (nRF receives <- ESP32 MISO/GPIO9)
+ * XIAO Pin 8 (P1.13) = SCK   (nRF clock -> ESP32 SCK/GPIO11)
+ * XIAO Pin 9 (P1.14) = CS    (nRF asserts -> ESP32 CS/GPIO12)
+ */
+&pinctrl {
+    spi1_default: spi1_default {
+        group1 {
+            psels = <NRF_PSEL(SPIM_MOSI, 1, 11)>,
+                    <NRF_PSEL(SPIM_MISO, 1, 12)>,
+                    <NRF_PSEL(SPIM_SCK, 1, 13)>;
+        };
+    };
+
+    spi1_sleep: spi1_sleep {
+        group1 {
+            psels = <NRF_PSEL(SPIM_MOSI, 1, 11)>,
+                    <NRF_PSEL(SPIM_MISO, 1, 12)>,
+                    <NRF_PSEL(SPIM_SCK, 1, 13)>;
+            low-power-enable;
+        };
+    };
+};
+
+&spi1 {
+    compatible = "nordic,nrf-spim";
+    status = "okay";
+    pinctrl-0 = <&spi1_default>;
+    pinctrl-1 = <&spi1_sleep>;
+    pinctrl-names = "default", "sleep";
+
+    /* CS is manually controlled via GPIO — hardware CS is too fast
+     * for ESP32 SPI slave to detect */
+};
+
+/* Disable UART0 - no longer used for bridge */
+&uart0 {
+    status = "disabled";
+};

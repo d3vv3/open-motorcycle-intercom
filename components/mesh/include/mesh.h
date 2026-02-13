@@ -344,6 +344,12 @@ esp_err_t mesh_start(void);
 esp_err_t mesh_stop(void);
 
 /**
+ * @brief Check if mesh subsystem is initialized
+ * @return true if initialized
+ */
+bool mesh_is_initialized(void);
+
+/**
  * @brief Get current mesh role
  * @return Current role (NONE, COORDINATOR, PARTICIPANT)
  */

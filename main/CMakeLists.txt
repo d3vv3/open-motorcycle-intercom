@@ -1,9 +1,14 @@
+# Main application
+# Both mesh (ESP-NOW) and uart_bridge (nRF52840) are included
+# Runtime detection determines which transport to use
+
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
     REQUIRES 
         audio
         mesh
+        uart_bridge
         hwtest
         power
         button

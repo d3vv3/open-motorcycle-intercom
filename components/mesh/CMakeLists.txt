@@ -1,3 +1,6 @@
+# Mesh component - ESP-NOW transport for when nRF52840 is not available
+# Always build - runtime detection determines if it's used
+
 idf_component_register(
     SRCS "mesh.c"
     INCLUDE_DIRS "include"

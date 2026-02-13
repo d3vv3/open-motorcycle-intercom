@@ -401,6 +401,11 @@ esp_err_t mesh_stop(void)
     return ESP_OK;
 }
 
+bool mesh_is_initialized(void)
+{
+    return s_initialized;
+}
+
 mesh_role_t mesh_get_role(void)
 {
     return s_role;
@@ -785,6 +790,11 @@ static void frame_timer_callback(void *arg)
 
 static void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
+    /* Discard packets if mesh is not active (prevents queue overflow) */
+    if (s_state == MESH_STATE_IDLE) {
+        return;
+    }
+
     if (len < sizeof(mesh_header_t)) {
         ESP_LOGW(TAG, "RX: packet too short (%d bytes)", len);
         return;

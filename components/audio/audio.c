@@ -1151,12 +1151,29 @@ esp_err_t audio_play_notification(audio_notify_t type)
     }
     free(mono_buffer);
 
+    /* Temporarily enable I2S TX if not already running.
+     * The notification may be called from button handler context
+     * when the audio task hasn't enabled the channel yet. */
+    bool need_enable = !s_running;
+    if (need_enable) {
+        esp_err_t en_ret = i2s_channel_enable(s_tx_chan);
+        if (en_ret != ESP_OK && en_ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Failed to enable I2S for notification: %s", esp_err_to_name(en_ret));
+            free(stereo_buffer);
+            return en_ret;
+        }
+    }
+
     /* Write stereo buffer to I2S (blocking) */
     size_t bytes_written = 0;
     esp_err_t ret = i2s_channel_write(s_tx_chan, stereo_buffer, stereo_samples * sizeof(int16_t),
                                       &bytes_written, 500);
 
     free(stereo_buffer);
+
+    if (need_enable) {
+        i2s_channel_disable(s_tx_chan);
+    }
 
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to play notification: %s", esp_err_to_name(ret));
