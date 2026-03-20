@@ -41,6 +41,7 @@ extern "C" {
 #define BRIDGE_PKT_STATUS     0x02
 #define BRIDGE_PKT_MESH_EVENT 0x03
 #define BRIDGE_PKT_CONTROL    0x04
+#define BRIDGE_PKT_LOG        0x05
 
 /* Mesh events received from nRF52840 */
 typedef enum {
@@ -126,6 +127,18 @@ bool uart_bridge_is_connected(void);
  * @return true if detected, false otherwise
  */
 bool uart_bridge_probe(uint32_t timeout_ms);
+
+/**
+ * @brief Send mesh enable command to nRF52840
+ * @return ESP_OK on success
+ */
+esp_err_t uart_bridge_mesh_enable(void);
+
+/**
+ * @brief Send mesh disable command to nRF52840
+ * @return ESP_OK on success
+ */
+esp_err_t uart_bridge_mesh_disable(void);
 
 #ifdef __cplusplus
 }

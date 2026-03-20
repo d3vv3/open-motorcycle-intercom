@@ -15,8 +15,9 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
  * Constants
  * ============================================================================ */
 
-#define ESB_MAX_PAYLOAD_LEN 252
+#define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 #define ESB_ADDR_LEN        5
+#define TX_DONE_TIMEOUT_MS  10 /* Max wait for TX completion */
 
 /* Broadcast address for mesh discovery */
 static const uint8_t broadcast_addr[ESB_ADDR_LEN] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
@@ -30,33 +31,45 @@ static uint8_t s_local_addr[ESB_ADDR_LEN];
 static struct esb_payload s_tx_payload;
 static struct esb_payload s_rx_payload;
 static bool s_initialized = false;
+static bool s_tx_in_progress = false; /* Prevent re-entry during TX */
+static bool s_rx_active = false;      /* Track if RX mode is running */
+
+/* Semaphore signaled when TX completes (success or fail) */
+static K_SEM_DEFINE(s_tx_done_sem, 0, 1);
 
 /* ============================================================================
  * ESB Event Handler
  * ============================================================================ */
 
+static volatile int s_last_tx_status = 0; /* 0=Success, -EIO=Failed */
+
 static void on_esb_event(struct esb_evt const *event)
 {
     switch (event->evt_id) {
     case ESB_EVENT_TX_SUCCESS:
-        LOG_DBG("TX success");
+        s_last_tx_status = 0;
+        k_sem_give(&s_tx_done_sem);
         break;
 
     case ESB_EVENT_TX_FAILED:
-        LOG_WRN("TX failed");
+        s_last_tx_status = -EIO;
+        k_sem_give(&s_tx_done_sem);
         break;
 
-    case ESB_EVENT_RX_RECEIVED:
-        while (esb_read_rx_payload(&s_rx_payload) == 0) {
-            LOG_DBG("RX: %d bytes from pipe %d", s_rx_payload.length, s_rx_payload.pipe);
-
+    case ESB_EVENT_RX_RECEIVED: {
+        int rx_count = 0;
+        while (esb_read_rx_payload(&s_rx_payload) == 0 && rx_count < 8) {
+            rx_count++;
             if (s_rx_callback && s_rx_payload.length > 0) {
-                /* Note: ESB doesn't provide source address directly,
-                 * it's embedded in our mesh protocol header */
                 s_rx_callback(s_rx_payload.data, s_rx_payload.length, NULL, s_rx_payload.rssi);
             }
         }
+        /* Flush anything remaining to prevent FIFO buildup */
+        if (rx_count >= 8) {
+            esb_flush_rx();
+        }
         break;
+    }
     }
 }
 
@@ -100,7 +113,7 @@ int esb_radio_init(uint8_t channel)
     config.retransmit_count = 3;
     config.tx_mode = ESB_TXMODE_AUTO;
     config.payload_length = ESB_MAX_PAYLOAD_LEN;
-    config.selective_auto_ack = false;
+    config.selective_auto_ack = true; /* Required for noack flag to work */
 
     int ret = esb_init(&config);
     if (ret) {
@@ -167,26 +180,89 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         return -EMSGSIZE;
     }
 
+    /* Prevent re-entry - if already transmitting, drop this packet */
+    if (s_tx_in_progress) {
+        LOG_WRN("TX busy, dropping packet");
+        return -EBUSY;
+    }
+    s_tx_in_progress = true;
+
+    /* Only stop RX if it was actually active */
+    bool was_rx_active = s_rx_active;
+    if (was_rx_active) {
+        esb_stop_rx();
+        s_rx_active = false;
+    }
+
+    /* Flush any pending TX to prevent FIFO overflow */
+    esb_flush_tx();
+
     /* Set destination address */
     int ret = esb_set_base_address_0(addr);
     if (ret) {
         LOG_ERR("Set TX addr failed: %d", ret);
+        s_tx_in_progress = false;
+        if (was_rx_active) {
+            esb_start_rx();
+            s_rx_active = true;
+        }
         return ret;
     }
 
     /* Prepare payload */
     s_tx_payload.pipe = 0;
     s_tx_payload.length = len;
+    s_tx_payload.noack = true; /* Don't wait for ACK on broadcast */
     memcpy(s_tx_payload.data, data, len);
+
+    /* Reset semaphore before TX */
+    k_sem_reset(&s_tx_done_sem);
 
     /* Send */
     ret = esb_write_payload(&s_tx_payload);
     if (ret) {
         LOG_ERR("TX write failed: %d", ret);
+        s_tx_in_progress = false;
+        if (was_rx_active) {
+            esb_start_rx();
+            s_rx_active = true;
+        }
         return ret;
     }
 
-    return 0;
+    /* Wait for TX completion via semaphore (signaled by ESB event handler).
+     * With noack=true at 2Mbps, TX completes in <1ms. */
+    if (k_sem_take(&s_tx_done_sem, K_MSEC(TX_DONE_TIMEOUT_MS)) != 0) {
+        LOG_ERR("TX timed out");
+        s_tx_in_progress = false;
+        if (was_rx_active) {
+            esb_start_rx();
+            s_rx_active = true;
+        }
+        return -ETIMEDOUT;
+    }
+
+    /* Busy-wait for ESB to reach IDLE (should be immediate after sem) */
+    int idle_wait = 0;
+    while (!esb_is_idle() && idle_wait < 100) {
+        k_busy_wait(10);
+        idle_wait++;
+    }
+
+    s_tx_in_progress = false;
+
+    /* Resume RX mode only if it was active before */
+    if (was_rx_active) {
+        int rx_ret = esb_start_rx();
+        if (rx_ret == 0) {
+            s_rx_active = true;
+        } else {
+            LOG_ERR("Failed to resume RX after TX: %d", rx_ret);
+            s_rx_active = false;
+        }
+    }
+
+    return s_last_tx_status;
 }
 
 int esb_radio_start_rx(void)
@@ -201,6 +277,7 @@ int esb_radio_start_rx(void)
         return ret;
     }
 
+    s_rx_active = true;
     LOG_DBG("RX started");
     return 0;
 }
@@ -212,6 +289,7 @@ void esb_radio_stop_rx(void)
     }
 
     esb_stop_rx();
+    s_rx_active = false;
     LOG_DBG("RX stopped");
 }
 

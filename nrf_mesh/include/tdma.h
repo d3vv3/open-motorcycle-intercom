@@ -53,4 +53,10 @@ int32_t tdma_get_time_to_slot_us(void);
  */
 void tdma_sync(uint32_t frame_counter, int16_t drift_ppm);
 
+/**
+ * @brief Tune the next frame interval by adding offset_us
+ * @param offset_us Microseconds to add (can be negative, though implementation might clamp)
+ */
+void tdma_tune_timing(int32_t offset_us);
+
 #endif /* OMI_TDMA_H */

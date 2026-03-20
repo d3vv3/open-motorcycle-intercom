@@ -63,15 +63,30 @@ static uint16_t s_tx_pending_len = 0;
 static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
 {
     switch (type) {
-    case UART_PKT_AUDIO:
+    case UART_PKT_AUDIO: {
+        static int32_t last_log = 0;
+        static uint32_t audio_pkt_count = 0;
+        audio_pkt_count++;
+        int32_t now = k_uptime_get();
+        if (now - last_log > 5000) {
+            LOG_INF("Audio: %u pkts received (last len=%d)", audio_pkt_count, len);
+            last_log = now;
+        }
         mesh_protocol_send_audio(payload, len);
         break;
+    }
 
     case UART_PKT_COMMAND:
         if (len > 0) {
             uint8_t cmd_id = payload[0];
             LOG_INF("Received command: 0x%02X", cmd_id);
             if (cmd_id == 0x01) { /* Enable Mesh */
+                /* Stop first if already running, then start fresh */
+                if (mesh_protocol_get_state() != MESH_STATE_IDLE) {
+                    LOG_INF("Mesh already running, restarting...");
+                    mesh_protocol_stop();
+                    k_sleep(K_MSEC(100)); /* Brief delay for clean shutdown */
+                }
                 mesh_protocol_start();
             } else if (cmd_id == 0x02) { /* Disable Mesh */
                 mesh_protocol_stop();
@@ -301,4 +316,26 @@ void uart_bridge_process(void)
 bool uart_bridge_is_initialized(void)
 {
     return s_initialized;
+}
+
+int uart_bridge_send_log(const char *msg, uint8_t len)
+{
+    if (!s_initialized || msg == NULL || len == 0) {
+        return -EINVAL;
+    }
+
+    if (len > SPI_MAX_PAYLOAD) {
+        len = SPI_MAX_PAYLOAD; /* Truncate if too long */
+    }
+
+    /* Build packet: [SYNC][LEN][TYPE][MSG...] */
+    memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
+    s_tx_buf[0] = UART_SYNC_BYTE;
+    s_tx_buf[1] = len + 1; /* type + msg */
+    s_tx_buf[2] = UART_PKT_LOG;
+    memcpy(&s_tx_buf[3], msg, len);
+
+    s_tx_pending_len = 3 + len;
+
+    return 0;
 }

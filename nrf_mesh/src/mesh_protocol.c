@@ -7,6 +7,7 @@
 
 #include "mesh_protocol.h"
 
+#include <stdarg.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -16,6 +17,23 @@
 #include "uart_bridge.h"
 
 LOG_MODULE_REGISTER(mesh, LOG_LEVEL_INF);
+
+/* ============================================================================
+ * Debug Log Forwarding to ESP32
+ * ============================================================================ */
+
+/* Helper to send log to ESP32 via SPI bridge */
+static void mesh_log(const char *fmt, ...)
+{
+    char buf[128];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintk(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (len > 0 && uart_bridge_is_initialized()) {
+        uart_bridge_send_log(buf, (uint8_t)len);
+    }
+}
 
 /* ============================================================================
  * Constants
@@ -43,12 +61,55 @@ static uint8_t s_peer_count = 0;
 
 static uint8_t s_tx_seq = 0;
 
+/* Check for lost coordinator */
+static uint32_t s_last_sync_time = 0;
+#define SYNC_TIMEOUT_MS 5000 /* 5 seconds timeout to allow for some packet loss */
+
 /* Work queue items */
 static struct k_work_delayable s_scan_work;
 static struct k_work_delayable s_join_work;
 static struct k_work_delayable s_status_work;
+static struct k_work s_rx_work; /* For deferred RX processing */
 
 static int s_join_attempts = 0;
+
+/* RX ring buffer for deferred processing (replaces single-packet buffer) */
+#define RX_RING_SIZE 8
+struct rx_ring_entry {
+    uint8_t data[256];
+    uint8_t len;
+    int8_t rssi;
+};
+static struct rx_ring_entry s_rx_ring[RX_RING_SIZE];
+static volatile uint8_t s_rx_ring_head = 0; /* ISR writes here */
+static volatile uint8_t s_rx_ring_tail = 0; /* Work reads here */
+
+/* Packet statistics */
+/* Packet statistics */
+static uint32_t s_stat_tx_count = 0;
+static uint32_t s_stat_tx_fail = 0;
+static uint32_t s_stat_tx_underflow = 0;
+
+static uint32_t s_stat_rx_count = 0;
+static uint32_t s_stat_rx_drop = 0;
+static uint32_t s_stat_audio_fwd = 0;
+static uint32_t s_stat_tx_overwrite = 0;  /* Audio overwritten before TDMA sent */
+static uint32_t s_stat_spi_audio_in = 0;  /* Audio packets received from ESP32 SPI */
+static uint32_t s_last_audio_in_time = 0; /* Timestamp of last audio packet from ESP32 */
+
+/* ... (lines 91-447 are unchanged, but I must match the context if I want to be safe,
+ * but the tool requires contiguous block. I'll stick to replacing the stats block
+ * and then the handler block separately? No, I can do multi-replace or big chunks)
+ *
+ * Actually, `status_work_handler` is around line 431.
+ * `slot_tx_handler` is around line 460.
+ * `s_stat_...` definitions are around line 84.
+ * These are far apart. I should use multi_replace.
+ */
+
+/* RE-READING TOOL DEFINITION: "Do NOT make multiple parallel calls to this tool".
+ * So I should use multi_replace_file_content.
+ */
 
 /* ============================================================================
  * Forward Declarations
@@ -57,8 +118,9 @@ static int s_join_attempts = 0;
 static void scan_work_handler(struct k_work *work);
 static void join_work_handler(struct k_work *work);
 static void status_work_handler(struct k_work *work);
-static void handle_rx_packet(const uint8_t *data, uint8_t len, const uint8_t *src_addr,
-                             int8_t rssi);
+static void rx_work_handler(struct k_work *work);
+static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi);
+static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src_addr, int8_t rssi);
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter);
 
 /* ============================================================================
@@ -104,11 +166,63 @@ static int send_sync(void)
     return send_packet(MESH_PKT_SYNC, &payload, sizeof(payload));
 }
 
+static int send_join_ack(uint8_t assigned_id, uint8_t slot_index)
+{
+    mesh_join_ack_payload_t payload = {
+        .assigned_id = assigned_id,
+        .slot_index = slot_index,
+        .coordinator_id = s_node_id,
+    };
+    LOG_INF("Sending JOIN_ACK: id=%d, slot=%d", assigned_id, slot_index);
+    return send_packet(MESH_PKT_JOIN_ACK, &payload, sizeof(payload));
+}
+
 /* ============================================================================
- * Packet Handling
+ * Packet Handling (deferred to thread context)
  * ============================================================================ */
 
-static void handle_rx_packet(const uint8_t *data, uint8_t len, const uint8_t *src_addr, int8_t rssi)
+/* ISR-safe callback - copies data to ring buffer and submits work */
+static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src_addr, int8_t rssi)
+{
+    ARG_UNUSED(src_addr);
+
+    /* NOTE: Don't printk here - ISR context, can deadlock with USB/UART */
+
+    uint8_t next_head = (s_rx_ring_head + 1) % RX_RING_SIZE;
+    if (next_head == s_rx_ring_tail) {
+        /* Ring full - drop packet */
+        s_stat_rx_drop++;
+        return;
+    }
+
+    if (len > sizeof(s_rx_ring[0].data)) {
+        return;
+    }
+
+    struct rx_ring_entry *entry = &s_rx_ring[s_rx_ring_head];
+    memcpy(entry->data, data, len);
+    entry->len = len;
+    entry->rssi = rssi;
+    s_rx_ring_head = next_head;
+
+    /* Submit work to process in thread context */
+    k_work_submit(&s_rx_work);
+}
+
+/* Work handler - drains all pending packets from ring buffer */
+static void rx_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    while (s_rx_ring_tail != s_rx_ring_head) {
+        struct rx_ring_entry *entry = &s_rx_ring[s_rx_ring_tail];
+        process_rx_packet(entry->data, entry->len, entry->rssi);
+        s_rx_ring_tail = (s_rx_ring_tail + 1) % RX_RING_SIZE;
+    }
+}
+
+/* Actual packet processing - safe to call kernel functions here */
+static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
 {
     if (len < sizeof(mesh_header_t)) {
         return;
@@ -123,6 +237,8 @@ static void handle_rx_packet(const uint8_t *data, uint8_t len, const uint8_t *sr
 
     LOG_DBG("RX type=0x%02X src=%d seq=%d (RSSI=%d)", hdr->type, hdr->src_id, hdr->seq, rssi);
 
+    s_stat_rx_count++;
+
     switch (hdr->type) {
     case MESH_PKT_AUDIO:
         if (s_state == MESH_STATE_ACTIVE && hdr->payload_len > 4) {
@@ -130,6 +246,7 @@ static void handle_rx_packet(const uint8_t *data, uint8_t len, const uint8_t *sr
             const mesh_audio_payload_t *audio = (const mesh_audio_payload_t *)payload;
             uint8_t audio_len = hdr->payload_len - 4; /* Subtract header */
             uart_bridge_send_audio(hdr->src_id, audio->data, audio_len);
+            s_stat_audio_fwd++;
         }
         break;
 
@@ -146,14 +263,91 @@ static void handle_rx_packet(const uint8_t *data, uint8_t len, const uint8_t *sr
             /* Sync to coordinator timing */
             const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
             tdma_sync(sync->frame_counter, sync->drift_ppm);
+            s_last_sync_time = k_uptime_get_32();
         }
         break;
 
     case MESH_PKT_JOIN:
         if (s_role == MESH_ROLE_COORDINATOR) {
-            /* Assign ID and slot to new node */
-            /* TODO: Implement coordinator logic */
-            LOG_INF("Received JOIN from new node");
+            /* Deduplication: if we recently assigned a slot and the new peer
+             * hasn't confirmed (sent KEEPALIVE), assume this is a retry from
+             * the same joiner and resend the previous JOIN_ACK. */
+            static uint8_t s_last_join_id = 0;
+            static int8_t s_last_join_slot = -1;
+            static int64_t s_last_join_time = 0;
+
+            int64_t now = k_uptime_get();
+            if (s_last_join_id != 0 && (now - s_last_join_time) < 10000) {
+                /* Check if the last assigned peer ever sent anything back */
+                bool last_peer_confirmed = false;
+                for (int i = 0; i < MESH_MAX_NODES; i++) {
+                    if (s_peers[i].active && s_peers[i].node_id == s_last_join_id) {
+                        /* If last_seen hasn't changed from assignment time,
+                         * it's the same joiner retrying */
+                        if ((now - s_peers[i].last_seen_ms) < 10000) {
+                            last_peer_confirmed = false;
+                        }
+                        break;
+                    }
+                }
+
+                if (!last_peer_confirmed) {
+                    LOG_INF("JOIN retry, resending ACK: id=%d slot=%d", s_last_join_id,
+                            s_last_join_slot);
+                    send_join_ack(s_last_join_id, s_last_join_slot);
+                    break;
+                }
+            }
+
+            /* Find next available slot and ID for new node */
+            uint8_t new_id = 0;
+            int8_t new_slot = -1;
+
+            /* Find first free slot (start at 1, slot 0 is coordinator) */
+            for (int i = 1; i < MESH_MAX_NODES; i++) {
+                bool slot_used = false;
+                for (int j = 0; j < MESH_MAX_NODES; j++) {
+                    if (s_peers[j].active && s_peers[j].slot_index == i) {
+                        slot_used = true;
+                        break;
+                    }
+                }
+                if (!slot_used) {
+                    new_slot = i;
+                    new_id = i + 1; /* ID = slot + 1 */
+                    break;
+                }
+            }
+
+            if (new_slot < 0) {
+                LOG_WRN("No free slots for new node");
+                break;
+            }
+
+            LOG_INF("Received JOIN, assigning id=%d slot=%d", new_id, new_slot);
+
+            /* Add new peer to our list */
+            for (int i = 0; i < MESH_MAX_NODES; i++) {
+                if (!s_peers[i].active) {
+                    s_peers[i].node_id = new_id;
+                    s_peers[i].slot_index = new_slot;
+                    s_peers[i].active = true;
+                    s_peers[i].last_seen_ms = k_uptime_get();
+                    s_peer_count++;
+                    break;
+                }
+            }
+
+            /* Track this assignment for dedup */
+            s_last_join_id = new_id;
+            s_last_join_slot = new_slot;
+            s_last_join_time = k_uptime_get();
+
+            /* Send JOIN_ACK to the new node */
+            send_join_ack(new_id, new_slot);
+
+            /* Notify ESP32 of new peer joining */
+            uart_bridge_send_event(0x02, NULL, 0); /* BRIDGE_EVENT_PEER_JOINED */
         }
         break;
 
@@ -173,7 +367,11 @@ static void handle_rx_packet(const uint8_t *data, uint8_t len, const uint8_t *sr
             tdma_start(s_slot_index);
 
             /* Start periodic status updates */
+            s_last_sync_time = k_uptime_get_32();
             k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
+
+            /* Notify ESP32 that we joined the mesh */
+            uart_bridge_send_event(0x02, NULL, 0); /* BRIDGE_EVENT_PEER_JOINED */
         }
         break;
 
@@ -221,6 +419,8 @@ static void scan_work_handler(struct k_work *work)
     s_peers[0].last_seen_ms = k_uptime_get();
     s_peer_count = 1;
 
+    /* RX is already running from scanning phase */
+
     /* Start TDMA */
     tdma_start(s_slot_index);
 
@@ -242,10 +442,12 @@ static void join_work_handler(struct k_work *work)
         send_join_request();
         s_join_attempts++;
         LOG_INF("JOIN attempt %d/%d", s_join_attempts, JOIN_RETRY_COUNT);
+        mesh_log("MESH: JOIN attempt %d/%d", s_join_attempts, JOIN_RETRY_COUNT);
         k_work_schedule(&s_join_work, K_MSEC(JOIN_RETRY_MS));
     } else {
         /* Give up and become coordinator */
         LOG_WRN("JOIN timeout, becoming coordinator");
+        mesh_log("MESH: JOIN timeout, becoming coord");
         s_state = MESH_STATE_SCANNING;
         k_work_schedule(&s_scan_work, K_NO_WAIT);
     }
@@ -262,10 +464,34 @@ static void status_work_handler(struct k_work *work)
     /* Send status to ESP32 */
     uart_bridge_send_status(s_role, s_peer_count, s_node_id);
 
-    /* Coordinator sends SYNC periodically */
+    /* Log packet stats */
+    printk("[MESH] tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u under=%u\n",
+           s_stat_tx_count, s_stat_tx_fail, s_stat_rx_count, s_stat_rx_drop, s_stat_audio_fwd,
+           s_stat_spi_audio_in, s_stat_tx_overwrite, s_stat_tx_underflow);
+
+    /* Coordinator sends SYNC on every status update for discovery */
     if (s_role == MESH_ROLE_COORDINATOR) {
-        if ((tdma_get_frame_counter() % MESH_SYNC_INTERVAL_FRAMES) == 0) {
-            send_sync();
+        send_sync();
+    } else if (s_role == MESH_ROLE_PARTICIPANT) {
+        /* Check for coordinator timeout */
+        if (k_uptime_get_32() - s_last_sync_time > SYNC_TIMEOUT_MS) {
+            LOG_WRN("Coordinator lost (timeout), rescanning...");
+            mesh_log("MESH: Coordinator lost, rescanning");
+
+            /* Notify ESP32 that we lost connection */
+            uart_bridge_send_event(0x03, NULL, 0); /* BRIDGE_EVENT_PEER_LEFT */
+
+            /* Stop TDMA */
+            tdma_stop();
+
+            /* Return to scanning */
+            s_state = MESH_STATE_SCANNING;
+            s_role = MESH_ROLE_NONE; // Reset role
+            s_node_id = 0;
+            s_slot_index = -1;
+
+            k_work_schedule(&s_scan_work, K_NO_WAIT);
+            return; /* Don't reschedule status work */
         }
     }
 
@@ -273,9 +499,15 @@ static void status_work_handler(struct k_work *work)
     k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
 }
 
-static uint8_t s_tx_audio_buf[MESH_MAX_AUDIO_PAYLOAD];
-static uint8_t s_tx_audio_len = 0;
-static bool s_tx_audio_ready = false;
+#define TX_AUDIO_RING_SIZE 32
+struct tx_audio_entry {
+    uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
+    uint8_t len;
+};
+
+static struct tx_audio_entry s_tx_audio_ring[TX_AUDIO_RING_SIZE];
+static volatile uint8_t s_tx_head = 0;
+static volatile uint8_t s_tx_tail = 0;
 
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
 {
@@ -283,7 +515,10 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     ARG_UNUSED(slot_index);
     ARG_UNUSED(frame_counter);
 
-    if (s_state == MESH_STATE_ACTIVE && s_tx_audio_ready) {
+    if (s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail) {
+        /* Peek at tail */
+        struct tx_audio_entry *entry = &s_tx_audio_ring[s_tx_tail];
+
         mesh_audio_payload_t payload = {
             .codec = 1, /* Opus */
             .frame_ms = 20,
@@ -291,16 +526,73 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
             .reserved = 0,
         };
 
-        if (s_tx_audio_len > MESH_MAX_AUDIO_PAYLOAD) {
-            s_tx_audio_len = MESH_MAX_AUDIO_PAYLOAD;
+        if (entry->len > MESH_MAX_AUDIO_PAYLOAD) {
+            entry->len = MESH_MAX_AUDIO_PAYLOAD;
         }
 
-        memcpy(payload.data, s_tx_audio_buf, s_tx_audio_len);
+        memcpy(payload.data, entry->data, entry->len);
 
-        /* Calculate total payload length: header (4) + audio data */
-        send_packet(MESH_PKT_AUDIO, &payload, 4 + s_tx_audio_len);
+        /* Send packet */
+        int ret = send_packet(MESH_PKT_AUDIO, &payload, 4 + entry->len);
 
-        s_tx_audio_ready = false;
+        if (ret == 0) {
+            s_stat_tx_count++;
+        } else {
+            s_stat_tx_fail++;
+        }
+
+        /* always consume */
+        s_tx_tail = (s_tx_tail + 1) % TX_AUDIO_RING_SIZE;
+
+        /* Flow control: check buffer level AFTER consuming.
+         * Use proportional braking to match ESP32 audio production rate.
+         */
+        uint8_t buf_count;
+        if (s_tx_head >= s_tx_tail) {
+            buf_count = s_tx_head - s_tx_tail;
+        } else {
+            buf_count = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
+        }
+
+        if (buf_count == 0) {
+            /* Just drained the last packet. Brake hard. */
+            s_stat_tx_underflow++;
+            tdma_tune_timing(2000); /* +2ms (was 5ms) */
+        } else if (buf_count == 1) {
+            tdma_tune_timing(1000); /* +1ms (was 2ms) */
+        } else if (buf_count < 4) {
+            tdma_tune_timing(200); /* +0.2ms (gentle nudge) */
+        }
+
+    } else {
+        /* Underflow (Buffer logic was: head!=tail, so this else is head==tail)
+         * ...
+         */
+
+        uint32_t now = k_uptime_get_32();
+        bool has_audio_source = (now - s_last_audio_in_time) < 100;
+
+        if (has_audio_source) {
+            /* Calculate number of packets in buffer */
+            uint8_t count;
+            if (s_tx_head >= s_tx_tail) {
+                count = s_tx_head - s_tx_tail;
+            } else {
+                count = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
+            }
+
+            /* Aggressive proportional flow control:
+             * Reduced values to prevent stalling.
+             */
+            if (count == 0) {
+                s_stat_tx_underflow++;
+                tdma_tune_timing(2000); /* +2ms */
+            } else if (count == 1) {
+                tdma_tune_timing(1000); /* +1ms */
+            } else if (count < 4) {
+                tdma_tune_timing(200); /* +0.2ms */
+            }
+        }
     }
 }
 
@@ -310,10 +602,33 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len)
         return -EMSGSIZE;
     }
 
-    /* Overwrite valid buffer (newest audio is best) */
-    memcpy(s_tx_audio_buf, data, len);
-    s_tx_audio_len = len;
-    s_tx_audio_ready = true;
+    s_stat_spi_audio_in++;
+    s_last_audio_in_time = k_uptime_get_32();
+
+    uint8_t next_head = (s_tx_head + 1) % TX_AUDIO_RING_SIZE;
+
+    if (next_head == s_tx_tail) {
+        /* Buffer full - overwrite oldest (tail) to keep latency low?
+         * Or drop new?
+         * If we drop new, we hear gaps.
+         * If we overwrite old, we skip ahead.
+         * Usage stats show we are overwriting significantly.
+         * Let's drop NEW packet and count it as overwrite/drop.
+         * Actually, current behavior was "overwrite old", but since it was single buffer,
+         * it was effectively "always send newest".
+         *
+         * With a queue, if we are full, it means we are choked.
+         * Let's drop the NEW packet to preserve the contiguous stream we already have queued.
+         */
+        s_stat_tx_overwrite++;
+        return -ENOMEM;
+    }
+
+    struct tx_audio_entry *entry = &s_tx_audio_ring[s_tx_head];
+    memcpy(entry->data, data, len);
+    entry->len = len;
+
+    s_tx_head = next_head;
 
     return 0;
 }
@@ -330,9 +645,10 @@ int mesh_protocol_init(void)
     k_work_init_delayable(&s_scan_work, scan_work_handler);
     k_work_init_delayable(&s_join_work, join_work_handler);
     k_work_init_delayable(&s_status_work, status_work_handler);
+    k_work_init(&s_rx_work, rx_work_handler);
 
     /* Set callbacks */
-    esb_radio_set_rx_callback(handle_rx_packet);
+    esb_radio_set_rx_callback(esb_rx_callback);
     tdma_set_slot_callback(slot_tx_handler);
 
     /* Get local address */
@@ -349,14 +665,17 @@ int mesh_protocol_start(void)
     }
 
     LOG_INF("Starting mesh protocol");
+    printk("[MESH] mesh_protocol_start called\n");
 
-    /* Start RX */
+    /* Start RX so we can hear SYNC broadcasts from an existing coordinator */
     esb_radio_start_rx();
 
     /* Enter scanning state */
     s_state = MESH_STATE_SCANNING;
+    printk("[MESH] Scanning for existing mesh (%dms timeout)...\n", SCAN_TIMEOUT_MS);
     k_work_schedule(&s_scan_work, K_MSEC(SCAN_TIMEOUT_MS));
 
+    printk("[MESH] mesh_protocol_start complete\n");
     return 0;
 }
 

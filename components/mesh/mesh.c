@@ -728,6 +728,9 @@ static void mesh_task(void *arg)
                     uint8_t src_id;
 
                     while (jitter_buffer_pop(audio_data, &audio_len, &src_id)) {
+                        /* Pass RSSI/Seq if available (requires updating struct/pop)
+                         * For now, just pass timestamp for latency calc.
+                         */
                         s_audio_cb(audio_data, audio_len, src_id, now);
                     }
                 }
@@ -1339,7 +1342,6 @@ static bool is_coordinator_candidate(void)
     xSemaphoreGive(s_peer_mutex);
     return true; /* We have lowest MAC */
 }
-
 static uint8_t assign_node_id(const uint8_t *mac)
 {
     /* Find first available ID (1-8) */

@@ -78,13 +78,10 @@ int main(void)
     }
     printk("[DIAG] Mesh protocol OK\n");
 
-    printk("[DIAG] Starting mesh protocol...\n");
-    ret = mesh_protocol_start();
-    if (ret) {
-        printk("[DIAG] Mesh start FAILED: %d\n", ret);
-        goto run_spi_only;
-    }
-    printk("[DIAG] Mesh started, entering main loop\n");
+    /* NOTE: Don't start mesh automatically - wait for ESP32 command.
+     * This allows both boards to be ready before mesh discovery starts,
+     * ensuring proper coordinator election. */
+    printk("[DIAG] Mesh initialized, waiting for ESP32 enable command\n");
 
 run_spi_only:
     /* Main loop - process UART bridge and let workqueue handle mesh */
@@ -96,8 +93,11 @@ run_spi_only:
         uart_bridge_process();
 
         loop_count++;
-        if (loop_count % 500 == 0) {
-            printk("[DIAG] heartbeat: %u loops\n", loop_count);
+        if (loop_count % 1000 == 0) {
+            printk("."); /* Quick heartbeat every 10 seconds */
+        }
+        if (loop_count % 3000 == 0) {
+            printk("\n[DIAG] heartbeat: %u loops\n", loop_count);
         }
 
         /* Sleep to let other tasks run */

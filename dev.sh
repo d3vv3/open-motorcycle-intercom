@@ -191,6 +191,7 @@ show_usage() {
     echo "  monitor   - Reset and monitor both boards"
     echo "  monitor-no-reset - Monitor without resetting"
     echo "  reset     - Reset both boards"
+    echo "  clean     - Clean build directory and sdkconfig"
     echo "  help      - Show this help"
     echo ""
     echo "Configuration:"
@@ -258,6 +259,12 @@ main() {
         reset)
             check_devices
             reset_both
+            ;;
+        
+        clean)
+            print_msg "Cleaning build..." "$COLOR_YELLOW"
+            rm -rf build sdkconfig
+            print_msg "✓ Clean complete" "$COLOR_GREEN"
             ;;
         
         help|--help|-h)

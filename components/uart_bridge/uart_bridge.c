@@ -53,18 +53,25 @@ static uart_bridge_status_t s_status = {0};
 static bool s_connected = false;
 
 /*
- * TX queue: the slave pre-loads one outgoing buffer for the NEXT master
- * transaction.  Double-buffered so the app can write the next packet while
- * the current transaction is in flight.
+ * TX double-buffer: s_tx_buf is the staging area where the app writes
+ * new packets.  s_tx_dma_buf is what the SPI DMA actually reads from.
+ * prepare_tx_buf() copies staging -> DMA so the audio callback can
+ * safely write to s_tx_buf while a DMA transfer is in flight.
  */
-static WORD_ALIGNED_ATTR uint8_t s_tx_buf[BRIDGE_SPI_MAX_XFER];
+static WORD_ALIGNED_ATTR uint8_t s_tx_buf[BRIDGE_SPI_MAX_XFER];     /* Staging buffer */
+static WORD_ALIGNED_ATTR uint8_t s_tx_dma_buf[BRIDGE_SPI_MAX_XFER]; /* DMA buffer */
 static WORD_ALIGNED_ATTR uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
 
-/* Mutex protecting s_tx_buf between the app thread and the SPI post */
+/* Mutex protecting s_tx_buf between the app thread and the SPI task */
 static SemaphoreHandle_t s_tx_mutex;
 
 /* Pending TX packet length (0 = idle, send zeros) */
 static volatile uint16_t s_tx_pending_len = 0;
+
+/* Pipeline diagnostics */
+static uint32_t s_audio_tx_queued = 0;    /* Audio frames queued for SPI TX */
+static uint32_t s_audio_tx_overwrite = 0; /* Audio frames that overwrote unsent ones */
+static uint32_t s_audio_rx_count = 0;     /* Audio frames received from nRF */
 
 /* ============================================================================
  * Private Functions
@@ -76,6 +83,7 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
     case BRIDGE_PKT_AUDIO:
         if (s_audio_cb && len > 1) {
             uint8_t src_id = payload[0];
+            s_audio_rx_count++;
             s_audio_cb(src_id, payload + 1, len - 1, esp_timer_get_time());
         }
         break;
@@ -103,6 +111,17 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
         if (s_event_cb && len > 0) {
             uart_bridge_event_t event = (uart_bridge_event_t)payload[0];
             s_event_cb(event, payload + 1, len - 1);
+        }
+        break;
+
+    case BRIDGE_PKT_LOG:
+        if (len > 0) {
+            /* Print nRF52 log with prefix, ensure null termination */
+            char log_msg[129];
+            uint16_t copy_len = (len < sizeof(log_msg) - 1) ? len : sizeof(log_msg) - 1;
+            memcpy(log_msg, payload, copy_len);
+            log_msg[copy_len] = '\0';
+            ESP_LOGI("nRF52", "%s", log_msg);
         }
         break;
 
@@ -149,23 +168,26 @@ static void parse_rx(const uint8_t *buf, size_t len)
 }
 
 /**
- * @brief Prepare the TX buffer for the next SPI transaction.
+ * @brief Prepare the DMA TX buffer for the next SPI transaction.
  *
- * If a packet is queued (s_tx_pending_len > 0) the buffer already contains
- * it.  Otherwise fill with zeros (idle frame).
+ * Copies from staging buffer (s_tx_buf) to DMA buffer (s_tx_dma_buf)
+ * and clears the pending flag so the staging buffer can accept new data.
  */
 static void prepare_tx_buf(void)
 {
     if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (s_tx_pending_len == 0) {
-            memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
+        if (s_tx_pending_len > 0) {
+            /* Copy staging -> DMA and clear pending */
+            memcpy(s_tx_dma_buf, s_tx_buf, BRIDGE_SPI_MAX_XFER);
+            s_tx_pending_len = 0;
+        } else {
+            /* Nothing pending, send idle frame */
+            memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
         }
-        /* If pending, the buffer already holds the framed packet. */
-        /* After the transaction completes, we'll clear the pending flag. */
         xSemaphoreGive(s_tx_mutex);
     } else {
         /* Couldn't lock - send idle */
-        memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
+        memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
     }
 }
 
@@ -190,7 +212,7 @@ static void spi_slave_task(void *arg)
 
         memset(s_rx_buf, 0, BRIDGE_SPI_MAX_XFER);
         txn.length = BRIDGE_SPI_MAX_XFER * 8; /* length in bits */
-        txn.tx_buffer = s_tx_buf;
+        txn.tx_buffer = s_tx_dma_buf;
         txn.rx_buffer = s_rx_buf;
 
         /* Block until the master performs a transaction */
@@ -202,12 +224,6 @@ static void spi_slave_task(void *arg)
         }
 
         txn_count++;
-
-        /* Clear pending TX now that it was clocked out */
-        if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            s_tx_pending_len = 0;
-            xSemaphoreGive(s_tx_mutex);
-        }
 
         /* Parse what the master sent us */
         size_t rx_bytes = txn.trans_len / 8;
@@ -345,6 +361,21 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
 
 esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
 {
+    /* Track overwrites: if previous audio wasn't sent yet */
+    if (s_tx_pending_len > 0) {
+        s_audio_tx_overwrite++;
+    }
+    s_audio_tx_queued++;
+
+    /* Log stats periodically */
+    static int64_t last_log = 0;
+    int64_t now = esp_timer_get_time();
+    if (now - last_log > 5000000) { /* Every 5s */
+        ESP_LOGI(TAG, "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu", s_audio_tx_queued,
+                 s_audio_tx_overwrite, s_audio_rx_count);
+        last_log = now;
+    }
+
     return queue_tx_packet(BRIDGE_PKT_AUDIO, data, len);
 }
 
@@ -421,4 +452,26 @@ bool uart_bridge_probe(uint32_t timeout_ms)
 
     ESP_LOGW(TAG, "nRF52840 probe timed out after %d attempts", MAX_PROBE_ATTEMPTS);
     return false;
+}
+
+esp_err_t uart_bridge_mesh_enable(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Sending mesh enable command to nRF52840");
+    uint8_t cmd_payload[] = {0x01}; /* CMD_ID = Enable Mesh */
+    return queue_tx_packet(BRIDGE_PKT_CONTROL, cmd_payload, sizeof(cmd_payload));
+}
+
+esp_err_t uart_bridge_mesh_disable(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Sending mesh disable command to nRF52840");
+    uint8_t cmd_payload[] = {0x02}; /* CMD_ID = Disable Mesh */
+    return queue_tx_packet(BRIDGE_PKT_CONTROL, cmd_payload, sizeof(cmd_payload));
 }

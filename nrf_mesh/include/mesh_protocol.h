@@ -141,6 +141,12 @@ int mesh_protocol_start(void);
 void mesh_protocol_stop(void);
 
 /**
+ * @brief Get current mesh state
+ * @return Current state (IDLE, SCANNING, JOINING, ACTIVE)
+ */
+mesh_state_t mesh_protocol_get_state(void);
+
+/**
  * @brief Get current mesh role
  * @return Current role (NONE, COORDINATOR, PARTICIPANT)
  */

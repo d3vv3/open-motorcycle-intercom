@@ -17,6 +17,7 @@
 #define UART_PKT_STATUS  0x02 /* Mesh status -> ESP32 */
 #define UART_PKT_EVENT   0x03 /* Mesh event -> ESP32 */
 #define UART_PKT_COMMAND 0x04 /* Command ESP32 -> nRF */
+#define UART_PKT_LOG     0x05 /* Debug log -> ESP32 */
 
 /* Packet sync byte */
 #define UART_SYNC_BYTE 0xAA
@@ -72,5 +73,13 @@ void uart_bridge_process(void);
  * @return true if initialized
  */
 bool uart_bridge_is_initialized(void);
+
+/**
+ * @brief Send debug log message to ESP32
+ * @param msg Log message string
+ * @param len Length of message (max 250 bytes)
+ * @return 0 on success
+ */
+int uart_bridge_send_log(const char *msg, uint8_t len);
 
 #endif /* OMI_UART_BRIDGE_H */

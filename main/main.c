@@ -101,10 +101,26 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timesta
         break;
 
     case TRANSPORT_NRF52840:
-        if (uart_bridge_is_connected()) {
+        if (s_mesh_active && uart_bridge_is_connected()) {
             esp_err_t ret = uart_bridge_send_audio(data, len);
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
+            } else {
+                /* Rate limit logs */
+                static int64_t last_log = 0;
+                int64_t now = esp_timer_get_time();
+                if (now - last_log > 5000000) { /* Every 5s */
+                    ESP_LOGI(TAG, "Audio sent via SPI bridge (len=%d)", len);
+                    last_log = now;
+                }
+            }
+        } else {
+            /* Log if we're trying to send but bridge thinks it's disconnected */
+            static int64_t last_log = 0;
+            int64_t now = esp_timer_get_time();
+            if (now - last_log > 1000000) { /* Every 1s */
+                ESP_LOGW(TAG, "Audio dropped - SPI bridge not connected");
+                last_log = now;
             }
         }
         break;
@@ -239,8 +255,10 @@ static void button_long_press_callback(int gpio)
 
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_stop();
+        } else if (s_active_transport == TRANSPORT_NRF52840) {
+            /* Send mesh disable command to nRF52840 */
+            ret = uart_bridge_mesh_disable();
         }
-        /* For nRF52840, we could send a disable command, but for now just track state */
 
         if (ret == ESP_OK) {
             s_mesh_active = false;
@@ -256,8 +274,10 @@ static void button_long_press_callback(int gpio)
 
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_start();
+        } else if (s_active_transport == TRANSPORT_NRF52840) {
+            /* Send mesh enable command to nRF52840 */
+            ret = uart_bridge_mesh_enable();
         }
-        /* For nRF52840, we could send an enable command */
 
         if (ret == ESP_OK) {
             s_mesh_active = true;

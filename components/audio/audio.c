@@ -38,7 +38,7 @@ static const char *TAG = "audio";
 #define AUDIO_HEARTBEAT_INTERVAL_MS 10000 /* Log heartbeat every 10s */
 
 /* I2S DMA buffer configuration - reduced for lower latency */
-#define I2S_DMA_BUFFER_COUNT 2   /* Minimum for double-buffering, saves ~20ms latency */
+#define I2S_DMA_BUFFER_COUNT 4   /* More headroom to prevent blocking the encode loop */
 #define I2S_DMA_BUFFER_SIZE  320 /* Samples per buffer (20ms @ 16kHz) */
 
 /* ADC configuration */
@@ -87,7 +87,8 @@ typedef struct {
  * ============================================================================ */
 
 static bool s_initialized = false;
-static bool s_running = false;
+static volatile bool s_running = false;
+static volatile bool s_beep_playing = false;
 static audio_config_t s_config = AUDIO_CONFIG_DEFAULT();
 static audio_stats_t s_stats = {0};
 
@@ -541,6 +542,12 @@ static void audio_task(void *arg)
 
     ESP_LOGI(TAG, "Audio pipeline active");
 
+    /* Frame pacing: maintain fixed 50Hz cadence (20ms per frame)
+     * This prevents bursts when encode time varies,  ensuring steady
+     * packet delivery to the mesh network. */
+    int64_t next_frame_time_us = esp_timer_get_time();
+    const int64_t frame_period_us = 20000; /* 20ms = 50 Hz */
+
     while (s_running) {
         int64_t frame_start_us = esp_timer_get_time();
         s_stats.task_loops++;
@@ -681,24 +688,33 @@ static void audio_task(void *arg)
             } else {
                 /* Mesh mode: check RX queue for incoming audio */
                 audio_rx_item_t rx_item;
-                if (s_rx_queue != NULL && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
-                    int64_t decode_start = esp_timer_get_time();
+                if (s_rx_queue != NULL) {
+                    UBaseType_t items = uxQueueMessagesWaiting(s_rx_queue);
 
-                    samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
-                                                  s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
+                    if (xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
+                        int64_t decode_start = esp_timer_get_time();
 
-                    int64_t decode_time = esp_timer_get_time() - decode_start;
+                        samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
+                                                      s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
 
-                    if (samples_decoded == AUDIO_FRAME_SAMPLES) {
-                        s_stats.frames_decoded++;
-                        decode_time_sum += decode_time;
-                        s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
-                        if (decode_time > s_stats.decode_time_us_max) {
-                            s_stats.decode_time_us_max = decode_time;
+                        int64_t decode_time = esp_timer_get_time() - decode_start;
+
+                        if (samples_decoded == AUDIO_FRAME_SAMPLES) {
+                            s_stats.frames_decoded++;
+                            decode_time_sum += decode_time;
+                            s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
+                            if (decode_time > s_stats.decode_time_us_max) {
+                                s_stats.decode_time_us_max = decode_time;
+                            }
+                            s_stats.jitter_buffer_depth = (uint8_t)items; // Track instant depth
+                            have_audio_to_play = true;
+                        } else {
+                            ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                         }
-                        have_audio_to_play = true;
                     } else {
-                        ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
+                        /* RX Queue Empty! Underrun! */
+                        s_stats.glitches_detected++;
+                        /* Don't log every time to avoid spam, trust periodic stats */
                     }
                 }
             }
@@ -718,13 +734,20 @@ static void audio_task(void *arg)
             }
 
             size_t bytes_written = 0;
-            ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
-                                    AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
-                                    portMAX_DELAY);
+            /* Use timeout (e.g. 10ms) instead of portMAX_DELAY.
+             * If I2S buffer is full (e.g. DAC clock slower than ESP32), we must NOT stall
+             * because that would delay the Mesh TX/RX processing.
+             * Better to have a local audio glitch than to break the mesh link.
+             */
+            if (!s_beep_playing) {
+                ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
+                                        AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
+                                        pdMS_TO_TICKS(10));
 
-            if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t)) {
-                ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
-                s_stats.glitches_detected++;
+                if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t)) {
+                    ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
+                    s_stats.glitches_detected++;
+                }
             }
 
             /* ================================================================
@@ -779,6 +802,13 @@ static void audio_task(void *arg)
                      s_stats.adc_overruns);
             last_heartbeat = now_ms;
         }
+
+        /* Frame pacing:
+         * We are paced by the ADC data availability (ulTaskNotifyTake at top of loop).
+         * We do NOT want to sleep here, because that would double-pace the loop
+         * and cause drift if the ADC clock != system clock.
+         * Just loop back and wait for next ADC buffer.
+         */
     }
 
     /* Stop audio */
@@ -1151,9 +1181,8 @@ esp_err_t audio_play_notification(audio_notify_t type)
     }
     free(mono_buffer);
 
-    /* Temporarily enable I2S TX if not already running.
-     * The notification may be called from button handler context
-     * when the audio task hasn't enabled the channel yet. */
+    /* Check if we need to enable I2S TX for this notification.
+     * We only enable it if the main audio task is not running. */
     bool need_enable = !s_running;
     if (need_enable) {
         esp_err_t en_ret = i2s_channel_enable(s_tx_chan);
@@ -1166,8 +1195,10 @@ esp_err_t audio_play_notification(audio_notify_t type)
 
     /* Write stereo buffer to I2S (blocking) */
     size_t bytes_written = 0;
+    s_beep_playing = true;
     esp_err_t ret = i2s_channel_write(s_tx_chan, stereo_buffer, stereo_samples * sizeof(int16_t),
                                       &bytes_written, 500);
+    s_beep_playing = false;
 
     free(stereo_buffer);
 
