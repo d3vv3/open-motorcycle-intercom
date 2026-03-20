@@ -19,6 +19,30 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 /* RF channel - must match other nodes */
 #define RF_CHANNEL 40
 
+/* SPI poll cadence for ESP32 bridge */
+#define SPI_POLL_MS 2
+
+/* Dedicated SPI bridge thread to minimize main-loop jitter */
+#define SPI_THREAD_STACK_SIZE 2048
+#define SPI_THREAD_PRIORITY   0
+
+K_THREAD_STACK_DEFINE(s_spi_thread_stack, SPI_THREAD_STACK_SIZE);
+static struct k_thread s_spi_thread;
+static volatile uint32_t s_spi_loop_count = 0;
+
+static void spi_bridge_thread(void *arg1, void *arg2, void *arg3)
+{
+    ARG_UNUSED(arg1);
+    ARG_UNUSED(arg2);
+    ARG_UNUSED(arg3);
+
+    while (1) {
+        uart_bridge_process();
+        s_spi_loop_count++;
+        k_sleep(K_MSEC(SPI_POLL_MS));
+    }
+}
+
 /* External functions from mesh_protocol.c */
 extern int mesh_protocol_init(void);
 extern int mesh_protocol_start(void);
@@ -84,24 +108,23 @@ int main(void)
     printk("[DIAG] Mesh initialized, waiting for ESP32 enable command\n");
 
 run_spi_only:
-    /* Main loop - process UART bridge and let workqueue handle mesh */
-    printk("[DIAG] Entering main loop (SPI bridging active)\n");
+    /* Start dedicated SPI polling thread and let main loop stay lightweight */
+    k_thread_create(&s_spi_thread, s_spi_thread_stack, K_THREAD_STACK_SIZEOF(s_spi_thread_stack),
+                    spi_bridge_thread, NULL, NULL, NULL, SPI_THREAD_PRIORITY, 0, K_NO_WAIT);
+    printk("[DIAG] Entering main loop (SPI thread active)\n");
 
     uint32_t loop_count = 0;
     while (1) {
-        /* Process any incoming SPI commands */
-        uart_bridge_process();
-
         loop_count++;
-        if (loop_count % 1000 == 0) {
+        if (loop_count % 100 == 0) {
             printk("."); /* Quick heartbeat every 10 seconds */
         }
-        if (loop_count % 3000 == 0) {
-            printk("\n[DIAG] heartbeat: %u loops\n", loop_count);
+        if (loop_count % 300 == 0) {
+            printk("\n[DIAG] heartbeat: main=%u spi=%u\n", loop_count, s_spi_loop_count);
         }
 
         /* Sleep to let other tasks run */
-        k_sleep(K_MSEC(10));
+        k_sleep(K_MSEC(100));
     }
 
     return 0;

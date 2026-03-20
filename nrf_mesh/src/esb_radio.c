@@ -34,6 +34,14 @@ static bool s_initialized = false;
 static bool s_tx_in_progress = false; /* Prevent re-entry during TX */
 static bool s_rx_active = false;      /* Track if RX mode is running */
 
+/* ESB TX/RX timing diagnostics */
+static uint32_t s_tx_count = 0;
+static uint32_t s_tx_timeout_count = 0;
+static uint64_t s_tx_wait_sum_us = 0;
+static uint32_t s_tx_wait_max_us = 0;
+static uint64_t s_rx_pause_sum_us = 0;
+static uint32_t s_rx_pause_max_us = 0;
+
 /* Semaphore signaled when TX completes (success or fail) */
 static K_SEM_DEFINE(s_tx_done_sem, 0, 1);
 
@@ -172,6 +180,9 @@ int esb_radio_send(const uint8_t *data, uint8_t len)
 
 int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
 {
+    int64_t tx_start_us = k_ticks_to_us_floor64(k_uptime_ticks());
+    int64_t rx_pause_start_us = 0;
+
     if (!s_initialized || data == NULL || len == 0) {
         return -EINVAL;
     }
@@ -190,6 +201,7 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
     /* Only stop RX if it was actually active */
     bool was_rx_active = s_rx_active;
     if (was_rx_active) {
+        rx_pause_start_us = k_ticks_to_us_floor64(k_uptime_ticks());
         esb_stop_rx();
         s_rx_active = false;
     }
@@ -234,10 +246,20 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
      * With noack=true at 2Mbps, TX completes in <1ms. */
     if (k_sem_take(&s_tx_done_sem, K_MSEC(TX_DONE_TIMEOUT_MS)) != 0) {
         LOG_ERR("TX timed out");
+        s_tx_timeout_count++;
         s_tx_in_progress = false;
         if (was_rx_active) {
             esb_start_rx();
             s_rx_active = true;
+
+            if (rx_pause_start_us > 0) {
+                uint32_t pause_us =
+                    (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - rx_pause_start_us);
+                s_rx_pause_sum_us += pause_us;
+                if (pause_us > s_rx_pause_max_us) {
+                    s_rx_pause_max_us = pause_us;
+                }
+            }
         }
         return -ETIMEDOUT;
     }
@@ -256,10 +278,26 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         int rx_ret = esb_start_rx();
         if (rx_ret == 0) {
             s_rx_active = true;
+
+            if (rx_pause_start_us > 0) {
+                uint32_t pause_us =
+                    (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - rx_pause_start_us);
+                s_rx_pause_sum_us += pause_us;
+                if (pause_us > s_rx_pause_max_us) {
+                    s_rx_pause_max_us = pause_us;
+                }
+            }
         } else {
             LOG_ERR("Failed to resume RX after TX: %d", rx_ret);
             s_rx_active = false;
         }
+    }
+
+    s_tx_count++;
+    uint32_t tx_wait_us = (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - tx_start_us);
+    s_tx_wait_sum_us += tx_wait_us;
+    if (tx_wait_us > s_tx_wait_max_us) {
+        s_tx_wait_max_us = tx_wait_us;
     }
 
     return s_last_tx_status;
@@ -298,4 +336,18 @@ void esb_radio_get_address(uint8_t *addr)
     if (addr) {
         memcpy(addr, s_local_addr, ESB_ADDR_LEN);
     }
+}
+
+void esb_radio_get_timing_stats(esb_radio_timing_stats_t *stats)
+{
+    if (!stats) {
+        return;
+    }
+
+    stats->tx_count = s_tx_count;
+    stats->tx_timeout_count = s_tx_timeout_count;
+    stats->tx_wait_us_max = s_tx_wait_max_us;
+    stats->tx_wait_us_avg = s_tx_count ? (uint32_t)(s_tx_wait_sum_us / s_tx_count) : 0;
+    stats->rx_pause_us_max = s_rx_pause_max_us;
+    stats->rx_pause_us_avg = s_tx_count ? (uint32_t)(s_rx_pause_sum_us / s_tx_count) : 0;
 }

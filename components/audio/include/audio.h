@@ -174,7 +174,12 @@ typedef struct {
     uint32_t latency_ms_avg;     /**< Average end-to-end latency in milliseconds */
     uint32_t latency_ms_max;     /**< Maximum end-to-end latency in milliseconds */
     uint32_t glitches_detected;  /**< Number of audio glitches detected */
+    uint32_t rx_queue_underruns; /**< Mesh RX queue empty events */
+    uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
     uint8_t jitter_buffer_depth; /**< Current jitter buffer depth */
+    uint8_t rx_q_depth_min;      /**< Minimum observed RX queue depth */
+    uint8_t rx_q_depth_avg;      /**< Average observed RX queue depth */
+    uint8_t rx_q_depth_max;      /**< Maximum observed RX queue depth */
     uint32_t task_loops;         /**< Audio task loop count (health indicator) */
     uint32_t adc_overruns;       /**< ADC buffer overrun count */
     bool vox_active;             /**< Current VOX state */

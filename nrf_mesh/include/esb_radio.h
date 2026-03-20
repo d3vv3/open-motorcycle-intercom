@@ -15,6 +15,15 @@
 typedef void (*esb_rx_callback_t)(const uint8_t *data, uint8_t len, const uint8_t *src_addr,
                                   int8_t rssi);
 
+typedef struct {
+    uint32_t tx_count;
+    uint32_t tx_timeout_count;
+    uint32_t tx_wait_us_avg;
+    uint32_t tx_wait_us_max;
+    uint32_t rx_pause_us_avg;
+    uint32_t rx_pause_us_max;
+} esb_radio_timing_stats_t;
+
 /**
  * @brief Initialize ESB radio
  * @param channel RF channel (0-100)
@@ -59,5 +68,10 @@ void esb_radio_stop_rx(void);
  * @brief Get local ESB address
  */
 void esb_radio_get_address(uint8_t *addr);
+
+/**
+ * @brief Get ESB TX/RX timing statistics
+ */
+void esb_radio_get_timing_stats(esb_radio_timing_stats_t *stats);
 
 #endif /* OMI_ESB_RADIO_H */

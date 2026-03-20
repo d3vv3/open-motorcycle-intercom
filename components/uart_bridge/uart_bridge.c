@@ -38,6 +38,7 @@ static const char *TAG = "spi_bridge";
 #define MAX_PACKET_LEN     256
 #define RX_TASK_STACK_SIZE 4096
 #define RX_TASK_PRIORITY   5
+#define RX_TASK_CORE       0
 
 /* ============================================================================
  * Static Variables
@@ -199,7 +200,7 @@ static void prepare_tx_buf(void)
  */
 static void spi_slave_task(void *arg)
 {
-    ESP_LOGI(TAG, "SPI slave task started");
+    ESP_LOGI(TAG, "SPI slave task started on core %d", xPortGetCoreID());
 
     spi_slave_transaction_t txn;
     memset(&txn, 0, sizeof(txn));
@@ -287,9 +288,9 @@ esp_err_t uart_bridge_init(void)
     gpio_set_pull_mode(BRIDGE_SPI_SCLK_PIN, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode(BRIDGE_SPI_CS_PIN, GPIO_PULLUP_ONLY);
 
-    /* Start SPI slave task — pinned to core 1 for debugging */
+    /* Start SPI slave task on core 0 so audio stays on core 1 */
     BaseType_t ret = xTaskCreatePinnedToCore(spi_slave_task, "spi_bridge_rx", RX_TASK_STACK_SIZE,
-                                             NULL, RX_TASK_PRIORITY, &s_rx_task, 1);
+                                             NULL, RX_TASK_PRIORITY, &s_rx_task, RX_TASK_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SPI task");
         spi_slave_free(BRIDGE_SPI_HOST);

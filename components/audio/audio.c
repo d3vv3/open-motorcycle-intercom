@@ -32,14 +32,17 @@ static const char *TAG = "audio";
  * ============================================================================ */
 
 #define AUDIO_TASK_STACK_SIZE 32768 /* 32KB - Opus encoder needs significant stack */
-#define AUDIO_TASK_PRIORITY   5
+#define AUDIO_TASK_PRIORITY   7
 #define AUDIO_TASK_CORE       1
 
 #define AUDIO_HEARTBEAT_INTERVAL_MS 10000 /* Log heartbeat every 10s */
 
 /* I2S DMA buffer configuration - reduced for lower latency */
-#define I2S_DMA_BUFFER_COUNT 4   /* More headroom to prevent blocking the encode loop */
+#define I2S_DMA_BUFFER_COUNT 6   /* A/B: extra headroom to reduce write stalls */
 #define I2S_DMA_BUFFER_SIZE  320 /* Samples per buffer (20ms @ 16kHz) */
+
+/* Debug isolation: allow longer speaker write wait before counting glitch */
+#define I2S_WRITE_TIMEOUT_MS 10
 
 /* ADC configuration */
 /* Audio frame size (20ms @ 16kHz) */
@@ -123,11 +126,17 @@ static int16_t s_pcm_output[AUDIO_FRAME_SAMPLES];
 static int16_t s_pcm_stereo[AUDIO_FRAME_SAMPLES * 2]; /* Stereo output for I2S */
 static uint8_t s_opus_buffer[MAX_OPUS_PACKET_SIZE];
 
+/* RX queue occupancy diagnostics */
+static uint32_t s_rx_q_depth_sum = 0;
+static uint32_t s_rx_q_depth_samples = 0;
+
 /* Phase 2: Mesh mode support */
 static audio_tx_cb_t s_tx_callback = NULL;
 static QueueHandle_t s_rx_queue = NULL;
 
 #define AUDIO_RX_QUEUE_SIZE 8
+#define MESH_RX_PREFILL_FRAMES 3
+#define MESH_RX_MAX_TARGET_FRAMES 5
 
 /**
  * @brief RX frame queue item
@@ -521,7 +530,7 @@ static void audio_task(void *arg)
     /* Store task handle for ADC callback notification */
     s_adc_notify_task = xTaskGetCurrentTaskHandle();
 
-    ESP_LOGI(TAG, "Audio task started - Phase 1 loopback mode");
+    ESP_LOGI(TAG, "Audio task started on core %d", xPortGetCoreID());
 
     /* Start ADC */
     esp_err_t ret = adc_continuous_start(s_adc_handle);
@@ -547,6 +556,9 @@ static void audio_task(void *arg)
      * packet delivery to the mesh network. */
     int64_t next_frame_time_us = esp_timer_get_time();
     const int64_t frame_period_us = 20000; /* 20ms = 50 Hz */
+
+    int64_t last_rx_packet_us = 0;
+    bool mesh_playout_started = false;
 
     while (s_running) {
         int64_t frame_start_us = esp_timer_get_time();
@@ -690,9 +702,47 @@ static void audio_task(void *arg)
                 audio_rx_item_t rx_item;
                 if (s_rx_queue != NULL) {
                     UBaseType_t items = uxQueueMessagesWaiting(s_rx_queue);
+                    uint8_t qdepth = (uint8_t)items;
 
-                    if (xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
+                    if (s_rx_q_depth_samples == 0) {
+                        s_stats.rx_q_depth_min = qdepth;
+                        s_stats.rx_q_depth_max = qdepth;
+                    } else {
+                        if (qdepth < s_stats.rx_q_depth_min) {
+                            s_stats.rx_q_depth_min = qdepth;
+                        }
+                        if (qdepth > s_stats.rx_q_depth_max) {
+                            s_stats.rx_q_depth_max = qdepth;
+                        }
+                    }
+                    s_rx_q_depth_sum += qdepth;
+                    s_rx_q_depth_samples++;
+                    s_stats.rx_q_depth_avg = (uint8_t)(s_rx_q_depth_sum / s_rx_q_depth_samples);
+
+                    /* Keep small fixed playout buffer in mesh mode:
+                     * - Wait for initial prefill before starting playback
+                     * - Trim excessive backlog to bound latency
+                     */
+                    if (!mesh_playout_started) {
+                        if (items >= MESH_RX_PREFILL_FRAMES) {
+                            mesh_playout_started = true;
+                        }
+                    }
+
+                    if (mesh_playout_started) {
+                        while (items > MESH_RX_MAX_TARGET_FRAMES) {
+                            if (xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
+                                s_stats.frames_dropped++;
+                                items = uxQueueMessagesWaiting(s_rx_queue);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (mesh_playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
                         int64_t decode_start = esp_timer_get_time();
+                        last_rx_packet_us = decode_start;
 
                         samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
                                                       s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
@@ -712,9 +762,13 @@ static void audio_task(void *arg)
                             ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                         }
                     } else {
-                        /* RX Queue Empty! Underrun! */
-                        s_stats.glitches_detected++;
-                        /* Don't log every time to avoid spam, trust periodic stats */
+                        int64_t now_us = esp_timer_get_time();
+                        if ((now_us - last_rx_packet_us) < 200000) {
+                            s_stats.rx_queue_underruns++;
+                            s_stats.glitches_detected++;
+                        } else {
+                            mesh_playout_started = false;
+                        }
                     }
                 }
             }
@@ -742,10 +796,11 @@ static void audio_task(void *arg)
             if (!s_beep_playing) {
                 ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
                                         AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
-                                        pdMS_TO_TICKS(10));
+                                        pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
 
                 if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t)) {
                     ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
+                    s_stats.i2s_write_incomplete++;
                     s_stats.glitches_detected++;
                 }
             }
@@ -798,8 +853,11 @@ static void audio_task(void *arg)
                      s_stats.decode_time_us_max);
             ESP_LOGI(TAG, "  Latency: avg=%lu ms, max=%lu ms", s_stats.latency_ms_avg,
                      s_stats.latency_ms_max);
-            ESP_LOGI(TAG, "  Glitches: %lu, ADC overruns: %lu", s_stats.glitches_detected,
-                     s_stats.adc_overruns);
+            ESP_LOGI(TAG, "  Glitches: %lu (rx_und=%lu i2s_inc=%lu), ADC overruns: %lu",
+                     s_stats.glitches_detected, s_stats.rx_queue_underruns,
+                     s_stats.i2s_write_incomplete, s_stats.adc_overruns);
+            ESP_LOGI(TAG, "  RX queue depth: min=%u avg=%u max=%u", s_stats.rx_q_depth_min,
+                     s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max);
             last_heartbeat = now_ms;
         }
 
@@ -883,6 +941,8 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
 
     /* Reset statistics */
     memset(&s_stats, 0, sizeof(s_stats));
+    s_rx_q_depth_sum = 0;
+    s_rx_q_depth_samples = 0;
 
     s_initialized = true;
     ESP_LOGI(TAG, "========================================");

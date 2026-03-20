@@ -35,6 +35,7 @@ static int64_t s_frame_start_us = 0;
 static int32_t s_tune_offset_us = 0;
 static int8_t s_slot_index = -1;
 static bool s_running = false;
+static uint8_t s_small_sync_count = 0;
 
 /* ============================================================================
  * Work Handler (runs in system workqueue thread context)
@@ -107,6 +108,7 @@ int tdma_start(int8_t slot_index)
     s_frame_counter = 0;
     s_frame_start_us = k_uptime_get() * 1000;
     s_tune_offset_us = 0;
+    s_small_sync_count = 0;
     s_running = true;
 
     /* Start one-shot timer for first frame end */
@@ -166,15 +168,24 @@ void tdma_sync(uint32_t frame_counter, int16_t drift_ppm)
     /* Adjust our frame counter based on coordinator's SYNC */
     int32_t frame_diff = (int32_t)frame_counter - (int32_t)s_frame_counter;
 
-    if (frame_diff != 0) {
+    if (frame_diff > 1 || frame_diff < -1) {
         LOG_INF("SYNC: adjusting frame counter by %d (drift=%d ppm)", frame_diff, drift_ppm);
         s_frame_counter = frame_counter;
+        s_small_sync_count = 0;
 
         /* For relative timing, we don't strictly need to snap local timer
          * unless we want to align slots perfectly.
          * Snapping relative timer is hard without restarting it.
          * For now, just accept the frame counter update.
          */
+    } else if (frame_diff == 1 || frame_diff == -1) {
+        /* Ignore +/-1 jitter corrections to avoid slot-phase thrash on participant. */
+        s_small_sync_count++;
+        if (s_small_sync_count >= 4) {
+            s_small_sync_count = 0;
+        }
+    } else {
+        s_small_sync_count = 0;
     }
 
     ARG_UNUSED(drift_ppm);

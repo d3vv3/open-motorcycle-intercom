@@ -29,6 +29,7 @@ LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
  * ============================================================================ */
 
 #define SPI_MAX_PAYLOAD 128
+#define TX_AUDIO_QUEUE_SIZE 16
 
 /* ============================================================================
  * Static Variables
@@ -50,8 +51,28 @@ static uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
 
 static bool s_initialized = false;
 
-/* Pending TX packet length (0 = idle) */
-static uint16_t s_tx_pending_len = 0;
+/* Outbound TX queues to ESP32 (audio prioritized over control) */
+struct tx_entry {
+    uint8_t buf[BRIDGE_SPI_MAX_XFER];
+    uint16_t len;
+};
+
+static struct tx_entry s_audio_q[TX_AUDIO_QUEUE_SIZE];
+static uint8_t s_audio_head = 0;
+static uint8_t s_audio_tail = 0;
+
+static struct tx_entry s_ctrl_pending;
+static bool s_ctrl_pending_valid = false;
+
+static struct k_mutex s_tx_lock;
+static uint32_t s_audio_q_overwrite = 0;
+
+/* SPI poll interval jitter diagnostics */
+static int64_t s_last_poll_us = 0;
+static uint32_t s_poll_dt_count = 0;
+static uint64_t s_poll_dt_sum_us = 0;
+static uint32_t s_poll_dt_min_us = 0;
+static uint32_t s_poll_dt_max_us = 0;
 
 /* ============================================================================
  * Private Functions
@@ -135,6 +156,15 @@ static void parse_rx(const uint8_t *buf, size_t len)
     handle_rx_packet(pkt_type, payload, payload_len);
 }
 
+static void queue_control_packet(const uint8_t *buf, uint16_t len)
+{
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    memcpy(s_ctrl_pending.buf, buf, len);
+    s_ctrl_pending.len = len;
+    s_ctrl_pending_valid = true;
+    k_mutex_unlock(&s_tx_lock);
+}
+
 /* ============================================================================
  * Public Functions
  * ============================================================================ */
@@ -171,6 +201,7 @@ int uart_bridge_init(void)
     s_spi_cfg.slave = 0;
 
     s_initialized = true;
+    k_mutex_init(&s_tx_lock);
     printk("[uart_bridge] SPI bridge initialized (master mode, 4MHz)\n");
     LOG_INF("SPI bridge initialized");
 
@@ -191,15 +222,29 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
         return -EMSGSIZE;
     }
 
-    /* Build packet: [SYNC][LEN][TYPE][SRC_ID][DATA...] */
-    memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
-    s_tx_buf[0] = UART_SYNC_BYTE;
-    s_tx_buf[1] = len + 2; /* type + src_id + audio data */
-    s_tx_buf[2] = UART_PKT_AUDIO;
-    s_tx_buf[3] = src_id;
-    memcpy(&s_tx_buf[4], data, len);
+    uint8_t next_head;
 
-    s_tx_pending_len = 4 + len;
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    next_head = (s_audio_head + 1) % TX_AUDIO_QUEUE_SIZE;
+    if (next_head == s_audio_tail) {
+        /* Full: drop oldest to keep low latency */
+        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
+        s_audio_q_overwrite++;
+        if ((s_audio_q_overwrite % 200) == 0) {
+            LOG_WRN("Audio SPI TX queue overwrite count=%u", s_audio_q_overwrite);
+        }
+    }
+
+    struct tx_entry *e = &s_audio_q[s_audio_head];
+    memset(e->buf, 0, BRIDGE_SPI_MAX_XFER);
+    e->buf[0] = UART_SYNC_BYTE;
+    e->buf[1] = len + 2; /* type + src_id + audio data */
+    e->buf[2] = UART_PKT_AUDIO;
+    e->buf[3] = src_id;
+    memcpy(&e->buf[4], data, len);
+    e->len = 4 + len;
+    s_audio_head = next_head;
+    k_mutex_unlock(&s_tx_lock);
 
     LOG_DBG("Queued audio packet: src=%d, len=%d", src_id, len);
     return 0;
@@ -211,17 +256,17 @@ int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
         return -EINVAL;
     }
 
-    memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
-    s_tx_buf[0] = UART_SYNC_BYTE;
-    s_tx_buf[1] = len + 2; /* type + event_type + data */
-    s_tx_buf[2] = UART_PKT_EVENT;
-    s_tx_buf[3] = event_type;
+    uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
+    pkt[0] = UART_SYNC_BYTE;
+    pkt[1] = len + 2; /* type + event_type + data */
+    pkt[2] = UART_PKT_EVENT;
+    pkt[3] = event_type;
 
     if (len > 0 && data != NULL) {
-        memcpy(&s_tx_buf[4], data, len);
+        memcpy(&pkt[4], data, len);
     }
 
-    s_tx_pending_len = 4 + len;
+    queue_control_packet(pkt, 4 + len);
 
     LOG_DBG("Queued event: type=%d, len=%d", event_type, len);
     return 0;
@@ -233,15 +278,15 @@ int uart_bridge_send_status(uint8_t role, uint8_t peer_count, uint8_t node_id)
         return -EINVAL;
     }
 
-    memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
-    s_tx_buf[0] = UART_SYNC_BYTE;
-    s_tx_buf[1] = 4; /* type + role + peer_count + node_id */
-    s_tx_buf[2] = UART_PKT_STATUS;
-    s_tx_buf[3] = role;
-    s_tx_buf[4] = peer_count;
-    s_tx_buf[5] = node_id;
+    uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
+    pkt[0] = UART_SYNC_BYTE;
+    pkt[1] = 4; /* type + role + peer_count + node_id */
+    pkt[2] = UART_PKT_STATUS;
+    pkt[3] = role;
+    pkt[4] = peer_count;
+    pkt[5] = node_id;
 
-    s_tx_pending_len = 6;
+    queue_control_packet(pkt, 6);
 
     LOG_DBG("Queued status: role=%d, peers=%d, id=%d", role, peer_count, node_id);
     return 0;
@@ -255,11 +300,46 @@ void uart_bridge_process(void)
 
     static uint32_t txn_count = 0;
 
-    /* If nothing queued to send, re-send STATUS so ESP32 can always detect us */
-    if (s_tx_pending_len == 0) {
+    int64_t now_us = k_uptime_get() * 1000;
+    if (s_last_poll_us != 0 && now_us > s_last_poll_us) {
+        uint32_t dt = (uint32_t)(now_us - s_last_poll_us);
+        if (s_poll_dt_count == 0) {
+            s_poll_dt_min_us = dt;
+            s_poll_dt_max_us = dt;
+        } else {
+            if (dt < s_poll_dt_min_us) {
+                s_poll_dt_min_us = dt;
+            }
+            if (dt > s_poll_dt_max_us) {
+                s_poll_dt_max_us = dt;
+            }
+        }
+        s_poll_dt_sum_us += dt;
+        s_poll_dt_count++;
+    }
+    s_last_poll_us = now_us;
+
+    static uint32_t status_keepalive = 0;
+
+    /* Periodic keepalive status when no control packet is pending */
+    if ((status_keepalive++ % 50) == 0) {
         uart_bridge_send_status(mesh_protocol_get_role(), mesh_protocol_get_peer_count(),
                                 mesh_protocol_get_node_id());
     }
+
+    memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
+
+    /* Select packet to transmit: audio first, then control */
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    if (s_audio_head != s_audio_tail) {
+        struct tx_entry *e = &s_audio_q[s_audio_tail];
+        memcpy(s_tx_buf, e->buf, e->len);
+        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
+    } else if (s_ctrl_pending_valid) {
+        memcpy(s_tx_buf, s_ctrl_pending.buf, s_ctrl_pending.len);
+        s_ctrl_pending_valid = false;
+    }
+    k_mutex_unlock(&s_tx_lock);
 
     memset(s_rx_buf, 0, BRIDGE_SPI_MAX_XFER);
 
@@ -306,11 +386,15 @@ void uart_bridge_process(void)
                s_rx_buf[1], s_rx_buf[2], s_rx_buf[3]);
     }
 
-    /* TX was clocked out, clear pending */
-    s_tx_pending_len = 0;
-
     /* Parse what the slave sent back */
     parse_rx(s_rx_buf, BRIDGE_SPI_MAX_XFER);
+
+    if ((txn_count % 2500) == 0 && s_poll_dt_count > 0) {
+        uint32_t avg = (uint32_t)(s_poll_dt_sum_us / s_poll_dt_count);
+        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u\n", s_poll_dt_min_us, avg,
+               s_poll_dt_max_us, s_audio_q_overwrite);
+    }
+
 }
 
 bool uart_bridge_is_initialized(void)
@@ -328,14 +412,13 @@ int uart_bridge_send_log(const char *msg, uint8_t len)
         len = SPI_MAX_PAYLOAD; /* Truncate if too long */
     }
 
-    /* Build packet: [SYNC][LEN][TYPE][MSG...] */
-    memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
-    s_tx_buf[0] = UART_SYNC_BYTE;
-    s_tx_buf[1] = len + 1; /* type + msg */
-    s_tx_buf[2] = UART_PKT_LOG;
-    memcpy(&s_tx_buf[3], msg, len);
+    uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
+    pkt[0] = UART_SYNC_BYTE;
+    pkt[1] = len + 1; /* type + msg */
+    pkt[2] = UART_PKT_LOG;
+    memcpy(&pkt[3], msg, len);
 
-    s_tx_pending_len = 3 + len;
+    queue_control_packet(pkt, 3 + len);
 
     return 0;
 }

@@ -85,10 +85,12 @@ static volatile uint8_t s_rx_ring_head = 0; /* ISR writes here */
 static volatile uint8_t s_rx_ring_tail = 0; /* Work reads here */
 
 /* Packet statistics */
-/* Packet statistics */
 static uint32_t s_stat_tx_count = 0;
 static uint32_t s_stat_tx_fail = 0;
 static uint32_t s_stat_tx_underflow = 0;
+
+/* TX queue depth for ESP->nRF audio handoff */
+#define TX_AUDIO_RING_SIZE 8
 
 static uint32_t s_stat_rx_count = 0;
 static uint32_t s_stat_rx_drop = 0;
@@ -96,20 +98,10 @@ static uint32_t s_stat_audio_fwd = 0;
 static uint32_t s_stat_tx_overwrite = 0;  /* Audio overwritten before TDMA sent */
 static uint32_t s_stat_spi_audio_in = 0;  /* Audio packets received from ESP32 SPI */
 static uint32_t s_last_audio_in_time = 0; /* Timestamp of last audio packet from ESP32 */
-
-/* ... (lines 91-447 are unchanged, but I must match the context if I want to be safe,
- * but the tool requires contiguous block. I'll stick to replacing the stats block
- * and then the handler block separately? No, I can do multi-replace or big chunks)
- *
- * Actually, `status_work_handler` is around line 431.
- * `slot_tx_handler` is around line 460.
- * `s_stat_...` definitions are around line 84.
- * These are far apart. I should use multi_replace.
- */
-
-/* RE-READING TOOL DEFINITION: "Do NOT make multiple parallel calls to this tool".
- * So I should use multi_replace_file_content.
- */
+static uint8_t s_tx_queue_depth_dbg = 0;  /* Current TX queue depth for diagnostics */
+static uint32_t s_under_prev = 0;
+static uint32_t s_under_delta_last = 0;
+static uint32_t s_status_log_decim = 0;
 
 /* ============================================================================
  * Forward Declarations
@@ -465,9 +457,21 @@ static void status_work_handler(struct k_work *work)
     uart_bridge_send_status(s_role, s_peer_count, s_node_id);
 
     /* Log packet stats */
-    printk("[MESH] tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u under=%u\n",
-           s_stat_tx_count, s_stat_tx_fail, s_stat_rx_count, s_stat_rx_drop, s_stat_audio_fwd,
-           s_stat_spi_audio_in, s_stat_tx_overwrite, s_stat_tx_underflow);
+    esb_radio_timing_stats_t esb_stats = {0};
+    esb_radio_get_timing_stats(&esb_stats);
+
+    if ((s_status_log_decim++ % 2) == 0) {
+        printk("[MESH] r=%u id=%u sl=%d tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u under=%u q=%u\n",
+               s_role, s_node_id, s_slot_index, s_stat_tx_count, s_stat_tx_fail, s_stat_rx_count,
+               s_stat_rx_drop, s_stat_audio_fwd, s_stat_spi_audio_in, s_stat_tx_overwrite,
+               s_stat_tx_underflow, s_tx_queue_depth_dbg);
+        printk("[ESB_TIM] tx=%u to=%u txwait=%u/%u rxpause=%u/%u us\n", esb_stats.tx_count,
+               esb_stats.tx_timeout_count, esb_stats.tx_wait_us_avg, esb_stats.tx_wait_us_max,
+               esb_stats.rx_pause_us_avg, esb_stats.rx_pause_us_max);
+    }
+
+    s_under_delta_last = s_stat_tx_underflow - s_under_prev;
+    s_under_prev = s_stat_tx_underflow;
 
     /* Coordinator sends SYNC on every status update for discovery */
     if (s_role == MESH_ROLE_COORDINATOR) {
@@ -499,7 +503,6 @@ static void status_work_handler(struct k_work *work)
     k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
 }
 
-#define TX_AUDIO_RING_SIZE 32
 struct tx_audio_entry {
     uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
     uint8_t len;
@@ -553,22 +556,19 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         } else {
             buf_count = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
         }
+        s_tx_queue_depth_dbg = buf_count;
 
         if (buf_count == 0) {
-            /* Just drained the last packet. Brake hard. */
+            /* Just drained the last packet - slow down next slot a bit. */
             s_stat_tx_underflow++;
-            tdma_tune_timing(2000); /* +2ms (was 5ms) */
+            tdma_tune_timing((s_under_delta_last > 100) ? 600 : 1200);
         } else if (buf_count == 1) {
-            tdma_tune_timing(1000); /* +1ms (was 2ms) */
+            tdma_tune_timing((s_under_delta_last > 100) ? 300 : 600);
         } else if (buf_count < 4) {
-            tdma_tune_timing(200); /* +0.2ms (gentle nudge) */
+            tdma_tune_timing(100);
         }
 
     } else {
-        /* Underflow (Buffer logic was: head!=tail, so this else is head==tail)
-         * ...
-         */
-
         uint32_t now = k_uptime_get_32();
         bool has_audio_source = (now - s_last_audio_in_time) < 100;
 
@@ -580,17 +580,15 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
             } else {
                 count = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
             }
+            s_tx_queue_depth_dbg = count;
 
-            /* Aggressive proportional flow control:
-             * Reduced values to prevent stalling.
-             */
             if (count == 0) {
                 s_stat_tx_underflow++;
-                tdma_tune_timing(2000); /* +2ms */
+                tdma_tune_timing((s_under_delta_last > 100) ? 600 : 1200);
             } else if (count == 1) {
-                tdma_tune_timing(1000); /* +1ms */
+                tdma_tune_timing((s_under_delta_last > 100) ? 300 : 600);
             } else if (count < 4) {
-                tdma_tune_timing(200); /* +0.2ms */
+                tdma_tune_timing(100);
             }
         }
     }
@@ -608,20 +606,9 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len)
     uint8_t next_head = (s_tx_head + 1) % TX_AUDIO_RING_SIZE;
 
     if (next_head == s_tx_tail) {
-        /* Buffer full - overwrite oldest (tail) to keep latency low?
-         * Or drop new?
-         * If we drop new, we hear gaps.
-         * If we overwrite old, we skip ahead.
-         * Usage stats show we are overwriting significantly.
-         * Let's drop NEW packet and count it as overwrite/drop.
-         * Actually, current behavior was "overwrite old", but since it was single buffer,
-         * it was effectively "always send newest".
-         *
-         * With a queue, if we are full, it means we are choked.
-         * Let's drop the NEW packet to preserve the contiguous stream we already have queued.
-         */
+        /* Buffer full: drop oldest and keep newest to bound latency growth. */
+        s_tx_tail = (s_tx_tail + 1) % TX_AUDIO_RING_SIZE;
         s_stat_tx_overwrite++;
-        return -ENOMEM;
     }
 
     struct tx_audio_entry *entry = &s_tx_audio_ring[s_tx_head];
@@ -629,6 +616,12 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len)
     entry->len = len;
 
     s_tx_head = next_head;
+
+    if (s_tx_head >= s_tx_tail) {
+        s_tx_queue_depth_dbg = s_tx_head - s_tx_tail;
+    } else {
+        s_tx_queue_depth_dbg = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
+    }
 
     return 0;
 }
