@@ -6,6 +6,8 @@
  */
 
 #include "audio.h"
+#include "voice_cleanup.h"
+#include "vox.h"
 
 #include <math.h>
 #include <string.h>
@@ -37,6 +39,9 @@ static const char *TAG = "audio";
 
 #define AUDIO_HEARTBEAT_INTERVAL_MS 10000 /* Log heartbeat every 10s */
 
+/* Stage-1 voice cleanup (lightweight AEC + NS) */
+#define AUDIO_ENABLE_AEC_NS 1
+
 /* I2S DMA buffer configuration - reduced for lower latency */
 #define I2S_DMA_BUFFER_COUNT 6   /* A/B: extra headroom to reduce write stalls */
 #define I2S_DMA_BUFFER_SIZE  320 /* Samples per buffer (20ms @ 16kHz) */
@@ -57,9 +62,6 @@ static const char *TAG = "audio";
 /* Maximum Opus packet size */
 #define MAX_OPUS_PACKET_SIZE 64
 
-/* VOX state machine */
-#define VOX_HANGOVER_FRAMES 15 /* 15 frames @ 20ms = 300ms */
-
 /* ============================================================================
  * Type Definitions
  * ============================================================================ */
@@ -73,17 +75,6 @@ typedef struct {
     float b0, b1, b2; /* Numerator coefficients */
     float a1, a2;     /* Denominator coefficients (a0 = 1) */
 } hpf_state_t;
-
-/**
- * @brief VOX detector state
- */
-typedef struct {
-    bool active;                  /* Current VOX state */
-    uint16_t hangover_counter;    /* Frames remaining in hangover */
-    float activation_threshold;   /* RMS threshold for activation */
-    float deactivation_threshold; /* RMS threshold for deactivation */
-    uint32_t activation_count;    /* Total activations */
-} vox_state_t;
 
 /* ============================================================================
  * Static Variables
@@ -125,6 +116,8 @@ static int16_t s_pcm_input[AUDIO_FRAME_SAMPLES];
 static int16_t s_pcm_output[AUDIO_FRAME_SAMPLES];
 static int16_t s_pcm_stereo[AUDIO_FRAME_SAMPLES * 2]; /* Stereo output for I2S */
 static uint8_t s_opus_buffer[MAX_OPUS_PACKET_SIZE];
+static int16_t s_far_ref_frame[AUDIO_FRAME_SAMPLES];
+static voice_cleanup_state_t s_voice_cleanup = {0};
 
 /* RX queue occupancy diagnostics */
 static uint32_t s_rx_q_depth_sum = 0;
@@ -160,9 +153,6 @@ static esp_err_t opus_init(const audio_config_t *config);
 static void opus_deinit(void);
 static void hpf_init(hpf_state_t *state, float cutoff_hz, float sample_rate);
 static void hpf_process(hpf_state_t *state, int16_t *samples, size_t count);
-static void vox_init(vox_state_t *state, const audio_vox_config_t *config);
-static bool vox_process(vox_state_t *state, const int16_t *samples, size_t count);
-static float calculate_rms(const int16_t *samples, size_t count);
 static void audio_task(void *arg);
 
 /* ============================================================================
@@ -448,73 +438,6 @@ static void hpf_process(hpf_state_t *state, int16_t *samples, size_t count)
 }
 
 /* ============================================================================
- * VOX Detection Implementation
- * ============================================================================ */
-
-/**
- * @brief Initialize VOX detector
- */
-static void vox_init(vox_state_t *state, const audio_vox_config_t *config)
-{
-    memset(state, 0, sizeof(vox_state_t));
-    state->activation_threshold = config->activation_threshold;
-    state->deactivation_threshold = config->deactivation_threshold;
-
-    ESP_LOGI(TAG, "VOX initialized");
-    ESP_LOGI(TAG, "  Activation threshold: %.3f", config->activation_threshold);
-    ESP_LOGI(TAG, "  Deactivation threshold: %.3f", config->deactivation_threshold);
-    ESP_LOGI(TAG, "  Hangover: %u ms", config->hangover_ms);
-}
-
-/**
- * @brief Calculate RMS (Root Mean Square) of audio samples
- */
-static float calculate_rms(const int16_t *samples, size_t count)
-{
-    float sum = 0.0f;
-    for (size_t i = 0; i < count; i++) {
-        float normalized = (float)samples[i] / 32768.0f;
-        sum += normalized * normalized;
-    }
-    return sqrtf(sum / (float)count);
-}
-
-/**
- * @brief Process VOX detection
- *
- * @param state VOX state
- * @param samples Input samples
- * @param count Number of samples
- * @return true if speech is detected (VOX active)
- */
-static bool vox_process(vox_state_t *state, const int16_t *samples, size_t count)
-{
-    float rms = calculate_rms(samples, count);
-
-    if (rms > state->activation_threshold) {
-        /* Speech detected - activate VOX */
-        if (!state->active) {
-            state->active = true;
-            state->activation_count++;
-            power_notify_voice_start(); /* Phase 3: Notify power manager */
-            ESP_LOGD(TAG, "VOX activated (RMS: %.4f)", rms);
-        }
-        state->hangover_counter = VOX_HANGOVER_FRAMES;
-    } else if (rms < state->deactivation_threshold) {
-        /* No speech - decrement hangover counter */
-        if (state->hangover_counter > 0) {
-            state->hangover_counter--;
-        } else if (state->active) {
-            state->active = false;
-            power_notify_voice_end(); /* Phase 3: Notify power manager */
-            ESP_LOGD(TAG, "VOX deactivated");
-        }
-    }
-
-    return state->active;
-}
-
-/* ============================================================================
  * Audio Task - Main Processing Loop
  * ============================================================================ */
 
@@ -627,6 +550,13 @@ static void audio_task(void *arg)
             if (s_config.enable_hpf) {
                 hpf_process(&s_hpf_state, s_pcm_input, AUDIO_FRAME_SAMPLES);
             }
+
+#if AUDIO_ENABLE_AEC_NS
+            if (s_config.mode == AUDIO_MODE_MESH) {
+                voice_cleanup_process(&s_voice_cleanup, s_pcm_input, s_far_ref_frame,
+                                      AUDIO_FRAME_SAMPLES);
+            }
+#endif
 
             /* ================================================================
              * STEP 3: VOX Detection
@@ -776,6 +706,13 @@ static void audio_task(void *arg)
             if (!have_audio_to_play) {
                 /* No audio to play - output silence */
                 memset(s_pcm_output, 0, AUDIO_FRAME_SAMPLES * sizeof(int16_t));
+            }
+
+            /* Keep far-end reference for next mic frame AEC */
+            if (have_audio_to_play) {
+                memcpy(s_far_ref_frame, s_pcm_output, sizeof(s_far_ref_frame));
+            } else {
+                memset(s_far_ref_frame, 0, sizeof(s_far_ref_frame));
             }
 
             /* ================================================================
@@ -938,6 +875,9 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
 
     /* Initialize VOX */
     vox_init(&s_vox_state, &s_config.vox_config);
+
+    /* Initialize voice cleanup (AEC + noise suppression) */
+    voice_cleanup_init(&s_voice_cleanup);
 
     /* Reset statistics */
     memset(&s_stats, 0, sizeof(s_stats));
