@@ -35,7 +35,7 @@ Responsibilities:
 - User interface
 - Bluetooth Classic (HFP/A2DP)
 
-This MCU owns *time*.
+This MCU owns *audio cadence*.
 
 ---
 
@@ -55,9 +55,9 @@ This MCU owns *RF correctness*.
 ## 3. Clock Ownership & Time Model
 
 - Application MCU defines **audio frame cadence** (20 ms)
-- Radio MCU aligns slots to this cadence
+- Radio MCU currently runs the TDMA timer and adapts cadence based on bridge buffer depth
 
-Radio MCU is **not allowed** to invent timing.
+Current implementation note: strict clock ownership is deferred; alignment is enforced indirectly via adaptive timing.
 
 Time flows:
 ```
@@ -69,12 +69,14 @@ Audio frame tick → TDMA slot → RF TX/RX
 ## 4. Interconnect Options
 
 Preferred:
-- SPI (10–20 MHz)
+- SPI (10–20 MHz target)
 
 Fallback:
 - UART (DMA only, no interrupts)
 
 I2C is explicitly rejected.
+
+Current implementation note: SPI runs at 4 MHz today due to ESP32 SPI-slave CS timing constraints.
 
 ---
 
@@ -83,7 +85,7 @@ I2C is explicitly rejected.
 All messages use fixed headers:
 
 ```
-| Type | Length | Seq | Payload | CRC |
+| Sync(0xAA) | Length | Seq | Type | Payload | CRC8 |
 ```
 
 Rules:
@@ -110,6 +112,7 @@ Examples:
 - Slot assignment
 - Peer join/leave
 - RSSI reports
+- Status snapshots
 
 Lower priority than audio.
 
@@ -136,6 +139,8 @@ If queue is full:
 - Drop oldest non-audio
 - Never block audio pipeline
 
+Current implementation note: explicit TX-slot advertisement is deferred. Audio remains prioritized and oldest queued audio may be dropped under sustained pressure.
+
 ---
 
 ## 8. Failure Isolation
@@ -161,6 +166,8 @@ Symptoms:
 Response:
 - Radio MCU enters low-power idle
 
+Current implementation note: app MCU fail timeout and radio idle transition are deferred.
+
 ---
 
 ## 9. Power Coordination
@@ -174,6 +181,8 @@ Application MCU signals:
 
 Radio MCU may reject deep sleep if mesh timing requires wake.
 
+Current implementation note: cross-MCU power signaling is deferred.
+
 ---
 
 ## 10. Security Boundary
@@ -182,6 +191,8 @@ Radio MCU may reject deep sleep if mesh timing requires wake.
 - Application MCU never sees mesh keys
 
 This prevents Bluetooth compromise from leaking mesh credentials.
+
+Current implementation note: cryptographic keying/encryption is deferred.
 
 ---
 
@@ -194,6 +205,8 @@ Mandatory counters:
 - Clock drift
 
 Telemetry must be pull-based.
+
+Current implementation note: current telemetry is mostly push-based; pull-only telemetry is deferred.
 
 ---
 
@@ -223,4 +236,3 @@ This contract is intentionally strict.
 ## 14. Status
 
 This document defines the **non-negotiable MCU interface** for OMI.
-

@@ -135,8 +135,8 @@ Slots are **logical**, not tied to Node IDs.
 
 ### Forwarding
 
-- Relayed packets are transmitted in the node’s own slot
-- No packet forwarding outside slot
+- No packet relaying in current design
+- Each node transmits only its own audio in its own slot
 
 This guarantees bounded latency and prevents amplification.
 
@@ -213,7 +213,7 @@ This avoids mid-frame chaos.
 
 ### Election Rule
 
-- Lowest Node ID becomes provisional master
+- Lowest MAC address becomes provisional master
 - Provisional master issues SYNC
 - Others accept unless conflict detected
 
@@ -278,4 +278,3 @@ TDMA is intentionally boring. That is its strength.
 This document defines the **authoritative TDMA behavior** for OMI.
 
 Any deviation must justify increased complexity or improved determinism.
-

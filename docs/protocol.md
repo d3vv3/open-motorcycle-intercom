@@ -9,7 +9,6 @@ This specification covers:
 - Audio encapsulation
 - TDMA frame usage
 - Control messages
-- Routing and relaying rules
 
 [TOC]
 
@@ -19,7 +18,6 @@ This specification covers:
 
 - Deterministic latency beats throughput
 - Fixed-size packets where possible
-- Stateless forwarding
 - Small headers, explicit fields
 - Audio is first-class; everything else is secondary
 
@@ -40,9 +38,7 @@ This specification covers:
 - Small, bounded mesh (2–10 nodes)
 - Single logical group per mesh
 - One active time master
-- Max hop count: 2 (configurable)
-
-Nodes outside hop limit are ignored.
+- Single-hop broadcast transport (no relaying)
 
 ---
 
@@ -58,7 +54,7 @@ All packets share a common header.
 | 1 | 1 | Type | Packet type |
 | 2 | 1 | SrcID | Source node ID |
 | 3 | 1 | Seq | Sequence number |
-| 4 | 1 | Hop | Remaining hop count |
+| 4 | 1 | Reserved0 | Reserved for future use |
 | 5 | 1 | Flags | Control flags |
 | 6 | 2 | PayloadLen | Bytes following header |
 
@@ -102,7 +98,6 @@ Typical payload size:
 ### Rules
 - AUDIO packets **must only be sent in TDMA slots**
 - Packets received outside slot are dropped
-- If Hop > 0, packet may be forwarded
 
 ---
 
@@ -127,26 +122,7 @@ Typical payload size:
 
 ---
 
-## 8. Routing & Relaying
-
-### Forwarding Rules
-
-Upon receiving an AUDIO packet:
-
-1. If Hop == 0 → do not forward
-2. If SrcID == local ID → drop
-3. If packet already seen → drop
-4. Decrement Hop
-5. Forward in own slot
-
-### Duplicate Detection
-
-- Maintain rolling window of Seq per SrcID
-- Window size: implementation-defined (e.g. 8)
-
----
-
-## 9. Control Plane (CSMA)
+## 8. Control Plane (CSMA)
 
 Control packets are transmitted **outside TDMA slots** using contention-based access.
 
@@ -171,7 +147,7 @@ Payload:
 
 ---
 
-## 10. Time Synchronization (SYNC)
+## 9. Time Synchronization (SYNC)
 
 ### SYNC Packet
 
@@ -190,7 +166,7 @@ Payload:
 
 ---
 
-## 11. Slot Map (SLOT_MAP)
+## 10. Slot Map (SLOT_MAP)
 
 Broadcast by master when:
 - Node joins/leaves
@@ -202,6 +178,32 @@ Payload:
 |------|----|------|------------|
 | 0 | 1 | SlotCount | Number of slots |
 | 1 | N | SlotIDs | Ordered list of node IDs |
+
+---
+
+## 11. Status & Keepalive
+
+### STATUS Packet
+
+Payload:
+
+| Offset | Size | Field | Description |
+|------|----|------|------------|
+| 0 | 1 | BatteryPct | Battery percentage (0-100, 255=unknown) |
+| 1 | 1 | RssiDbm | Last measured RSSI (dBm) |
+| 2 | 1 | PeerCount | Active peer count |
+| 3 | 1 | FwVersion | Firmware protocol version |
+| 4 | 1 | TemperatureC | Temperature in C (127=unknown) |
+| 5 | 1 | Reserved | Future use |
+
+### KEEPALIVE Packet
+
+Payload:
+
+| Offset | Size | Field | Description |
+|------|----|------|------------|
+| 0 | 1 | BatteryPct | Battery percentage (0-100, 255=unknown) |
+| 1 | 1 | Reserved | Future use |
 
 ---
 
@@ -218,7 +220,7 @@ Payload:
 
 ### Master Loss
 
-- Lowest Node ID becomes provisional master
+- Lowest MAC address becomes provisional master
 - New SYNC issued
 
 ---
@@ -231,20 +233,29 @@ Payload:
 
 ### Message Types
 
-| Type | Direction | Purpose |
-|----|----------|--------|
-| AUDIO_IN | ESP → nRF | Send encoded audio |
-| AUDIO_OUT | nRF → ESP | Received audio |
-| CTRL | Bidirectional | Control messages |
+| Type | Value | Direction | Purpose |
+|----|----|----------|--------|
+| AUDIO | 0x01 | Bidirectional | Audio data |
+| STATUS | 0x02 | nRF → ESP | Mesh status |
+| EVENT | 0x03 | nRF → ESP | Mesh events |
+| COMMAND | 0x04 | ESP → nRF | Mesh commands |
+| LOG | 0x05 | nRF → ESP | Debug logs |
+
+### Frame Format
+
+```
+[SYNC:0xAA] [LEN] [SEQ] [TYPE] [PAYLOAD...] [CRC8]
+```
+
+- LEN covers: `SEQ + TYPE + PAYLOAD`
+- CRC8 covers: `LEN + SEQ + TYPE + PAYLOAD`
 
 ### Audio Message
 
 | Offset | Size | Field |
 |------|----|------|
-| 0 | 1 | StreamID |
-| 1 | 1 | Seq |
-| 2 | 1 | Hop |
-| 3 | N | OpusData |
+| 0 | 1 | SrcID |
+| 1 | N | OpusData |
 
 ---
 
