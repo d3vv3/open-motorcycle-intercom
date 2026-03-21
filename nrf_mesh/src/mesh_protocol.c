@@ -499,7 +499,10 @@ static void status_work_handler(struct k_work *work)
 
     /* Coordinator sends SYNC on every status update for discovery */
     if (s_role == MESH_ROLE_COORDINATOR) {
-        send_sync();
+        static uint8_t sync_decim = 0;
+        if ((sync_decim++ % 2) == 0) {
+            send_sync();
+        }
     } else if (s_role == MESH_ROLE_PARTICIPANT) {
         /* Check for coordinator timeout */
         if (k_uptime_get_32() - s_last_sync_time > SYNC_TIMEOUT_MS) {
@@ -536,11 +539,22 @@ static struct tx_audio_entry s_tx_audio_ring[TX_AUDIO_RING_SIZE];
 static volatile uint8_t s_tx_head = 0;
 static volatile uint8_t s_tx_tail = 0;
 
+static uint8_t tx_queue_depth(void)
+{
+    if (s_tx_head >= s_tx_tail) {
+        return s_tx_head - s_tx_tail;
+    }
+    return TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
+}
+
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
 {
     /* Called by TDMA when it's our slot - send audio if queued */
     ARG_UNUSED(slot_index);
     ARG_UNUSED(frame_counter);
+
+    uint32_t now = k_uptime_get_32();
+    bool has_audio_source = (now - s_last_audio_in_time) < 100;
 
     if (s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail) {
         /* Peek at tail */
@@ -574,12 +588,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         /* Flow control: check buffer level AFTER consuming.
          * Use proportional braking to match ESP32 audio production rate.
          */
-        uint8_t buf_count;
-        if (s_tx_head >= s_tx_tail) {
-            buf_count = s_tx_head - s_tx_tail;
-        } else {
-            buf_count = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
-        }
+        uint8_t buf_count = tx_queue_depth();
         s_tx_queue_depth_dbg = buf_count;
 
         if (buf_count == 0) {
@@ -600,17 +609,9 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         }
 
     } else {
-        uint32_t now = k_uptime_get_32();
-        bool has_audio_source = (now - s_last_audio_in_time) < 100;
-
         if (has_audio_source) {
             /* Calculate number of packets in buffer */
-            uint8_t count;
-            if (s_tx_head >= s_tx_tail) {
-                count = s_tx_head - s_tx_tail;
-            } else {
-                count = TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
-            }
+            uint8_t count = tx_queue_depth();
             s_tx_queue_depth_dbg = count;
 
             if (count == 0) {
