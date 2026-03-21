@@ -24,7 +24,7 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* Dedicated SPI bridge thread to minimize main-loop jitter */
 #define SPI_THREAD_STACK_SIZE 2048
-#define SPI_THREAD_PRIORITY   0
+#define SPI_THREAD_PRIORITY   -1
 
 K_THREAD_STACK_DEFINE(s_spi_thread_stack, SPI_THREAD_STACK_SIZE);
 static struct k_thread s_spi_thread;
@@ -36,10 +36,24 @@ static void spi_bridge_thread(void *arg1, void *arg2, void *arg3)
     ARG_UNUSED(arg2);
     ARG_UNUSED(arg3);
 
+    int64_t next_wake_ms = k_uptime_get();
+
     while (1) {
         uart_bridge_process();
         s_spi_loop_count++;
-        k_sleep(K_MSEC(SPI_POLL_MS));
+
+        next_wake_ms += SPI_POLL_MS;
+        int64_t now_ms = k_uptime_get();
+        int32_t sleep_ms = (int32_t)(next_wake_ms - now_ms);
+
+        if (sleep_ms > 0) {
+            k_sleep(K_MSEC(sleep_ms));
+        } else {
+            if (sleep_ms < -20) {
+                next_wake_ms = now_ms;
+            }
+            k_yield();
+        }
     }
 }
 

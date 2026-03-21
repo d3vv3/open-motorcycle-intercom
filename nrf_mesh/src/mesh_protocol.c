@@ -102,6 +102,8 @@ static uint8_t s_tx_queue_depth_dbg = 0;  /* Current TX queue depth for diagnost
 static uint32_t s_under_prev = 0;
 static uint32_t s_under_delta_last = 0;
 static uint32_t s_status_log_decim = 0;
+static uint32_t s_under_log_next = 64;
+static uint8_t s_part_catchup_budget = 0;
 
 /* ============================================================================
  * Forward Declarations
@@ -114,6 +116,17 @@ static void rx_work_handler(struct k_work *work);
 static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi);
 static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src_addr, int8_t rssi);
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter);
+
+static void note_underflow(const char *reason)
+{
+    if (s_stat_tx_underflow >= s_under_log_next) {
+        int32_t tts = tdma_get_time_to_slot_us();
+        printk("[UFLOW] r=%u id=%u sl=%d under=%u d1s=%u q=%u tts=%d reason=%s\n", s_role,
+               s_node_id, s_slot_index, s_stat_tx_underflow, s_under_delta_last,
+               s_tx_queue_depth_dbg, tts, reason);
+        s_under_log_next += 64;
+    }
+}
 
 /* ============================================================================
  * Packet Sending
@@ -473,6 +486,17 @@ static void status_work_handler(struct k_work *work)
     s_under_delta_last = s_stat_tx_underflow - s_under_prev;
     s_under_prev = s_stat_tx_underflow;
 
+    if (s_role == MESH_ROLE_PARTICIPANT) {
+        if (s_under_delta_last > 120) {
+            /* Underflow burst: briefly speed up frame cadence to refill playout. */
+            s_part_catchup_budget = 40;
+        } else if (s_under_delta_last > 60 && s_part_catchup_budget < 20) {
+            s_part_catchup_budget = 20;
+        }
+    } else {
+        s_part_catchup_budget = 0;
+    }
+
     /* Coordinator sends SYNC on every status update for discovery */
     if (s_role == MESH_ROLE_COORDINATOR) {
         send_sync();
@@ -561,11 +585,18 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         if (buf_count == 0) {
             /* Just drained the last packet - slow down next slot a bit. */
             s_stat_tx_underflow++;
+            note_underflow("drain0");
             tdma_tune_timing((s_under_delta_last > 100) ? 600 : 1200);
         } else if (buf_count == 1) {
             tdma_tune_timing((s_under_delta_last > 100) ? 300 : 600);
         } else if (buf_count < 4) {
             tdma_tune_timing(100);
+        }
+
+        if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && buf_count >= 2) {
+            /* Mild temporary catch-up to counter starvation bursts. */
+            tdma_tune_timing(-150);
+            s_part_catchup_budget--;
         }
 
     } else {
@@ -584,11 +615,17 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
 
             if (count == 0) {
                 s_stat_tx_underflow++;
+                note_underflow("empty");
                 tdma_tune_timing((s_under_delta_last > 100) ? 600 : 1200);
             } else if (count == 1) {
                 tdma_tune_timing((s_under_delta_last > 100) ? 300 : 600);
             } else if (count < 4) {
                 tdma_tune_timing(100);
+            }
+
+            if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && count >= 2) {
+                tdma_tune_timing(-150);
+                s_part_catchup_budget--;
             }
         }
     }
