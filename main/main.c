@@ -23,6 +23,7 @@
 #include "mesh.h"
 #include "nvs_flash.h"
 #include "power.h"
+#include "rtt_probe.h"
 #include "uart_bridge.h"
 
 static const char *TAG = "omi";
@@ -55,137 +56,8 @@ static uint32_t s_audio_seq_lost = 0;
 static uint32_t s_audio_seq_reorder = 0;
 static uint32_t s_audio_seq_oversize_drop = 0;
 
-/* Transport RTT probe diagnostics (ESP<->ESP over nRF mesh path) */
-#define RTT_MAGIC0 0x4F /* 'O' */
-#define RTT_MAGIC1 0x4D /* 'M' */
-#define RTT_MAGIC2 0x49 /* 'I' */
-#define RTT_MAGIC3 0x52 /* 'R' */
-#define RTT_TYPE_REQ 0x01
-#define RTT_TYPE_RSP 0x02
-#define RTT_PKT_LEN  7
-
-#define RTT_PROBE_INTERVAL_MS 2000
-#define RTT_LOG_INTERVAL_MS   10000
-
-static uint8_t s_rtt_probe_id = 0;
-static uint32_t s_rtt_sent = 0;
-static uint32_t s_rtt_recv = 0;
-static uint32_t s_rtt_lost = 0;
-static uint32_t s_rtt_ms_avg = 0;
-static uint32_t s_rtt_ms_max = 0;
-static uint32_t s_rtt_jitter_ms_avg = 0;
-static uint32_t s_rtt_jitter_ms_max = 0;
-
-static int64_t s_rtt_prev_ms = -1;
-static uint64_t s_rtt_sum_ms = 0;
-static uint64_t s_rtt_jitter_sum_ms = 0;
-
-static bool s_rtt_pending[256] = {0};
-static int64_t s_rtt_send_ts_us[256] = {0};
-
-/* Separate sequence for diagnostic packets sent over same audio channel */
-static uint8_t s_diag_tx_seq = 0;
-
-static void send_rtt_probe(void)
-{
-    if (!s_mesh_active || !uart_bridge_is_connected()) {
-        return;
-    }
-
-    uint8_t id = ++s_rtt_probe_id;
-    uint8_t pkt[RTT_PKT_LEN] = {
-        ++s_diag_tx_seq,
-        RTT_MAGIC0,
-        RTT_MAGIC1,
-        RTT_MAGIC2,
-        RTT_MAGIC3,
-        RTT_TYPE_REQ,
-        id,
-    };
-
-    esp_err_t ret = uart_bridge_send_audio(pkt, sizeof(pkt));
-    if (ret == ESP_OK) {
-        s_rtt_pending[id] = true;
-        s_rtt_send_ts_us[id] = esp_timer_get_time();
-        s_rtt_sent++;
-    }
-}
-
-static bool handle_rtt_packet(uint8_t src_id, const uint8_t *data, uint16_t len)
-{
-    (void)src_id;
-
-    if (len != RTT_PKT_LEN) {
-        return false;
-    }
-
-    if (data[1] != RTT_MAGIC0 || data[2] != RTT_MAGIC1 || data[3] != RTT_MAGIC2 ||
-        data[4] != RTT_MAGIC3) {
-        return false;
-    }
-
-    uint8_t type = data[5];
-    uint8_t id = data[6];
-
-    if (type == RTT_TYPE_REQ) {
-        /* Immediate echo response */
-        uint8_t rsp[RTT_PKT_LEN] = {
-            ++s_diag_tx_seq,
-            RTT_MAGIC0,
-            RTT_MAGIC1,
-            RTT_MAGIC2,
-            RTT_MAGIC3,
-            RTT_TYPE_RSP,
-            id,
-        };
-        (void)uart_bridge_send_audio(rsp, sizeof(rsp));
-        return true;
-    }
-
-    if (type == RTT_TYPE_RSP && s_rtt_pending[id]) {
-        int64_t now_us = esp_timer_get_time();
-        int64_t start_us = s_rtt_send_ts_us[id];
-        s_rtt_pending[id] = false;
-
-        if (start_us > 0 && now_us > start_us) {
-            uint32_t rtt_ms = (uint32_t)((now_us - start_us) / 1000);
-
-            s_rtt_recv++;
-            s_rtt_sum_ms += rtt_ms;
-            s_rtt_ms_avg = (uint32_t)(s_rtt_sum_ms / s_rtt_recv);
-            if (rtt_ms > s_rtt_ms_max) {
-                s_rtt_ms_max = rtt_ms;
-            }
-
-            if (s_rtt_prev_ms >= 0) {
-                uint32_t j = (rtt_ms > (uint32_t)s_rtt_prev_ms) ? (rtt_ms - (uint32_t)s_rtt_prev_ms)
-                                                                 : ((uint32_t)s_rtt_prev_ms - rtt_ms);
-                s_rtt_jitter_sum_ms += j;
-                s_rtt_jitter_ms_avg = (uint32_t)(s_rtt_jitter_sum_ms / s_rtt_recv);
-                if (j > s_rtt_jitter_ms_max) {
-                    s_rtt_jitter_ms_max = j;
-                }
-            }
-            s_rtt_prev_ms = rtt_ms;
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-static void rtt_housekeeping(void)
-{
-    int64_t now_us = esp_timer_get_time();
-
-    for (int i = 0; i < 256; i++) {
-        if (s_rtt_pending[i] && s_rtt_send_ts_us[i] > 0 && (now_us - s_rtt_send_ts_us[i]) > 5000000) {
-            s_rtt_pending[i] = false;
-            s_rtt_lost++;
-        }
-    }
-}
+/* RTT log cadence while using nRF transport */
+#define RTT_LOG_INTERVAL_MS 10000
 
 /* ============================================================================
  * Utility Functions
@@ -319,7 +191,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 {
     audio_frame_t frame;
 
-    if (handle_rtt_packet(src_id, data, len)) {
+    if (rtt_probe_handle_packet(src_id, data, len)) {
         return;
     }
 
@@ -479,6 +351,7 @@ static void button_long_press_callback(int gpio)
 void app_main(void)
 {
     int64_t boot_time = get_time_ms();
+    rtt_probe_init();
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "OMI - Open Motorcycle Intercom");
@@ -669,35 +542,35 @@ void app_main(void)
                 audio_stats.frames_decoded, mesh_stats.jitter_depth);
 
             if (s_active_transport == TRANSPORT_NRF52840) {
+                rtt_probe_stats_t rtt = {0};
+                rtt_probe_get_stats(&rtt);
+
                 ESP_LOGI(TAG,
                          "[SEQ] tx=%lu rx=%lu lost=%lu reord=%lu ovsz_drop=%lu last_rx=%u",
                          s_audio_seq_tx, s_audio_seq_rx, s_audio_seq_lost, s_audio_seq_reorder,
                          s_audio_seq_oversize_drop, s_audio_rx_expected);
                 ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
-                         s_rtt_sent, s_rtt_recv, s_rtt_lost, s_rtt_ms_avg, s_rtt_ms_max,
-                         s_rtt_jitter_ms_avg, s_rtt_jitter_ms_max);
+                         rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
+                         rtt.jitter_ms_avg, rtt.jitter_ms_max);
             }
 
             last_quick_stats = now_ms;
         }
 
         if (s_active_transport == TRANSPORT_NRF52840) {
-            static int64_t last_rtt_probe_ms = 0;
             static int64_t last_rtt_log_ms = 0;
 
-            if ((now_ms - last_rtt_probe_ms) >= RTT_PROBE_INTERVAL_MS) {
-                send_rtt_probe();
-                last_rtt_probe_ms = now_ms;
-            }
+            rtt_probe_tick(now_ms, s_mesh_active, uart_bridge_is_connected());
 
             if ((now_ms - last_rtt_log_ms) >= RTT_LOG_INTERVAL_MS) {
+                rtt_probe_stats_t rtt = {0};
+                rtt_probe_get_stats(&rtt);
+
                 ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
-                         s_rtt_sent, s_rtt_recv, s_rtt_lost, s_rtt_ms_avg, s_rtt_ms_max,
-                         s_rtt_jitter_ms_avg, s_rtt_jitter_ms_max);
+                         rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
+                         rtt.jitter_ms_avg, rtt.jitter_ms_max);
                 last_rtt_log_ms = now_ms;
             }
-
-            rtt_housekeeping();
         }
 #endif
 

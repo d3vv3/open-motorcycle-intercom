@@ -6,6 +6,7 @@
  */
 
 #include "audio.h"
+#include "audio_jitter_buffer.h"
 #include "voice_cleanup.h"
 #include "vox.h"
 
@@ -119,27 +120,12 @@ static uint8_t s_opus_buffer[MAX_OPUS_PACKET_SIZE];
 static int16_t s_far_ref_frame[AUDIO_FRAME_SAMPLES];
 static voice_cleanup_state_t s_voice_cleanup = {0};
 
-/* RX queue occupancy diagnostics */
-static uint32_t s_rx_q_depth_sum = 0;
-static uint32_t s_rx_q_depth_samples = 0;
+/* RX jitter/playout state */
+static audio_jitter_state_t s_jitter_state = {0};
 
 /* Phase 2: Mesh mode support */
 static audio_tx_cb_t s_tx_callback = NULL;
 static QueueHandle_t s_rx_queue = NULL;
-
-#define AUDIO_RX_QUEUE_SIZE 8
-#define MESH_RX_PREFILL_FRAMES 3
-#define MESH_RX_MAX_TARGET_FRAMES 5
-
-/**
- * @brief RX frame queue item
- */
-typedef struct {
-    uint8_t data[MAX_OPUS_PACKET_SIZE];
-    uint16_t len;
-    uint8_t source_id;
-    int64_t timestamp_us;
-} audio_rx_item_t;
 
 /* ============================================================================
  * Private Function Prototypes
@@ -480,8 +466,7 @@ static void audio_task(void *arg)
     int64_t next_frame_time_us = esp_timer_get_time();
     const int64_t frame_period_us = 20000; /* 20ms = 50 Hz */
 
-    int64_t last_rx_packet_us = 0;
-    bool mesh_playout_started = false;
+    audio_jitter_state_t *jitter = &s_jitter_state;
 
     while (s_running) {
         int64_t frame_start_us = esp_timer_get_time();
@@ -632,47 +617,13 @@ static void audio_task(void *arg)
                 audio_rx_item_t rx_item;
                 if (s_rx_queue != NULL) {
                     UBaseType_t items = uxQueueMessagesWaiting(s_rx_queue);
-                    uint8_t qdepth = (uint8_t)items;
+                    audio_jitter_record_depth(jitter, &s_stats, items);
+                    audio_jitter_update_playout_start(jitter, items);
+                    audio_jitter_trim_backlog(s_rx_queue, jitter, &s_stats, &rx_item);
 
-                    if (s_rx_q_depth_samples == 0) {
-                        s_stats.rx_q_depth_min = qdepth;
-                        s_stats.rx_q_depth_max = qdepth;
-                    } else {
-                        if (qdepth < s_stats.rx_q_depth_min) {
-                            s_stats.rx_q_depth_min = qdepth;
-                        }
-                        if (qdepth > s_stats.rx_q_depth_max) {
-                            s_stats.rx_q_depth_max = qdepth;
-                        }
-                    }
-                    s_rx_q_depth_sum += qdepth;
-                    s_rx_q_depth_samples++;
-                    s_stats.rx_q_depth_avg = (uint8_t)(s_rx_q_depth_sum / s_rx_q_depth_samples);
-
-                    /* Keep small fixed playout buffer in mesh mode:
-                     * - Wait for initial prefill before starting playback
-                     * - Trim excessive backlog to bound latency
-                     */
-                    if (!mesh_playout_started) {
-                        if (items >= MESH_RX_PREFILL_FRAMES) {
-                            mesh_playout_started = true;
-                        }
-                    }
-
-                    if (mesh_playout_started) {
-                        while (items > MESH_RX_MAX_TARGET_FRAMES) {
-                            if (xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
-                                s_stats.frames_dropped++;
-                                items = uxQueueMessagesWaiting(s_rx_queue);
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    if (mesh_playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
+                    if (jitter->playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
                         int64_t decode_start = esp_timer_get_time();
-                        last_rx_packet_us = decode_start;
+                        jitter->last_rx_packet_us = decode_start;
 
                         samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
                                                       s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
@@ -693,11 +644,11 @@ static void audio_task(void *arg)
                         }
                     } else {
                         int64_t now_us = esp_timer_get_time();
-                        if ((now_us - last_rx_packet_us) < 200000) {
+                        if (audio_jitter_should_count_underrun(jitter, now_us)) {
                             s_stats.rx_queue_underruns++;
                             s_stats.glitches_detected++;
                         } else {
-                            mesh_playout_started = false;
+                            jitter->playout_started = false;
                         }
                     }
                 }
@@ -881,8 +832,7 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
 
     /* Reset statistics */
     memset(&s_stats, 0, sizeof(s_stats));
-    s_rx_q_depth_sum = 0;
-    s_rx_q_depth_samples = 0;
+    audio_jitter_reset(&s_jitter_state);
 
     s_initialized = true;
     ESP_LOGI(TAG, "========================================");

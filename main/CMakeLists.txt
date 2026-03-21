@@ -3,7 +3,7 @@
 # Runtime detection determines which transport to use
 
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "rtt_probe.c"
     INCLUDE_DIRS "."
     REQUIRES 
         audio
