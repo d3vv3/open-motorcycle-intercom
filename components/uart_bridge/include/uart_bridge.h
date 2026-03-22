@@ -36,7 +36,7 @@ extern "C" {
 #define BRIDGE_SPI_DMA_CHAN SPI_DMA_CH_AUTO
 #define BRIDGE_SPI_HOST     SPI2_HOST
 
-/* Packet types matching nRF52840 bridge protocol (unchanged) */
+/* Packet types matching nRF52840 bridge protocol */
 #define BRIDGE_PKT_AUDIO      0x01
 #define BRIDGE_PKT_STATUS     0x02
 #define BRIDGE_PKT_MESH_EVENT 0x03

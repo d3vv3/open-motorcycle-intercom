@@ -7,8 +7,10 @@
  * packet to the slave, the slave simultaneously sends its queued packet
  * (or a zero-filled idle frame) to the master.
  *
- * Packet wire format (same as old UART protocol, fits in one SPI xfer):
- *   [0xAA] [LEN] [TYPE] [PAYLOAD...]
+ * Packet wire format:
+ *   [0xAA] [LEN] [SEQ] [TYPE] [PAYLOAD...] [CRC8]
+ * LEN covers: [SEQ] [TYPE] [PAYLOAD...]
+ * CRC8 is calculated over: [LEN] [SEQ] [TYPE] [PAYLOAD...]
  * Padded with zeros to BRIDGE_SPI_MAX_XFER bytes.
  *
  * "uart_bridge" naming retained for API compatibility.
@@ -73,6 +75,11 @@ static volatile uint16_t s_tx_pending_len = 0;
 static uint32_t s_audio_tx_queued = 0;    /* Audio frames queued for SPI TX */
 static uint32_t s_audio_tx_overwrite = 0; /* Audio frames that overwrote unsent ones */
 static uint32_t s_audio_rx_count = 0;     /* Audio frames received from nRF */
+static uint8_t s_bridge_tx_seq = 0;
+static uint8_t s_bridge_rx_expected = 0;
+static bool s_bridge_rx_seq_init = false;
+static uint32_t s_bridge_rx_seq_gaps = 0;
+static uint32_t s_bridge_rx_crc_fail = 0;
 
 /* ============================================================================
  * Private Functions
@@ -132,6 +139,22 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
     }
 }
 
+static uint8_t crc8_compute(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x80) {
+                crc = (uint8_t)((crc << 1) ^ 0x07);
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
 /**
  * @brief Parse a received SPI buffer for a framed packet.
  *
@@ -140,7 +163,7 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
  */
 static void parse_rx(const uint8_t *buf, size_t len)
 {
-    if (len < 3) {
+    if (len < 5) {
         return;
     }
 
@@ -150,20 +173,43 @@ static void parse_rx(const uint8_t *buf, size_t len)
     }
 
     uint8_t pkt_len = buf[1];
-    if (pkt_len < 1 || pkt_len > MAX_PACKET_LEN - 2) {
+    if (pkt_len < 2 || pkt_len > MAX_PACKET_LEN - 3) {
         ESP_LOGW(TAG, "Bad packet length: %u", pkt_len);
         return;
     }
 
     /* Ensure we actually received enough bytes */
-    if ((size_t)(pkt_len + 2) > len) {
-        ESP_LOGW(TAG, "Truncated packet: need %u, got %u", pkt_len + 2, (unsigned)len);
+    if ((size_t)(pkt_len + 3) > len) {
+        ESP_LOGW(TAG, "Truncated packet: need %u, got %u", pkt_len + 3, (unsigned)len);
         return;
     }
 
-    uint8_t pkt_type = buf[2];
-    const uint8_t *payload = &buf[3];
-    uint16_t payload_len = pkt_len - 1; /* -1 for type byte */
+    uint8_t rx_crc = buf[2 + pkt_len];
+    uint8_t calc_crc = crc8_compute(&buf[1], (size_t)(pkt_len + 1));
+    if (rx_crc != calc_crc) {
+        s_bridge_rx_crc_fail++;
+        if ((s_bridge_rx_crc_fail % 50) == 1) {
+            ESP_LOGW(TAG, "CRC mismatch: rx=0x%02X calc=0x%02X fail=%lu", rx_crc, calc_crc,
+                     s_bridge_rx_crc_fail);
+        }
+        return;
+    }
+
+    uint8_t seq = buf[2];
+    if (!s_bridge_rx_seq_init) {
+        s_bridge_rx_expected = seq;
+        s_bridge_rx_seq_init = true;
+    } else {
+        uint8_t expected_next = (uint8_t)(s_bridge_rx_expected + 1);
+        if (seq != expected_next) {
+            s_bridge_rx_seq_gaps++;
+        }
+    }
+    s_bridge_rx_expected = seq;
+
+    uint8_t pkt_type = buf[3];
+    const uint8_t *payload = &buf[4];
+    uint16_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
 
     handle_rx_packet(pkt_type, payload, payload_len);
 }
@@ -338,7 +384,8 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint16_t total = 3 + len; /* SYNC + LEN + TYPE + PAYLOAD */
+    uint16_t wire_len = (uint16_t)(2 + len);   /* SEQ + TYPE + PAYLOAD */
+    uint16_t total = (uint16_t)(3 + wire_len); /* SYNC + LEN + BODY + CRC */
     if (total > BRIDGE_SPI_MAX_XFER) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -349,11 +396,13 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
 
     memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
     s_tx_buf[0] = SYNC_BYTE;
-    s_tx_buf[1] = (uint8_t)(len + 1); /* LEN = type byte + payload */
-    s_tx_buf[2] = type;
+    s_tx_buf[1] = (uint8_t)wire_len;
+    s_tx_buf[2] = s_bridge_tx_seq++;
+    s_tx_buf[3] = type;
     if (len > 0 && payload != NULL) {
-        memcpy(&s_tx_buf[3], payload, len);
+        memcpy(&s_tx_buf[4], payload, len);
     }
+    s_tx_buf[2 + wire_len] = crc8_compute(&s_tx_buf[1], (size_t)(wire_len + 1));
     s_tx_pending_len = total;
 
     xSemaphoreGive(s_tx_mutex);

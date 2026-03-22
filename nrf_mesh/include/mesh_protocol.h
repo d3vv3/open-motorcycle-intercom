@@ -47,7 +47,7 @@ typedef struct __attribute__((packed)) {
     uint8_t type;         /* Packet type */
     uint8_t src_id;       /* Source node ID */
     uint8_t seq;          /* Sequence number */
-    uint8_t hop;          /* Hop count */
+    uint8_t reserved0;    /* Reserved for future use */
     uint8_t flags;        /* Control flags */
     uint16_t payload_len; /* Payload length */
 } mesh_header_t;
@@ -85,6 +85,20 @@ typedef struct __attribute__((packed)) {
     uint8_t reserved;
 } mesh_keepalive_payload_t;
 
+typedef struct __attribute__((packed)) {
+    uint8_t slot_count;
+    uint8_t slot_ids[MESH_MAX_NODES];
+} mesh_slot_map_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t battery_pct;
+    int8_t rssi_dbm;
+    uint8_t peer_count;
+    uint8_t fw_version;
+    int8_t temperature_c;
+    uint8_t reserved;
+} mesh_status_payload_t;
+
 /* ============================================================================
  * Node State
  * ============================================================================ */
@@ -112,6 +126,10 @@ typedef struct {
     int8_t slot_index;
     int64_t last_seen_ms;
     uint8_t battery_pct;
+    int8_t rssi_dbm;
+    uint8_t peer_count;
+    uint8_t fw_version;
+    int8_t temperature_c;
     bool active;
 } mesh_peer_info_t;
 

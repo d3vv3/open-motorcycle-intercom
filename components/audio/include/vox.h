@@ -10,6 +10,9 @@
 typedef struct {
     bool active;
     uint16_t hangover_counter;
+    uint16_t hangover_frames;
+    uint16_t min_active_counter;
+    uint16_t min_active_frames;
     float activation_threshold;
     float deactivation_threshold;
     uint32_t activation_count;

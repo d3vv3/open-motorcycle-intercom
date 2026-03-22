@@ -1,7 +1,7 @@
 #include "audio_jitter_buffer.h"
 
-#define MESH_RX_PREFILL_FRAMES    3
-#define MESH_RX_MAX_TARGET_FRAMES 5
+#define MESH_RX_PREFILL_FRAMES    4
+#define MESH_RX_MAX_TARGET_FRAMES 7
 
 void audio_jitter_reset(audio_jitter_state_t *state)
 {

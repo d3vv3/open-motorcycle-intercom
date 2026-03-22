@@ -82,6 +82,7 @@ typedef struct {
 typedef struct {
     float activation_threshold;   /**< RMS threshold for speech detection (0.0-1.0) */
     float deactivation_threshold; /**< RMS threshold for speech end (0.0-1.0) */
+    uint16_t min_active_ms;       /**< Minimum on-time once VOX activates */
     uint16_t hangover_ms;         /**< Time to keep VOX active after speech ends */
 } audio_vox_config_t;
 
@@ -92,7 +93,8 @@ typedef struct {
     {                                                                                              \
         .activation_threshold = 0.03f,    /* Normal sensitive threshold */                         \
         .deactivation_threshold = 0.010f, /* 67% of activation (hysteresis) */                     \
-        .hangover_ms = 300,               /* 300ms hangover */                                     \
+        .min_active_ms = 500,             /* Keep TX active for at least 500ms */                  \
+        .hangover_ms = 500,               /* 500ms hangover for smoother speech tails */            \
     }
 
 /**

@@ -47,14 +47,6 @@ static const char *TAG = "omi";
 static bool s_mesh_active = false;
 
 /* End-to-end audio sequence diagnostics (nRF transport path) */
-static uint8_t s_audio_tx_seq = 0;
-static uint8_t s_audio_rx_expected = 0;
-static bool s_audio_rx_seq_init = false;
-static uint32_t s_audio_seq_tx = 0;
-static uint32_t s_audio_seq_rx = 0;
-static uint32_t s_audio_seq_lost = 0;
-static uint32_t s_audio_seq_reorder = 0;
-static uint32_t s_audio_seq_oversize_drop = 0;
 
 /* RTT log cadence while using nRF transport */
 #define RTT_LOG_INTERVAL_MS 10000
@@ -120,21 +112,10 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timesta
 
     case TRANSPORT_NRF52840:
         if (s_mesh_active && uart_bridge_is_connected()) {
-            uint8_t seq_frame[65];
-            if (len > (sizeof(seq_frame) - 1)) {
-                s_audio_seq_oversize_drop++;
-                return;
-            }
-
-            s_audio_tx_seq++;
-            seq_frame[0] = s_audio_tx_seq;
-            memcpy(&seq_frame[1], data, len);
-
-            esp_err_t ret = uart_bridge_send_audio(seq_frame, len + 1);
+            esp_err_t ret = uart_bridge_send_audio(data, len);
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
             } else {
-                s_audio_seq_tx++;
                 /* Rate limit logs */
                 static int64_t last_log = 0;
                 int64_t now = esp_timer_get_time();
@@ -195,35 +176,17 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
         return;
     }
 
-    if (len < 2) {
+    if (len < 1) {
         return;
     }
 
-    uint8_t rx_seq = data[0];
-    if (!s_audio_rx_seq_init) {
-        s_audio_rx_expected = rx_seq;
-        s_audio_rx_seq_init = true;
-    } else {
-        uint8_t expected_next = s_audio_rx_expected + 1;
-        if (rx_seq != expected_next) {
-            uint8_t gap = (uint8_t)(rx_seq - expected_next);
-            if (gap > 0 && gap < 128) {
-                s_audio_seq_lost += gap;
-            } else {
-                s_audio_seq_reorder++;
-            }
-        }
-    }
-    s_audio_rx_expected = rx_seq;
-    s_audio_seq_rx++;
-
-    if ((len - 1) > sizeof(frame.data)) {
+    if (len > sizeof(frame.data)) {
         ESP_LOGW(TAG, "Audio frame too large: %u bytes", len);
         return;
     }
 
-    memcpy(frame.data, data + 1, len - 1);
-    frame.len = len - 1;
+    memcpy(frame.data, data, len);
+    frame.len = len;
     frame.timestamp_ms = timestamp_us / 1000;
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
@@ -544,11 +507,6 @@ void app_main(void)
             if (s_active_transport == TRANSPORT_NRF52840) {
                 rtt_probe_stats_t rtt = {0};
                 rtt_probe_get_stats(&rtt);
-
-                ESP_LOGI(TAG,
-                         "[SEQ] tx=%lu rx=%lu lost=%lu reord=%lu ovsz_drop=%lu last_rx=%u",
-                         s_audio_seq_tx, s_audio_seq_rx, s_audio_seq_lost, s_audio_seq_reorder,
-                         s_audio_seq_oversize_drop, s_audio_rx_expected);
                 ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
                          rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
                          rtt.jitter_ms_avg, rtt.jitter_ms_max);

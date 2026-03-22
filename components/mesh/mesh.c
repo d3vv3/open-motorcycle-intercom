@@ -44,6 +44,7 @@ static const char *TAG = "mesh";
 #define MESH_SCAN_TIMEOUT_MS  2000 /* Time to listen before becoming coordinator */
 #define MESH_JOIN_TIMEOUT_MS  5000 /* Time to wait for JOIN_ACK */
 #define MESH_JOIN_RETRY_COUNT 10
+#define MESH_STATUS_INTERVAL_MS 1000
 
 /* Frame timing in microseconds */
 #define MESH_FRAME_US   (MESH_FRAME_MS * 1000)
@@ -163,12 +164,16 @@ static void handle_join_packet(const mesh_rx_item_t *rx);
 static void handle_join_ack_packet(const mesh_rx_item_t *rx);
 static void handle_sync_packet(const mesh_rx_item_t *rx);
 static void handle_keepalive_packet(const mesh_rx_item_t *rx);
+static void handle_slot_map_packet(const mesh_rx_item_t *rx);
+static void handle_status_packet(const mesh_rx_item_t *rx);
 
 static esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len);
 static esp_err_t send_join_request(void);
 static esp_err_t send_join_ack(uint8_t node_id, uint8_t slot, const uint8_t *dest_mac);
 static esp_err_t send_sync(void);
 static esp_err_t send_keepalive(void);
+static esp_err_t send_slot_map(void);
+static esp_err_t send_status(void);
 static esp_err_t send_audio_in_slot(void);
 
 static void set_state(mesh_state_t new_state);
@@ -563,6 +568,7 @@ static void mesh_task(void *arg)
     int64_t scan_start = esp_timer_get_time();
     int64_t last_join_attempt = 0;
     int64_t last_keepalive = 0;
+    int64_t last_status = 0;
     int64_t last_beacon = 0;
     int join_attempts = 0;
     bool saw_lower_mac = false;        /* Track if we saw a node with lower MAC */
@@ -741,6 +747,12 @@ static void mesh_task(void *arg)
                     last_keepalive = now;
                 }
 
+                /* Send STATUS periodically */
+                if ((now - last_status) > (MESH_STATUS_INTERVAL_MS * 1000)) {
+                    send_status();
+                    last_status = now;
+                }
+
                 /* Check for peer timeouts */
                 check_peer_timeouts();
 
@@ -885,6 +897,14 @@ static void handle_packet(const mesh_rx_item_t *rx)
         handle_keepalive_packet(rx);
         break;
 
+    case MESH_PKT_SLOT_MAP:
+        handle_slot_map_packet(rx);
+        break;
+
+    case MESH_PKT_STATUS:
+        handle_status_packet(rx);
+        break;
+
     case MESH_PKT_LEAVE:
         /* Handle peer leaving */
         ESP_LOGI(TAG, "Node %d leaving mesh", rx->header.src_id);
@@ -905,6 +925,9 @@ static void handle_packet(const mesh_rx_item_t *rx)
             }
         }
         xSemaphoreGive(s_peer_mutex);
+        if (s_role == MESH_ROLE_COORDINATOR) {
+            send_slot_map();
+        }
         break;
 
     default:
@@ -1033,6 +1056,7 @@ static void handle_join_packet(const mesh_rx_item_t *rx)
 
     /* Send JOIN_ACK */
     send_join_ack(new_id, new_slot, rx->src_mac);
+    send_slot_map();
 }
 
 static void handle_join_ack_packet(const mesh_rx_item_t *rx)
@@ -1166,6 +1190,66 @@ static void handle_keepalive_packet(const mesh_rx_item_t *rx)
     xSemaphoreGive(s_peer_mutex);
 }
 
+static void handle_slot_map_packet(const mesh_rx_item_t *rx)
+{
+    if (rx->header.payload_len < sizeof(uint8_t)) {
+        return;
+    }
+
+    const mesh_slot_map_payload_t *slot_map = (const mesh_slot_map_payload_t *)rx->payload;
+    uint8_t slot_count = slot_map->slot_count;
+    if (slot_count > MESH_MAX_NODES) {
+        slot_count = MESH_MAX_NODES;
+    }
+
+    if (rx->header.payload_len < (uint16_t)(1 + slot_count)) {
+        return;
+    }
+
+    xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
+    for (uint8_t slot = 0; slot < slot_count; slot++) {
+        uint8_t node_id = slot_map->slot_ids[slot];
+        if (node_id == 0) {
+            continue;
+        }
+
+        if (node_id == s_node_id) {
+            s_slot_index = (int8_t)slot;
+        }
+
+        for (int i = 0; i < MESH_MAX_NODES; i++) {
+            if (s_peers[i].info.active && s_peers[i].info.node_id == node_id) {
+                s_peers[i].info.slot_index = (int8_t)slot;
+                break;
+            }
+        }
+    }
+    xSemaphoreGive(s_peer_mutex);
+}
+
+static void handle_status_packet(const mesh_rx_item_t *rx)
+{
+    if (rx->header.payload_len < sizeof(mesh_status_payload_t)) {
+        return;
+    }
+
+    const mesh_status_payload_t *status = (const mesh_status_payload_t *)rx->payload;
+
+    xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
+    for (int i = 0; i < MESH_MAX_NODES; i++) {
+        if (s_peers[i].info.node_id == rx->header.src_id) {
+            s_peers[i].info.last_seen_ms = rx->timestamp_us / 1000;
+            s_peers[i].info.battery_pct = status->battery_pct;
+            s_peers[i].info.rssi_dbm = rx->rssi;
+            s_peers[i].info.peer_count = status->peer_count;
+            s_peers[i].info.fw_version = status->fw_version;
+            s_peers[i].info.temperature_c = status->temperature_c;
+            break;
+        }
+    }
+    xSemaphoreGive(s_peer_mutex);
+}
+
 /* ============================================================================
  * Private Functions - Packet Transmission
  * ============================================================================ */
@@ -1179,7 +1263,7 @@ static esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t
     header->type = type;
     header->src_id = s_node_id;
     header->seq = s_tx_seq++;
-    header->hop = s_config.max_hops;
+    header->reserved0 = 0;
     header->flags = 0;
     header->payload_len = len;
 
@@ -1206,7 +1290,7 @@ static esp_err_t send_join_request(void)
     header->type = MESH_PKT_JOIN;
     header->src_id = 0; /* Unassigned */
     header->seq = s_tx_seq++;
-    header->hop = 1;
+    header->reserved0 = 0;
     header->flags = 0;
     header->payload_len = sizeof(payload);
 
@@ -1240,7 +1324,7 @@ static esp_err_t send_join_ack(uint8_t node_id, uint8_t slot, const uint8_t *des
     header->type = MESH_PKT_JOIN_ACK;
     header->src_id = s_node_id;
     header->seq = s_tx_seq++;
-    header->hop = 1;
+    header->reserved0 = 0;
     header->flags = 0;
     header->payload_len = sizeof(payload);
 
@@ -1269,6 +1353,37 @@ static esp_err_t send_keepalive(void)
     return send_packet(MESH_PKT_KEEPALIVE, &payload, sizeof(payload));
 }
 
+static esp_err_t send_slot_map(void)
+{
+    mesh_slot_map_payload_t payload = {0};
+    payload.slot_count = MESH_MAX_NODES;
+
+    xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
+    for (int i = 0; i < MESH_MAX_NODES; i++) {
+        if (s_peers[i].info.active && s_peers[i].info.slot_index >= 0 &&
+            s_peers[i].info.slot_index < MESH_MAX_NODES) {
+            payload.slot_ids[s_peers[i].info.slot_index] = s_peers[i].info.node_id;
+        }
+    }
+    xSemaphoreGive(s_peer_mutex);
+
+    return send_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
+}
+
+static esp_err_t send_status(void)
+{
+    mesh_status_payload_t payload = {
+        .battery_pct = 100,
+        .rssi_dbm = 127,
+        .peer_count = mesh_get_node_count(),
+        .fw_version = MESH_PROTOCOL_VERSION,
+        .temperature_c = 127,
+        .reserved = 0,
+    };
+
+    return send_packet(MESH_PKT_STATUS, &payload, sizeof(payload));
+}
+
 static esp_err_t send_audio_in_slot(void)
 {
     mesh_tx_item_t tx_item;
@@ -1288,13 +1403,13 @@ static esp_err_t send_audio_in_slot(void)
     header->type = MESH_PKT_AUDIO;
     header->src_id = s_node_id;
     header->seq = s_tx_seq++;
-    header->hop = s_config.max_hops;
+    header->reserved0 = 0;
     header->flags = 0;
     header->payload_len = 4 + tx_item.len;
 
     audio->codec = 0x01; /* Opus */
     audio->frame_ms = MESH_FRAME_MS;
-    audio->stream_id = 0;
+    audio->stream_id = s_node_id;
     audio->reserved = 0;
     memcpy(audio->data, tx_item.data, tx_item.len);
 
@@ -1405,6 +1520,10 @@ static void check_peer_timeouts(void)
 
                 if (s_peer_cb) {
                     s_peer_cb(&peer_info, false);
+                }
+
+                if (s_role == MESH_ROLE_COORDINATOR) {
+                    send_slot_map();
                 }
 
                 /* If coordinator timed out, go back to scanning to discover new mesh state.

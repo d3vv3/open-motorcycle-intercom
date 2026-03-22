@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Packet types (unchanged from UART protocol) */
+/* Packet types used by SPI bridge protocol */
 #define UART_PKT_AUDIO   0x01 /* Audio Data (Bidirectional) */
 #define UART_PKT_STATUS  0x02 /* Mesh status -> ESP32 */
 #define UART_PKT_EVENT   0x03 /* Mesh event -> ESP32 */

@@ -13,7 +13,7 @@
  * - ESP-NOW transport
  * - TDMA scheduling
  * - Slot management
- * - Packet routing (single-hop only in Phase 2)
+ * - Single-hop packet transport (no relaying)
  * - Time synchronization
  */
 
@@ -143,7 +143,7 @@ typedef struct __attribute__((packed)) {
     uint8_t type;         /**< Packet type (mesh_pkt_type_t) */
     uint8_t src_id;       /**< Source node ID (0 = unassigned) */
     uint8_t seq;          /**< Sequence number */
-    uint8_t hop;          /**< Remaining hop count */
+    uint8_t reserved0;    /**< Reserved for future use */
     uint8_t flags;        /**< Control flags */
     uint16_t payload_len; /**< Payload length in bytes */
 } mesh_header_t;
@@ -201,11 +201,22 @@ typedef struct __attribute__((packed)) {
 } mesh_slot_map_payload_t;
 
 /**
+ * @brief STATUS payload (6 bytes)
+ */
+typedef struct __attribute__((packed)) {
+    uint8_t battery_pct;  /**< Battery percentage (0-100, 255=unknown) */
+    int8_t rssi_dbm;      /**< Last measured RSSI (dBm) */
+    uint8_t peer_count;   /**< Number of active peers */
+    uint8_t fw_version;   /**< Firmware version byte */
+    int8_t temperature_c; /**< Temperature in Celsius (127=unknown) */
+    uint8_t reserved;
+} mesh_status_payload_t;
+
+/**
  * @brief Mesh configuration
  */
 typedef struct {
     uint8_t node_id;  /**< Local node ID (0 = auto-assign) */
-    uint8_t max_hops; /**< Maximum hop count (default: 2) */
     uint8_t tx_power; /**< TX power level (dBm) */
     uint8_t channel;  /**< WiFi channel (1-13) */
 } mesh_config_t;
@@ -216,7 +227,6 @@ typedef struct {
 #define MESH_CONFIG_DEFAULT()                                                                      \
     {                                                                                              \
         .node_id = 0,                                                                              \
-        .max_hops = 2,                                                                             \
         .tx_power = 20,                                                                            \
         .channel = 1,                                                                              \
     }
@@ -230,6 +240,10 @@ typedef struct {
     int8_t slot_index;    /**< Assigned slot (-1 if none) */
     int64_t last_seen_ms; /**< Last packet received timestamp */
     uint8_t battery_pct;  /**< Last reported battery level */
+    int8_t rssi_dbm;      /**< Last reported RSSI */
+    uint8_t peer_count;   /**< Last reported peer count */
+    uint8_t fw_version;   /**< Last reported firmware version */
+    int8_t temperature_c; /**< Last reported temperature */
     bool active;          /**< Node is active in mesh */
 } mesh_peer_info_t;
 
@@ -241,7 +255,6 @@ typedef struct {
     uint32_t packets_tx;         /**< Total packets transmitted */
     uint32_t packets_rx;         /**< Total packets received */
     uint32_t packets_dropped;    /**< Packets dropped (TX failure) */
-    uint32_t packets_forwarded;  /**< Packets forwarded (Phase 4+) */
     uint32_t rx_queue_overflows; /**< RX queue full events */
 
     /* Audio-specific */

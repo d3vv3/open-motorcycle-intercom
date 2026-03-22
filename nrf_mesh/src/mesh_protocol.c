@@ -90,7 +90,7 @@ static uint32_t s_stat_tx_fail = 0;
 static uint32_t s_stat_tx_underflow = 0;
 
 /* TX queue depth for ESP->nRF audio handoff */
-#define TX_AUDIO_RING_SIZE 8
+#define TX_AUDIO_RING_SIZE 16
 
 static uint32_t s_stat_rx_count = 0;
 static uint32_t s_stat_rx_drop = 0;
@@ -141,7 +141,7 @@ static int send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
     hdr->type = type;
     hdr->src_id = s_node_id;
     hdr->seq = s_tx_seq++;
-    hdr->hop = 2;
+    hdr->reserved0 = 0;
     hdr->flags = 0;
     hdr->payload_len = len;
 
@@ -169,6 +169,42 @@ static int send_sync(void)
         .drift_ppm = 0,
     };
     return send_packet(MESH_PKT_SYNC, &payload, sizeof(payload));
+}
+
+static int send_keepalive(void)
+{
+    mesh_keepalive_payload_t payload = {
+        .battery_pct = 255,
+        .reserved = 0,
+    };
+    return send_packet(MESH_PKT_KEEPALIVE, &payload, sizeof(payload));
+}
+
+static int send_slot_map(void)
+{
+    mesh_slot_map_payload_t payload = {0};
+    payload.slot_count = MESH_MAX_NODES;
+
+    for (int i = 0; i < MESH_MAX_NODES; i++) {
+        if (s_peers[i].active && s_peers[i].slot_index >= 0 && s_peers[i].slot_index < MESH_MAX_NODES) {
+            payload.slot_ids[s_peers[i].slot_index] = s_peers[i].node_id;
+        }
+    }
+
+    return send_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
+}
+
+static int send_status_packet(void)
+{
+    mesh_status_payload_t payload = {
+        .battery_pct = 255,
+        .rssi_dbm = 127,
+        .peer_count = s_peer_count,
+        .fw_version = MESH_PROTOCOL_VERSION,
+        .temperature_c = 127,
+        .reserved = 0,
+    };
+    return send_packet(MESH_PKT_STATUS, &payload, sizeof(payload));
 }
 
 static int send_join_ack(uint8_t assigned_id, uint8_t slot_index)
@@ -300,6 +336,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                     LOG_INF("JOIN retry, resending ACK: id=%d slot=%d", s_last_join_id,
                             s_last_join_slot);
                     send_join_ack(s_last_join_id, s_last_join_slot);
+                    send_slot_map();
                     break;
                 }
             }
@@ -350,6 +387,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
 
             /* Send JOIN_ACK to the new node */
             send_join_ack(new_id, new_slot);
+            send_slot_map();
 
             /* Notify ESP32 of new peer joining */
             uart_bridge_send_event(0x02, NULL, 0); /* BRIDGE_EVENT_PEER_JOINED */
@@ -387,6 +425,70 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                 s_peers[i].last_seen_ms = k_uptime_get();
                 break;
             }
+        }
+        break;
+
+    case MESH_PKT_STATUS:
+        if (hdr->payload_len >= sizeof(mesh_status_payload_t)) {
+            const mesh_status_payload_t *status = (const mesh_status_payload_t *)payload;
+            for (int i = 0; i < MESH_MAX_NODES; i++) {
+                if (s_peers[i].active && s_peers[i].node_id == hdr->src_id) {
+                    s_peers[i].battery_pct = status->battery_pct;
+                    s_peers[i].rssi_dbm = rssi;
+                    s_peers[i].peer_count = status->peer_count;
+                    s_peers[i].fw_version = status->fw_version;
+                    s_peers[i].temperature_c = status->temperature_c;
+                    s_peers[i].last_seen_ms = k_uptime_get();
+                    break;
+                }
+            }
+        }
+        break;
+
+    case MESH_PKT_SLOT_MAP:
+        if (hdr->payload_len >= sizeof(uint8_t)) {
+            const mesh_slot_map_payload_t *slot_map = (const mesh_slot_map_payload_t *)payload;
+            uint8_t slot_count = slot_map->slot_count;
+            if (slot_count > MESH_MAX_NODES) {
+                slot_count = MESH_MAX_NODES;
+            }
+
+            if (hdr->payload_len < (uint16_t)(1 + slot_count)) {
+                break;
+            }
+
+            for (uint8_t slot = 0; slot < slot_count; slot++) {
+                uint8_t node_id = slot_map->slot_ids[slot];
+                if (node_id == 0) {
+                    continue;
+                }
+
+                if (node_id == s_node_id) {
+                    s_slot_index = (int8_t)slot;
+                }
+
+                for (int i = 0; i < MESH_MAX_NODES; i++) {
+                    if (s_peers[i].active && s_peers[i].node_id == node_id) {
+                        s_peers[i].slot_index = (int8_t)slot;
+                        break;
+                    }
+                }
+            }
+        }
+        break;
+
+    case MESH_PKT_LEAVE:
+        for (int i = 0; i < MESH_MAX_NODES; i++) {
+            if (s_peers[i].active && s_peers[i].node_id == hdr->src_id) {
+                s_peers[i].active = false;
+                if (s_peer_count > 0) {
+                    s_peer_count--;
+                }
+                break;
+            }
+        }
+        if (s_role == MESH_ROLE_COORDINATOR) {
+            send_slot_map();
         }
         break;
 
@@ -468,6 +570,10 @@ static void status_work_handler(struct k_work *work)
 
     /* Send status to ESP32 */
     uart_bridge_send_status(s_role, s_peer_count, s_node_id);
+
+    /* Send mesh status and keepalive over RF */
+    send_status_packet();
+    send_keepalive();
 
     /* Log packet stats */
     esb_radio_timing_stats_t esb_stats = {0};
@@ -554,7 +660,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     ARG_UNUSED(frame_counter);
 
     uint32_t now = k_uptime_get_32();
-    bool has_audio_source = (now - s_last_audio_in_time) < 100;
+    bool has_audio_source = (now - s_last_audio_in_time) < 120;
 
     if (s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail) {
         /* Peek at tail */
@@ -595,16 +701,18 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
             /* Just drained the last packet - slow down next slot a bit. */
             s_stat_tx_underflow++;
             note_underflow("drain0");
-            tdma_tune_timing((s_under_delta_last > 100) ? 600 : 1200);
+            tdma_tune_timing((s_under_delta_last > 100) ? 1400 : 2200);
         } else if (buf_count == 1) {
-            tdma_tune_timing((s_under_delta_last > 100) ? 300 : 600);
+            tdma_tune_timing((s_under_delta_last > 100) ? 700 : 1400);
         } else if (buf_count < 4) {
-            tdma_tune_timing(100);
+            tdma_tune_timing(500);
+        } else if (buf_count < 6) {
+            tdma_tune_timing(150);
         }
 
-        if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && buf_count >= 2) {
+        if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && buf_count >= 4) {
             /* Mild temporary catch-up to counter starvation bursts. */
-            tdma_tune_timing(-150);
+            tdma_tune_timing(-100);
             s_part_catchup_budget--;
         }
 
@@ -617,15 +725,17 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
             if (count == 0) {
                 s_stat_tx_underflow++;
                 note_underflow("empty");
-                tdma_tune_timing((s_under_delta_last > 100) ? 600 : 1200);
+                tdma_tune_timing((s_under_delta_last > 100) ? 1400 : 2200);
             } else if (count == 1) {
-                tdma_tune_timing((s_under_delta_last > 100) ? 300 : 600);
+                tdma_tune_timing((s_under_delta_last > 100) ? 700 : 1400);
             } else if (count < 4) {
-                tdma_tune_timing(100);
+                tdma_tune_timing(500);
+            } else if (count < 6) {
+                tdma_tune_timing(150);
             }
 
-            if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && count >= 2) {
-                tdma_tune_timing(-150);
+            if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && count >= 4) {
+                tdma_tune_timing(-100);
                 s_part_catchup_budget--;
             }
         }
@@ -717,6 +827,10 @@ void mesh_protocol_stop(void)
     k_work_cancel_delayable(&s_scan_work);
     k_work_cancel_delayable(&s_join_work);
     k_work_cancel_delayable(&s_status_work);
+
+    if (s_state == MESH_STATE_ACTIVE && s_node_id != 0) {
+        send_packet(MESH_PKT_LEAVE, NULL, 0);
+    }
 
     tdma_stop();
     esb_radio_stop_rx();

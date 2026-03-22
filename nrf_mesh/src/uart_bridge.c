@@ -2,7 +2,9 @@
  * @file uart_bridge.c
  * @brief SPI Bridge to ESP32-S3 (nRF52840 = SPI Master)
  *
- * Protocol: [SYNC:0xAA][LEN:1B][TYPE:1B][PAYLOAD:0-128B]
+ * Protocol: [SYNC:0xAA][LEN:1B][SEQ:1B][TYPE:1B][PAYLOAD:0-128B][CRC8:1B]
+ * LEN covers: [SEQ][TYPE][PAYLOAD]
+ * CRC8 covers: [LEN][SEQ][TYPE][PAYLOAD]
  * Each call to uart_bridge_process() performs one full-duplex SPI
  * transaction at BRIDGE_SPI_MAX_XFER bytes.  The master sends its
  * queued packet (or an idle frame of zeros) and simultaneously
@@ -73,6 +75,11 @@ static uint32_t s_poll_dt_count = 0;
 static uint64_t s_poll_dt_sum_us = 0;
 static uint32_t s_poll_dt_min_us = 0;
 static uint32_t s_poll_dt_max_us = 0;
+static uint8_t s_bridge_tx_seq = 0;
+static uint8_t s_bridge_rx_expected = 0;
+static bool s_bridge_rx_seq_init = false;
+static uint32_t s_bridge_rx_seq_gap = 0;
+static uint32_t s_bridge_rx_crc_fail = 0;
 
 /* ============================================================================
  * Private Functions
@@ -124,12 +131,28 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
     }
 }
 
+static uint8_t crc8_compute(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0x00;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x80) {
+                crc = (uint8_t)((crc << 1) ^ 0x07);
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
 /**
  * @brief Parse the RX buffer after an SPI transaction.
  */
 static void parse_rx(const uint8_t *buf, size_t len)
 {
-    if (len < 3) {
+    if (len < 5) {
         return;
     }
 
@@ -139,21 +162,58 @@ static void parse_rx(const uint8_t *buf, size_t len)
     }
 
     uint8_t pkt_len = buf[1];
-    if (pkt_len < 1 || pkt_len > SPI_MAX_PAYLOAD + 1) {
+    if (pkt_len < 2 || pkt_len > SPI_MAX_PAYLOAD + 2) {
         LOG_WRN("Bad packet length: %u", pkt_len);
         return;
     }
 
-    if ((size_t)(pkt_len + 2) > len) {
-        LOG_WRN("Truncated packet: need %u, got %u", pkt_len + 2, (unsigned int)len);
+    if ((size_t)(pkt_len + 3) > len) {
+        LOG_WRN("Truncated packet: need %u, got %u", pkt_len + 3, (unsigned int)len);
         return;
     }
 
-    uint8_t pkt_type = buf[2];
-    const uint8_t *payload = &buf[3];
-    uint8_t payload_len = pkt_len - 1; /* -1 for type byte */
+    uint8_t rx_crc = buf[2 + pkt_len];
+    uint8_t calc_crc = crc8_compute(&buf[1], (size_t)(pkt_len + 1));
+    if (rx_crc != calc_crc) {
+        s_bridge_rx_crc_fail++;
+        if ((s_bridge_rx_crc_fail % 50) == 1) {
+            LOG_WRN("CRC mismatch rx=0x%02X calc=0x%02X fail=%u", rx_crc, calc_crc,
+                    s_bridge_rx_crc_fail);
+        }
+        return;
+    }
+
+    uint8_t seq = buf[2];
+    if (!s_bridge_rx_seq_init) {
+        s_bridge_rx_expected = seq;
+        s_bridge_rx_seq_init = true;
+    } else {
+        uint8_t expected_next = (uint8_t)(s_bridge_rx_expected + 1);
+        if (seq != expected_next) {
+            s_bridge_rx_seq_gap++;
+        }
+    }
+    s_bridge_rx_expected = seq;
+
+    uint8_t pkt_type = buf[3];
+    const uint8_t *payload = &buf[4];
+    uint8_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
 
     handle_rx_packet(pkt_type, payload, payload_len);
+}
+
+static uint16_t build_packet(uint8_t *dst, uint8_t type, const uint8_t *payload, uint8_t len)
+{
+    uint8_t wire_len = (uint8_t)(2 + len);
+    dst[0] = UART_SYNC_BYTE;
+    dst[1] = wire_len;
+    dst[2] = s_bridge_tx_seq++;
+    dst[3] = type;
+    if (len > 0 && payload != NULL) {
+        memcpy(&dst[4], payload, len);
+    }
+    dst[2 + wire_len] = crc8_compute(&dst[1], (size_t)(wire_len + 1));
+    return (uint16_t)(3 + wire_len);
 }
 
 static void queue_control_packet(const uint8_t *buf, uint16_t len)
@@ -237,12 +297,10 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
 
     struct tx_entry *e = &s_audio_q[s_audio_head];
     memset(e->buf, 0, BRIDGE_SPI_MAX_XFER);
-    e->buf[0] = UART_SYNC_BYTE;
-    e->buf[1] = len + 2; /* type + src_id + audio data */
-    e->buf[2] = UART_PKT_AUDIO;
-    e->buf[3] = src_id;
-    memcpy(&e->buf[4], data, len);
-    e->len = 4 + len;
+    uint8_t payload[SPI_MAX_PAYLOAD] = {0};
+    payload[0] = src_id;
+    memcpy(&payload[1], data, len);
+    e->len = build_packet(e->buf, UART_PKT_AUDIO, payload, (uint8_t)(len + 1));
     s_audio_head = next_head;
     k_mutex_unlock(&s_tx_lock);
 
@@ -257,16 +315,14 @@ int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
     }
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
-    pkt[0] = UART_SYNC_BYTE;
-    pkt[1] = len + 2; /* type + event_type + data */
-    pkt[2] = UART_PKT_EVENT;
-    pkt[3] = event_type;
-
+    uint8_t payload[SPI_MAX_PAYLOAD] = {0};
+    payload[0] = event_type;
     if (len > 0 && data != NULL) {
-        memcpy(&pkt[4], data, len);
+        memcpy(&payload[1], data, len);
     }
 
-    queue_control_packet(pkt, 4 + len);
+    uint16_t pkt_len = build_packet(pkt, UART_PKT_EVENT, payload, (uint8_t)(len + 1));
+    queue_control_packet(pkt, pkt_len);
 
     LOG_DBG("Queued event: type=%d, len=%d", event_type, len);
     return 0;
@@ -279,14 +335,9 @@ int uart_bridge_send_status(uint8_t role, uint8_t peer_count, uint8_t node_id)
     }
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
-    pkt[0] = UART_SYNC_BYTE;
-    pkt[1] = 4; /* type + role + peer_count + node_id */
-    pkt[2] = UART_PKT_STATUS;
-    pkt[3] = role;
-    pkt[4] = peer_count;
-    pkt[5] = node_id;
-
-    queue_control_packet(pkt, 6);
+    uint8_t payload[3] = {role, peer_count, node_id};
+    uint16_t pkt_len = build_packet(pkt, UART_PKT_STATUS, payload, sizeof(payload));
+    queue_control_packet(pkt, pkt_len);
 
     LOG_DBG("Queued status: role=%d, peers=%d, id=%d", role, peer_count, node_id);
     return 0;
@@ -391,8 +442,9 @@ void uart_bridge_process(void)
 
     if ((txn_count % 2500) == 0 && s_poll_dt_count > 0) {
         uint32_t avg = (uint32_t)(s_poll_dt_sum_us / s_poll_dt_count);
-        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u\n", s_poll_dt_min_us, avg,
-               s_poll_dt_max_us, s_audio_q_overwrite);
+        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u seq_gap=%u crc_fail=%u\n",
+               s_poll_dt_min_us, avg, s_poll_dt_max_us, s_audio_q_overwrite, s_bridge_rx_seq_gap,
+               s_bridge_rx_crc_fail);
     }
 
 }
@@ -413,12 +465,8 @@ int uart_bridge_send_log(const char *msg, uint8_t len)
     }
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
-    pkt[0] = UART_SYNC_BYTE;
-    pkt[1] = len + 1; /* type + msg */
-    pkt[2] = UART_PKT_LOG;
-    memcpy(&pkt[3], msg, len);
-
-    queue_control_packet(pkt, 3 + len);
+    uint16_t pkt_len = build_packet(pkt, UART_PKT_LOG, (const uint8_t *)msg, len);
+    queue_control_packet(pkt, pkt_len);
 
     return 0;
 }
