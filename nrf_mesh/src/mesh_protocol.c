@@ -103,7 +103,19 @@ static uint32_t s_under_prev = 0;
 static uint32_t s_under_delta_last = 0;
 static uint32_t s_status_log_decim = 0;
 static uint32_t s_under_log_next = 64;
-static uint8_t s_part_catchup_budget = 0;
+/* PI queue-level controller state */
+#define QUEUE_TARGET      4    /* Desired queue depth (frames) */
+#define PI_KP_US          500  /* Proportional gain */
+#define PI_KI_US          60   /* Integral gain */
+#define PI_INTEGRAL_MIN  -666  /* Anti-windup lower clamp */
+#define PI_INTEGRAL_MAX   2000 /* Anti-windup upper clamp */
+#define PI_OUTPUT_MIN    -666  /* Total output lower clamp (us) */
+#define PI_OUTPUT_MAX    4200  /* Total output upper clamp (us) */
+
+static int32_t s_pi_integral = 0;       /* Integral accumulator */
+static int32_t s_pi_last_output = 0;    /* Last computed output for logging */
+static uint32_t s_auto_sat_ticks = 0;
+static uint32_t s_auto_ticks = 0;
 
 /* ============================================================================
  * Forward Declarations
@@ -126,6 +138,30 @@ static void note_underflow(const char *reason)
                s_tx_queue_depth_dbg, tts, reason);
         s_under_log_next += 64;
     }
+}
+
+static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
+{
+    if (v < lo) {
+        return lo;
+    }
+    if (v > hi) {
+        return hi;
+    }
+    return v;
+}
+
+static int32_t compute_slot_tune(uint8_t queue_depth)
+{
+    int32_t error = QUEUE_TARGET - (int32_t)queue_depth;
+
+    /* Proportional term */
+    int32_t p_term = PI_KP_US * error;
+
+    /* Combined output */
+    int32_t output = p_term + s_pi_integral;
+
+    return clamp_i32(output, PI_OUTPUT_MIN, PI_OUTPUT_MAX);
 }
 
 /* ============================================================================
@@ -579,7 +615,8 @@ static void status_work_handler(struct k_work *work)
     esb_radio_timing_stats_t esb_stats = {0};
     esb_radio_get_timing_stats(&esb_stats);
 
-    if ((s_status_log_decim++ % 2) == 0) {
+    bool log_now = ((s_status_log_decim++ % 2) == 0);
+    if (log_now) {
         printk("[MESH] r=%u id=%u sl=%d tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u under=%u q=%u\n",
                s_role, s_node_id, s_slot_index, s_stat_tx_count, s_stat_tx_fail, s_stat_rx_count,
                s_stat_rx_drop, s_stat_audio_fwd, s_stat_spi_audio_in, s_stat_tx_overwrite,
@@ -592,15 +629,34 @@ static void status_work_handler(struct k_work *work)
     s_under_delta_last = s_stat_tx_underflow - s_under_prev;
     s_under_prev = s_stat_tx_underflow;
 
-    if (s_role == MESH_ROLE_PARTICIPANT) {
-        if (s_under_delta_last > 120) {
-            /* Underflow burst: briefly speed up frame cadence to refill playout. */
-            s_part_catchup_budget = 40;
-        } else if (s_under_delta_last > 60 && s_part_catchup_budget < 20) {
-            s_part_catchup_budget = 20;
+    /* PI integral update (role-agnostic).
+     * Error = target - actual queue depth.  Positive means starving.
+     */
+    {
+        int32_t qi_error = QUEUE_TARGET - (int32_t)s_tx_queue_depth_dbg;
+
+        /* Only integrate when output is NOT saturated (anti-windup). */
+        int32_t candidate = s_pi_integral + PI_KI_US * qi_error;
+        int32_t clamped = clamp_i32(candidate, PI_INTEGRAL_MIN, PI_INTEGRAL_MAX);
+
+        /* If output was at a clamp bound last tick and error would push further,
+         * freeze the integrator (conditional integration anti-windup). */
+        bool at_upper = (s_pi_last_output >= PI_OUTPUT_MAX) && (qi_error > 0);
+        bool at_lower = (s_pi_last_output <= PI_OUTPUT_MIN) && (qi_error < 0);
+        if (!at_upper && !at_lower) {
+            s_pi_integral = clamped;
         }
-    } else {
-        s_part_catchup_budget = 0;
+    }
+
+    s_auto_ticks++;
+    if (s_pi_integral >= PI_INTEGRAL_MAX || s_pi_integral <= PI_INTEGRAL_MIN) {
+        s_auto_sat_ticks++;
+    }
+
+    if (log_now) {
+        printk("[ATUNE] r=%u id=%u q=%u under_d=%u int=%d out=%d sat=%u/%u\n", s_role,
+               s_node_id, s_tx_queue_depth_dbg, s_under_delta_last, s_pi_integral,
+               s_pi_last_output, s_auto_sat_ticks, s_auto_ticks);
     }
 
     /* Coordinator sends SYNC on every status update for discovery */
@@ -691,52 +747,37 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         /* always consume */
         s_tx_tail = (s_tx_tail + 1) % TX_AUDIO_RING_SIZE;
 
-        /* Flow control: check buffer level AFTER consuming.
-         * Use proportional braking to match ESP32 audio production rate.
-         */
+        /* Update queue depth after consuming */
         uint8_t buf_count = tx_queue_depth();
         s_tx_queue_depth_dbg = buf_count;
 
         if (buf_count == 0) {
-            /* Just drained the last packet - slow down next slot a bit. */
             s_stat_tx_underflow++;
             note_underflow("drain0");
-            tdma_tune_timing((s_under_delta_last > 100) ? 1500 : 2300);
-        } else if (buf_count == 1) {
-            tdma_tune_timing((s_under_delta_last > 100) ? 800 : 1500);
-        } else if (buf_count == 2) {
-            tdma_tune_timing(300);
-        } else if (buf_count < 4) {
-            tdma_tune_timing(100);
         }
 
-        if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && buf_count >= 5) {
-            /* Mild temporary catch-up to counter starvation bursts. */
-            tdma_tune_timing(-60);
-            s_part_catchup_budget--;
+        /* Apply PI controller output */
+        int32_t tune = compute_slot_tune(buf_count);
+        s_pi_last_output = tune;
+        if (tune != 0) {
+            tdma_tune_timing(tune);
         }
 
     } else {
         if (has_audio_source) {
-            /* Calculate number of packets in buffer */
             uint8_t count = tx_queue_depth();
             s_tx_queue_depth_dbg = count;
 
             if (count == 0) {
                 s_stat_tx_underflow++;
                 note_underflow("empty");
-                tdma_tune_timing((s_under_delta_last > 100) ? 1500 : 2300);
-            } else if (count == 1) {
-                tdma_tune_timing((s_under_delta_last > 100) ? 800 : 1500);
-            } else if (count == 2) {
-                tdma_tune_timing(300);
-            } else if (count < 4) {
-                tdma_tune_timing(100);
             }
 
-            if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && count >= 5) {
-                tdma_tune_timing(-60);
-                s_part_catchup_budget--;
+            /* Apply PI controller output */
+            int32_t tune = compute_slot_tune(count);
+            s_pi_last_output = tune;
+            if (tune != 0) {
+                tdma_tune_timing(tune);
             }
         }
     }

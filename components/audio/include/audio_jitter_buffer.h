@@ -23,6 +23,7 @@ typedef struct {
     int64_t last_rx_packet_us;
     uint32_t depth_sum;
     uint32_t depth_samples;
+    uint8_t consecutive_empty;  /* Consecutive empty polls (for underrun grace) */
 } audio_jitter_state_t;
 
 void audio_jitter_reset(audio_jitter_state_t *state);

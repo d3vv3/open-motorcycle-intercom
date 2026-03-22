@@ -12,6 +12,7 @@ void audio_jitter_reset(audio_jitter_state_t *state)
     state->last_rx_packet_us = 0;
     state->depth_sum = 0;
     state->depth_samples = 0;
+    state->consecutive_empty = 0;
 }
 
 void audio_jitter_record_depth(audio_jitter_state_t *state, audio_stats_t *stats, UBaseType_t items)

@@ -624,6 +624,7 @@ static void audio_task(void *arg)
                     if (jitter->playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
                         int64_t decode_start = esp_timer_get_time();
                         jitter->last_rx_packet_us = decode_start;
+                        jitter->consecutive_empty = 0; /* Reset miss counter */
 
                         samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
                                                       s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
@@ -637,18 +638,35 @@ static void audio_task(void *arg)
                             if (decode_time > s_stats.decode_time_us_max) {
                                 s_stats.decode_time_us_max = decode_time;
                             }
-                            s_stats.jitter_buffer_depth = (uint8_t)items; // Track instant depth
+                            s_stats.jitter_buffer_depth = (uint8_t)items;
                             have_audio_to_play = true;
                         } else {
                             ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                         }
-                    } else {
-                        int64_t now_us = esp_timer_get_time();
-                        if (audio_jitter_should_count_underrun(jitter, now_us)) {
-                            s_stats.rx_queue_underruns++;
-                            s_stats.glitches_detected++;
-                        } else {
-                            jitter->playout_started = false;
+                    } else if (jitter->playout_started) {
+                        /* Queue empty during active playout.
+                         * ADC and mesh clocks are independent, so a single
+                         * empty poll is expected when the clocks are nearly
+                         * in-phase.  Replay the last decoded frame (PLC-lite)
+                         * for up to GRACE_EMPTY_MAX consecutive empty polls
+                         * to bridge short timing gaps.  Only count an underrun
+                         * once the grace window is exhausted. */
+                        #define GRACE_EMPTY_MAX 5  /* 5 x 20ms = 100ms grace */
+                        jitter->consecutive_empty++;
+                        if (jitter->consecutive_empty > GRACE_EMPTY_MAX) {
+                            int64_t now_us = esp_timer_get_time();
+                            if (audio_jitter_should_count_underrun(jitter, now_us)) {
+                                s_stats.rx_queue_underruns++;
+                                s_stats.glitches_detected++;
+                            } else {
+                                jitter->playout_started = false;
+                            }
+                        }
+                        /* During grace window, replay the last frame to mask
+                         * the gap.  s_pcm_output still holds the previous
+                         * decoded samples. */
+                        if (jitter->consecutive_empty <= GRACE_EMPTY_MAX) {
+                            have_audio_to_play = true; /* replay last frame */
                         }
                     }
                 }
@@ -676,11 +694,6 @@ static void audio_task(void *arg)
             }
 
             size_t bytes_written = 0;
-            /* Use timeout (e.g. 10ms) instead of portMAX_DELAY.
-             * If I2S buffer is full (e.g. DAC clock slower than ESP32), we must NOT stall
-             * because that would delay the Mesh TX/RX processing.
-             * Better to have a local audio glitch than to break the mesh link.
-             */
             if (!s_beep_playing) {
                 ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
                                         AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
