@@ -701,18 +701,18 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
             /* Just drained the last packet - slow down next slot a bit. */
             s_stat_tx_underflow++;
             note_underflow("drain0");
-            tdma_tune_timing((s_under_delta_last > 100) ? 1400 : 2200);
+            tdma_tune_timing((s_under_delta_last > 100) ? 1500 : 2300);
         } else if (buf_count == 1) {
-            tdma_tune_timing((s_under_delta_last > 100) ? 700 : 1400);
+            tdma_tune_timing((s_under_delta_last > 100) ? 800 : 1500);
+        } else if (buf_count == 2) {
+            tdma_tune_timing(300);
         } else if (buf_count < 4) {
-            tdma_tune_timing(500);
-        } else if (buf_count < 6) {
-            tdma_tune_timing(150);
+            tdma_tune_timing(100);
         }
 
-        if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && buf_count >= 4) {
+        if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && buf_count >= 5) {
             /* Mild temporary catch-up to counter starvation bursts. */
-            tdma_tune_timing(-100);
+            tdma_tune_timing(-60);
             s_part_catchup_budget--;
         }
 
@@ -725,17 +725,17 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
             if (count == 0) {
                 s_stat_tx_underflow++;
                 note_underflow("empty");
-                tdma_tune_timing((s_under_delta_last > 100) ? 1400 : 2200);
+                tdma_tune_timing((s_under_delta_last > 100) ? 1500 : 2300);
             } else if (count == 1) {
-                tdma_tune_timing((s_under_delta_last > 100) ? 700 : 1400);
+                tdma_tune_timing((s_under_delta_last > 100) ? 800 : 1500);
+            } else if (count == 2) {
+                tdma_tune_timing(300);
             } else if (count < 4) {
-                tdma_tune_timing(500);
-            } else if (count < 6) {
-                tdma_tune_timing(150);
+                tdma_tune_timing(100);
             }
 
-            if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && count >= 4) {
-                tdma_tune_timing(-100);
+            if (s_role == MESH_ROLE_PARTICIPANT && s_part_catchup_budget > 0 && count >= 5) {
+                tdma_tune_timing(-60);
                 s_part_catchup_budget--;
             }
         }

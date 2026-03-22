@@ -41,6 +41,12 @@ static const char *TAG = "spi_bridge";
 #define RX_TASK_STACK_SIZE 4096
 #define RX_TASK_PRIORITY   5
 #define RX_TASK_CORE       0
+#define TX_AUDIO_QUEUE_SIZE 16
+
+typedef struct {
+    uint8_t buf[BRIDGE_SPI_MAX_XFER];
+    uint16_t len;
+} tx_entry_t;
 
 /* ============================================================================
  * Static Variables
@@ -68,8 +74,12 @@ static WORD_ALIGNED_ATTR uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
 /* Mutex protecting s_tx_buf between the app thread and the SPI task */
 static SemaphoreHandle_t s_tx_mutex;
 
-/* Pending TX packet length (0 = idle, send zeros) */
-static volatile uint16_t s_tx_pending_len = 0;
+/* TX queues: audio ring (priority) + single control slot */
+static tx_entry_t s_audio_q[TX_AUDIO_QUEUE_SIZE];
+static uint8_t s_audio_head = 0;
+static uint8_t s_audio_tail = 0;
+static tx_entry_t s_ctrl_pending;
+static bool s_ctrl_pending_valid = false;
 
 /* Pipeline diagnostics */
 static uint32_t s_audio_tx_queued = 0;    /* Audio frames queued for SPI TX */
@@ -80,6 +90,14 @@ static uint8_t s_bridge_rx_expected = 0;
 static bool s_bridge_rx_seq_init = false;
 static uint32_t s_bridge_rx_seq_gaps = 0;
 static uint32_t s_bridge_rx_crc_fail = 0;
+
+static uint8_t audio_queue_depth_locked(void)
+{
+    if (s_audio_head >= s_audio_tail) {
+        return (uint8_t)(s_audio_head - s_audio_tail);
+    }
+    return (uint8_t)(TX_AUDIO_QUEUE_SIZE - s_audio_tail + s_audio_head);
+}
 
 /* ============================================================================
  * Private Functions
@@ -223,10 +241,13 @@ static void parse_rx(const uint8_t *buf, size_t len)
 static void prepare_tx_buf(void)
 {
     if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (s_tx_pending_len > 0) {
-            /* Copy staging -> DMA and clear pending */
-            memcpy(s_tx_dma_buf, s_tx_buf, BRIDGE_SPI_MAX_XFER);
-            s_tx_pending_len = 0;
+        if (s_audio_head != s_audio_tail) {
+            tx_entry_t *e = &s_audio_q[s_audio_tail];
+            memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
+            s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
+        } else if (s_ctrl_pending_valid) {
+            memcpy(s_tx_dma_buf, s_ctrl_pending.buf, BRIDGE_SPI_MAX_XFER);
+            s_ctrl_pending_valid = false;
         } else {
             /* Nothing pending, send idle frame */
             memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
@@ -403,7 +424,9 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
         memcpy(&s_tx_buf[4], payload, len);
     }
     s_tx_buf[2 + wire_len] = crc8_compute(&s_tx_buf[1], (size_t)(wire_len + 1));
-    s_tx_pending_len = total;
+    memcpy(s_ctrl_pending.buf, s_tx_buf, BRIDGE_SPI_MAX_XFER);
+    s_ctrl_pending.len = total;
+    s_ctrl_pending_valid = true;
 
     xSemaphoreGive(s_tx_mutex);
     return ESP_OK;
@@ -411,22 +434,55 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
 
 esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
 {
-    /* Track overwrites: if previous audio wasn't sent yet */
-    if (s_tx_pending_len > 0) {
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t wire_len = (uint16_t)(2 + len);   /* SEQ + TYPE + PAYLOAD */
+    uint16_t total = (uint16_t)(3 + wire_len); /* SYNC + LEN + BODY + CRC */
+    if (total > BRIDGE_SPI_MAX_XFER) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint8_t next_head = (uint8_t)((s_audio_head + 1) % TX_AUDIO_QUEUE_SIZE);
+    if (next_head == s_audio_tail) {
+        s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
         s_audio_tx_overwrite++;
     }
+
+    tx_entry_t *entry = &s_audio_q[s_audio_head];
+    memset(entry->buf, 0, BRIDGE_SPI_MAX_XFER);
+    entry->buf[0] = SYNC_BYTE;
+    entry->buf[1] = (uint8_t)wire_len;
+    entry->buf[2] = s_bridge_tx_seq++;
+    entry->buf[3] = BRIDGE_PKT_AUDIO;
+    if (len > 0 && data != NULL) {
+        memcpy(&entry->buf[4], data, len);
+    }
+    entry->buf[2 + wire_len] = crc8_compute(&entry->buf[1], (size_t)(wire_len + 1));
+    entry->len = total;
+    s_audio_head = next_head;
+
     s_audio_tx_queued++;
 
     /* Log stats periodically */
     static int64_t last_log = 0;
     int64_t now = esp_timer_get_time();
     if (now - last_log > 5000000) { /* Every 5s */
-        ESP_LOGI(TAG, "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu", s_audio_tx_queued,
-                 s_audio_tx_overwrite, s_audio_rx_count);
+        ESP_LOGI(TAG,
+                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d",
+                 s_audio_tx_queued, s_audio_tx_overwrite, s_audio_rx_count,
+                 audio_queue_depth_locked(), s_ctrl_pending_valid ? 1 : 0);
         last_log = now;
     }
 
-    return queue_tx_packet(BRIDGE_PKT_AUDIO, data, len);
+    xSemaphoreGive(s_tx_mutex);
+
+    return ESP_OK;
 }
 
 void uart_bridge_set_audio_callback(uart_bridge_audio_cb_t cb)
