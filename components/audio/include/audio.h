@@ -178,6 +178,8 @@ typedef struct {
     uint32_t glitches_detected;  /**< Number of audio glitches detected */
     uint32_t rx_queue_underruns; /**< Mesh RX queue empty events */
     uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
+    uint32_t plc_frames;         /**< Opus PLC concealment frames generated */
+    uint32_t grace_empty_polls;  /**< Empty RX polls inside grace window */
     uint8_t jitter_buffer_depth; /**< Current jitter buffer depth */
     uint8_t rx_q_depth_min;      /**< Minimum observed RX queue depth */
     uint8_t rx_q_depth_avg;      /**< Average observed RX queue depth */

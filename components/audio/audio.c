@@ -646,13 +646,12 @@ static void audio_task(void *arg)
                     } else if (jitter->playout_started) {
                         /* Queue empty during active playout.
                          * ADC and mesh clocks are independent, so a single
-                         * empty poll is expected when the clocks are nearly
-                         * in-phase.  Replay the last decoded frame (PLC-lite)
-                         * for up to GRACE_EMPTY_MAX consecutive empty polls
-                         * to bridge short timing gaps.  Only count an underrun
-                         * once the grace window is exhausted. */
+                         * empty poll is expected when clocks are near phase.
+                         * During grace, use Opus PLC instead of frame replay
+                         * to reduce robotic artifacts on short gaps. */
                         #define GRACE_EMPTY_MAX 5  /* 5 x 20ms = 100ms grace */
                         jitter->consecutive_empty++;
+                        s_stats.grace_empty_polls++;
                         if (jitter->consecutive_empty > GRACE_EMPTY_MAX) {
                             int64_t now_us = esp_timer_get_time();
                             if (audio_jitter_should_count_underrun(jitter, now_us)) {
@@ -662,11 +661,24 @@ static void audio_task(void *arg)
                                 jitter->playout_started = false;
                             }
                         }
-                        /* During grace window, replay the last frame to mask
-                         * the gap.  s_pcm_output still holds the previous
-                         * decoded samples. */
                         if (jitter->consecutive_empty <= GRACE_EMPTY_MAX) {
-                            have_audio_to_play = true; /* replay last frame */
+                            int64_t plc_start = esp_timer_get_time();
+                            int plc_samples = opus_decode(s_opus_decoder, NULL, 0,
+                                                          s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
+                            int64_t plc_time = esp_timer_get_time() - plc_start;
+
+                            if (plc_samples == AUDIO_FRAME_SAMPLES) {
+                                s_stats.plc_frames++;
+                                s_stats.frames_decoded++;
+                                decode_time_sum += plc_time;
+                                s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
+                                if (plc_time > s_stats.decode_time_us_max) {
+                                    s_stats.decode_time_us_max = plc_time;
+                                }
+                                have_audio_to_play = true;
+                            } else {
+                                ESP_LOGW(TAG, "Opus PLC failed: %d", plc_samples);
+                            }
                         }
                     }
                 }
@@ -757,6 +769,8 @@ static void audio_task(void *arg)
             ESP_LOGI(TAG, "  Glitches: %lu (rx_und=%lu i2s_inc=%lu), ADC overruns: %lu",
                      s_stats.glitches_detected, s_stats.rx_queue_underruns,
                      s_stats.i2s_write_incomplete, s_stats.adc_overruns);
+            ESP_LOGI(TAG, "  Concealment: plc=%lu grace_empty=%lu",
+                     s_stats.plc_frames, s_stats.grace_empty_polls);
             ESP_LOGI(TAG, "  RX queue depth: min=%u avg=%u max=%u", s_stats.rx_q_depth_min,
                      s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max);
             last_heartbeat = now_ms;
