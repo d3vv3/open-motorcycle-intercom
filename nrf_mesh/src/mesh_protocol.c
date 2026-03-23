@@ -15,6 +15,7 @@
 #include "esb_radio.h"
 #include "tdma.h"
 #include "uart_bridge.h"
+#include "ws_sync.h"
 
 LOG_MODULE_REGISTER(mesh, LOG_LEVEL_INF);
 
@@ -103,19 +104,21 @@ static uint32_t s_under_prev = 0;
 static uint32_t s_under_delta_last = 0;
 static uint32_t s_status_log_decim = 0;
 static uint32_t s_under_log_next = 64;
-/* PI queue-level controller state */
-#define QUEUE_TARGET      4    /* Desired queue depth (frames) */
-#define PI_KP_US          500  /* Proportional gain */
-#define PI_KI_US          60   /* Integral gain */
-#define PI_INTEGRAL_MIN  -666  /* Anti-windup lower clamp */
-#define PI_INTEGRAL_MAX   2000 /* Anti-windup upper clamp */
-#define PI_OUTPUT_MIN    -666  /* Total output lower clamp (us) */
-#define PI_OUTPUT_MAX    4200  /* Total output upper clamp (us) */
+/* Skip-send queue buffering strategy.
+ *
+ * Problem: PI frame-stretch matched send rate to arrival rate but never built
+ * queue depth — any jitter caused immediate underflow.
+ *
+ * New approach: hold back (skip sending) when queue is below a low-water mark
+ * until it fills to a high-water target, then resume normal 1-per-slot sending.
+ * This is prefill + hysteresis.
+ */
+#define QUEUE_LO          2    /* Enter skip mode below this depth */
+#define QUEUE_HI          4    /* Resume sending at this depth */
 
-static int32_t s_pi_integral = 0;       /* Integral accumulator */
-static int32_t s_pi_last_output = 0;    /* Last computed output for logging */
-static uint32_t s_auto_sat_ticks = 0;
-static uint32_t s_auto_ticks = 0;
+static bool     s_skip_mode = true;     /* Start in skip (prefill) mode */
+static uint32_t s_skip_count = 0;       /* Frames skipped for logging */
+static uint32_t s_auto_ticks = 0;       /* Status log counter */
 
 /* ============================================================================
  * Forward Declarations
@@ -138,30 +141,6 @@ static void note_underflow(const char *reason)
                s_tx_queue_depth_dbg, tts, reason);
         s_under_log_next += 64;
     }
-}
-
-static int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
-{
-    if (v < lo) {
-        return lo;
-    }
-    if (v > hi) {
-        return hi;
-    }
-    return v;
-}
-
-static int32_t compute_slot_tune(uint8_t queue_depth)
-{
-    int32_t error = QUEUE_TARGET - (int32_t)queue_depth;
-
-    /* Proportional term */
-    int32_t p_term = PI_KP_US * error;
-
-    /* Combined output */
-    int32_t output = p_term + s_pi_integral;
-
-    return clamp_i32(output, PI_OUTPUT_MIN, PI_OUTPUT_MAX);
 }
 
 /* ============================================================================
@@ -629,34 +608,16 @@ static void status_work_handler(struct k_work *work)
     s_under_delta_last = s_stat_tx_underflow - s_under_prev;
     s_under_prev = s_stat_tx_underflow;
 
-    /* PI integral update (role-agnostic).
-     * Error = target - actual queue depth.  Positive means starving.
-     */
-    {
-        int32_t qi_error = QUEUE_TARGET - (int32_t)s_tx_queue_depth_dbg;
-
-        /* Only integrate when output is NOT saturated (anti-windup). */
-        int32_t candidate = s_pi_integral + PI_KI_US * qi_error;
-        int32_t clamped = clamp_i32(candidate, PI_INTEGRAL_MIN, PI_INTEGRAL_MAX);
-
-        /* If output was at a clamp bound last tick and error would push further,
-         * freeze the integrator (conditional integration anti-windup). */
-        bool at_upper = (s_pi_last_output >= PI_OUTPUT_MAX) && (qi_error > 0);
-        bool at_lower = (s_pi_last_output <= PI_OUTPUT_MIN) && (qi_error < 0);
-        if (!at_upper && !at_lower) {
-            s_pi_integral = clamped;
-        }
-    }
-
     s_auto_ticks++;
-    if (s_pi_integral >= PI_INTEGRAL_MAX || s_pi_integral <= PI_INTEGRAL_MIN) {
-        s_auto_sat_ticks++;
-    }
 
     if (log_now) {
-        printk("[ATUNE] r=%u id=%u q=%u under_d=%u int=%d out=%d sat=%u/%u\n", s_role,
-               s_node_id, s_tx_queue_depth_dbg, s_under_delta_last, s_pi_integral,
-               s_pi_last_output, s_auto_sat_ticks, s_auto_ticks);
+        uint32_t ws_edges = 0;
+        int32_t ws_last_corr = 0, ws_cum_drift = 0;
+        ws_sync_get_diag(&ws_edges, &ws_last_corr, &ws_cum_drift);
+        printk("[ATUNE] r=%u id=%u q=%u under_d=%u skip=%u/%u ws_e=%u ws_c=%d ws_d=%d\n",
+               s_role, s_node_id, s_tx_queue_depth_dbg, s_under_delta_last,
+               s_skip_count, s_auto_ticks,
+               ws_edges, ws_last_corr, ws_cum_drift);
     }
 
     /* Coordinator sends SYNC on every status update for discovery */
@@ -718,6 +679,25 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     uint32_t now = k_uptime_get_32();
     bool has_audio_source = (now - s_last_audio_in_time) < 120;
 
+    uint8_t depth = tx_queue_depth();
+    s_tx_queue_depth_dbg = depth;
+
+    /* Hysteresis: skip sending while queue is below QUEUE_HI to let it build.
+     * Resume sending once it reaches QUEUE_HI.  Re-enter skip if it drops
+     * below QUEUE_LO. */
+    if (s_skip_mode) {
+        if (depth >= QUEUE_HI) {
+            s_skip_mode = false;
+        } else {
+            /* Still building — don't send, don't count underflow */
+            return;
+        }
+    } else if (depth < QUEUE_LO) {
+        s_skip_mode = true;
+        s_skip_count++;
+        return;
+    }
+
     if (s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail) {
         /* Peek at tail */
         struct tx_audio_entry *entry = &s_tx_audio_ring[s_tx_tail];
@@ -748,37 +728,18 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         s_tx_tail = (s_tx_tail + 1) % TX_AUDIO_RING_SIZE;
 
         /* Update queue depth after consuming */
-        uint8_t buf_count = tx_queue_depth();
-        s_tx_queue_depth_dbg = buf_count;
+        depth = tx_queue_depth();
+        s_tx_queue_depth_dbg = depth;
 
-        if (buf_count == 0) {
+        if (depth == 0) {
             s_stat_tx_underflow++;
             note_underflow("drain0");
         }
 
-        /* Apply PI controller output */
-        int32_t tune = compute_slot_tune(buf_count);
-        s_pi_last_output = tune;
-        if (tune != 0) {
-            tdma_tune_timing(tune);
-        }
-
     } else {
-        if (has_audio_source) {
-            uint8_t count = tx_queue_depth();
-            s_tx_queue_depth_dbg = count;
-
-            if (count == 0) {
-                s_stat_tx_underflow++;
-                note_underflow("empty");
-            }
-
-            /* Apply PI controller output */
-            int32_t tune = compute_slot_tune(count);
-            s_pi_last_output = tune;
-            if (tune != 0) {
-                tdma_tune_timing(tune);
-            }
+        if (has_audio_source && depth == 0) {
+            s_stat_tx_underflow++;
+            note_underflow("empty");
         }
     }
 }

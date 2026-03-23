@@ -12,6 +12,7 @@
 #include <zephyr/logging/log.h>
 
 #include "mesh_protocol.h"
+#include "ws_sync.h"
 
 LOG_MODULE_REGISTER(tdma, LOG_LEVEL_INF);
 
@@ -73,6 +74,13 @@ static void frame_timer_handler(struct k_timer *timer)
         period_us += s_tune_offset_us;
         s_tune_offset_us = 0;
     }
+
+    /* WS sync clock discipline — disabled: fights PI controller.
+     * XTAL (~20 ppm) provides sufficient base stability. */
+    /* int32_t ws_correction = 0;
+    if (ws_sync_sample(&ws_correction)) {
+        period_us += ws_correction;
+    } */
 
     /* Clamp minimal period */
     if (period_us < 1000)

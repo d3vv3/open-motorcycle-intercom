@@ -104,7 +104,18 @@ The master polls the slave every 5 ms with a full-duplex 256-byte transaction.
 | **Pin 9** (P1.14 / CS)   | **GPIO12** | Chip Select (active low) |
 | **GND** | **GND** | Common ground |
 
-**SPI Configuration:** Mode 0 (CPOL=0, CPHA=0), 4 MHz, MSB first
+### I2S WS Sync Wire (Clock Discipline)
+
+The ESP32's I2S Word Select (WS) output is tapped and fed to the nRF52840 to discipline
+the TDMA frame timer.  This eliminates clock drift between boards.
+
+| ESP32-S3 | XIAO nRF52840 | Function |
+|----------|---------------|----------|
+| **GPIO 5** (I2S WS/LCK) | **Pin D0** (P0.02) | Sync clock (16 kHz) |
+
+> **Note:** GPIO5 is already wired to the speaker amplifier (MAX98357A/PCM5102A LCK).
+> Simply add a second wire from the same GPIO5 pad to XIAO D0.
+> The nRF input is high-impedance and will not affect the amplifier signal.
 
 ### Wiring Diagram
 
@@ -116,6 +127,7 @@ ESP32-S3                    XIAO nRF52840
 │   GPIO9  ├────────────────┤ Pin 7    │  (MISO)
 │   GPIO11 ├────────────────┤ Pin 8    │  (SCK)
 │   GPIO12 ├────────────────┤ Pin 9    │  (CS)
+│   GPIO5  ├────────────────┤ Pin D0   │  (I2S WS Sync)
 │          │                │          │
 │   GND    ├────────────────┤ GND      │
 │          │                │          │

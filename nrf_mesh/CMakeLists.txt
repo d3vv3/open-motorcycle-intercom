@@ -11,6 +11,7 @@ target_sources(app PRIVATE
     src/tdma.c
     src/uart_bridge.c
     src/mesh_protocol.c
+    src/ws_sync.c
 )
 
 target_include_directories(app PRIVATE

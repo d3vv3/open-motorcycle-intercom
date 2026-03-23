@@ -13,6 +13,7 @@
 #include "mesh_protocol.h"
 #include "tdma.h"
 #include "uart_bridge.h"
+#include "ws_sync.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -106,6 +107,16 @@ int main(void)
         goto run_spi_only;
     }
     printk("[DIAG] TDMA OK\n");
+
+    /* Initialize WS sync capture (I2S clock discipline) */
+    printk("[DIAG] Initializing WS sync capture...\n");
+    ret = ws_sync_init();
+    if (ret) {
+        printk("[DIAG] WS sync init FAILED: %d (continuing without sync)\n", ret);
+    } else {
+        printk("[DIAG] WS sync OK\n");
+        ws_sync_start();
+    }
 
     /* Initialize mesh protocol */
     printk("[DIAG] Initializing mesh protocol...\n");
