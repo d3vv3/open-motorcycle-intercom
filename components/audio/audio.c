@@ -123,6 +123,12 @@ static voice_cleanup_state_t s_voice_cleanup = {0};
 /* RX jitter/playout state */
 static audio_jitter_state_t s_jitter_state = {0};
 
+/* Pipeline latency accumulators (microseconds) */
+static uint64_t s_tx_pipe_sum_us = 0;
+static uint32_t s_tx_pipe_count = 0;
+static uint64_t s_rx_pipe_sum_us = 0;
+static uint32_t s_rx_pipe_count = 0;
+
 /* Phase 2: Mesh mode support */
 static audio_tx_cb_t s_tx_callback = NULL;
 static QueueHandle_t s_rx_queue = NULL;
@@ -685,6 +691,16 @@ static void audio_task(void *arg)
                             s_stats.jitter_buffer_depth = (uint8_t)items;
                             have_audio_to_play = true;
 
+                            int64_t rx_pipe_us = decode_start - rx_item.timestamp_us;
+                            if (rx_pipe_us >= 0) {
+                                s_rx_pipe_count++;
+                                s_rx_pipe_sum_us += (uint64_t)rx_pipe_us;
+                                s_stats.rx_pipe_us_avg = (uint32_t)(s_rx_pipe_sum_us / s_rx_pipe_count);
+                                if ((uint32_t)rx_pipe_us > s_stats.rx_pipe_us_max) {
+                                    s_stats.rx_pipe_us_max = (uint32_t)rx_pipe_us;
+                                }
+                            }
+
                             /* Check remaining depth after dequeue */
                             UBaseType_t remaining = uxQueueMessagesWaiting(s_rx_queue);
 
@@ -832,6 +848,10 @@ static void audio_task(void *arg)
                      s_stats.encode_time_us_max);
             ESP_LOGI(TAG, "  Decode time: avg=%lu us, max=%lu us", s_stats.decode_time_us_avg,
                      s_stats.decode_time_us_max);
+            ESP_LOGI(TAG, "  TX pipeline: avg=%lu us, max=%lu us", s_stats.tx_pipe_us_avg,
+                     s_stats.tx_pipe_us_max);
+            ESP_LOGI(TAG, "  RX pipeline: avg=%lu us, max=%lu us", s_stats.rx_pipe_us_avg,
+                     s_stats.rx_pipe_us_max);
             ESP_LOGI(TAG, "  Latency: avg=%lu ms, max=%lu ms", s_stats.latency_ms_avg,
                      s_stats.latency_ms_max);
             ESP_LOGI(TAG, "  Glitches: %lu (rx_und=%lu i2s_inc=%lu), ADC overruns: %lu",
@@ -1106,6 +1126,17 @@ esp_err_t audio_get_stats(audio_stats_t *stats)
     }
 
     *stats = s_stats;
+    return ESP_OK;
+}
+
+esp_err_t audio_record_tx_pipeline_latency_us(uint32_t latency_us)
+{
+    s_tx_pipe_count++;
+    s_tx_pipe_sum_us += latency_us;
+    s_stats.tx_pipe_us_avg = (uint32_t)(s_tx_pipe_sum_us / s_tx_pipe_count);
+    if (latency_us > s_stats.tx_pipe_us_max) {
+        s_stats.tx_pipe_us_max = latency_us;
+    }
     return ESP_OK;
 }
 
