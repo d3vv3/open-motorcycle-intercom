@@ -4377,7 +4377,7 @@
 			(embedded_fonts no)
 		)
 	)
-	(text "omi"
+	(text "open-helmet"
 		(exclude_from_sim no)
 		(at 229.108 172.72 0)
 		(effects
@@ -4551,6 +4551,16 @@
 			(type solid)
 		)
 		(uuid "0437f2f6-7cff-43e7-8ade-122d10da3c9a")
+	)
+	(wire
+		(pts
+			(xy 146.05 87.63) (xy 156.21 87.63)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "0452b2fd-7fc7-44e8-8771-df51c363d757")
 	)
 	(wire
 		(pts
@@ -5936,7 +5946,7 @@
 		)
 		(uuid "530962ed-967f-49e2-b34b-c3fb2c33e6f1")
 	)
-	(label "AUDIO_LRCK"
+	(label "COM_XTAL"
 		(at 40.64 57.15 0)
 		(effects
 			(font
@@ -6006,7 +6016,7 @@
 		)
 		(uuid "9907d94b-8f3e-428a-b1aa-804bf8cca00b")
 	)
-	(label "AUDIO_LRCK"
+	(label "COM_XTAL"
 		(at 224.79 109.22 0)
 		(effects
 			(font
@@ -6107,6 +6117,16 @@
 			(justify left bottom)
 		)
 		(uuid "d2c92e3e-ff27-4083-9a2e-14b1d6aa9321")
+	)
+	(label "COM_XTAL"
+		(at 146.05 87.63 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left bottom)
+		)
+		(uuid "d3c50168-7f76-44bb-9f3c-fad413c7933d")
 	)
 	(label "FILTER"
 		(at 101.6 34.29 0)
