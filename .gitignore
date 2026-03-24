@@ -138,3 +138,4 @@ docs/.doctrees/
 # OMI-Specific
 # ============================================================================
 # Add project-specific ignores below
+benchmark_runs/
