@@ -111,6 +111,7 @@ typedef enum {
 } transport_type_t;
 
 static transport_type_t s_active_transport = TRANSPORT_NONE;
+static bool s_mesh_user_enabled = false;
 
 static esp_err_t init_audio_with_test_flags(void)
 {
@@ -302,8 +303,18 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
     switch (event) {
     case BRIDGE_EVENT_MESH_READY:
         ESP_LOGI(TAG, "nRF52840 mesh ready");
-        s_mesh_active = true;
-        audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+        if (!s_mesh_user_enabled) {
+            /* Enforce boot policy: mesh stays disabled until user enables it. */
+            ESP_LOGI(TAG, "Ignoring mesh-ready while disabled by user policy");
+            (void)uart_bridge_mesh_disable();
+            s_mesh_active = false;
+            break;
+        }
+
+        if (!s_mesh_active) {
+            s_mesh_active = true;
+            audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+        }
         break;
     case BRIDGE_EVENT_PEER_JOINED:
         ESP_LOGI(TAG, "Peer joined mesh");
@@ -325,7 +336,7 @@ static void button_long_press_callback(int gpio)
 {
     ESP_LOGI(TAG, "Button long press detected on GPIO %d - toggling mesh", gpio);
 
-    if (s_mesh_active) {
+    if (s_mesh_user_enabled) {
         /* Disable mesh */
         ESP_LOGI(TAG, "Disabling mesh networking...");
         esp_err_t ret = ESP_OK;
@@ -333,11 +344,17 @@ static void button_long_press_callback(int gpio)
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_stop();
         } else if (s_active_transport == TRANSPORT_NRF52840) {
-            /* Send mesh disable command to nRF52840 */
-            ret = uart_bridge_mesh_disable();
+            if (uart_bridge_is_connected()) {
+                /* nRF handles graceful LEAVE broadcast before stopping mesh. */
+                ret = uart_bridge_mesh_disable();
+            } else {
+                ESP_LOGW(TAG, "nRF bridge disconnected; applying local mesh disable policy");
+                ret = ESP_OK;
+            }
         }
 
         if (ret == ESP_OK) {
+            s_mesh_user_enabled = false;
             s_mesh_active = false;
             audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
             ESP_LOGI(TAG, "Mesh disabled");
@@ -352,12 +369,20 @@ static void button_long_press_callback(int gpio)
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_start();
         } else if (s_active_transport == TRANSPORT_NRF52840) {
-            /* Send mesh enable command to nRF52840 */
-            ret = uart_bridge_mesh_enable();
+            if (uart_bridge_is_connected()) {
+                /* Send mesh enable command to nRF52840 */
+                ret = uart_bridge_mesh_enable();
+            } else {
+                ESP_LOGW(TAG, "Cannot enable mesh: nRF bridge disconnected");
+                ret = ESP_ERR_INVALID_STATE;
+            }
         }
 
         if (ret == ESP_OK) {
-            s_mesh_active = true;
+            s_mesh_user_enabled = true;
+            if (s_active_transport == TRANSPORT_ESP_NOW) {
+                s_mesh_active = true;
+            }
             audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
             ESP_LOGI(TAG, "Mesh enabled");
         } else {
@@ -426,6 +451,12 @@ void app_main(void)
 
         uart_bridge_set_audio_callback(bridge_audio_callback);
         uart_bridge_set_event_callback(bridge_event_callback);
+
+        /* Enforce startup behavior: always start with mesh disabled.
+         * User must long-press BOOT to enable. */
+        s_mesh_user_enabled = false;
+        s_mesh_active = false;
+        (void)uart_bridge_mesh_disable();
     } else {
         /* No nRF52840 - fallback to ESP-NOW */
         s_active_transport = TRANSPORT_ESP_NOW;
@@ -500,6 +531,8 @@ void app_main(void)
 
 #if ENABLE_MESH_MODE
     /* Mesh networking - starts disabled, enabled by holding boot button for 2 seconds */
+    s_mesh_user_enabled = false;
+    s_mesh_active = false;
     ESP_LOGI(TAG, "Mesh networking ready (hold boot button for 2s to enable)");
     ESP_LOGI(TAG, "");
 #endif
