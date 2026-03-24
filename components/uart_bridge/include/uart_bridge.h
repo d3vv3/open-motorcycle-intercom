@@ -30,6 +30,7 @@ extern "C" {
 #define BRIDGE_SPI_MOSI_PIN 10 /* ESP32 GPIO10 <- nRF MOSI (ESP receives) */
 #define BRIDGE_SPI_SCLK_PIN 11 /* ESP32 GPIO11 <- nRF SCK */
 #define BRIDGE_SPI_CS_PIN   12 /* ESP32 GPIO12 <- nRF CS */
+#define BRIDGE_ACK_GPIO_PIN 2  /* ESP32 GPIO2  <- nRF ACK (XIAO D1) */
 
 #define BRIDGE_SPI_MODE     0 /* CPOL=0, CPHA=0 */
 #define BRIDGE_SPI_MAX_XFER 256

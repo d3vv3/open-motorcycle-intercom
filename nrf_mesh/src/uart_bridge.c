@@ -47,6 +47,7 @@ static struct spi_config s_spi_cfg;
 #define CS_PORT_NODE DT_NODELABEL(gpio1)
 #define CS_PIN       14
 static const struct device *s_cs_port;
+static const struct device *s_ack_port;
 
 static uint8_t s_tx_buf[BRIDGE_SPI_MAX_XFER];
 static uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
@@ -85,6 +86,21 @@ static uint8_t s_bridge_rx_expected = 0;
 static bool s_bridge_rx_seq_init = false;
 static uint32_t s_bridge_rx_seq_gap = 0;
 static uint32_t s_bridge_rx_crc_fail = 0;
+static bool s_last_audio_seq_valid = false;
+static uint8_t s_last_audio_seq = 0;
+static uint32_t s_ack_pulse_count = 0;
+
+static inline void pulse_ack_line(void)
+{
+    if (s_ack_port == NULL) {
+        return;
+    }
+
+    gpio_pin_set(s_ack_port, BRIDGE_ACK_PIN, 1);
+    k_busy_wait(20);
+    gpio_pin_set(s_ack_port, BRIDGE_ACK_PIN, 0);
+    s_ack_pulse_count++;
+}
 
 /* ============================================================================
  * Private Functions
@@ -194,15 +210,28 @@ static void parse_rx(const uint8_t *buf, size_t len)
         s_bridge_rx_seq_init = true;
     } else {
         uint8_t expected_next = (uint8_t)(s_bridge_rx_expected + 1);
-        if (seq != expected_next) {
+        if (seq == expected_next) {
+            s_bridge_rx_expected = seq;
+        } else if (seq != s_bridge_rx_expected) {
             s_bridge_rx_seq_gap++;
+            s_bridge_rx_expected = seq;
         }
     }
-    s_bridge_rx_expected = seq;
 
     uint8_t pkt_type = buf[3];
     const uint8_t *payload = &buf[4];
     uint8_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
+
+    if (pkt_type == UART_PKT_AUDIO) {
+        bool duplicate = s_last_audio_seq_valid && (seq == s_last_audio_seq);
+        if (!duplicate) {
+            handle_rx_packet(pkt_type, payload, payload_len);
+            s_last_audio_seq = seq;
+            s_last_audio_seq_valid = true;
+        }
+        pulse_ack_line();
+        return;
+    }
 
     handle_rx_packet(pkt_type, payload, payload_len);
 }
@@ -263,6 +292,18 @@ int uart_bridge_init(void)
     if (cs_ret) {
         LOG_ERR("CS pin config failed: %d", cs_ret);
         return cs_ret;
+    }
+
+    s_ack_port = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+    if (!device_is_ready(s_ack_port)) {
+        LOG_ERR("ACK GPIO port not ready");
+        return -ENODEV;
+    }
+
+    int ack_ret = gpio_pin_configure(s_ack_port, BRIDGE_ACK_PIN, GPIO_OUTPUT_INACTIVE);
+    if (ack_ret) {
+        LOG_ERR("ACK pin config failed: %d", ack_ret);
+        return ack_ret;
     }
 
     /* SPI master config: 4 MHz, CPOL=0/CPHA=0, MSB first, 8-bit words
@@ -461,9 +502,9 @@ void uart_bridge_process(void)
 
     if ((txn_count % 2500) == 0 && s_poll_dt_count > 0) {
         uint32_t avg = (uint32_t)(s_poll_dt_sum_us / s_poll_dt_count);
-        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u seq_gap=%u crc_fail=%u\n",
+        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u seq_gap=%u crc_fail=%u ack_pulse=%u\n",
                s_poll_dt_min_us, avg, s_poll_dt_max_us, s_audio_q_overwrite, s_bridge_rx_seq_gap,
-               s_bridge_rx_crc_fail);
+               s_bridge_rx_crc_fail, s_ack_pulse_count);
     }
 
 }

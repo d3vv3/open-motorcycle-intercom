@@ -28,6 +28,10 @@
 /* Max transfer size - must match ESP32 slave */
 #define BRIDGE_SPI_MAX_XFER 256
 
+/* Hardware ACK line: nRF XIAO D10 (P1.15) -> ESP32 XIAO D1 (GPIO2) */
+#define BRIDGE_ACK_PORT 1
+#define BRIDGE_ACK_PIN  15
+
 /**
  * @brief Initialize SPI bridge (master mode)
  * @return 0 on success

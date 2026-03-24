@@ -81,6 +81,8 @@ static SemaphoreHandle_t s_tx_mutex;
 static tx_entry_t s_audio_q[TX_AUDIO_QUEUE_SIZE];
 static volatile uint8_t s_audio_head = 0;
 static volatile uint8_t s_audio_tail = 0;
+static SemaphoreHandle_t s_audio_slots_free;
+static SemaphoreHandle_t s_audio_slots_used;
 
 /* Control slot: protected by s_tx_mutex (low-frequency path) */
 static tx_entry_t s_ctrl_pending;
@@ -98,6 +100,34 @@ static uint32_t s_bridge_rx_crc_fail = 0;
 static uint32_t s_bridge_rx_bad_sync = 0;
 static uint32_t s_bridge_rx_bad_len = 0;
 static uint32_t s_bridge_rx_trunc = 0;
+static uint8_t s_audio_tx_waiting_ack_seq = 0;
+static bool s_audio_tx_waiting_ack = false;
+static tx_entry_t s_audio_tx_inflight;
+static bool s_audio_tx_inflight_valid = false;
+static volatile uint32_t s_ack_irq_count = 0;
+static volatile uint32_t s_ack_release_count = 0;
+static volatile uint32_t s_ack_spurious_count = 0;
+
+static void IRAM_ATTR ack_gpio_isr_handler(void *arg)
+{
+    BaseType_t woke = pdFALSE;
+
+    (void)arg;
+    s_ack_irq_count++;
+
+    if (s_audio_tx_waiting_ack) {
+        s_audio_tx_waiting_ack = false;
+        s_audio_tx_inflight_valid = false;
+        s_ack_release_count++;
+        xSemaphoreGiveFromISR(s_audio_slots_free, &woke);
+    } else {
+        s_ack_spurious_count++;
+    }
+
+    if (woke == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
 
 static uint8_t audio_queue_depth(void)
 {
@@ -254,14 +284,24 @@ static void parse_rx(const uint8_t *buf, size_t len)
  */
 static void prepare_tx_buf(void)
 {
-    /* Fast path: audio queue (lock-free SPSC) */
-    uint8_t h = s_audio_head;
-    __sync_synchronize();  /* Ensure we read entry data written before head was updated */
-    uint8_t t = s_audio_tail;
-    if (h != t) {
+    /* Fast path: audio queue with GPIO ACK-driven stop-and-wait. */
+    if (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) {
+        memcpy(s_tx_dma_buf, s_audio_tx_inflight.buf, BRIDGE_SPI_MAX_XFER);
+        return;
+    }
+
+    if (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
+        uint8_t t = s_audio_tail;
+        __sync_synchronize();
         tx_entry_t *e = &s_audio_q[t];
         memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
         s_audio_tail = (uint8_t)((t + 1) % TX_AUDIO_QUEUE_SIZE);
+
+        memcpy(s_audio_tx_inflight.buf, e->buf, BRIDGE_SPI_MAX_XFER);
+        s_audio_tx_inflight.len = e->len;
+        s_audio_tx_inflight_valid = true;
+        s_audio_tx_waiting_ack = true;
+        s_audio_tx_waiting_ack_seq = e->buf[2];
         return;
     }
 
@@ -348,6 +388,66 @@ esp_err_t uart_bridge_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    s_audio_slots_free = xSemaphoreCreateCounting(TX_AUDIO_QUEUE_SIZE - 1, TX_AUDIO_QUEUE_SIZE - 1);
+    s_audio_slots_used = xSemaphoreCreateCounting(TX_AUDIO_QUEUE_SIZE - 1, 0);
+    if (s_audio_slots_free == NULL || s_audio_slots_used == NULL) {
+        ESP_LOGE(TAG, "Failed to create audio queue semaphores");
+        if (s_audio_slots_free) {
+            vSemaphoreDelete(s_audio_slots_free);
+            s_audio_slots_free = NULL;
+        }
+        if (s_audio_slots_used) {
+            vSemaphoreDelete(s_audio_slots_used);
+            s_audio_slots_used = NULL;
+        }
+        vSemaphoreDelete(s_tx_mutex);
+        s_tx_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    gpio_config_t ack_gpio_cfg = {
+        .pin_bit_mask = (1ULL << BRIDGE_ACK_GPIO_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
+    };
+    esp_err_t err = gpio_config(&ack_gpio_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure ACK GPIO: %s", esp_err_to_name(err));
+        vSemaphoreDelete(s_audio_slots_free);
+        vSemaphoreDelete(s_audio_slots_used);
+        vSemaphoreDelete(s_tx_mutex);
+        s_audio_slots_free = NULL;
+        s_audio_slots_used = NULL;
+        s_tx_mutex = NULL;
+        return err;
+    }
+
+    err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to install GPIO ISR service: %s", esp_err_to_name(err));
+        vSemaphoreDelete(s_audio_slots_free);
+        vSemaphoreDelete(s_audio_slots_used);
+        vSemaphoreDelete(s_tx_mutex);
+        s_audio_slots_free = NULL;
+        s_audio_slots_used = NULL;
+        s_tx_mutex = NULL;
+        return err;
+    }
+
+    err = gpio_isr_handler_add(BRIDGE_ACK_GPIO_PIN, ack_gpio_isr_handler, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add ACK GPIO ISR: %s", esp_err_to_name(err));
+        vSemaphoreDelete(s_audio_slots_free);
+        vSemaphoreDelete(s_audio_slots_used);
+        vSemaphoreDelete(s_tx_mutex);
+        s_audio_slots_free = NULL;
+        s_audio_slots_used = NULL;
+        s_tx_mutex = NULL;
+        return err;
+    }
+
     /* SPI slave bus configuration */
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = BRIDGE_SPI_MOSI_PIN,
@@ -365,11 +465,16 @@ esp_err_t uart_bridge_init(void)
         .mode = BRIDGE_SPI_MODE,
     };
 
-    esp_err_t err =
-        spi_slave_initialize(BRIDGE_SPI_HOST, &bus_cfg, &slave_cfg, BRIDGE_SPI_DMA_CHAN);
+    err = spi_slave_initialize(BRIDGE_SPI_HOST, &bus_cfg, &slave_cfg, BRIDGE_SPI_DMA_CHAN);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize SPI slave: %s", esp_err_to_name(err));
+        gpio_isr_handler_remove(BRIDGE_ACK_GPIO_PIN);
         vSemaphoreDelete(s_tx_mutex);
+        vSemaphoreDelete(s_audio_slots_free);
+        vSemaphoreDelete(s_audio_slots_used);
+        s_tx_mutex = NULL;
+        s_audio_slots_free = NULL;
+        s_audio_slots_used = NULL;
         return err;
     }
 
@@ -385,11 +490,22 @@ esp_err_t uart_bridge_init(void)
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SPI task");
         spi_slave_free(BRIDGE_SPI_HOST);
+        gpio_isr_handler_remove(BRIDGE_ACK_GPIO_PIN);
         vSemaphoreDelete(s_tx_mutex);
+        vSemaphoreDelete(s_audio_slots_free);
+        vSemaphoreDelete(s_audio_slots_used);
+        s_tx_mutex = NULL;
+        s_audio_slots_free = NULL;
+        s_audio_slots_used = NULL;
         return ESP_FAIL;
     }
 
     s_initialized = true;
+    s_audio_head = 0;
+    s_audio_tail = 0;
+    s_audio_tx_waiting_ack = false;
+    s_audio_tx_waiting_ack_seq = 0;
+    s_audio_tx_inflight_valid = false;
     ESP_LOGI(TAG, "SPI bridge initialized (MOSI=%d, MISO=%d, SCK=%d, CS=%d)", BRIDGE_SPI_MOSI_PIN,
              BRIDGE_SPI_MISO_PIN, BRIDGE_SPI_SCLK_PIN, BRIDGE_SPI_CS_PIN);
 
@@ -407,6 +523,7 @@ void uart_bridge_deinit(void)
         s_rx_task = NULL;
     }
 
+    gpio_isr_handler_remove(BRIDGE_ACK_GPIO_PIN);
     spi_slave_free(BRIDGE_SPI_HOST);
 
     if (s_tx_mutex) {
@@ -414,8 +531,19 @@ void uart_bridge_deinit(void)
         s_tx_mutex = NULL;
     }
 
+    if (s_audio_slots_free) {
+        vSemaphoreDelete(s_audio_slots_free);
+        s_audio_slots_free = NULL;
+    }
+    if (s_audio_slots_used) {
+        vSemaphoreDelete(s_audio_slots_used);
+        s_audio_slots_used = NULL;
+    }
+
     s_initialized = false;
     s_connected = false;
+    s_audio_tx_waiting_ack = false;
+    s_audio_tx_inflight_valid = false;
 
     ESP_LOGI(TAG, "SPI bridge deinitialized");
 }
@@ -468,16 +596,13 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    if (xSemaphoreTake(s_audio_slots_free, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     /* Lock-free SPSC enqueue: only this thread writes s_audio_head */
     uint8_t cur_head = s_audio_head;
     uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
-    if (next_head == s_audio_tail) {
-        /* Full: drop oldest to keep low latency.
-         * Advance tail (consumer side).  Safe here because if the consumer
-         * is mid-dequeue it will read the NEXT entry, not this one. */
-        s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
-        s_audio_tx_overwrite++;
-    }
 
     tx_entry_t *entry = &s_audio_q[cur_head];
     memset(entry->buf, 0, BRIDGE_SPI_MAX_XFER);
@@ -497,6 +622,7 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
      * a single core, but the consumer runs on a different core. */
     __sync_synchronize();
     s_audio_head = next_head;
+    xSemaphoreGive(s_audio_slots_used);
 
     s_audio_tx_queued++;
 
@@ -505,11 +631,12 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     int64_t now = esp_timer_get_time();
     if (now - last_log > 5000000) { /* Every 5s */
         ESP_LOGI(TAG,
-                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu",
+                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu ack_spur=%lu waiting=%d",
                  s_audio_tx_queued, s_audio_tx_overwrite, s_audio_rx_count,
                  audio_queue_depth(), s_ctrl_pending_valid ? 1 : 0,
                  s_bridge_rx_bad_sync, s_bridge_rx_bad_len, s_bridge_rx_trunc,
-                 s_bridge_rx_crc_fail, s_bridge_rx_seq_gaps);
+                 s_bridge_rx_crc_fail, s_bridge_rx_seq_gaps, s_ack_irq_count,
+                 s_ack_release_count, s_ack_spurious_count, s_audio_tx_waiting_ack ? 1 : 0);
         last_log = now;
     }
 
