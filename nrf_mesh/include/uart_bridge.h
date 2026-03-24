@@ -18,7 +18,6 @@
 #define UART_PKT_EVENT   0x03 /* Mesh event -> ESP32 */
 #define UART_PKT_COMMAND 0x04 /* Command ESP32 -> nRF */
 #define UART_PKT_LOG     0x05 /* Debug log -> ESP32 */
-#define UART_PKT_AUDIO_ACK 0x06 /* ESP->nRF audio ACK -> ESP32 */
 
 /* Packet sync byte */
 #define UART_SYNC_BYTE 0xAA

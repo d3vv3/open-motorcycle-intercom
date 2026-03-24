@@ -136,6 +136,8 @@ static esp_err_t init_audio_with_test_flags(void)
  */
 static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timestamp_us)
 {
+    (void)timestamp_us;
+
     switch (s_active_transport) {
     case TRANSPORT_ESP_NOW:
         if (mesh_get_state() == MESH_STATE_ACTIVE) {
@@ -164,15 +166,11 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timesta
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
             } else {
-                int64_t now_us = esp_timer_get_time();
-                if (now_us >= timestamp_us) {
-                    (void)audio_record_tx_pipeline_latency_us((uint32_t)(now_us - timestamp_us));
-                }
                 s_e2e_tx_seq++;
                 s_e2e_tx_frames++;
                 /* Rate limit logs */
                 static int64_t last_log = 0;
-                int64_t now = now_us;
+                int64_t now = esp_timer_get_time();
                 if (now - last_log > 5000000) { /* Every 5s */
                     ESP_LOGI(TAG, "Audio sent via SPI bridge (len=%d)", len);
                     last_log = now;

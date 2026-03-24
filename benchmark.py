@@ -67,14 +67,6 @@ ESP_AUDIO_DECODE_TIME_RE = re.compile(
     r"Decode time:\s*avg=(?P<dec_avg_us>\d+)\s*us,\s*max=(?P<dec_max_us>\d+)\s*us"
 )
 
-ESP_AUDIO_TX_PIPE_RE = re.compile(
-    r"TX pipeline:\s*avg=(?P<tx_pipe_avg_us>\d+)\s*us,\s*max=(?P<tx_pipe_max_us>\d+)\s*us"
-)
-
-ESP_AUDIO_RX_PIPE_RE = re.compile(
-    r"RX pipeline:\s*avg=(?P<rx_pipe_avg_us>\d+)\s*us,\s*max=(?P<rx_pipe_max_us>\d+)\s*us"
-)
-
 ESP_AUDIO_VOX_RE = re.compile(
     r"VOX activations:\s*(?P<vox_activations>\d+)\s*"
     r"\(active:\s*(?P<vox_active>YES|yes|no)\)"
@@ -125,8 +117,6 @@ _SIMPLE_PARSERS: list[tuple[re.Pattern, str]] = [
     (ESP_AUDIO_LATENCY_RE, "latency"),
     (ESP_AUDIO_ENCODE_TIME_RE, "encode"),
     (ESP_AUDIO_DECODE_TIME_RE, "decode"),
-    (ESP_AUDIO_TX_PIPE_RE, "tx_pipeline"),
-    (ESP_AUDIO_RX_PIPE_RE, "rx_pipeline"),
     (ESP_AUDIO_RX_DEPTH_RE, "rx_depth"),
     (ESP_E2E_RE, "e2e_esp"),
     (NRF_E2E_RE, "e2e_nrf"),
@@ -210,8 +200,6 @@ class PortStats:
     latency_samples: int = 0
     encode_samples: int = 0
     decode_samples: int = 0
-    tx_pipeline_samples: int = 0
-    rx_pipeline_samples: int = 0
     vox_samples: int = 0
     rx_depth_samples: int = 0
     frame_counts_samples: int = 0
@@ -240,10 +228,6 @@ class PortStats:
     last_encode: dict = field(default_factory=dict)
     first_decode: dict = field(default_factory=dict)
     last_decode: dict = field(default_factory=dict)
-    first_tx_pipeline: dict = field(default_factory=dict)
-    last_tx_pipeline: dict = field(default_factory=dict)
-    first_rx_pipeline: dict = field(default_factory=dict)
-    last_rx_pipeline: dict = field(default_factory=dict)
     first_vox: dict = field(default_factory=dict)
     last_vox: dict = field(default_factory=dict)
     first_rx_depth: dict = field(default_factory=dict)
@@ -469,8 +453,6 @@ _SNAPSHOT_NAMES = [
     "latency",
     "encode",
     "decode",
-    "tx_pipeline",
-    "rx_pipeline",
     "vox",
     "rx_depth",
     "frame_counts",
@@ -508,8 +490,6 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
         "latency_samples": s.latency_samples,
         "encode_samples": s.encode_samples,
         "decode_samples": s.decode_samples,
-        "tx_pipeline_samples": s.tx_pipeline_samples,
-        "rx_pipeline_samples": s.rx_pipeline_samples,
         "vox_samples": s.vox_samples,
         "rx_depth_samples": s.rx_depth_samples,
         "frame_counts_samples": s.frame_counts_samples,
@@ -583,8 +563,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         f"  Samples: mesh={s.mesh_samples} spi={s.spi_samples} "
         f"audio_pipe={s.audio_pipe_samples} glitch={s.glitch_samples} "
         f"latency={s.latency_samples} enc={s.encode_samples} "
-        f"dec={s.decode_samples} txp={s.tx_pipeline_samples} rxp={s.rx_pipeline_samples} "
-        f"vox={s.vox_samples} depth={s.rx_depth_samples} "
+        f"dec={s.decode_samples} vox={s.vox_samples} depth={s.rx_depth_samples} "
         f"uflow={s.uflow_events} nrf_audio={s.nrf_audio_samples} "
         f"atune={s.atune_samples} e2e_esp={s.e2e_esp_samples} "
         f"e2e_nrf={s.e2e_nrf_samples}"
@@ -683,16 +662,6 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     if s.last_decode:
         m = s.last_decode
         out.append(f"  Last Decode: avg={m['dec_avg_us']}us max={m['dec_max_us']}us")
-    if s.last_tx_pipeline:
-        m = s.last_tx_pipeline
-        out.append(
-            f"  Last TX pipeline: avg={m['tx_pipe_avg_us']}us max={m['tx_pipe_max_us']}us"
-        )
-    if s.last_rx_pipeline:
-        m = s.last_rx_pipeline
-        out.append(
-            f"  Last RX pipeline: avg={m['rx_pipe_avg_us']}us max={m['rx_pipe_max_us']}us"
-        )
 
     # VOX
     if s.last_vox:

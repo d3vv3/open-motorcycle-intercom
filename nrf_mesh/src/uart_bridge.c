@@ -64,8 +64,6 @@ struct tx_entry {
 static struct tx_entry s_audio_q[TX_AUDIO_QUEUE_SIZE];
 static volatile uint8_t s_audio_head = 0;
 static volatile uint8_t s_audio_tail = 0;
-K_SEM_DEFINE(s_audio_slots_free, TX_AUDIO_QUEUE_SIZE - 1, TX_AUDIO_QUEUE_SIZE - 1);
-K_SEM_DEFINE(s_audio_slots_used, 0, TX_AUDIO_QUEUE_SIZE - 1);
 
 /* Control packet FIFO (replaces single-slot buffer to prevent event loss) */
 #define TX_CTRL_QUEUE_SIZE 4
@@ -87,10 +85,6 @@ static uint8_t s_bridge_rx_expected = 0;
 static bool s_bridge_rx_seq_init = false;
 static uint32_t s_bridge_rx_seq_gap = 0;
 static uint32_t s_bridge_rx_crc_fail = 0;
-static bool s_last_audio_seq_valid = false;
-static uint8_t s_last_audio_seq = 0;
-static bool s_audio_ack_pending = false;
-static uint8_t s_audio_ack_seq = 0;
 
 /* ============================================================================
  * Private Functions
@@ -200,30 +194,15 @@ static void parse_rx(const uint8_t *buf, size_t len)
         s_bridge_rx_seq_init = true;
     } else {
         uint8_t expected_next = (uint8_t)(s_bridge_rx_expected + 1);
-        if (seq == expected_next) {
-            s_bridge_rx_expected = seq;
-        } else if (seq != s_bridge_rx_expected) {
-            /* Forward jump/backward reset (not a pure duplicate). Count once and resync. */
+        if (seq != expected_next) {
             s_bridge_rx_seq_gap++;
-            s_bridge_rx_expected = seq;
         }
     }
+    s_bridge_rx_expected = seq;
 
     uint8_t pkt_type = buf[3];
     const uint8_t *payload = &buf[4];
     uint8_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
-
-    if (pkt_type == UART_PKT_AUDIO) {
-        bool duplicate = s_last_audio_seq_valid && (seq == s_last_audio_seq);
-        if (!duplicate) {
-            handle_rx_packet(pkt_type, payload, payload_len);
-            s_last_audio_seq = seq;
-            s_last_audio_seq_valid = true;
-        }
-        s_audio_ack_seq = seq;
-        s_audio_ack_pending = true;
-        return;
-    }
 
     handle_rx_packet(pkt_type, payload, payload_len);
 }
@@ -314,13 +293,17 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
         return -EMSGSIZE;
     }
 
-    if (k_sem_take(&s_audio_slots_free, K_MSEC(20)) != 0) {
-        return -EAGAIN;
-    }
-
-    /* SPSC enqueue (single producer = mesh RX callback) */
+    /* Lock-free SPSC enqueue (single producer = mesh RX callback) */
     uint8_t cur_head = s_audio_head;
     uint8_t next_head = (cur_head + 1) % TX_AUDIO_QUEUE_SIZE;
+    if (next_head == s_audio_tail) {
+        /* Full: drop oldest to keep low latency */
+        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
+        s_audio_q_overwrite++;
+        if ((s_audio_q_overwrite % 200) == 0) {
+            LOG_WRN("Audio SPI TX queue overwrite count=%u", s_audio_q_overwrite);
+        }
+    }
 
     struct tx_entry *e = &s_audio_q[cur_head];
     memset(e->buf, 0, BRIDGE_SPI_MAX_XFER);
@@ -332,7 +315,6 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
     /* Memory barrier: ensure entry data is visible before consumer sees new head */
     __DMB();
     s_audio_head = next_head;
-    k_sem_give(&s_audio_slots_used);
 
     LOG_DBG("Queued audio packet: src=%d, len=%d", src_id, len);
     return 0;
@@ -410,20 +392,14 @@ void uart_bridge_process(void)
 
     memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
 
-    /* ACKs first (critical for ESP-side reliable stop-and-wait). */
-    if (s_audio_ack_pending) {
-        uint8_t ack_payload[1] = {s_audio_ack_seq};
-        (void)build_packet(s_tx_buf, UART_PKT_AUDIO_ACK, ack_payload, sizeof(ack_payload));
-        s_audio_ack_pending = false;
-    }
-    /* Then normal packet selection: audio first, then control. */
-    else if (k_sem_take(&s_audio_slots_used, K_NO_WAIT) == 0) {
-        uint8_t at = s_audio_tail;
-        __DMB();  /* Ensure we see entry data written before head was updated */
+    /* Select packet to transmit: audio first (lock-free), then control (mutex) */
+    uint8_t ah = s_audio_head;
+    __DMB();  /* Ensure we see entry data written before head was updated */
+    uint8_t at = s_audio_tail;
+    if (ah != at) {
         struct tx_entry *e = &s_audio_q[at];
         memcpy(s_tx_buf, e->buf, e->len);
         s_audio_tail = (at + 1) % TX_AUDIO_QUEUE_SIZE;
-        k_sem_give(&s_audio_slots_free);
     } else {
         /* Control FIFO — low frequency, use mutex */
         k_mutex_lock(&s_tx_lock, K_FOREVER);
