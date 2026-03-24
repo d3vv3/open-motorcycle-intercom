@@ -53,20 +53,25 @@ static uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
 
 static bool s_initialized = false;
 
-/* Outbound TX queues to ESP32 (audio prioritized over control) */
+/* Outbound TX queues to ESP32 (audio prioritized over control).
+ * Audio: lock-free SPSC ring (producer = mesh RX callback, consumer = SPI poll).
+ * Control: mutex-protected FIFO (low frequency path). */
 struct tx_entry {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
     uint16_t len;
 };
 
 static struct tx_entry s_audio_q[TX_AUDIO_QUEUE_SIZE];
-static uint8_t s_audio_head = 0;
-static uint8_t s_audio_tail = 0;
+static volatile uint8_t s_audio_head = 0;
+static volatile uint8_t s_audio_tail = 0;
 
-static struct tx_entry s_ctrl_pending;
-static bool s_ctrl_pending_valid = false;
+/* Control packet FIFO (replaces single-slot buffer to prevent event loss) */
+#define TX_CTRL_QUEUE_SIZE 4
+static struct tx_entry s_ctrl_q[TX_CTRL_QUEUE_SIZE];
+static uint8_t s_ctrl_head = 0;
+static uint8_t s_ctrl_tail = 0;
 
-static struct k_mutex s_tx_lock;
+static struct k_mutex s_tx_lock;   /* Protects control FIFO only */
 static uint32_t s_audio_q_overwrite = 0;
 
 /* SPI poll interval jitter diagnostics */
@@ -219,9 +224,15 @@ static uint16_t build_packet(uint8_t *dst, uint8_t type, const uint8_t *payload,
 static void queue_control_packet(const uint8_t *buf, uint16_t len)
 {
     k_mutex_lock(&s_tx_lock, K_FOREVER);
-    memcpy(s_ctrl_pending.buf, buf, len);
-    s_ctrl_pending.len = len;
-    s_ctrl_pending_valid = true;
+    uint8_t next_head = (s_ctrl_head + 1) % TX_CTRL_QUEUE_SIZE;
+    if (next_head == s_ctrl_tail) {
+        /* Full: drop oldest to make room for the new event */
+        s_ctrl_tail = (s_ctrl_tail + 1) % TX_CTRL_QUEUE_SIZE;
+    }
+    struct tx_entry *e = &s_ctrl_q[s_ctrl_head];
+    memcpy(e->buf, buf, len);
+    e->len = len;
+    s_ctrl_head = next_head;
     k_mutex_unlock(&s_tx_lock);
 }
 
@@ -282,10 +293,9 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
         return -EMSGSIZE;
     }
 
-    uint8_t next_head;
-
-    k_mutex_lock(&s_tx_lock, K_FOREVER);
-    next_head = (s_audio_head + 1) % TX_AUDIO_QUEUE_SIZE;
+    /* Lock-free SPSC enqueue (single producer = mesh RX callback) */
+    uint8_t cur_head = s_audio_head;
+    uint8_t next_head = (cur_head + 1) % TX_AUDIO_QUEUE_SIZE;
     if (next_head == s_audio_tail) {
         /* Full: drop oldest to keep low latency */
         s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
@@ -295,14 +305,16 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
         }
     }
 
-    struct tx_entry *e = &s_audio_q[s_audio_head];
+    struct tx_entry *e = &s_audio_q[cur_head];
     memset(e->buf, 0, BRIDGE_SPI_MAX_XFER);
     uint8_t payload[SPI_MAX_PAYLOAD] = {0};
     payload[0] = src_id;
     memcpy(&payload[1], data, len);
     e->len = build_packet(e->buf, UART_PKT_AUDIO, payload, (uint8_t)(len + 1));
+
+    /* Memory barrier: ensure entry data is visible before consumer sees new head */
+    __DMB();
     s_audio_head = next_head;
-    k_mutex_unlock(&s_tx_lock);
 
     LOG_DBG("Queued audio packet: src=%d, len=%d", src_id, len);
     return 0;
@@ -380,17 +392,24 @@ void uart_bridge_process(void)
 
     memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
 
-    /* Select packet to transmit: audio first, then control */
-    k_mutex_lock(&s_tx_lock, K_FOREVER);
-    if (s_audio_head != s_audio_tail) {
-        struct tx_entry *e = &s_audio_q[s_audio_tail];
+    /* Select packet to transmit: audio first (lock-free), then control (mutex) */
+    uint8_t ah = s_audio_head;
+    __DMB();  /* Ensure we see entry data written before head was updated */
+    uint8_t at = s_audio_tail;
+    if (ah != at) {
+        struct tx_entry *e = &s_audio_q[at];
         memcpy(s_tx_buf, e->buf, e->len);
-        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
-    } else if (s_ctrl_pending_valid) {
-        memcpy(s_tx_buf, s_ctrl_pending.buf, s_ctrl_pending.len);
-        s_ctrl_pending_valid = false;
+        s_audio_tail = (at + 1) % TX_AUDIO_QUEUE_SIZE;
+    } else {
+        /* Control FIFO — low frequency, use mutex */
+        k_mutex_lock(&s_tx_lock, K_FOREVER);
+        if (s_ctrl_head != s_ctrl_tail) {
+            struct tx_entry *e = &s_ctrl_q[s_ctrl_tail];
+            memcpy(s_tx_buf, e->buf, e->len);
+            s_ctrl_tail = (s_ctrl_tail + 1) % TX_CTRL_QUEUE_SIZE;
+        }
+        k_mutex_unlock(&s_tx_lock);
     }
-    k_mutex_unlock(&s_tx_lock);
 
     memset(s_rx_buf, 0, BRIDGE_SPI_MAX_XFER);
 

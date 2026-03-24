@@ -545,6 +545,11 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                 if (s_peer_count > 0) {
                     s_peer_count--;
                 }
+                LOG_INF("Peer %u left, remaining peers: %u", hdr->src_id, s_peer_count);
+
+                /* Notify ESP32 so it can play a disconnect tone */
+                uart_bridge_send_event(0x03, NULL, 0); /* BRIDGE_EVENT_PEER_LEFT */
+
                 break;
             }
         }
@@ -684,8 +689,11 @@ static void status_work_handler(struct k_work *work)
             LOG_WRN("Coordinator lost (timeout), rescanning...");
             mesh_log("MESH: Coordinator lost, rescanning");
 
-            /* Notify ESP32 that we lost connection */
-            uart_bridge_send_event(0x03, NULL, 0); /* BRIDGE_EVENT_PEER_LEFT */
+            /* Notify ESP32 that coordinator sync was lost.
+             * Do NOT emit PEER_LEFT here: this path can be transient (role
+             * transition/rescan) and audio may continue, which caused false
+             * disconnect tones on ESP. */
+            uart_bridge_send_event(0x05, NULL, 0); /* BRIDGE_EVENT_SYNC_LOST */
 
             /* Stop TDMA */
             tdma_stop();
@@ -905,6 +913,8 @@ void mesh_protocol_stop(void)
 
     if (s_state == MESH_STATE_ACTIVE && s_node_id != 0) {
         send_packet(MESH_PKT_LEAVE, NULL, 0);
+        /* Notify ESP32 that we are leaving the mesh */
+        uart_bridge_send_event(0x03, NULL, 0); /* BRIDGE_EVENT_PEER_LEFT */
     }
 
     tdma_stop();

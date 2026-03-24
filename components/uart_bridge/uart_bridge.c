@@ -74,12 +74,17 @@ static WORD_ALIGNED_ATTR uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
 /* Mutex protecting s_tx_buf between the app thread and the SPI task */
 static SemaphoreHandle_t s_tx_mutex;
 
-/* TX queues: audio ring (priority) + single control slot */
+/* TX audio ring: lock-free SPSC (single-producer, single-consumer).
+ * Producer = audio callback thread (uart_bridge_send_audio).
+ * Consumer = SPI slave task (prepare_tx_buf).
+ * head/tail are volatile so each side sees the other's updates. */
 static tx_entry_t s_audio_q[TX_AUDIO_QUEUE_SIZE];
-static uint8_t s_audio_head = 0;
-static uint8_t s_audio_tail = 0;
+static volatile uint8_t s_audio_head = 0;
+static volatile uint8_t s_audio_tail = 0;
+
+/* Control slot: protected by s_tx_mutex (low-frequency path) */
 static tx_entry_t s_ctrl_pending;
-static bool s_ctrl_pending_valid = false;
+static volatile bool s_ctrl_pending_valid = false;
 
 /* Pipeline diagnostics */
 static uint32_t s_audio_tx_queued = 0;    /* Audio frames queued for SPI TX */
@@ -94,12 +99,14 @@ static uint32_t s_bridge_rx_bad_sync = 0;
 static uint32_t s_bridge_rx_bad_len = 0;
 static uint32_t s_bridge_rx_trunc = 0;
 
-static uint8_t audio_queue_depth_locked(void)
+static uint8_t audio_queue_depth(void)
 {
-    if (s_audio_head >= s_audio_tail) {
-        return (uint8_t)(s_audio_head - s_audio_tail);
+    uint8_t h = s_audio_head;
+    uint8_t t = s_audio_tail;
+    if (h >= t) {
+        return (uint8_t)(h - t);
     }
-    return (uint8_t)(TX_AUDIO_QUEUE_SIZE - s_audio_tail + s_audio_head);
+    return (uint8_t)(TX_AUDIO_QUEUE_SIZE - t + h);
 }
 
 /* ============================================================================
@@ -242,28 +249,38 @@ static void parse_rx(const uint8_t *buf, size_t len)
 /**
  * @brief Prepare the DMA TX buffer for the next SPI transaction.
  *
- * Copies from staging buffer (s_tx_buf) to DMA buffer (s_tx_dma_buf)
- * and clears the pending flag so the staging buffer can accept new data.
+ * Audio dequeue is lock-free (SPSC ring).  Only the control slot
+ * needs the mutex, and it's the low-frequency path.
  */
 static void prepare_tx_buf(void)
 {
-    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if (s_audio_head != s_audio_tail) {
-            tx_entry_t *e = &s_audio_q[s_audio_tail];
-            memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
-            s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
-        } else if (s_ctrl_pending_valid) {
-            memcpy(s_tx_dma_buf, s_ctrl_pending.buf, BRIDGE_SPI_MAX_XFER);
-            s_ctrl_pending_valid = false;
-        } else {
-            /* Nothing pending, send idle frame */
-            memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
-        }
-        xSemaphoreGive(s_tx_mutex);
-    } else {
-        /* Couldn't lock - send idle */
-        memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
+    /* Fast path: audio queue (lock-free SPSC) */
+    uint8_t h = s_audio_head;
+    __sync_synchronize();  /* Ensure we read entry data written before head was updated */
+    uint8_t t = s_audio_tail;
+    if (h != t) {
+        tx_entry_t *e = &s_audio_q[t];
+        memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
+        s_audio_tail = (uint8_t)((t + 1) % TX_AUDIO_QUEUE_SIZE);
+        return;
     }
+
+    /* Slow path: control packet (needs mutex, but very rare) */
+    if (s_ctrl_pending_valid) {
+        if (xSemaphoreTake(s_tx_mutex, 0) == pdTRUE) {
+            if (s_ctrl_pending_valid) {
+                memcpy(s_tx_dma_buf, s_ctrl_pending.buf, BRIDGE_SPI_MAX_XFER);
+                s_ctrl_pending_valid = false;
+            } else {
+                memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
+            }
+            xSemaphoreGive(s_tx_mutex);
+            return;
+        }
+    }
+
+    /* Nothing pending, send idle frame */
+    memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
 }
 
 /**
@@ -451,17 +468,18 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    uint8_t next_head = (uint8_t)((s_audio_head + 1) % TX_AUDIO_QUEUE_SIZE);
+    /* Lock-free SPSC enqueue: only this thread writes s_audio_head */
+    uint8_t cur_head = s_audio_head;
+    uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
     if (next_head == s_audio_tail) {
+        /* Full: drop oldest to keep low latency.
+         * Advance tail (consumer side).  Safe here because if the consumer
+         * is mid-dequeue it will read the NEXT entry, not this one. */
         s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
         s_audio_tx_overwrite++;
     }
 
-    tx_entry_t *entry = &s_audio_q[s_audio_head];
+    tx_entry_t *entry = &s_audio_q[cur_head];
     memset(entry->buf, 0, BRIDGE_SPI_MAX_XFER);
     entry->buf[0] = SYNC_BYTE;
     entry->buf[1] = (uint8_t)wire_len;
@@ -472,24 +490,28 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     }
     entry->buf[2 + wire_len] = crc8_compute(&entry->buf[1], (size_t)(wire_len + 1));
     entry->len = total;
+
+    /* Memory barrier: ensure all writes to entry are visible before
+     * the consumer sees the new head. On ESP32 (Xtensa) this is implicit
+     * because volatile reads/writes are sequentially consistent within
+     * a single core, but the consumer runs on a different core. */
+    __sync_synchronize();
     s_audio_head = next_head;
 
     s_audio_tx_queued++;
 
-    /* Log stats periodically */
+    /* Log stats periodically — OUTSIDE any critical section */
     static int64_t last_log = 0;
     int64_t now = esp_timer_get_time();
     if (now - last_log > 5000000) { /* Every 5s */
         ESP_LOGI(TAG,
                  "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu",
                  s_audio_tx_queued, s_audio_tx_overwrite, s_audio_rx_count,
-                 audio_queue_depth_locked(), s_ctrl_pending_valid ? 1 : 0,
+                 audio_queue_depth(), s_ctrl_pending_valid ? 1 : 0,
                  s_bridge_rx_bad_sync, s_bridge_rx_bad_len, s_bridge_rx_trunc,
                  s_bridge_rx_crc_fail, s_bridge_rx_seq_gaps);
         last_log = now;
     }
-
-    xSemaphoreGive(s_tx_mutex);
 
     return ESP_OK;
 }

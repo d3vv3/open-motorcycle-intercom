@@ -18,7 +18,7 @@
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 /* RF channel - must match other nodes */
-#define RF_CHANNEL 80
+#define RF_CHANNEL 40
 
 /* SPI poll cadence for ESP32 bridge */
 #define SPI_POLL_MS 2
