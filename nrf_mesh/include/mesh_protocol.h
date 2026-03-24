@@ -78,6 +78,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t frame_counter;
     int16_t drift_ppm;
+    uint8_t coordinator_addr[5]; /* ESB address for coordinator tiebreaking */
 } mesh_sync_payload_t;
 
 typedef struct __attribute__((packed)) {

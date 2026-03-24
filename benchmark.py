@@ -694,6 +694,35 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
             f"  Last RX pipeline: avg={m['rx_pipe_avg_us']}us max={m['rx_pipe_max_us']}us"
         )
 
+    # Consolidated latency summary
+    if s.last_latency or s.last_tx_pipeline or s.last_rx_pipeline:
+        lat_summary: list[str] = []
+        if s.last_latency:
+            lat_summary.append(
+                f"total={s.last_latency['lat_avg_ms']}/{s.latency_max_peak_ms}ms"
+            )
+        if s.last_tx_pipeline:
+            lat_summary.append(
+                f"TX={round(s.last_tx_pipeline['tx_pipe_avg_us'] / 1000, 1)}"
+                f"/{round(s.last_tx_pipeline['tx_pipe_max_us'] / 1000, 1)}ms"
+            )
+        if s.last_rx_pipeline:
+            lat_summary.append(
+                f"RX={round(s.last_rx_pipeline['rx_pipe_avg_us'] / 1000, 1)}"
+                f"/{round(s.last_rx_pipeline['rx_pipe_max_us'] / 1000, 1)}ms"
+            )
+        if s.last_encode:
+            lat_summary.append(
+                f"enc={round(s.last_encode['enc_avg_us'] / 1000, 1)}"
+                f"/{round(s.last_encode['enc_max_us'] / 1000, 1)}ms"
+            )
+        if s.last_decode:
+            lat_summary.append(
+                f"dec={round(s.last_decode['dec_avg_us'] / 1000, 1)}"
+                f"/{round(s.last_decode['dec_max_us'] / 1000, 1)}ms"
+            )
+        out.append(f"  Latency (avg/max): {' | '.join(lat_summary)}")
+
     # VOX
     if s.last_vox:
         d = s.delta("vox")
@@ -908,24 +937,49 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
         glitch_d = s.delta("glitch")
         hop = compute_hop_pct(s)
 
-        # ESP port: glitches + e2e delivery
-        if glitch_d or (hop and "esp_e2e_delivery_pct" in hop):
+        # ESP port: glitches + e2e delivery + latency
+        is_esp = glitch_d or (hop and "esp_e2e_delivery_pct" in hop)
+        if is_esp:
             parts: list[str] = []
             if glitch_d:
                 gl = glitch_d.get("glitches", 0)
                 gpm = _rate_per_min(gl, duration)
                 parts.append(f"glitches={gl} ({gpm}/min)")
-                und = glitch_d.get("rx_und", 0)
-                if und:
-                    parts.append(f"rx_und={und}")
             if hop.get("esp_e2e_delivery_pct") is not None:
                 parts.append(f"e2e_delivery={hop['esp_e2e_delivery_pct']}%")
             if hop.get("esp_e2e_gap_pct") is not None:
                 parts.append(f"e2e_gap={hop['esp_e2e_gap_pct']}%")
-            if hop.get("esp_txq_to_rx_from_nrf_pct") is not None:
-                parts.append(f"txq->rx={hop['esp_txq_to_rx_from_nrf_pct']}%")
             if parts:
                 print(f"  {s.port} (ESP): {' | '.join(parts)}")
+                printed = True
+
+            # Latency breakdown
+            lat_parts: list[str] = []
+            if s.last_latency:
+                lat_parts.append(
+                    f"total avg={s.last_latency['lat_avg_ms']}ms "
+                    f"max={s.latency_max_peak_ms}ms"
+                )
+            if s.last_tx_pipeline:
+                lat_parts.append(
+                    f"TX avg={round(s.last_tx_pipeline['tx_pipe_avg_us'] / 1000, 1)}ms "
+                    f"max={round(s.last_tx_pipeline['tx_pipe_max_us'] / 1000, 1)}ms"
+                )
+            if s.last_rx_pipeline:
+                lat_parts.append(
+                    f"RX avg={round(s.last_rx_pipeline['rx_pipe_avg_us'] / 1000, 1)}ms "
+                    f"max={round(s.last_rx_pipeline['rx_pipe_max_us'] / 1000, 1)}ms"
+                )
+            if s.last_encode:
+                lat_parts.append(
+                    f"enc avg={round(s.last_encode['enc_avg_us'] / 1000, 1)}ms"
+                )
+            if s.last_decode:
+                lat_parts.append(
+                    f"dec avg={round(s.last_decode['dec_avg_us'] / 1000, 1)}ms"
+                )
+            if lat_parts:
+                print(f"    Latency: {' | '.join(lat_parts)}")
                 printed = True
 
         # nRF port: hop ratios

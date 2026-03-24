@@ -206,6 +206,7 @@ static int send_sync(void)
         .frame_counter = tdma_get_frame_counter(),
         .drift_ppm = 0,
     };
+    memcpy(payload.coordinator_addr, s_local_addr, 5);
     return send_packet(MESH_PKT_SYNC, &payload, sizeof(payload));
 }
 
@@ -366,6 +367,29 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
             const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
             tdma_sync(sync->frame_counter, sync->drift_ppm);
             s_last_sync_time = k_uptime_get_32();
+        } else if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_COORDINATOR) {
+            /* Dual-coordinator conflict: lower MAC address wins */
+            const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
+            int cmp = memcmp(sync->coordinator_addr, s_local_addr, 5);
+            if (cmp < 0) {
+                /* Other coordinator has lower MAC — we demote */
+                LOG_WRN("Dual coordinator detected, other MAC is lower — demoting to scan");
+                mesh_log("MESH: Dual coordinator, demoting (lower MAC wins)");
+
+                tdma_stop();
+                s_state = MESH_STATE_SCANNING;
+                s_role = MESH_ROLE_NONE;
+                s_node_id = 0;
+                s_slot_index = -1;
+                s_peer_count = 0;
+                memset(s_peers, 0, sizeof(s_peers));
+
+                k_work_cancel_delayable(&s_status_work);
+                k_work_schedule(&s_scan_work, K_NO_WAIT);
+            } else if (cmp > 0) {
+                LOG_INF("Dual coordinator detected, we have lower MAC — staying coordinator");
+            }
+            /* cmp == 0: same node (shouldn't happen), ignore */
         }
         break;
 
