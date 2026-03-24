@@ -90,6 +90,9 @@ static uint8_t s_bridge_rx_expected = 0;
 static bool s_bridge_rx_seq_init = false;
 static uint32_t s_bridge_rx_seq_gaps = 0;
 static uint32_t s_bridge_rx_crc_fail = 0;
+static uint32_t s_bridge_rx_bad_sync = 0;
+static uint32_t s_bridge_rx_bad_len = 0;
+static uint32_t s_bridge_rx_trunc = 0;
 
 static uint8_t audio_queue_depth_locked(void)
 {
@@ -182,22 +185,26 @@ static uint8_t crc8_compute(const uint8_t *data, size_t len)
 static void parse_rx(const uint8_t *buf, size_t len)
 {
     if (len < 5) {
+        s_bridge_rx_trunc++;
         return;
     }
 
     /* Idle frame from master (all zeros or no sync byte) */
     if (buf[0] != SYNC_BYTE) {
+        s_bridge_rx_bad_sync++;
         return;
     }
 
     uint8_t pkt_len = buf[1];
     if (pkt_len < 2 || pkt_len > MAX_PACKET_LEN - 3) {
+        s_bridge_rx_bad_len++;
         ESP_LOGW(TAG, "Bad packet length: %u", pkt_len);
         return;
     }
 
     /* Ensure we actually received enough bytes */
     if ((size_t)(pkt_len + 3) > len) {
+        s_bridge_rx_trunc++;
         ESP_LOGW(TAG, "Truncated packet: need %u, got %u", pkt_len + 3, (unsigned)len);
         return;
     }
@@ -474,9 +481,11 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     int64_t now = esp_timer_get_time();
     if (now - last_log > 5000000) { /* Every 5s */
         ESP_LOGI(TAG,
-                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d",
+                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu",
                  s_audio_tx_queued, s_audio_tx_overwrite, s_audio_rx_count,
-                 audio_queue_depth_locked(), s_ctrl_pending_valid ? 1 : 0);
+                 audio_queue_depth_locked(), s_ctrl_pending_valid ? 1 : 0,
+                 s_bridge_rx_bad_sync, s_bridge_rx_bad_len, s_bridge_rx_trunc,
+                 s_bridge_rx_crc_fail, s_bridge_rx_seq_gaps);
         last_log = now;
     }
 

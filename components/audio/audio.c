@@ -547,6 +547,7 @@ static void audio_task(void *arg)
              * STEP 3: VOX Detection
              * ================================================================ */
             bool vox_active = vox_process(&s_vox_state, s_pcm_input, AUDIO_FRAME_SAMPLES);
+            bool tx_active = vox_active || s_config.force_tx_always;
             s_stats.vox_active = vox_active;
             s_stats.vox_activations = s_vox_state.activation_count;
 
@@ -554,7 +555,7 @@ static void audio_task(void *arg)
              * STEP 4: Opus Encode (only if VOX active)
              * ================================================================ */
             int opus_bytes = 0;
-            if (vox_active) {
+            if (tx_active) {
                 int64_t encode_start = esp_timer_get_time();
 
                 opus_bytes = opus_encode(s_opus_encoder, s_pcm_input, AUDIO_FRAME_SAMPLES,
@@ -578,8 +579,27 @@ static void audio_task(void *arg)
                     ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(opus_bytes));
                 }
             } else {
-                /* VOX inactive - no transmission */
-                opus_bytes = 0;
+                /* VOX inactive — encode and send a silence comfort frame to keep
+                 * the stream at a steady 50 fps.  Opus compresses silence to
+                 * ~3-6 bytes, so this adds negligible bandwidth while preventing
+                 * receiver starvation from VOX gaps. */
+                static int16_t s_silence_frame[AUDIO_FRAME_SAMPLES]; /* BSS-zeroed */
+                int64_t encode_start = esp_timer_get_time();
+                opus_bytes = opus_encode(s_opus_encoder, s_silence_frame, AUDIO_FRAME_SAMPLES,
+                                         s_opus_buffer, MAX_OPUS_PACKET_SIZE);
+                int64_t encode_time = esp_timer_get_time() - encode_start;
+
+                if (opus_bytes > 0) {
+                    s_stats.frames_encoded++;
+                    encode_time_sum += encode_time;
+                    s_stats.encode_time_us_avg = encode_time_sum / s_stats.frames_encoded;
+                    if (encode_time > s_stats.encode_time_us_max) {
+                        s_stats.encode_time_us_max = encode_time;
+                    }
+                    if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
+                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, frame_start_us);
+                    }
+                }
             }
 
             /* ================================================================
@@ -621,7 +641,31 @@ static void audio_task(void *arg)
                     audio_jitter_update_playout_start(jitter, items);
                     audio_jitter_trim_backlog(s_rx_queue, jitter, &s_stats, &rx_item);
 
-                    if (jitter->playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
+                    /* ---- Adaptive playout: hold / normal / catch-up ---- */
+                    #define HOLD_BUDGET_MAX  3  /* Max accumulated holds (60ms) */
+                    #define CATCHUP_DEPTH    4  /* Burn off latency above this depth */
+
+                    if (jitter->playout_started && jitter->hold_next) {
+                        /* Hold iteration: output PLC to let queue refill.
+                         * We don't dequeue — just generate concealment.  */
+                        jitter->hold_next = false;
+                        s_stats.hold_frames++;
+                        int64_t plc_start = esp_timer_get_time();
+                        int plc_samples = opus_decode(s_opus_decoder, NULL, 0,
+                                                      s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
+                        int64_t plc_time = esp_timer_get_time() - plc_start;
+                        if (plc_samples == AUDIO_FRAME_SAMPLES) {
+                            s_stats.frames_decoded++;
+                            decode_time_sum += plc_time;
+                            s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
+                            if (plc_time > s_stats.decode_time_us_max) {
+                                s_stats.decode_time_us_max = plc_time;
+                            }
+                            have_audio_to_play = true;
+                        }
+                        /* Reset consecutive_empty since this was intentional */
+                        jitter->consecutive_empty = 0;
+                    } else if (jitter->playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
                         int64_t decode_start = esp_timer_get_time();
                         jitter->last_rx_packet_us = decode_start;
                         jitter->consecutive_empty = 0; /* Reset miss counter */
@@ -640,6 +684,30 @@ static void audio_task(void *arg)
                             }
                             s_stats.jitter_buffer_depth = (uint8_t)items;
                             have_audio_to_play = true;
+
+                            /* Check remaining depth after dequeue */
+                            UBaseType_t remaining = uxQueueMessagesWaiting(s_rx_queue);
+
+                            /* If queue just emptied, trigger hold next iteration */
+                            if (remaining == 0 && jitter->hold_budget < HOLD_BUDGET_MAX) {
+                                jitter->hold_next = true;
+                                jitter->hold_budget++;
+                            }
+
+                            /* If queue is healthy and we have hold debt, catch up
+                             * by discarding one extra frame to reduce latency. */
+                            if (remaining >= CATCHUP_DEPTH && jitter->hold_budget > 0) {
+                                audio_rx_item_t discard;
+                                if (xQueueReceive(s_rx_queue, &discard, 0) == pdTRUE) {
+                                    /* Decode the discard frame to keep Opus state correct,
+                                     * but throw away the output. */
+                                    int16_t discard_pcm[AUDIO_FRAME_SAMPLES];
+                                    (void)opus_decode(s_opus_decoder, discard.data, discard.len,
+                                                discard_pcm, AUDIO_FRAME_SAMPLES, 0);
+                                    jitter->hold_budget--;
+                                    s_stats.catchup_frames++;
+                                }
+                            }
                         } else {
                             ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                         }
@@ -771,6 +839,8 @@ static void audio_task(void *arg)
                      s_stats.i2s_write_incomplete, s_stats.adc_overruns);
             ESP_LOGI(TAG, "  Concealment: plc=%lu grace_empty=%lu",
                      s_stats.plc_frames, s_stats.grace_empty_polls);
+            ESP_LOGI(TAG, "  Adaptive playout: hold=%lu catchup=%lu budget=%u",
+                     s_stats.hold_frames, s_stats.catchup_frames, jitter->hold_budget);
             ESP_LOGI(TAG, "  RX queue depth: min=%u avg=%u max=%u", s_stats.rx_q_depth_min,
                      s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max);
             last_heartbeat = now_ms;

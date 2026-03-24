@@ -104,6 +104,29 @@ static uint32_t s_under_prev = 0;
 static uint32_t s_under_delta_last = 0;
 static uint32_t s_status_log_decim = 0;
 static uint32_t s_under_log_next = 64;
+
+/* End-to-end sequence diagnostics.
+ * Sequence is injected by ESP in first 2 bytes of Opus payload and forwarded
+ * unchanged over nRF mesh and back to ESP. */
+struct e2e_src_state {
+    bool init;
+    uint16_t last_seq;
+};
+
+static struct e2e_src_state s_e2e_spi_in_src[256];
+static struct e2e_src_state s_e2e_rf_rx_src[256];
+static uint32_t s_e2e_spi_in_frames = 0;
+static uint32_t s_e2e_spi_in_gap_evt = 0;
+static uint32_t s_e2e_spi_in_gap_fr = 0;
+static uint32_t s_e2e_spi_in_reset_evt = 0;
+static uint32_t s_e2e_rf_tx_frames = 0;
+static uint32_t s_e2e_rf_rx_frames = 0;
+static uint32_t s_e2e_rf_rx_gap_evt = 0;
+static uint32_t s_e2e_rf_rx_gap_fr = 0;
+static uint32_t s_e2e_rf_rx_reset_evt = 0;
+static uint32_t s_e2e_spi_out_frames = 0;
+
+#define E2E_MAX_FORWARD_GAP 32
 /* Skip-send queue buffering strategy.
  *
  * Problem: PI frame-stretch matched send rate to arrival rate but never built
@@ -113,8 +136,8 @@ static uint32_t s_under_log_next = 64;
  * until it fills to a high-water target, then resume normal 1-per-slot sending.
  * This is prefill + hysteresis.
  */
-#define QUEUE_LO          2    /* Enter skip mode below this depth */
-#define QUEUE_HI          4    /* Resume sending at this depth */
+#define QUEUE_LO          2    /* Resume skip when queue drops below this */
+#define QUEUE_HI          4    /* Resume send when queue reaches this */
 
 static bool     s_skip_mode = true;     /* Start in skip (prefill) mode */
 static uint32_t s_skip_count = 0;       /* Frames skipped for logging */
@@ -301,8 +324,31 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
             /* Forward audio to ESP32 via UART */
             const mesh_audio_payload_t *audio = (const mesh_audio_payload_t *)payload;
             uint8_t audio_len = hdr->payload_len - 4; /* Subtract header */
+
+            if (audio_len >= 2) {
+                uint16_t e2e_seq = ((uint16_t)audio->data[0] << 8) | audio->data[1];
+                struct e2e_src_state *st = &s_e2e_rf_rx_src[hdr->src_id];
+                if (!st->init) {
+                    st->init = true;
+                } else {
+                    uint16_t expected = (uint16_t)(st->last_seq + 1);
+                    if (e2e_seq != expected) {
+                        int16_t signed_delta = (int16_t)(e2e_seq - expected);
+                        if (signed_delta > 0 && signed_delta <= E2E_MAX_FORWARD_GAP) {
+                            s_e2e_rf_rx_gap_evt++;
+                            s_e2e_rf_rx_gap_fr += (uint16_t)signed_delta;
+                        } else {
+                            s_e2e_rf_rx_reset_evt++;
+                        }
+                    }
+                }
+                st->last_seq = e2e_seq;
+                s_e2e_rf_rx_frames++;
+            }
+
             uart_bridge_send_audio(hdr->src_id, audio->data, audio_len);
             s_stat_audio_fwd++;
+            s_e2e_spi_out_frames++;
         }
         break;
 
@@ -618,6 +664,12 @@ static void status_work_handler(struct k_work *work)
                s_role, s_node_id, s_tx_queue_depth_dbg, s_under_delta_last,
                s_skip_count, s_auto_ticks,
                ws_edges, ws_last_corr, ws_cum_drift);
+        printk("[E2E_NRF] id=%u spi_in=%u spi_gap=%u/%u spi_reset=%u rf_tx=%u rf_rx=%u rf_gap=%u/%u rf_reset=%u spi_out=%u\n",
+               s_node_id,
+               s_e2e_spi_in_frames, s_e2e_spi_in_gap_evt, s_e2e_spi_in_gap_fr, s_e2e_spi_in_reset_evt,
+               s_e2e_rf_tx_frames, s_e2e_rf_rx_frames, s_e2e_rf_rx_gap_evt, s_e2e_rf_rx_gap_fr,
+               s_e2e_rf_rx_reset_evt,
+               s_e2e_spi_out_frames);
     }
 
     /* Coordinator sends SYNC on every status update for discovery */
@@ -682,19 +734,18 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     uint8_t depth = tx_queue_depth();
     s_tx_queue_depth_dbg = depth;
 
-    /* Hysteresis: skip sending while queue is below QUEUE_HI to let it build.
-     * Resume sending once it reaches QUEUE_HI.  Re-enter skip if it drops
-     * below QUEUE_LO. */
+    /* Skip-send hysteresis: stay in skip mode until queue reaches
+     * QUEUE_HI, then send until it drops below QUEUE_LO.
+     * This rate-matches nRF output (~43/s from ESP) to TDMA slots,
+     * preventing TX ring underflows (under_d=0). */
     if (s_skip_mode) {
         if (depth >= QUEUE_HI) {
             s_skip_mode = false;
         } else {
-            /* Still building — don't send, don't count underflow */
             return;
         }
     } else if (depth < QUEUE_LO) {
         s_skip_mode = true;
-        s_skip_count++;
         return;
     }
 
@@ -720,6 +771,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
 
         if (ret == 0) {
             s_stat_tx_count++;
+            s_e2e_rf_tx_frames++;
         } else {
             s_stat_tx_fail++;
         }
@@ -748,6 +800,27 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len)
 {
     if (len > MESH_MAX_AUDIO_PAYLOAD) {
         return -EMSGSIZE;
+    }
+
+    if (len >= 2) {
+        uint16_t e2e_seq = ((uint16_t)data[0] << 8) | data[1];
+        struct e2e_src_state *st = &s_e2e_spi_in_src[s_node_id];
+        if (!st->init) {
+            st->init = true;
+        } else {
+            uint16_t expected = (uint16_t)(st->last_seq + 1);
+            if (e2e_seq != expected) {
+                int16_t signed_delta = (int16_t)(e2e_seq - expected);
+                if (signed_delta > 0 && signed_delta <= E2E_MAX_FORWARD_GAP) {
+                    s_e2e_spi_in_gap_evt++;
+                    s_e2e_spi_in_gap_fr += (uint16_t)signed_delta;
+                } else {
+                    s_e2e_spi_in_reset_evt++;
+                }
+            }
+        }
+        st->last_seq = e2e_seq;
+        s_e2e_spi_in_frames++;
     }
 
     s_stat_spi_audio_in++;

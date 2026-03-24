@@ -40,6 +40,10 @@ static const char *TAG = "omi";
 /* Debug instrumentation knobs */
 #define REDUCED_LOGGING_MODE 1
 
+/* Test knob: bypass VOX gating and always transmit microphone frames.
+ * 0 = normal VOX behavior, 1 = force continuous TX. */
+#define FORCE_TX_ALWAYS_FOR_TEST 1
+
 /* ============================================================================
  * State
  * ============================================================================ */
@@ -47,6 +51,21 @@ static const char *TAG = "omi";
 static bool s_mesh_active = false;
 
 /* End-to-end audio sequence diagnostics (nRF transport path) */
+static uint16_t s_e2e_tx_seq = 0;
+static uint32_t s_e2e_tx_frames = 0;
+static uint32_t s_e2e_rx_frames = 0;
+static uint32_t s_e2e_rx_gap_events = 0;
+static uint32_t s_e2e_rx_gap_frames = 0;
+static uint32_t s_e2e_rx_reset_events = 0;
+
+typedef struct {
+    bool initialized;
+    uint16_t last_seq;
+} e2e_rx_seq_state_t;
+
+static e2e_rx_seq_state_t s_e2e_rx_seq_state[256] = {0};
+
+#define E2E_MAX_FORWARD_GAP 32
 
 /* RTT log cadence while using nRF transport */
 #define RTT_LOG_INTERVAL_MS 10000
@@ -93,6 +112,13 @@ typedef enum {
 
 static transport_type_t s_active_transport = TRANSPORT_NONE;
 
+static esp_err_t init_audio_with_test_flags(void)
+{
+    audio_config_t audio_cfg = AUDIO_CONFIG_DEFAULT();
+    audio_cfg.force_tx_always = (FORCE_TX_ALWAYS_FOR_TEST != 0);
+    return audio_init_with_config(&audio_cfg);
+}
+
 /**
  * @brief Callback from audio subsystem when encoded frame is ready
  */
@@ -112,10 +138,22 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timesta
 
     case TRANSPORT_NRF52840:
         if (s_mesh_active && uart_bridge_is_connected()) {
-            esp_err_t ret = uart_bridge_send_audio(data, len);
+            uint8_t tx_buf[130];
+            if (len > (sizeof(tx_buf) - 2)) {
+                ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
+                break;
+            }
+
+            uint16_t seq = s_e2e_tx_seq++;
+            tx_buf[0] = (uint8_t)(seq >> 8);
+            tx_buf[1] = (uint8_t)(seq & 0xFF);
+            memcpy(&tx_buf[2], data, len);
+
+            esp_err_t ret = uart_bridge_send_audio(tx_buf, (uint16_t)(len + 2));
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
             } else {
+                s_e2e_tx_frames++;
                 /* Rate limit logs */
                 static int64_t last_log = 0;
                 int64_t now = esp_timer_get_time();
@@ -176,17 +214,38 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
         return;
     }
 
-    if (len < 1) {
+    if (len < 3) {
         return;
     }
 
-    if (len > sizeof(frame.data)) {
-        ESP_LOGW(TAG, "Audio frame too large: %u bytes", len);
+    uint16_t e2e_seq = ((uint16_t)data[0] << 8) | data[1];
+    e2e_rx_seq_state_t *seq_state = &s_e2e_rx_seq_state[src_id];
+    if (!seq_state->initialized) {
+        seq_state->initialized = true;
+    } else {
+        uint16_t expected = (uint16_t)(seq_state->last_seq + 1);
+        if (e2e_seq != expected) {
+            int16_t signed_delta = (int16_t)(e2e_seq - expected);
+            if (signed_delta > 0 && signed_delta <= E2E_MAX_FORWARD_GAP) {
+                s_e2e_rx_gap_events++;
+                s_e2e_rx_gap_frames += (uint16_t)signed_delta;
+            } else {
+                /* Backward jump or implausibly large forward jump -> reset/restart. */
+                s_e2e_rx_reset_events++;
+            }
+        }
+    }
+    seq_state->last_seq = e2e_seq;
+    s_e2e_rx_frames++;
+
+    uint16_t opus_len = (uint16_t)(len - 2);
+    if (opus_len > sizeof(frame.data)) {
+        ESP_LOGW(TAG, "Audio frame too large: %u bytes", opus_len);
         return;
     }
 
-    memcpy(frame.data, data, len);
-    frame.len = len;
+    memcpy(frame.data, data + 2, opus_len);
+    frame.len = opus_len;
     frame.timestamp_ms = timestamp_us / 1000;
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
@@ -375,11 +434,13 @@ void app_main(void)
 
     /* Initialize audio subsystem (after SPI so DMA channels are available) */
     ESP_LOGI(TAG, "");
-    ret = audio_init();
+    ret = init_audio_with_test_flags();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
         goto error_halt;
     }
+    ESP_LOGI(TAG, "Audio test flags: force_tx_always=%s",
+             FORCE_TX_ALWAYS_FOR_TEST ? "YES" : "no");
 
     /* Configure audio for mesh mode */
     ret = audio_set_mode(AUDIO_MODE_MESH);
@@ -409,11 +470,13 @@ void app_main(void)
 #else
     /* Non-mesh: initialize audio directly (no SPI contention) */
     ESP_LOGI(TAG, "");
-    ret = audio_init();
+    ret = init_audio_with_test_flags();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
         goto error_halt;
     }
+    ESP_LOGI(TAG, "Audio test flags: force_tx_always=%s",
+             FORCE_TX_ALWAYS_FOR_TEST ? "YES" : "no");
 #endif /* ENABLE_MESH_MODE */
 
     /* Start audio pipeline */
@@ -527,6 +590,10 @@ void app_main(void)
                 ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
                          rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
                          rtt.jitter_ms_avg, rtt.jitter_ms_max);
+                ESP_LOGI(TAG,
+                         "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu",
+                         s_e2e_tx_frames, s_e2e_rx_frames, s_e2e_rx_gap_events,
+                         s_e2e_rx_gap_frames, s_e2e_rx_reset_events);
                 last_rtt_log_ms = now_ms;
             }
         }

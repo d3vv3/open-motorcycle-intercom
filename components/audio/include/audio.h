@@ -131,25 +131,27 @@ typedef struct {
     audio_vox_config_t vox_config; /**< VOX detection configuration */
     bool enable_hpf;               /**< Enable high-pass filter */
     float hpf_cutoff_hz;           /**< HPF cutoff frequency (default: 120 Hz) */
+    bool force_tx_always;          /**< Test mode: always TX mic frame (ignore VOX gating) */
     audio_mode_t mode;             /**< Operating mode (default: LOOPBACK) */
 } audio_config_t;
 
 /**
  * @brief Default audio configuration
  */
-#define AUDIO_CONFIG_DEFAULT()                                                                     \
-    {                                                                                              \
-        .sample_rate = 16000,                                                                      \
-        .channels = 1,                                                                             \
-        .bits_per_sample = 16,                                                                     \
-        .frame_size_ms = 20,                                                                       \
-        .opus_bitrate = 16000,                                                                     \
-        .i2s_pins = AUDIO_I2S_PINS_DEFAULT(),                                                      \
-        .adc_config = AUDIO_ADC_CONFIG_DEFAULT(),                                                  \
-        .vox_config = AUDIO_VOX_CONFIG_DEFAULT(),                                                  \
-        .enable_hpf = true,                                                                        \
-        .hpf_cutoff_hz = 80.0f,                                                                    \
-        .mode = AUDIO_MODE_LOOPBACK,                                                               \
+#define AUDIO_CONFIG_DEFAULT()      \
+    {                               \
+        .sample_rate = 16000,       \
+        .channels = 1,              \
+        .bits_per_sample = 16,      \
+        .frame_size_ms = 20,        \
+        .opus_bitrate = 16000,      \
+        .i2s_pins = AUDIO_I2S_PINS_DEFAULT(), \
+        .adc_config = AUDIO_ADC_CONFIG_DEFAULT(), \
+        .vox_config = AUDIO_VOX_CONFIG_DEFAULT(), \
+        .enable_hpf = true,         \
+        .hpf_cutoff_hz = 80.0f,     \
+        .force_tx_always = false,   \
+        .mode = AUDIO_MODE_LOOPBACK, \
     }
 
 /**
@@ -180,6 +182,8 @@ typedef struct {
     uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
     uint32_t plc_frames;         /**< Opus PLC concealment frames generated */
     uint32_t grace_empty_polls;  /**< Empty RX polls inside grace window */
+    uint32_t hold_frames;        /**< Adaptive playout hold frames (queue refill) */
+    uint32_t catchup_frames;     /**< Adaptive playout catch-up discards */
     uint8_t jitter_buffer_depth; /**< Current jitter buffer depth */
     uint8_t rx_q_depth_min;      /**< Minimum observed RX queue depth */
     uint8_t rx_q_depth_avg;      /**< Average observed RX queue depth */
