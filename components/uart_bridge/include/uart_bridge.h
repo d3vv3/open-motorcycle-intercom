@@ -42,6 +42,7 @@ extern "C" {
 #define BRIDGE_PKT_MESH_EVENT 0x03
 #define BRIDGE_PKT_CONTROL    0x04
 #define BRIDGE_PKT_LOG        0x05
+#define BRIDGE_PKT_AUDIO_ACK  0x06
 
 /* Mesh events received from nRF52840 */
 typedef enum {

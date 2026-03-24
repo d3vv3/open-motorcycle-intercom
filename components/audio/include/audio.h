@@ -177,6 +177,10 @@ typedef struct {
     uint32_t decode_time_us_max; /**< Maximum decode time in microseconds */
     uint32_t latency_ms_avg;     /**< Average end-to-end latency in milliseconds */
     uint32_t latency_ms_max;     /**< Maximum end-to-end latency in milliseconds */
+    uint32_t tx_pipe_us_avg;     /**< Mic capture -> transport enqueue latency avg (us) */
+    uint32_t tx_pipe_us_max;     /**< Mic capture -> transport enqueue latency max (us) */
+    uint32_t rx_pipe_us_avg;     /**< RX packet enqueue -> speaker write latency avg (us) */
+    uint32_t rx_pipe_us_max;     /**< RX packet enqueue -> speaker write latency max (us) */
     uint32_t glitches_detected;  /**< Number of audio glitches detected */
     uint32_t rx_queue_underruns; /**< Mesh RX queue empty events */
     uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
@@ -281,6 +285,17 @@ audio_mode_t audio_get_mode(void);
  * @return ESP_OK on success
  */
 esp_err_t audio_get_stats(audio_stats_t *stats);
+
+/**
+ * @brief Record TX pipeline latency from capture to transport enqueue.
+ *
+ * Called by transport layer when an encoded frame has been successfully queued
+ * for transmission.
+ *
+ * @param latency_us Capture-to-transport latency in microseconds
+ * @return ESP_OK on success
+ */
+esp_err_t audio_record_tx_pipeline_latency_us(uint32_t latency_us);
 
 /* ============================================================================
  * Notification Sounds

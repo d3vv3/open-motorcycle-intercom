@@ -81,6 +81,8 @@ static SemaphoreHandle_t s_tx_mutex;
 static tx_entry_t s_audio_q[TX_AUDIO_QUEUE_SIZE];
 static volatile uint8_t s_audio_head = 0;
 static volatile uint8_t s_audio_tail = 0;
+static SemaphoreHandle_t s_audio_slots_free;
+static SemaphoreHandle_t s_audio_slots_used;
 
 /* Control slot: protected by s_tx_mutex (low-frequency path) */
 static tx_entry_t s_ctrl_pending;
@@ -98,6 +100,11 @@ static uint32_t s_bridge_rx_crc_fail = 0;
 static uint32_t s_bridge_rx_bad_sync = 0;
 static uint32_t s_bridge_rx_bad_len = 0;
 static uint32_t s_bridge_rx_trunc = 0;
+static uint8_t s_audio_tx_next_seq = 0;
+static uint8_t s_audio_tx_waiting_ack_seq = 0;
+static bool s_audio_tx_waiting_ack = false;
+static tx_entry_t s_audio_tx_inflight;
+static bool s_audio_tx_inflight_valid = false;
 
 static uint8_t audio_queue_depth(void)
 {
@@ -243,6 +250,16 @@ static void parse_rx(const uint8_t *buf, size_t len)
     const uint8_t *payload = &buf[4];
     uint16_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
 
+    if (pkt_type == BRIDGE_PKT_AUDIO_ACK && payload_len >= 1) {
+        uint8_t ack_seq = payload[0];
+        if (s_audio_tx_waiting_ack && ack_seq == s_audio_tx_waiting_ack_seq) {
+            s_audio_tx_waiting_ack = false;
+            s_audio_tx_inflight_valid = false;
+            xSemaphoreGive(s_audio_slots_free);
+        }
+        return;
+    }
+
     handle_rx_packet(pkt_type, payload, payload_len);
 }
 
@@ -254,14 +271,26 @@ static void parse_rx(const uint8_t *buf, size_t len)
  */
 static void prepare_tx_buf(void)
 {
-    /* Fast path: audio queue (lock-free SPSC) */
-    uint8_t h = s_audio_head;
-    __sync_synchronize();  /* Ensure we read entry data written before head was updated */
-    uint8_t t = s_audio_tail;
-    if (h != t) {
+    /* Fast path: audio queue (semaphore-backed SPSC) */
+    if (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) {
+        /* Stop-and-wait retransmit: keep sending inflight until ACK arrives. */
+        memcpy(s_tx_dma_buf, s_audio_tx_inflight.buf, BRIDGE_SPI_MAX_XFER);
+        return;
+    }
+
+    if (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
+        uint8_t t = s_audio_tail;
+        __sync_synchronize();  /* Ensure we read entry after producer writes */
         tx_entry_t *e = &s_audio_q[t];
         memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
         s_audio_tail = (uint8_t)((t + 1) % TX_AUDIO_QUEUE_SIZE);
+
+        /* Mark inflight for ACK-driven release of queue slot */
+        memcpy(s_audio_tx_inflight.buf, e->buf, BRIDGE_SPI_MAX_XFER);
+        s_audio_tx_inflight.len = e->len;
+        s_audio_tx_inflight_valid = true;
+        s_audio_tx_waiting_ack = true;
+        s_audio_tx_waiting_ack_seq = e->buf[2];
         return;
     }
 
@@ -348,6 +377,23 @@ esp_err_t uart_bridge_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    s_audio_slots_free = xSemaphoreCreateCounting(TX_AUDIO_QUEUE_SIZE - 1, TX_AUDIO_QUEUE_SIZE - 1);
+    s_audio_slots_used = xSemaphoreCreateCounting(TX_AUDIO_QUEUE_SIZE - 1, 0);
+    if (s_audio_slots_free == NULL || s_audio_slots_used == NULL) {
+        ESP_LOGE(TAG, "Failed to create audio queue semaphores");
+        if (s_audio_slots_free) {
+            vSemaphoreDelete(s_audio_slots_free);
+            s_audio_slots_free = NULL;
+        }
+        if (s_audio_slots_used) {
+            vSemaphoreDelete(s_audio_slots_used);
+            s_audio_slots_used = NULL;
+        }
+        vSemaphoreDelete(s_tx_mutex);
+        s_tx_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
     /* SPI slave bus configuration */
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = BRIDGE_SPI_MOSI_PIN,
@@ -390,6 +436,11 @@ esp_err_t uart_bridge_init(void)
     }
 
     s_initialized = true;
+    s_audio_head = 0;
+    s_audio_tail = 0;
+    s_audio_tx_next_seq = 0;
+    s_audio_tx_waiting_ack = false;
+    s_audio_tx_inflight_valid = false;
     ESP_LOGI(TAG, "SPI bridge initialized (MOSI=%d, MISO=%d, SCK=%d, CS=%d)", BRIDGE_SPI_MOSI_PIN,
              BRIDGE_SPI_MISO_PIN, BRIDGE_SPI_SCLK_PIN, BRIDGE_SPI_CS_PIN);
 
@@ -414,8 +465,19 @@ void uart_bridge_deinit(void)
         s_tx_mutex = NULL;
     }
 
+    if (s_audio_slots_free) {
+        vSemaphoreDelete(s_audio_slots_free);
+        s_audio_slots_free = NULL;
+    }
+    if (s_audio_slots_used) {
+        vSemaphoreDelete(s_audio_slots_used);
+        s_audio_slots_used = NULL;
+    }
+
     s_initialized = false;
     s_connected = false;
+    s_audio_tx_waiting_ack = false;
+    s_audio_tx_inflight_valid = false;
 
     ESP_LOGI(TAG, "SPI bridge deinitialized");
 }
@@ -468,22 +530,19 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /* Lock-free SPSC enqueue: only this thread writes s_audio_head */
+    if (xSemaphoreTake(s_audio_slots_free, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* SPSC enqueue: only this thread writes s_audio_head */
     uint8_t cur_head = s_audio_head;
     uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
-    if (next_head == s_audio_tail) {
-        /* Full: drop oldest to keep low latency.
-         * Advance tail (consumer side).  Safe here because if the consumer
-         * is mid-dequeue it will read the NEXT entry, not this one. */
-        s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
-        s_audio_tx_overwrite++;
-    }
 
     tx_entry_t *entry = &s_audio_q[cur_head];
     memset(entry->buf, 0, BRIDGE_SPI_MAX_XFER);
     entry->buf[0] = SYNC_BYTE;
     entry->buf[1] = (uint8_t)wire_len;
-    entry->buf[2] = s_bridge_tx_seq++;
+    entry->buf[2] = s_audio_tx_next_seq++;
     entry->buf[3] = BRIDGE_PKT_AUDIO;
     if (len > 0 && data != NULL) {
         memcpy(&entry->buf[4], data, len);
@@ -497,6 +556,7 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
      * a single core, but the consumer runs on a different core. */
     __sync_synchronize();
     s_audio_head = next_head;
+    xSemaphoreGive(s_audio_slots_used);
 
     s_audio_tx_queued++;
 
