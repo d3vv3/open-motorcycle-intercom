@@ -139,3 +139,4 @@ docs/.doctrees/
 # ============================================================================
 # Add project-specific ignores below
 benchmark_runs/
+schematics/omi/omi-backups
