@@ -43,8 +43,8 @@ static const char *TAG = "audio";
 /* Stage-1 voice cleanup (lightweight AEC + NS) */
 #define AUDIO_ENABLE_AEC_NS 1
 
-/* I2S DMA buffer configuration - reduced for lower latency */
-#define I2S_DMA_BUFFER_COUNT 6   /* A/B: extra headroom to reduce write stalls */
+/* I2S DMA buffer configuration - keep enough headroom without over-buffering output */
+#define I2S_DMA_BUFFER_COUNT 4
 #define I2S_DMA_BUFFER_SIZE  320 /* Samples per buffer (20ms @ 16kHz) */
 
 /* Debug isolation: allow longer speaker write wait before counting glitch */
@@ -648,8 +648,8 @@ static void audio_task(void *arg)
                     audio_jitter_trim_backlog(s_rx_queue, jitter, &s_stats, &rx_item);
 
                     /* ---- Adaptive playout: hold / normal / catch-up ---- */
-                    #define HOLD_BUDGET_MAX  3  /* Max accumulated holds (60ms) */
-                    #define CATCHUP_DEPTH    4  /* Burn off latency above this depth */
+                    #define HOLD_BUDGET_MAX  1  /* Allow one refill hold before forcing catch-up */
+                    #define CATCHUP_DEPTH    3  /* Burn off latency once queue grows beyond steady state */
 
                     if (jitter->playout_started && jitter->hold_next) {
                         /* Hold iteration: output PLC to let queue refill.

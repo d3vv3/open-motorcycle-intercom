@@ -101,12 +101,16 @@ static uint32_t s_bridge_rx_bad_sync = 0;
 static uint32_t s_bridge_rx_bad_len = 0;
 static uint32_t s_bridge_rx_trunc = 0;
 static uint8_t s_audio_tx_waiting_ack_seq = 0;
-static bool s_audio_tx_waiting_ack = false;
+static volatile bool s_audio_tx_waiting_ack = false;
 static tx_entry_t s_audio_tx_inflight;
-static bool s_audio_tx_inflight_valid = false;
+static volatile bool s_audio_tx_inflight_valid = false;
 static volatile uint32_t s_ack_irq_count = 0;
 static volatile uint32_t s_ack_release_count = 0;
 static volatile uint32_t s_ack_spurious_count = 0;
+static int64_t s_ack_wait_start_us = 0;          /* Timestamp when waiting_ack was set */
+static volatile uint32_t s_ack_timeout_count = 0; /* Forced releases due to timeout */
+static volatile uint32_t s_ack_repair_count = 0;  /* Semaphore self-repairs */
+#define ACK_TIMEOUT_US  50000  /* 50 ms — force-release if ACK not received */
 
 static void IRAM_ATTR ack_gpio_isr_handler(void *arg)
 {
@@ -284,6 +288,22 @@ static void parse_rx(const uint8_t *buf, size_t len)
  */
 static void prepare_tx_buf(void)
 {
+    /* ---- ACK timeout recovery ----
+     * If the nRF ACK pulse was missed (noise, reboot, glitch), force-release
+     * the inflight frame so the pipeline doesn't deadlock permanently. */
+    if (s_audio_tx_waiting_ack) {
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - s_ack_wait_start_us) > ACK_TIMEOUT_US) {
+            /* Force-release: give back the slot, clear inflight */
+            portDISABLE_INTERRUPTS();
+            s_audio_tx_waiting_ack = false;
+            s_audio_tx_inflight_valid = false;
+            portENABLE_INTERRUPTS();
+            xSemaphoreGive(s_audio_slots_free);
+            s_ack_timeout_count++;
+        }
+    }
+
     /* Fast path: audio queue with GPIO ACK-driven stop-and-wait. */
     if (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) {
         memcpy(s_tx_dma_buf, s_audio_tx_inflight.buf, BRIDGE_SPI_MAX_XFER);
@@ -299,9 +319,16 @@ static void prepare_tx_buf(void)
 
         memcpy(s_audio_tx_inflight.buf, e->buf, BRIDGE_SPI_MAX_XFER);
         s_audio_tx_inflight.len = e->len;
+
+        /* Critical section: set inflight + waiting_ack atomically so the
+         * ISR cannot see a half-updated state and count a valid ACK as
+         * spurious (which would leak a semaphore slot permanently). */
+        portDISABLE_INTERRUPTS();
         s_audio_tx_inflight_valid = true;
         s_audio_tx_waiting_ack = true;
+        portENABLE_INTERRUPTS();
         s_audio_tx_waiting_ack_seq = e->buf[2];
+        s_ack_wait_start_us = esp_timer_get_time();
         return;
     }
 
@@ -630,13 +657,34 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     static int64_t last_log = 0;
     int64_t now = esp_timer_get_time();
     if (now - last_log > 5000000) { /* Every 5s */
+        /* ---- Semaphore self-repair audit ----
+         * The counting semaphore pair (free + used) must always sum to
+         * TX_AUDIO_QUEUE_SIZE - 1.  If a race or missed ACK leaked a
+         * slot, detect it here and inject the missing tokens. */
+        UBaseType_t sem_free = uxSemaphoreGetCount(s_audio_slots_free);
+        UBaseType_t sem_used = uxSemaphoreGetCount(s_audio_slots_used);
+        UBaseType_t expected_total = TX_AUDIO_QUEUE_SIZE - 1;
+        int inflight = (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) ? 1 : 0;
+        UBaseType_t actual_total = sem_free + sem_used + inflight;
+        if (actual_total < expected_total) {
+            UBaseType_t deficit = expected_total - actual_total;
+            for (UBaseType_t i = 0; i < deficit; i++) {
+                xSemaphoreGive(s_audio_slots_free);
+            }
+            s_ack_repair_count += deficit;
+            ESP_LOGW(TAG, "Semaphore repair: injected %u free slots (was free=%u used=%u inflight=%d)",
+                     (unsigned)deficit, (unsigned)sem_free, (unsigned)sem_used, inflight);
+        }
+
         ESP_LOGI(TAG,
-                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu ack_spur=%lu waiting=%d",
+                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu ack_spur=%lu ack_to=%lu ack_fix=%lu waiting=%d",
                  s_audio_tx_queued, s_audio_tx_overwrite, s_audio_rx_count,
                  audio_queue_depth(), s_ctrl_pending_valid ? 1 : 0,
                  s_bridge_rx_bad_sync, s_bridge_rx_bad_len, s_bridge_rx_trunc,
                  s_bridge_rx_crc_fail, s_bridge_rx_seq_gaps, s_ack_irq_count,
-                 s_ack_release_count, s_ack_spurious_count, s_audio_tx_waiting_ack ? 1 : 0);
+                 s_ack_release_count, s_ack_spurious_count,
+                 s_ack_timeout_count, s_ack_repair_count,
+                 s_audio_tx_waiting_ack ? 1 : 0);
         last_log = now;
     }
 

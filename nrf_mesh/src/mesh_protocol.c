@@ -40,7 +40,7 @@ static void mesh_log(const char *fmt, ...)
  * Constants
  * ============================================================================ */
 
-#define SCAN_TIMEOUT_MS    2000
+#define SCAN_TIMEOUT_MS    3000
 #define JOIN_TIMEOUT_MS    5000
 #define JOIN_RETRY_MS      500
 #define JOIN_RETRY_COUNT   10
@@ -137,7 +137,7 @@ static uint32_t s_e2e_spi_out_frames = 0;
  * This is prefill + hysteresis.
  */
 #define QUEUE_LO          2    /* Resume skip when queue drops below this */
-#define QUEUE_HI          4    /* Resume send when queue reaches this */
+#define QUEUE_HI          3    /* Resume send when queue reaches this */
 
 static bool     s_skip_mode = true;     /* Start in skip (prefill) mode */
 static uint32_t s_skip_count = 0;       /* Frames skipped for logging */
