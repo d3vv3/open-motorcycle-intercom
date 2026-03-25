@@ -16,8 +16,11 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
+#include "esp_event.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 
 #include "audio.h"
 #include "button.h"
@@ -95,6 +98,41 @@ static esp_err_t init_nvs(void)
         ret = nvs_flash_init();
     }
     return ret;
+}
+
+static void disable_esp_radios_for_nrf_transport(void)
+{
+#if CONFIG_ESP_WIFI_ENABLED
+    esp_err_t ret = esp_wifi_stop();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT && ret != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "WiFi stop failed during nRF handoff: %s", esp_err_to_name(ret));
+    }
+
+    ret = esp_wifi_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGW(TAG, "WiFi deinit failed during nRF handoff: %s", esp_err_to_name(ret));
+    }
+
+    ret = esp_event_loop_delete_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Event loop delete failed during nRF handoff: %s", esp_err_to_name(ret));
+    }
+
+    ret = esp_netif_deinit();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Netif deinit failed during nRF handoff: %s", esp_err_to_name(ret));
+    }
+
+    ESP_LOGI(TAG, "ESP WiFi/ESP-NOW disabled for nRF transport");
+#else
+    ESP_LOGI(TAG, "ESP WiFi disabled in build config");
+#endif
+
+#if CONFIG_BT_ENABLED
+    ESP_LOGW(TAG, "Bluetooth support is enabled in this build; no runtime BT stack is started");
+#else
+    ESP_LOGI(TAG, "ESP Bluetooth disabled in build config");
+#endif
 }
 
 /* ============================================================================
@@ -544,6 +582,7 @@ void app_main(void)
         s_mesh_user_enabled = false;
         s_mesh_active = false;
         (void)uart_bridge_mesh_disable();
+        disable_esp_radios_for_nrf_transport();
     } else {
         /* No nRF52840 - fallback to ESP-NOW */
         s_active_transport = TRANSPORT_ESP_NOW;

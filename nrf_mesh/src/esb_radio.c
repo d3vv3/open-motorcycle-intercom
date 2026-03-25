@@ -20,7 +20,8 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 #define TX_DONE_TIMEOUT_MS  10 /* Max wait for TX completion */
 
 /* RF robustness tuning */
-#define OMI_ESB_BITRATE ESB_BITRATE_1MBPS
+#define OMI_ESB_BITRATE      ESB_BITRATE_1MBPS
+#define OMI_ESB_TX_POWER_DBM 8
 
 /* Broadcast address for mesh discovery */
 static const uint8_t broadcast_addr[ESB_ADDR_LEN] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7};
@@ -119,7 +120,7 @@ int esb_radio_init(uint8_t channel)
     config.event_handler = on_esb_event;
     config.bitrate = OMI_ESB_BITRATE;
     config.crc = ESB_CRC_16BIT;
-    config.tx_output_power = ESB_TX_POWER_4DBM;
+    config.tx_output_power = OMI_ESB_TX_POWER_DBM;
     config.retransmit_delay = 600;
     config.retransmit_count = 3;
     config.tx_mode = ESB_TXMODE_AUTO;
