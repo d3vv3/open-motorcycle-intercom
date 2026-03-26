@@ -275,8 +275,11 @@ static void clear_speaker_grants(void)
 
 static bool relay_permitted_for_source(uint8_t src_id, uint8_t flags)
 {
+    /* Only relay audio that carries a speaker grant.  Ungrated audio is
+     * restricted to 1-hop — this prevents un-authorised flooding and
+     * ensures the coordinator controls relay bandwidth. */
     if ((flags & MESH_FLAG_SPEAKER_GRANTED) == 0) {
-        return true;
+        return false;
     }
 
     uint8_t self_bit = node_bit(s_node_id);
@@ -301,6 +304,12 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
 
 static uint8_t compute_relay_mask(uint8_t speaker_id)
 {
+    /* Relay permission mask: nodes that heard the speaker are permitted to relay
+     * its audio (they have the data).  Nodes that did NOT hear the speaker are
+     * the intended *recipients* of relays, not relayers.
+     *
+     * Fallback: if no peer reported hearing the speaker yet (bitmap cold-start),
+     * permit all peers to relay so the first frames still propagate. */
     uint8_t speaker_bit = node_bit(speaker_id);
     uint8_t mask = 0;
 
@@ -413,6 +422,7 @@ static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, 
     hdr->ttl = ttl;
     hdr->flags = flags;
 
+    __DMB();  /* Ensure data is written before head becomes visible to consumer */
     s_relay_head = next_head;
     return true;
 }
@@ -1190,6 +1200,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         }
 
     } else if (!relay_queue_empty()) {
+        __DMB();  /* Ensure we see data written by producer before reading entry */
         struct relay_entry *entry = &s_relay_ring[s_relay_tail];
         const mesh_header_t *relay_hdr = (const mesh_header_t *)entry->data;
         int ret = esb_radio_send(entry->data, entry->len);
@@ -1343,6 +1354,10 @@ void mesh_protocol_stop(void)
     s_seen_head = 0;
     s_relay_head = 0;
     s_relay_tail = 0;
+    s_tx_head = 0;
+    s_tx_tail = 0;
+    s_skip_mode = true;
+    s_skip_count = 0;
 
     s_state = MESH_STATE_IDLE;
     s_role = MESH_ROLE_NONE;

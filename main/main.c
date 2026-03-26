@@ -86,6 +86,16 @@ static inline int64_t get_time_ms(void)
     return esp_timer_get_time() / 1000;
 }
 
+static uint8_t get_bridge_node_id(void)
+{
+    uart_bridge_status_t status;
+    if (uart_bridge_get_status(&status) == ESP_OK) {
+        return status.node_id;
+    }
+
+    return 0;
+}
+
 /**
  * @brief Initialize NVS (required for persistent storage)
  */
@@ -266,8 +276,13 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
                                   int64_t timestamp_us)
 {
     audio_frame_t frame;
+    uint8_t local_node_id = get_bridge_node_id();
 
     if (len < 4) {
+        return;
+    }
+
+    if (local_node_id != 0 && src_id == local_node_id) {
         return;
     }
 

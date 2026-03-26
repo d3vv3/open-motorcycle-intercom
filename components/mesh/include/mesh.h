@@ -200,7 +200,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t frame_counter; /**< Current TDMA frame number */
     int16_t drift_ppm;      /**< Estimated clock drift */
-    uint8_t coordinator_addr[5]; /**< Coordinator address for tiebreaking */
+    uint8_t coordinator_addr[6]; /**< Coordinator MAC address for tiebreaking */
 } mesh_sync_payload_t;
 
 /**

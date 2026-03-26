@@ -308,6 +308,12 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
 
 static uint8_t compute_relay_mask(uint8_t speaker_id)
 {
+    /* Relay permission mask: nodes that heard the speaker are permitted to relay
+     * its audio (they have the data).  Nodes that did NOT hear the speaker are
+     * the intended *recipients* of relays, not relayers.
+     *
+     * Fallback: if no peer reported hearing the speaker yet (bitmap cold-start),
+     * permit all peers to relay so the first frames still propagate. */
     uint8_t speaker_mask = node_bit(speaker_id);
     uint8_t mask = 0;
 
@@ -1262,10 +1268,10 @@ static void handle_audio_packet(const mesh_rx_item_t *rx)
     jitter_buffer_insert(audio->data, opus_len, rx->header.src_id, rx->header.seq);
 
     if (rx->header.ttl > 0 && (rx->header.flags & MESH_FLAG_RELAY_REQUEST) != 0) {
-        bool relay_allowed = true;
+        bool relay_allowed = false;  /* Ungrated audio is not relayed (1-hop only) */
 
         if ((rx->header.flags & MESH_FLAG_SPEAKER_GRANTED) != 0) {
-            relay_allowed = false;
+            /* Granted audio: check if we are in the relay mask for this speaker */
             for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
                 if (s_active_speaker_ids[i] == rx->header.src_id &&
                     (s_relay_masks[i] & node_bit(s_node_id)) != 0) {
@@ -1838,6 +1844,10 @@ static void check_peer_timeouts(void)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
 
+    /* Collect timed-out peers while holding the mutex, then release before
+     * calling blocking functions (audio_play_notification, callbacks). */
+    mesh_peer_info_t timed_out[MESH_MAX_NODES];
+    int timed_out_count = 0;
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
 
     for (int i = 0; i < MESH_MAX_NODES; i++) {
@@ -1853,11 +1863,12 @@ static void check_peer_timeouts(void)
                 ESP_LOGW(TAG, "Node %d timeout (last seen %lld ms ago)", s_peers[i].info.node_id,
                          age);
 
-                mesh_peer_info_t peer_info = s_peers[i].info;
-                uint8_t timed_out_id = peer_info.node_id;
+                timed_out[timed_out_count] = s_peers[i].info;
+                uint8_t timed_out_id = s_peers[i].info.node_id;
                 s_peers[i].info.active = false;
                 s_peer_count--;
                 s_stats.node_timeouts++;
+                timed_out_count++;
 
                 for (int speaker = 0; speaker < MESH_MAX_ACTIVE_SPEAKERS; speaker++) {
                     if (s_active_speaker_ids[speaker] == timed_out_id) {
@@ -1870,13 +1881,6 @@ static void check_peer_timeouts(void)
                     }
                 }
 
-                /* Play leave notification */
-                audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
-
-                if (s_peer_cb) {
-                    s_peer_cb(&peer_info, false);
-                }
-
                 if (s_role == MESH_ROLE_COORDINATOR) {
                     update_speaker_grants();
                     send_slot_map();
@@ -1884,10 +1888,8 @@ static void check_peer_timeouts(void)
 
                 /* If coordinator timed out, go back to scanning to discover new mesh state.
                  * This ensures proper re-election of coordinator based on MAC addresses. */
-                if (peer_info.node_id == s_coordinator_id && s_role == MESH_ROLE_PARTICIPANT) {
+                if (timed_out_id == s_coordinator_id && s_role == MESH_ROLE_PARTICIPANT) {
                     ESP_LOGI(TAG, "Coordinator lost, returning to SCANNING");
-                    xSemaphoreGive(s_peer_mutex); /* Release before state change */
-
                     /* Clear RX queue to prevent overflow */
                     mesh_rx_item_t rx;
                     int cleared = 0;
@@ -1902,6 +1904,16 @@ static void check_peer_timeouts(void)
                     s_role = MESH_ROLE_PARTICIPANT;
                     s_node_id = 0;
                     s_coordinator_id = 0;
+                    xSemaphoreGive(s_peer_mutex);
+
+                    /* Fire deferred notifications outside mutex */
+                    for (int t = 0; t < timed_out_count; t++) {
+                        audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
+                        if (s_peer_cb) {
+                            s_peer_cb(&timed_out[t], false);
+                        }
+                    }
+
                     set_state(MESH_STATE_SCANNING);
                     return; /* Exit early since we released the mutex */
                 }
@@ -1910,6 +1922,14 @@ static void check_peer_timeouts(void)
     }
 
     xSemaphoreGive(s_peer_mutex);
+
+    /* Fire deferred notifications outside mutex */
+    for (int t = 0; t < timed_out_count; t++) {
+        audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
+        if (s_peer_cb) {
+            s_peer_cb(&timed_out[t], false);
+        }
+    }
 }
 
 static void jitter_buffer_insert(const uint8_t *data, uint16_t len, uint8_t src_id, uint8_t seq)
