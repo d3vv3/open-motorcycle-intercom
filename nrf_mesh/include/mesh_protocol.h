@@ -22,6 +22,14 @@
 #define MESH_KEEPALIVE_INTERVAL_MS 500
 #define MESH_PROTOCOL_VERSION      0x01
 #define MESH_MAX_AUDIO_PAYLOAD     64
+#define MESH_MAX_ACTIVE_SPEAKERS   2
+#define MESH_AUDIO_TTL_DEFAULT     2
+
+#define MESH_FLAG_RELAY_REQUEST    0x01
+#define MESH_FLAG_RELAYED          0x02
+#define MESH_FLAG_SPEAKER_GRANTED  0x04
+
+#define MESH_AUDIO_FLAG_ACTIVE     0x01
 
 /* ============================================================================
  * Packet Types
@@ -36,6 +44,8 @@ typedef enum {
     MESH_PKT_SLOT_MAP = 0x06,
     MESH_PKT_STATUS = 0x07,
     MESH_PKT_KEEPALIVE = 0x08,
+    MESH_PKT_SPEAKER_GRANT = 0x09,
+    MESH_PKT_SPEAKER_RELEASE = 0x0A,
 } mesh_pkt_type_t;
 
 /* ============================================================================
@@ -47,7 +57,7 @@ typedef struct __attribute__((packed)) {
     uint8_t type;         /* Packet type */
     uint8_t src_id;       /* Source node ID */
     uint8_t seq;          /* Sequence number */
-    uint8_t reserved0;    /* Reserved for future use */
+    uint8_t ttl;          /* Relay time-to-live */
     uint8_t flags;        /* Control flags */
     uint16_t payload_len; /* Payload length */
 } mesh_header_t;
@@ -60,7 +70,7 @@ typedef struct __attribute__((packed)) {
     uint8_t codec;
     uint8_t frame_ms;
     uint8_t stream_id;
-    uint8_t reserved;
+    uint8_t audio_flags;
     uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
 } mesh_audio_payload_t;
 
@@ -89,6 +99,9 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t slot_count;
     uint8_t slot_ids[MESH_MAX_NODES];
+    uint8_t active_speaker_count;
+    uint8_t active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS];
+    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS];
 } mesh_slot_map_payload_t;
 
 typedef struct __attribute__((packed)) {
@@ -97,8 +110,21 @@ typedef struct __attribute__((packed)) {
     uint8_t peer_count;
     uint8_t fw_version;
     int8_t temperature_c;
-    uint8_t reserved;
+    uint8_t heard_bitmap;
+    uint8_t relay_bitmap;
+    uint8_t active_speakers;
 } mesh_status_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t speaker_count;
+    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS];
+    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS];
+} mesh_speaker_grant_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t speaker_count;
+    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS];
+} mesh_speaker_release_payload_t;
 
 /* ============================================================================
  * Node State
@@ -131,6 +157,8 @@ typedef struct {
     uint8_t peer_count;
     uint8_t fw_version;
     int8_t temperature_c;
+    uint8_t heard_bitmap;
+    uint8_t relay_bitmap;
     bool active;
 } mesh_peer_info_t;
 
@@ -140,7 +168,7 @@ typedef struct {
  * @param len Payload length
  * @return 0 on success
  */
-int mesh_protocol_send_audio(const uint8_t *data, uint8_t len);
+int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags);
 
 /**
  * @brief Initialize mesh protocol

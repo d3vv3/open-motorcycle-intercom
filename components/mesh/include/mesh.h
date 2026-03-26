@@ -13,7 +13,7 @@
  * - ESP-NOW transport
  * - TDMA scheduling
  * - Slot management
- * - Single-hop packet transport (no relaying)
+ * - TDMA packet transport with bounded relay flooding
  * - Time synchronization
  */
 
@@ -98,6 +98,22 @@ extern "C" {
  */
 #define MESH_MAX_AUDIO_PAYLOAD 64
 
+/**
+ * @brief Maximum number of simultaneous speakers granted for relay
+ */
+#define MESH_MAX_ACTIVE_SPEAKERS 2
+
+/**
+ * @brief Default relay TTL for granted audio and control updates
+ */
+#define MESH_AUDIO_TTL_DEFAULT 2
+
+#define MESH_FLAG_RELAY_REQUEST   0x01
+#define MESH_FLAG_RELAYED         0x02
+#define MESH_FLAG_SPEAKER_GRANTED 0x04
+
+#define MESH_AUDIO_FLAG_ACTIVE    0x01
+
 /* ============================================================================
  * Type Definitions
  * ============================================================================ */
@@ -133,6 +149,8 @@ typedef enum {
     MESH_PKT_SLOT_MAP = 0x06,  /**< Slot assignment broadcast */
     MESH_PKT_STATUS = 0x07,    /**< Battery / health */
     MESH_PKT_KEEPALIVE = 0x08, /**< Presence check */
+    MESH_PKT_SPEAKER_GRANT = 0x09,   /**< Relay grant broadcast */
+    MESH_PKT_SPEAKER_RELEASE = 0x0A, /**< Relay grant release */
 } mesh_pkt_type_t;
 
 /**
@@ -143,7 +161,7 @@ typedef struct __attribute__((packed)) {
     uint8_t type;         /**< Packet type (mesh_pkt_type_t) */
     uint8_t src_id;       /**< Source node ID (0 = unassigned) */
     uint8_t seq;          /**< Sequence number */
-    uint8_t reserved0;    /**< Reserved for future use */
+    uint8_t ttl;          /**< Relay time-to-live */
     uint8_t flags;        /**< Control flags */
     uint16_t payload_len; /**< Payload length in bytes */
 } mesh_header_t;
@@ -155,7 +173,7 @@ typedef struct __attribute__((packed)) {
     uint8_t codec;     /**< Codec ID (0x01 = Opus) */
     uint8_t frame_ms;  /**< Frame duration (20) */
     uint8_t stream_id; /**< Stream identifier */
-    uint8_t reserved;
+    uint8_t audio_flags; /**< Audio activity flags */
     uint8_t data[MESH_MAX_AUDIO_PAYLOAD]; /**< Opus encoded data */
 } mesh_audio_payload_t;
 
@@ -182,6 +200,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t frame_counter; /**< Current TDMA frame number */
     int16_t drift_ppm;      /**< Estimated clock drift */
+    uint8_t coordinator_addr[5]; /**< Coordinator address for tiebreaking */
 } mesh_sync_payload_t;
 
 /**
@@ -198,6 +217,9 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t slot_count;               /**< Number of active slots */
     uint8_t slot_ids[MESH_MAX_NODES]; /**< Node ID for each slot (0 = empty) */
+    uint8_t active_speaker_count;     /**< Number of granted speakers */
+    uint8_t active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /**< Granted speaker IDs */
+    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS]; /**< Relay bitmap per speaker */
 } mesh_slot_map_payload_t;
 
 /**
@@ -209,8 +231,21 @@ typedef struct __attribute__((packed)) {
     uint8_t peer_count;   /**< Number of active peers */
     uint8_t fw_version;   /**< Firmware version byte */
     int8_t temperature_c; /**< Temperature in Celsius (127=unknown) */
-    uint8_t reserved;
+    uint8_t heard_bitmap; /**< Bitmap of source IDs heard recently */
+    uint8_t relay_bitmap; /**< Bitmap of source IDs relayed recently */
+    uint8_t active_speakers; /**< Count of active/granted speakers */
 } mesh_status_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t speaker_count; /**< Number of granted speakers */
+    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /**< Granted speaker IDs */
+    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS]; /**< Relay bitmap per speaker */
+} mesh_speaker_grant_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t speaker_count; /**< Number of released speakers */
+    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /**< Released speaker IDs */
+} mesh_speaker_release_payload_t;
 
 /**
  * @brief Mesh configuration
@@ -244,6 +279,8 @@ typedef struct {
     uint8_t peer_count;   /**< Last reported peer count */
     uint8_t fw_version;   /**< Last reported firmware version */
     int8_t temperature_c; /**< Last reported temperature */
+    uint8_t heard_bitmap; /**< Last reported heard-source bitmap */
+    uint8_t relay_bitmap; /**< Last reported relay-source bitmap */
     bool active;          /**< Node is active in mesh */
 } mesh_peer_info_t;
 
@@ -410,7 +447,7 @@ esp_err_t mesh_get_peer_info(uint8_t node_id, mesh_peer_info_t *info);
  * @param len Data length (typically 20-40 bytes)
  * @return ESP_OK on success, ESP_ERR_NO_MEM if queue full
  */
-esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len);
+esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags);
 
 /**
  * @brief Register callback for received audio frames

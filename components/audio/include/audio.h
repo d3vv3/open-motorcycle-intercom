@@ -113,9 +113,11 @@ typedef enum {
  *
  * @param data Opus-encoded audio data
  * @param len Length of encoded data (typically 20-40 bytes)
+ * @param active true when VOX marks the frame as active speech
  * @param timestamp_us Capture timestamp in microseconds
  */
-typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, int64_t timestamp_us);
+typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active,
+                              int64_t timestamp_us);
 
 /**
  * @brief Audio configuration parameters
@@ -125,7 +127,7 @@ typedef struct {
     uint8_t channels;              /**< Number of channels (default: 1) */
     uint8_t bits_per_sample;       /**< Bits per sample (default: 16) */
     uint16_t frame_size_ms;        /**< Frame size in ms (default: 20) */
-    uint32_t opus_bitrate;         /**< Opus bitrate in bps (default: 16000) */
+    uint32_t opus_bitrate;         /**< Opus bitrate in bps (default: 12000) */
     audio_i2s_pins_t i2s_pins;     /**< I2S GPIO pin configuration */
     audio_adc_config_t adc_config; /**< ADC configuration for mic input */
     audio_vox_config_t vox_config; /**< VOX detection configuration */
@@ -144,7 +146,7 @@ typedef struct {
         .channels = 1,              \
         .bits_per_sample = 16,      \
         .frame_size_ms = 20,        \
-        .opus_bitrate = 16000,      \
+        .opus_bitrate = 12000,      \
         .i2s_pins = AUDIO_I2S_PINS_DEFAULT(), \
         .adc_config = AUDIO_ADC_CONFIG_DEFAULT(), \
         .vox_config = AUDIO_VOX_CONFIG_DEFAULT(), \

@@ -121,7 +121,9 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
             LOG_INF("Audio: %u pkts received (last len=%d)", audio_pkt_count, len);
             last_log = now;
         }
-        mesh_protocol_send_audio(payload, len);
+        if (len >= 1) {
+            mesh_protocol_send_audio(payload + 1, (uint8_t)(len - 1), payload[0]);
+        }
         break;
     }
 

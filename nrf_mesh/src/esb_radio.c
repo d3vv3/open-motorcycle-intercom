@@ -20,7 +20,15 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 #define TX_DONE_TIMEOUT_MS  10 /* Max wait for TX completion */
 
 /* RF robustness tuning */
-#define OMI_ESB_BITRATE      ESB_BITRATE_1MBPS
+#ifndef ESB_BITRATE_250KBPS
+#if defined(RADIO_MODE_MODE_Nrf_250Kbit)
+#define ESB_BITRATE_250KBPS ((enum esb_bitrate)RADIO_MODE_MODE_Nrf_250Kbit)
+#else
+#define ESB_BITRATE_250KBPS ESB_BITRATE_1MBPS
+#endif
+#endif
+
+#define OMI_ESB_BITRATE      ESB_BITRATE_250KBPS
 #define OMI_ESB_TX_POWER_DBM 8
 
 /* Broadcast address for mesh discovery */
@@ -121,7 +129,7 @@ int esb_radio_init(uint8_t channel)
     config.bitrate = OMI_ESB_BITRATE;
     config.crc = ESB_CRC_16BIT;
     config.tx_output_power = OMI_ESB_TX_POWER_DBM;
-    config.retransmit_delay = 600;
+    config.retransmit_delay = 1500; /* Longer for 250 kbps airtime */
     config.retransmit_count = 3;
     config.tx_mode = ESB_TXMODE_AUTO;
     config.payload_length = ESB_MAX_PAYLOAD_LEN;
@@ -156,7 +164,7 @@ int esb_radio_init(uint8_t channel)
     }
 
     s_initialized = true;
-    LOG_INF("ESB radio initialized (bitrate=1Mbps)");
+    LOG_INF("ESB radio initialized (bitrate=250kbps)");
 
     return 0;
 }

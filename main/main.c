@@ -172,12 +172,13 @@ static esp_err_t init_audio_with_test_flags(void)
 /**
  * @brief Callback from audio subsystem when encoded frame is ready
  */
-static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timestamp_us)
+static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us)
 {
     switch (s_active_transport) {
     case TRANSPORT_ESP_NOW:
         if (mesh_get_state() == MESH_STATE_ACTIVE) {
-            esp_err_t ret = mesh_send_audio(data, len);
+            uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
+            esp_err_t ret = mesh_send_audio(data, len, audio_flags);
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Failed to queue audio for TX: %s", esp_err_to_name(ret));
             }
@@ -187,18 +188,20 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, int64_t timesta
     case TRANSPORT_NRF52840:
         if (s_mesh_active && uart_bridge_is_connected()) {
             uint8_t tx_buf[130];
-            if (len > (sizeof(tx_buf) - 2)) {
+            uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
+            if (len > (sizeof(tx_buf) - 3)) {
                 ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
                 break;
             }
 
-            /* Prepare E2E header with tentative seq — only commit on success */
+            /* Bridge payload format: [audio_flags][e2e_seq_hi][e2e_seq_lo][opus...] */
             uint16_t seq = s_e2e_tx_seq;
-            tx_buf[0] = (uint8_t)(seq >> 8);
-            tx_buf[1] = (uint8_t)(seq & 0xFF);
-            memcpy(&tx_buf[2], data, len);
+            tx_buf[0] = audio_flags;
+            tx_buf[1] = (uint8_t)(seq >> 8);
+            tx_buf[2] = (uint8_t)(seq & 0xFF);
+            memcpy(&tx_buf[3], data, len);
 
-            esp_err_t ret = uart_bridge_send_audio(tx_buf, (uint16_t)(len + 2));
+            esp_err_t ret = uart_bridge_send_audio(tx_buf, (uint16_t)(len + 3));
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
             } else {
@@ -264,15 +267,18 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 {
     audio_frame_t frame;
 
-    if (rtt_probe_handle_packet(src_id, data, len)) {
+    if (len < 4) {
         return;
     }
 
-    if (len < 3) {
+    const uint8_t *payload = data + 1;
+    uint16_t payload_len = (uint16_t)(len - 1);
+
+    if (rtt_probe_handle_packet(src_id, payload, payload_len)) {
         return;
     }
 
-    uint16_t e2e_seq = ((uint16_t)data[0] << 8) | data[1];
+    uint16_t e2e_seq = ((uint16_t)payload[0] << 8) | payload[1];
     e2e_rx_seq_state_t *seq_state = &s_e2e_rx_seq_state[src_id];
     if (!seq_state->initialized) {
         seq_state->initialized = true;
@@ -292,13 +298,13 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     seq_state->last_seq = e2e_seq;
     s_e2e_rx_frames++;
 
-    uint16_t opus_len = (uint16_t)(len - 2);
+    uint16_t opus_len = (uint16_t)(payload_len - 2);
     if (opus_len > sizeof(frame.data)) {
         ESP_LOGW(TAG, "Audio frame too large: %u bytes", opus_len);
         return;
     }
 
-    memcpy(frame.data, data + 2, opus_len);
+    memcpy(frame.data, payload + 2, opus_len);
     frame.len = opus_len;
     frame.timestamp_ms = timestamp_us / 1000;
 

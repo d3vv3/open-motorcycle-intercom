@@ -37,7 +37,8 @@ static int64_t s_last_probe_ms = 0;
 static void send_probe(void)
 {
     uint8_t id = ++s_probe_id;
-    uint8_t pkt[RTT_PKT_LEN] = {
+    uint8_t pkt[RTT_PKT_LEN + 1] = {
+        0,
         ++s_diag_tx_seq,
         RTT_MAGIC0,
         RTT_MAGIC1,
@@ -112,7 +113,8 @@ bool rtt_probe_handle_packet(uint8_t src_id, const uint8_t *data, uint16_t len)
     uint8_t id = data[6];
 
     if (type == RTT_TYPE_REQ) {
-        uint8_t rsp[RTT_PKT_LEN] = {
+        uint8_t rsp[RTT_PKT_LEN + 1] = {
+            0,
             ++s_diag_tx_seq,
             RTT_MAGIC0,
             RTT_MAGIC1,

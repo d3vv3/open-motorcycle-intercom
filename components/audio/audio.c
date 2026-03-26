@@ -88,7 +88,6 @@ static audio_config_t s_config = AUDIO_CONFIG_DEFAULT();
 static audio_stats_t s_stats = {0};
 
 /* I2S channel handles */
-static i2s_chan_handle_t s_rx_chan = NULL;
 static i2s_chan_handle_t s_tx_chan = NULL;
 
 /* ADC handle */
@@ -466,12 +465,6 @@ static void audio_task(void *arg)
 
     ESP_LOGI(TAG, "Audio pipeline active");
 
-    /* Frame pacing: maintain fixed 50Hz cadence (20ms per frame)
-     * This prevents bursts when encode time varies,  ensuring steady
-     * packet delivery to the mesh network. */
-    int64_t next_frame_time_us = esp_timer_get_time();
-    const int64_t frame_period_us = 20000; /* 20ms = 50 Hz */
-
     audio_jitter_state_t *jitter = &s_jitter_state;
 
     while (s_running) {
@@ -579,7 +572,7 @@ static void audio_task(void *arg)
 
                     /* Mesh mode: Send to TX callback instead of loopback */
                     if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
-                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, frame_start_us);
+                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, true, frame_start_us);
                     }
                 } else {
                     ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(opus_bytes));
@@ -603,7 +596,7 @@ static void audio_task(void *arg)
                         s_stats.encode_time_us_max = encode_time;
                     }
                     if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
-                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, frame_start_us);
+                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, false, frame_start_us);
                     }
                 }
             }
@@ -718,8 +711,10 @@ static void audio_task(void *arg)
                                     /* Decode the discard frame to keep Opus state correct,
                                      * but throw away the output. */
                                     int16_t discard_pcm[AUDIO_FRAME_SAMPLES];
-                                    (void)opus_decode(s_opus_decoder, discard.data, discard.len,
-                                                discard_pcm, AUDIO_FRAME_SAMPLES, 0);
+                                    if (opus_decode(s_opus_decoder, discard.data, discard.len,
+                                                    discard_pcm, AUDIO_FRAME_SAMPLES, 0) < 0) {
+                                        ESP_LOGW(TAG, "Discard-frame Opus decode failed");
+                                    }
                                     jitter->hold_budget--;
                                     s_stats.catchup_frames++;
                                 }
