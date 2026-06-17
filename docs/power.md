@@ -8,17 +8,17 @@ Power is a **first-class design constraint**. Any feature that breaks the power 
 
 ---
 
-## 1. Power Targets
+## Power Targets
 
 ### Usage Targets
 
-- **Active riding:** 8–16 hours
+- **Active riding:** 8-16 hours
 - **Standby (powered on, idle):** multiple days
 - **Deep sleep:** weeks
 
 ### Power Budget Summary
 
-| Mode | Target | Phase 3 Measured (ESP32-S3) |
+| Mode | Target | Measured (ESP32-S3) |
 |----|---------------------|-----------------------------|
 | Active voice | ≤150 mW | ~190 mW (57mA @ 3.3V) |
 | Mesh idle | ≤40 mW | ~190 mW (57mA @ 3.3V) |
@@ -26,13 +26,13 @@ Power is a **first-class design constraint**. Any feature that breaks the power 
 | Deep sleep | <10 µA | TBD |
 
 > [!NOTE]
-> Phase 3 measurements show ESP32-S3 WiFi always-listening mode draws ~57mA
+> Measurements show ESP32-S3 WiFi always-listening mode draws ~57mA
 > regardless of traffic. The ≤40mW mesh idle target requires aggressive
-> duty cycling (Phase 6 with nRF54) or protocol-level sleep scheduling.
+> duty cycling (on nRF52) or protocol-level sleep scheduling.
 
 ---
 
-## 2. Battery Assumptions
+## Battery Assumptions
 
 ### Battery Type
 
@@ -47,30 +47,41 @@ Power is a **first-class design constraint**. Any feature that breaks the power 
 | 1000 mAh | ~3.7 Wh |
 | 1500 mAh | ~5.6 Wh |
 
-Helmet-mounted constraints favor **1000–1500 mAh**.
+Helmet-mounted constraints favor **1000-1500 mAh**.
 
 ---
 
-## 3. System Power States
+## System Power States
 
 OMI firmware operates as a **strict power state machine**.
 
+```mermaid
+stateDiagram-v2
+    [*] --> DeepSleep
+    DeepSleep --> Standby: power on
+    Standby --> MeshIdle: join mesh
+    MeshIdle --> ActiveVoice: VOX / PTT voice start
+    ActiveVoice --> MeshIdle: voice end (after hangover)
+    MeshIdle --> DeepSleep: idle > deep_sleep_timeout (300 s)
 ```
-+-----------+     +-----------+     +-------------+
-| DeepSleep | --> | Standby   | --> | Mesh Idle   |
-+-----------+     +-----------+     +-------------+
-                                        |
-                                        v
-                                  +-------------+
-                                  | Active Voice|
-                                  +-------------+
-```
+
+> Currently implemented: `MeshIdle <-> ActiveVoice` (VOX-driven) and deep-sleep
+> entry. `Standby` and full deep-sleep optimization are partially implemented -
+> see the status note above.
 
 Transitions are explicit and measurable.
 
+> **Implementation status:** The `MESH_IDLE <-> ACTIVE_VOICE` transition is
+> implemented and VOX-driven (`power_notify_voice_start/end`). Deep-sleep entry
+> exists (`power_enter_deep_sleep`, idle timeout `deep_sleep_timeout_sec`, default
+> 300 s) but is not yet fully power-optimized, and radio duty-cycling
+> (`power_radio_slot_start/end`) is implemented but **disabled by default**
+> (`enable_radio_duty_cycle = false`). The current draw figures below are design
+> **targets**, not enforced/measured limits unless explicitly noted.
+
 ---
 
-## 4. Power State Definitions
+## Power State Definitions
 
 ### 4.1 Deep Sleep
 
@@ -85,11 +96,11 @@ Characteristics:
 
 Typical current:
 - ESP32-S3: <10 µA
-- nRF54: ~1–2 µA
+- nRF52840: ~1-2 µA
 
 ---
 
-### 4.2 Standby
+### Standby
 
 Used when:
 - Powered on
@@ -100,11 +111,11 @@ Characteristics:
 - UI active
 
 Typical power:
-- 3–10 mW
+- 3-10 mW
 
 ---
 
-### 4.3 Mesh Idle
+### Mesh Idle
 
 Used when:
 - Joined to mesh
@@ -116,12 +127,12 @@ Characteristics:
 - VOX monitoring
 
 Typical power:
-- ESP32-S3: ~190 mW (57mA @ 3.3V) — **Phase 3 measured**
-- nRF54: ~10–20 mW (target for Phase 6)
+- ESP32-S3: ~190 mW (57mA @ 3.3V) - **measured**
+- nRF52840: ~10-20 mW (target, dual-MCU)
 
 ---
 
-### 4.4 Active Voice
+### Active Voice
 
 Used when:
 - Local speech detected (VOX/PTT)
@@ -133,18 +144,18 @@ Characteristics:
 - TDMA slot usage
 
 Typical power:
-- ESP32-S3: 120–180 mW
-- nRF54: 30–60 mW
+- ESP32-S3: 120-180 mW
+- nRF52: 30-60 mW
 
 ---
 
-## 5. Duty Cycle Model
+## Duty Cycle Model
 
 Active voice is **bursty**, not continuous.
 
 Typical riding session:
-- 10–30% active speech
-- 70–90% mesh idle
+- 10-30% active speech
+- 70-90% mesh idle
 
 Weighted average power (ESP32-S3):
 
@@ -154,7 +165,7 @@ P_avg = 0.2 * 150 mW + 0.8 * 40 mW ≈ 62 mW
 
 ---
 
-## 6. Battery Life Estimation
+## Battery Life Estimation
 
 ### Example: 1000 mAh Battery
 
@@ -170,7 +181,7 @@ Real-world factors reduce this:
 - Bluetooth usage
 - Temperature
 
-**Conservative estimate:** 20–30 hours mixed use
+**Conservative estimate:** 20-30 hours mixed use
 
 ---
 
@@ -186,7 +197,7 @@ A 1000 mAh battery comfortably supports this.
 
 ---
 
-## 7. Radio Power Optimization
+## Radio Power Optimization
 
 ### TDMA Advantages
 
@@ -205,7 +216,7 @@ These techniques dominate power savings.
 
 ---
 
-## 8. Audio Power Optimization
+## Audio Power Optimization
 
 - Opus only runs during speech
 - VOX thresholds tuned aggressively
@@ -215,7 +226,7 @@ No audio → no encoding → no radio TX.
 
 ---
 
-## 9. Bluetooth Power Considerations
+## Bluetooth Power Considerations
 
 Bluetooth Classic is expensive:
 - SCO links are always-on
@@ -230,21 +241,21 @@ This is why dual-MCU architecture exists.
 
 ---
 
-## 10. Dual-MCU Power Split (Phase 2)
+## Dual-MCU Power Split
 
 | Component | Average Power |
 |---------|---------------|
-| nRF54 mesh | 10–30 mW |
-| ESP32 BT | 30–80 mW |
+| nRF52840 mesh | 10-30 mW |
+| ESP32 BT | 30-80 mW |
 
 Combined average:
-- ~50–100 mW typical
+- ~50-100 mW typical
 
 Multi-day battery life becomes realistic.
 
 ---
 
-## 11. Charging & Power Management
+## Charging & Power Management
 
 Recommended:
 - USB-C charging
@@ -257,7 +268,7 @@ Firmware should:
 
 ---
 
-## 12. Measurement Strategy
+## Measurement Strategy
 
 Required measurements:
 - Current per state
@@ -272,7 +283,7 @@ Assumptions without measurement are invalid.
 
 ---
 
-## 13. Design Discipline Rules
+## Design Discipline Rules
 
 - No background polling loops
 - No always-on radios
@@ -283,7 +294,7 @@ Power bugs are treated as functional bugs.
 
 ---
 
-## 14. Status
+## Status
 
 This document defines the **authoritative power model** for OMI.
 

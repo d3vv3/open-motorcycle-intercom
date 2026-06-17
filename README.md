@@ -8,21 +8,21 @@
     <a href="https://openhelmet.devve.space">website</a>
 </p>
 
-OpenHelmet is an **open‑source, motorcycle intercom system**
+OpenHelmet is an **open-source, motorcycle intercom system**
 designed to outperform current proprietary solutions
 in **latency, scalability, transparency, and hackability**.
 
 ## Key goals
 
 - Open protocol and open firmware
-- Commodity, off‑the‑shelf hardware
+- Commodity, off-the-shelf hardware
 - Use any microphone and any speakers from your existing helmet setup
-- Mesh networking for 4–8+ riders
-- Real‑time full‑duplex voice
-- 8–16 hours of active riding per charge
+- Mesh networking for 4-8+ riders
+- Real-time full-duplex voice
+- 8-16 hours of active riding per charge
 - Interoperability with legacy Bluetooth intercoms (Cardo, Sena, etc.) via standard profiles
 
-This project explicitly avoids reverse‑engineering proprietary intercom protocols.
+This project explicitly avoids reverse-engineering proprietary intercom protocols.
 Interoperability is achieved **only through standard Bluetooth audio profiles**.
 
 ---
@@ -31,28 +31,30 @@ Interoperability is achieved **only through standard Bluetooth audio profiles**.
 
 - Cardo/Sena mesh protocols are proprietary and closed
 - True mesh interoperability with them is impossible today
-- Voice communication requires **deterministic latency**, not best‑effort networking
+- Voice communication requires **deterministic latency**, not best-effort networking
 
-As a result, OpenHelmet is designed around **custom real‑time audio transport**.
+As a result, OpenHelmet is designed around **custom real-time audio transport**.
 
 ---
 
 ## Roadmap
 
-### Single‑MCU
+### Single-MCU
 
-- [x] **ESP32‑S3**
+- [x] **ESP32-S3**
 - [x] TDMA mesh protocol over [ESP-NOW](https://www.espressif.com/en/solutions/low-power-solutions/esp-now) (2.4 GHz)
-- [x] Opus low‑bitrate voice
+- [x] Opus low-bitrate voice
 - [x] Analog microphone via headphone jack
 - [x] Speaker output via headphone jack
 - [x] VOX for voice activation
-- [ ] Configure ESP32 tx power to 20 dBm (100 mW)
+- [x] Configure ESP32 tx power to 20 dBm (100 mW) for ESP-NOW
+- [x] Silence suppression (Opus DTX) - no radio TX during silence
 
-### Dual‑MCU
+### Dual-MCU
 
 - [x] **ESP32-S3 + Nordic nRF52 52840**
 - [x] TDMA mesh protocol over [ESB](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html) radio with custom PHY control
+  > ESB runs at 250 kbps with 8 dBm TX power (`OMI_ESB_BITRATE` / `OMI_ESB_TX_POWER_DBM`).
 - [x] SPI audio & control bridge between MCUs
   > Needed to make the SPI handling to take place only in 1 core of the ESP32
 - [x] Noise supression, echo cancellation
@@ -73,7 +75,7 @@ As a result, OpenHelmet is designed around **custom real‑time audio transport*
 - [ ] Battery power with charging circuit
 - [ ] USB-C for firmware flashing
 - [ ] Buttons
-- [ ] Open‑source manufacturing files
+- [ ] Open-source manufacturing files
 - [ ] Testing on real motorcycle rides
 
 ### Niceties
@@ -93,7 +95,7 @@ As a result, OpenHelmet is designed around **custom real‑time audio transport*
 - Unpredictable scheduling
 - Poor scaling for continuous audio
 
-These technologies are unsuitable for real‑time group voice.
+These technologies are unsuitable for real-time group voice.
 
 ---
 
@@ -182,7 +184,7 @@ stty -F /dev/ttyACM0 115200 raw -echo && cat /dev/ttyACM0
 
 ```
 I (xxx) omi: ========================================
-I (xxx) omi: OpenHelmet - Open Motorcycle Intercom
+I (xxx) omi: OMI - Open Motorcycle Intercom
 I (xxx) omi: Boot time: 0 ms
 I (xxx) omi: Opus version: libopus x.x.x
 I (xxx) omi: Free heap: 275432 bytes

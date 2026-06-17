@@ -14,7 +14,7 @@ This specification covers:
 
 ---
 
-## 1. Design Principles
+## Design Principles
 
 - Deterministic latency beats throughput
 - Fixed-size packets where possible
@@ -23,7 +23,7 @@ This specification covers:
 
 ---
 
-## 2. Terminology
+## Terminology
 
 - **Node**: One intercom unit (one rider)
 - **Frame**: One TDMA cycle (aligned to Opus frame)
@@ -33,20 +33,21 @@ This specification covers:
 
 ---
 
-## 3. Network Model
+## Network Model
 
-- Small, bounded mesh (2–10 nodes)
+- Small, bounded mesh (2-10 nodes)
 - Single logical group per mesh
 - One active time master
-- Single-hop broadcast transport (no relaying)
+- Multi-hop broadcast transport with TTL-bounded relaying (see "Relaying & Multi-Hop")
 
 ---
 
-## 4. Packet Overview
+## Packet Overview
 
 All packets share a common header.
 
 ### Common Packet Header (8 bytes)
+
 
 | Offset | Size | Field | Description |
 |------|----|------|------------|
@@ -54,15 +55,24 @@ All packets share a common header.
 | 1 | 1 | Type | Packet type |
 | 2 | 1 | SrcID | Source node ID |
 | 3 | 1 | Seq | Sequence number |
-| 4 | 1 | Reserved0 | Reserved for future use |
-| 5 | 1 | Flags | Control flags |
+| 4 | 1 | TTL | Relay time-to-live (decremented per hop; 0 = no relay) |
+| 5 | 1 | Flags | Control flags (see below) |
 | 6 | 2 | PayloadLen | Bytes following header |
 
 All fields are little-endian.
 
+### Control Flags
+
+| Bit | Name | Meaning |
+|----|------|---------|
+| 0x01 | RELAY_REQUEST | Source is requesting relays to forward this packet |
+| 0x02 | RELAYED | Packet has already been relayed at least once |
+| 0x04 | SPEAKER_GRANTED | Sender holds a coordinator speaker grant |
+
 ---
 
-## 5. Packet Types
+## Packet Types
+
 
 | Type | Name | Purpose |
 |----|------|--------|
@@ -74,12 +84,15 @@ All fields are little-endian.
 | 0x06 | SLOT_MAP | Slot assignment |
 | 0x07 | STATUS | Battery / health |
 | 0x08 | KEEPALIVE | Presence check |
+| 0x09 | SPEAKER_GRANT | Coordinator grants a speaker a relay/transmit slot |
+| 0x0A | SPEAKER_RELEASE | Coordinator releases a previously granted speaker |
 
 ---
 
-## 6. AUDIO Packet
+## Audio Packet
 
 ### Purpose
+
 Carries exactly **one Opus frame**.
 
 ### Payload Format
@@ -89,24 +102,30 @@ Carries exactly **one Opus frame**.
 | 0 | 1 | Codec | 0x01 = Opus |
 | 1 | 1 | FrameMs | Frame duration (20) |
 | 2 | 1 | StreamID | Logical audio stream |
-| 3 | 1 | Reserved | Future use |
-| 4 | N | OpusData | Encoded audio |
+| 3 | 1 | AudioFlags | Bit 0 = ACTIVE (speech); clear = intentional silence / comfort-noise frame |
+| 4 | N | OpusData | Encoded audio (Opus, may be a small DTX comfort-noise frame) |
 
 Typical payload size:
-- 20–40 bytes @ 8–16 kbps
+- 20-40 bytes @ 12 kbps active speech
+- 1-6 bytes for comfort-noise (DTX) frames during silence
+
+`AudioFlags` lets the receiver distinguish intentional silence from packet loss
+(see [audio.md](audio.md#51-silence-suppression-opus-dtx)). Pure 1-2 byte DTX frames are dropped before transmission, so
+the radio stays quiet during silence.
 
 ### Rules
+
 - AUDIO packets **must only be sent in TDMA slots**
 - Packets received outside slot are dropped
 
 ---
 
-## 7. TDMA Frame Usage
+## TDMA Frame Usage
 
 ### Frame Parameters
 
 - Frame duration: 20 ms
-- Slot duration: configurable (1–3 ms)
+- Slot duration: configurable (1-3 ms)
 - Guard time: implementation-defined
 
 ### Slot Ownership
@@ -117,12 +136,61 @@ Typical payload size:
 ### Transmission Rules
 
 - One AUDIO packet per slot
-- Silence = no transmission
+- Silence = suppressed: only periodic comfort-noise (DTX) frames are sent, and pure
+  1-2 byte DTX frames are dropped before TX (see [audio.md](audio.md#51-silence-suppression-opus-dtx))
 - No retransmissions
 
 ---
 
-## 8. Control Plane (CSMA)
+## Relaying & Multi-Hop
+
+Audio is **single-hop by default**: ordinary (ungranted) audio is **never
+relayed**, which prevents flooding. Multi-hop relaying is a conditional path used
+only for the currently-active speaker(s):
+
+- When a node is actively speaking (sending ACTIVE frames), the coordinator grants
+  it as an active speaker - up to `MESH_MAX_ACTIVE_SPEAKERS` concurrently - and
+  broadcasts **SPEAKER_GRANT**. That speaker's audio then carries the
+  `SPEAKER_GRANTED` flag. **SPEAKER_RELEASE** ends the grant when it goes idle.
+- Only `SPEAKER_GRANTED` audio is eligible for relay. A per-speaker **relay mask**
+  decides who relays: nodes that *heard* the speaker may relay it; nodes that did
+  not hear it are the intended recipients. (Comfort-noise / silence frames are not
+  ACTIVE, so they never trigger a grant or relay.)
+- Relays are **TTL-bounded** (`MESH_AUDIO_TTL_DEFAULT` = 2, decremented per hop;
+  TTL 0 is not forwarded) and **de-duplicated** by (Type, SrcID, Seq), so a frame
+  is never re-relayed or looped. The `RELAY_REQUEST` / `RELAYED` flags coordinate
+  this.
+- Relayed AUDIO is sent in the relay node's own slot.
+
+This is identical on both transports (ESP-NOW and nRF52840/ESB).
+
+---
+
+## Join & Sync Sequence
+
+```mermaid
+sequenceDiagram
+    participant N as New node
+    participant C as Coordinator (time master)
+    Note over N: Listen passively
+    C-->>N: SYNC (frame counter, drift, coordinator addr)
+    Note over N: Learn frame timing
+    N->>C: JOIN (capabilities)
+    C->>N: JOIN_ACK (assigned ID, slot, coordinator ID)
+    C-->>N: SLOT_MAP (broadcast)
+    Note over N: Begin TX in assigned slot
+    loop Every frame / interval
+        N->>C: AUDIO (in slot) / KEEPALIVE / STATUS
+    end
+```
+
+Dashed arrows are broadcasts (SYNC, SLOT_MAP). After joining, periodic
+KEEPALIVE/STATUS keep the node's `last_seen` fresh so it is not timed out
+(see "Node Loss"), independent of whether it is transmitting audio.
+
+---
+
+## Control Plane (CSMA)
 
 Control packets are transmitted **outside TDMA slots** using contention-based access.
 
@@ -132,8 +200,8 @@ Payload:
 
 | Offset | Size | Field | Description |
 |------|----|------|------------|
-| 0 | 1 | RequestedHop | Max hops supported |
-| 1 | 1 | Capabilities | Codec, features |
+| 0 | 1 | Capabilities | Codec / feature bitmap (0x01 = basic Opus) |
+| 1 | 1 | Reserved | Future use |
 
 ### JOIN_ACK Packet
 
@@ -141,13 +209,13 @@ Payload:
 
 | Offset | Size | Field | Description |
 |------|----|------|------------|
-| 0 | 1 | AssignedID | Node ID |
+| 0 | 1 | AssignedID | Node ID (1-8) |
 | 1 | 1 | SlotIndex | TDMA slot |
-| 2 | 1 | MasterID | Time master |
+| 2 | 1 | CoordinatorID | Current coordinator (time master) |
 
 ---
 
-## 9. Time Synchronization (SYNC)
+## Time Synchronization (SYNC)
 
 ### SYNC Packet
 
@@ -157,6 +225,7 @@ Payload:
 |------|----|------|------------|
 | 0 | 4 | FrameCounter | TDMA frame number |
 | 4 | 2 | DriftPPM | Estimated clock drift |
+| 6 | 5-6 | CoordinatorAddr | Coordinator radio address, used for master-election tiebreak (6 bytes WiFi MAC on ESP-NOW, 5 bytes ESB address on nRF52840) |
 
 ### Behavior
 
@@ -166,7 +235,7 @@ Payload:
 
 ---
 
-## 10. Slot Map (SLOT_MAP)
+## Slot Map (SLOT_MAP)
 
 Broadcast by master when:
 - Node joins/leaves
@@ -181,7 +250,7 @@ Payload:
 
 ---
 
-## 11. Status & Keepalive
+## Status & Keepalive
 
 ### STATUS Packet
 
@@ -207,7 +276,7 @@ Payload:
 
 ---
 
-## 12. Failure Handling
+## Failure Handling
 
 ### Audio Loss
 
@@ -216,20 +285,28 @@ Payload:
 
 ### Node Loss
 
-- Missing KEEPALIVE → slot reclaimed
+- Each node tracks a per-peer `last_seen` timestamp, refreshed by **any** packet
+  from that peer (AUDIO / KEEPALIVE / STATUS / JOIN).
+- A peer is dropped after `MESH_NODE_TIMEOUT_MS` (3000 ms) with no packets; its
+  slot is then freed and a new SLOT_MAP is broadcast by the coordinator.
+- Implemented on both transports (ESP-NOW and nRF52840/ESB).
+- Liveness is independent of voice activity: KEEPALIVE/STATUS continue during
+  silence (every 500 ms on ESP-NOW, ~1000 ms on nRF52840), so a silent node is
+  **not** dropped even though its audio TX is suppressed (see [audio.md](audio.md#51-silence-suppression-opus-dtx)).
 
 ### Master Loss
 
-- Lowest MAC address becomes provisional master
-- New SYNC issued
+- Coordinator loss is detected by SYNC timeout; nodes return to scanning.
+- On a coordinator conflict, the node with the lower radio address wins
+  (lexicographic `memcmp` of the address); the other demotes to participant.
 
 ---
 
-## 13. ESP32 ↔ nRF54 Inter-MCU Protocol (Phase 2)
+## ESP32 - nRF52 Inter-MCU Protocol
 
 ### Transport
 - SPI preferred
-- UART acceptable for early prototypes
+- ~UART acceptable for early prototypes~
 
 ### Message Types
 
@@ -259,7 +336,7 @@ Payload:
 
 ---
 
-## 14. Security (Deferred)
+## Security (Deferred)
 
 Initial versions focus on correctness and performance.
 
@@ -272,7 +349,7 @@ Security must not compromise latency.
 
 ---
 
-## 15. Versioning
+## Versioning
 
 - Major version increments break compatibility
 - Minor version adds optional fields
@@ -280,7 +357,7 @@ Security must not compromise latency.
 
 ---
 
-## 16. Status
+## Status
 
 This document defines **Protocol v0.1**.
 

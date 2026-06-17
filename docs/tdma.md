@@ -10,11 +10,11 @@ This is not a generic TDMA design. It is purpose-built for **small, mobile, real
 
 ---
 
-## 1. Why TDMA (and Not CSMA)
+## Why TDMA (and not CSMA)
 
 Voice intercoms fail when latency spikes or packets collide.
 
-CSMA-based systems (Wi‑Fi, BLE) suffer from:
+CSMA-based systems (Wi-Fi, BLE) suffer from:
 - Random backoff delays
 - Collision probability increasing with nodes
 - Unbounded worst-case latency
@@ -28,7 +28,7 @@ Motorcycle groups are **small and slow-changing**, which makes TDMA viable and r
 
 ---
 
-## 2. Core TDMA Parameters
+## TDMA Parameters
 
 ### Fixed Frame Duration
 
@@ -39,8 +39,8 @@ Motorcycle groups are **small and slow-changing**, which makes TDMA viable and r
 ### Slot Duration
 
 - Nominal slot length: **2 ms**
-- Configurable range: 1.5–2.5 ms
-- Per-slot guard time: ~100–200 µs (included in slot duration)
+- Configurable range: 1.5-2.5 ms
+- Per-slot guard time: ~100-200 µs (included in slot duration)
 
 ### Capacity Example
 
@@ -60,11 +60,11 @@ Slot capacity by configuration:
 | 2 ms | 16 ms | 2 ms + 2 ms | ~8 |
 | 2.5 ms | 15 ms | 2.5 ms + 2.5 ms | ~6 |
 
-Default configuration targets **6–8 nodes** with 2 ms slots.
+Default configuration targets **6-8 nodes** with 2 ms slots.
 
 ---
 
-## 3. Time Model
+## Time Model
 
 Each node maintains:
 - Local high-resolution timer
@@ -80,7 +80,7 @@ All nodes aim to transmit at the same frame boundaries.
 
 ---
 
-## 4. Time Master Concept
+## Time Master Concept
 
 One node acts as the **Time Master**.
 
@@ -93,11 +93,13 @@ The master **does not route more traffic** than others. It only coordinates time
 
 ---
 
-## 5. Time Synchronization
+## Time Synchronization
 
 ### SYNC Transmission
 
-- Sent periodically (e.g. every 10 frames)
+- Sent periodically by the master. Cadence differs by transport: ESP-NOW sends
+  every `MESH_SYNC_INTERVAL_FRAMES` (10 frames ~= 200 ms); the nRF52840/ESB build
+  sends on alternating status ticks (~= 1 s).
 - Broadcast during control (CSMA) window
 
 ### Synchronization Fields
@@ -115,7 +117,7 @@ Target sync accuracy: **<100 µs**
 
 ---
 
-## 6. Slot Ownership
+## Slot Ownership
 
 - Each node owns exactly **one slot**
 - Slot index is assigned by the master
@@ -125,24 +127,29 @@ Slots are **logical**, not tied to Node IDs.
 
 ---
 
-## 7. Transmission Rules
+## Transmission Rules
 
 ### Voice Transmission
 
 - Transmit **at most one AUDIO packet per frame**
 - Only inside own slot
-- Silence = do not transmit
+- Silence = suppressed via Opus DTX: only periodic comfort-noise frames are sent;
+  pure 1-2 byte DTX frames are dropped before TX (see [audio.md](audio.md#51-silence-suppression-opus-dtx))
 
 ### Forwarding
 
-- No packet relaying in current design
-- Each node transmits only its own audio in its own slot
+- **Single-hop by default**: ordinary (ungranted) audio is not relayed.
+- Only a currently-active, coordinator-**granted** speaker's audio is relayed, and
+  only by nodes in that speaker's relay mask (the nodes that heard it). Relays are
+  TTL-bounded (`MESH_AUDIO_TTL_DEFAULT` = 2) and de-duplicated by (Type, SrcID,
+  Seq) - see protocol.md "Relaying & Multi-Hop".
 
-This guarantees bounded latency and prevents amplification.
+Bounded TTL, the active-speaker grant, and the never-relay rule for ungranted
+audio keep latency bounded and prevent broadcast amplification.
 
 ---
 
-## 8. Guard Time
+## Guard Time
 
 Guard time absorbs:
 - Clock drift
@@ -150,13 +157,13 @@ Guard time absorbs:
 - Processing jitter
 
 Typical guard time:
-- 100–300 µs
+- 100-300 µs
 
 Guard time is included in slot duration.
 
 ---
 
-## 9. Join Procedure (TDMA Perspective)
+## Join Procedure (TDMA Perspective)
 
 1. New node listens passively
 2. Learns frame timing from SYNC
@@ -169,7 +176,7 @@ Until slot assignment, node **must not transmit voice**.
 
 ---
 
-## 10. Leave Procedure
+## Leave Procedure
 
 ### Graceful Leave
 
@@ -179,14 +186,18 @@ Until slot assignment, node **must not transmit voice**.
 
 ### Unplanned Loss
 
-- KEEPALIVE timeout
-- Slot reclaimed automatically
+- Each peer has a `last_seen` timestamp refreshed by any packet (AUDIO / KEEPALIVE
+  / STATUS / JOIN), not KEEPALIVE alone.
+- After `MESH_NODE_TIMEOUT_MS` (3000 ms) with no packets, the peer is dropped and
+  its slot reclaimed (implemented on both ESP-NOW and nRF52840/ESB).
+- A node that is merely silent keeps sending KEEPALIVE/STATUS, so silence does not
+  cause loss (see protocol.md "Node Loss").
 
 Slot reuse is immediate but synchronized.
 
 ---
 
-## 11. Slot Map Reconfiguration
+## Slot Map Reconfiguration
 
 Triggered when:
 - Node joins
@@ -201,7 +212,7 @@ This avoids mid-frame chaos.
 
 ---
 
-## 12. Master Election
+## Master Election
 
 ### Initial Master
 
@@ -213,15 +224,16 @@ This avoids mid-frame chaos.
 
 ### Election Rule
 
-- Lowest MAC address becomes provisional master
-- Provisional master issues SYNC
-- Others accept unless conflict detected
+- If two coordinators are detected, the one with the **lower radio address wins**
+  (lexicographic `memcmp` of the address carried in SYNC); the other demotes to
+  participant.
+- The winning coordinator continues issuing SYNC; demoted nodes phase-lock to it.
 
 This avoids complex elections.
 
 ---
 
-## 13. Handling Mobility & Topology Changes
+## Handling Mobility & Topology Changes
 
 Motorcycle topology is typically linear.
 
@@ -237,7 +249,7 @@ No attempt is made to merge partitions automatically.
 
 ---
 
-## 14. Failure Modes & Degradation
+## Failure Modes & Degradation
 
 | Failure | Behavior |
 |------|---------|
@@ -250,7 +262,7 @@ Silence is preferred over distortion.
 
 ---
 
-## 15. Debug & Instrumentation Hooks
+## Debug & Instrumentation Hooks
 
 Recommended metrics:
 - Slot miss count
@@ -262,7 +274,7 @@ These are critical for tuning.
 
 ---
 
-## 16. Design Rationale Summary
+## Design Rationale Summary
 
 - Fixed 20 ms frame aligns with audio
 - One packet per slot simplifies logic
@@ -273,7 +285,7 @@ TDMA is intentionally boring. That is its strength.
 
 ---
 
-## 17. Status
+## Status
 
 This document defines the **authoritative TDMA behavior** for OMI.
 

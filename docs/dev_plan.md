@@ -2,7 +2,7 @@
 
 This document defines the **execution plan** for the Open Motorcycle Intercom (OMI).
 
-It is intentionally concrete. Each phase has **exit criteria**. If a phase does not meet its criteria, the project does not advance.
+It is intentionally concrete. Each milestone has **exit criteria**. If a milestone does not meet its criteria, the project does not advance.
 
 [TOC]
 
@@ -14,11 +14,11 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 2. No RF work without instrumentation
 3. No audio feature without latency measurement
 4. No mesh scaling before 2-node stability
-5. Docs define behavior — code must follow
+5. Docs define behavior - code must follow
 
 ---
 
-## Phase 0 – Tooling & Baseline (1–2 weeks)
+## Tooling & Baseline (1-2 weeks)
 
 ### Goals
 - Establish reproducible dev environment
@@ -42,7 +42,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 1 – Audio Bring-Up (2–3 weeks)
+## Audio Bring-Up (2-3 weeks)
 
 ### Goals
 - Prove audio pipeline works locally
@@ -64,7 +64,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 2 – Single-Hop RF Link (2–3 weeks)
+## Single-Hop RF Link (2-3 weeks)
 
 ### Goals
 - Send voice between two devices
@@ -79,19 +79,19 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 - ESP-NOW provides the transport layer (PHY/MAC)
 - OMI implements TDMA scheduling and routing on top
 - This allows focusing on protocol logic before RF complexity
-- True custom PHY control comes with nRF54 in Phase 6
+- True custom PHY control comes with the dual-MCU nRF52840 build
 
 ### Measurements
 - Packet loss vs distance
 - Latency distribution
 
 ### Exit Criteria
-- Clear voice at 50–100 m LOS
+- Clear voice at 50-100 m LOS
 - Packet loss <10% sustained
 
 ---
 
-## Phase 3 – Power Discipline (1–2 weeks)
+## Power Discipline (1-2 weeks)
 
 ### Goals
 - Enforce power model
@@ -112,10 +112,10 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 4 – Mesh MVP (3–4 weeks)
+## Mesh MVP (3-4 weeks)
 
 ### Goals
-- 3–4 rider mesh
+- 3-4 rider mesh
 
 ### Tasks
 - Slot assignment
@@ -133,7 +133,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 5 – Bluetooth Integration (2–3 weeks)
+## Bluetooth Integration (2-3 weeks)
 
 ### Goals
 - Phone compatibility
@@ -149,7 +149,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 6 – Dual-MCU Prototype (nRF54) (4–6 weeks)
+## Dual-MCU Prototype (nRF52840) (4-6 weeks)
 
 ### Goals
 - Validate split architecture
@@ -165,7 +165,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 7 – Security Implementation (2–3 weeks)
+## Security Implementation (2-3 weeks)
 
 ### Goals
 - Secure mesh communication
@@ -187,10 +187,10 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 8 – Scaling & Stress (Ongoing)
+## Scaling & Stress (Ongoing)
 
 ### Goals
-- 6–8 rider stability
+- 6-8 rider stability
 
 ### Tasks
 - Slot pressure tests
@@ -203,7 +203,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 9 – Hardware Refinement (Optional)
+## Hardware Refinement (Optional)
 
 ### Goals
 - Prepare for real-world usage
@@ -231,7 +231,7 @@ These kill power and reliability.
 Project stops or pivots if:
 - Latency exceeds 120 ms
 - Battery <8h continuous
-- RF instability persists beyond Phase 4
+- RF instability persists beyond the mesh MVP milestone
 
 ---
 
@@ -239,5 +239,4 @@ Project stops or pivots if:
 
 This plan is the **single source of truth** for execution.
 
-Skipping phases is forbidden.
-
+Milestones are ordered; skipping them is forbidden.

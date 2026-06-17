@@ -2,7 +2,7 @@
 
 This document defines the **strict contract** between MCUs in the Open Motorcycle Intercom (OMI).
 
-The goal is not performance maximalism — it is **fault isolation, power efficiency, and timing determinism**.
+The goal is not performance maximalism - it is **fault isolation, power efficiency, and timing determinism**.
 
 [TOC]
 
@@ -10,7 +10,7 @@ The goal is not performance maximalism — it is **fault isolation, power effici
 
 ## 1. Why Dual MCU?
 
-A single MCU *can* do everything — until it can’t.
+A single MCU *can* do everything - until it can’t.
 
 Problems avoided by splitting:
 - RF stack jitter breaking audio timing
@@ -33,13 +33,13 @@ Responsibilities:
 - Audio mixing
 - TDMA scheduler (logical)
 - User interface
-- Bluetooth Classic (HFP/A2DP)
+- Bridge to the FSC-BT1026D Bluetooth Classic (HFP/A2DP) SoC (the ESP32-S3 has no BT Classic radio)
 
 This MCU owns *audio cadence*.
 
 ---
 
-### 2.2 Radio MCU (nRF54)
+### 2.2 Radio MCU (nRF52840)
 
 Responsibilities:
 - Mesh radio (ESB / custom PHY)
@@ -69,7 +69,7 @@ Audio frame tick → TDMA slot → RF TX/RX
 ## 4. Interconnect Options
 
 Preferred:
-- SPI (10–20 MHz target)
+- SPI (10-20 MHz target)
 
 Fallback:
 - UART (DMA only, no interrupts)
@@ -212,10 +212,10 @@ Current implementation note: current telemetry is mostly push-based; pull-only t
 
 ## 12. Migration Path
 
-| Phase | Configuration | Notes |
+| Stage | Configuration | Notes |
 |-------|---------------|-------|
-| Phase 1–5 | ESP32-S3 only | Single MCU, ESP-NOW transport |
-| Phase 6 | ESP32-S3 + nRF54 | Dual MCU, ESB transport |
+| Current | ESP32-S3 only | Single MCU, ESP-NOW transport |
+| Next | ESP32-S3 + nRF52840 | Dual MCU, ESB transport |
 | Future | nRF54 dual-core | Optional single-chip solution |
 
 The inter-MCU contract remains unchanged across configurations.

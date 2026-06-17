@@ -69,17 +69,21 @@ Replace `/dev/ttyUSB0` with your serial port (`/dev/ttyACM0`, `/dev/cu.usbmodem*
 ```
 I (123) omi: ========================================
 I (123) omi: OMI - Open Motorcycle Intercom
-I (123) omi: Boot time: 0 ms
-I (123) omi: IDF version: v5.2.2
+I (123) omi: IDF version: v5.5.2
 I (123) omi: Free heap: 275432 bytes
 I (123) omi: ========================================
 I (130) omi: [7 ms] NVS initialized
-I (135) audio: Initializing audio subsystem
+I (132) omi: [9 ms] Power management initialized
+I (134) omi: [11 ms] Button handler initialized
+I (140) omi: nRF52840 not detected - using ESP-NOW transport
 I (160) omi: [37 ms] Audio initialized
-I (165) mesh: Initializing mesh subsystem
 I (185) omi: [62 ms] Mesh initialized
 I (190) omi: [62 ms] System ready
 ```
+
+Timestamps and heap are illustrative. When an nRF52840 is wired up over the SPI
+bridge you'll instead see `nRF52840 detected on UART - using ESB transport`, and
+the ESP-NOW mesh init is skipped in favor of the nRF/ESB transport.
 
 ---
 
@@ -95,11 +99,17 @@ omi/
 │   ├── CMakeLists.txt
 │   └── main.c              # Application entry point
 │
-├── components/
-│   ├── audio/              # Audio capture, Opus, playback
-│   └── mesh/               # ESP-NOW, TDMA, routing
-│
-└── docs/                   # Documentation
+├-- components/
+|   ├-- audio/              # Audio capture, Opus (DTX), VOX, jitter buffer, playback
+|   ├-- mesh/               # ESP-NOW transport, TDMA, relay/routing
+|   ├-- uart_bridge/        # SPI bridge to the nRF52840 radio MCU
+|   ├-- power/              # Power state machine
+|   ├-- button/             # Boot-button UI handler
+|   └-- hwtest/             # Hardware bring-up / test utilities
+|
+├-- nrf_mesh/               # nRF52840 (Zephyr) radio firmware: ESB, TDMA, mesh
+|
+└-- docs/                   # Documentation
 ```
 
 ---
@@ -156,4 +166,4 @@ ln -sf build/compile_commands.json .
 
 ## Next Steps
 
-See [Development Plan](dev_plan.md) for phase requirements.
+See the [Development Plan](dev_plan.md) for the roadmap and exit criteria.
