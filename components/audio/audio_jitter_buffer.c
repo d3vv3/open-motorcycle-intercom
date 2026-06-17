@@ -15,6 +15,7 @@ void audio_jitter_reset(audio_jitter_state_t *state)
     state->consecutive_empty = 0;
     state->hold_next = false;
     state->hold_budget = 0;
+    state->stream_silent = false;
 }
 
 void audio_jitter_record_depth(audio_jitter_state_t *state, audio_stats_t *stats, UBaseType_t items)

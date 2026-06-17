@@ -63,6 +63,13 @@ static const char *TAG = "audio";
 /* Maximum Opus packet size */
 #define MAX_OPUS_PACKET_SIZE 64
 
+/* With DTX enabled, opus_encode() returns a 1-2 byte frame when it has nothing
+ * to send (pure silence between comfort-noise updates).  Frames at or below
+ * this size are dropped before transmit so the radio stays quiet during
+ * silence; larger frames (speech or periodic SID/comfort-noise updates) are
+ * sent so the receiver can sustain comfort noise. */
+#define OPUS_DTX_FRAME_MAX_BYTES 2
+
 /* ============================================================================
  * Type Definitions
  * ============================================================================ */
@@ -331,6 +338,12 @@ static esp_err_t opus_init(const audio_config_t *config)
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_COMPLEXITY(5));
+    /* Discontinuous transmission: during silence the encoder emits a periodic
+     * comfort-noise (SID) frame and otherwise returns a 1-2 byte DTX frame that
+     * we drop at the transport layer (see audio_task TX gating).  The decoder
+     * generates comfort noise from the last SID, so receivers hear a natural
+     * quiet rather than a dead link. */
+    opus_encoder_ctl(s_opus_encoder, OPUS_SET_DTX(1));
 
     /* Create Opus decoder */
     s_opus_decoder = opus_decoder_create(config->sample_rate, config->channels, &error);
@@ -578,10 +591,15 @@ static void audio_task(void *arg)
                     ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(opus_bytes));
                 }
             } else {
-                /* VOX inactive — encode and send a silence comfort frame to keep
-                 * the stream at a steady 50 fps.  Opus compresses silence to
-                 * ~3-6 bytes, so this adds negligible bandwidth while preventing
-                 * receiver starvation from VOX gaps. */
+                /* VOX inactive - feed a zeroed frame through the DTX-enabled
+                 * encoder.  Opus emits a small comfort-noise (SID) update at the
+                 * start of the silence period and roughly every 400 ms after,
+                 * returning a 1-2 byte DTX frame in between.  We transmit only
+                 * the comfort-noise updates and drop the DTX frames, so the
+                 * radio goes silent during silence while the receiver still has
+                 * enough to generate comfort noise.  The audio_flags inactive
+                 * bit (active=false) tells the receiver this is intentional
+                 * silence, not packet loss. */
                 static int16_t s_silence_frame[AUDIO_FRAME_SAMPLES]; /* BSS-zeroed */
                 int64_t encode_start = esp_timer_get_time();
                 opus_bytes = opus_encode(s_opus_encoder, s_silence_frame, AUDIO_FRAME_SAMPLES,
@@ -595,8 +613,16 @@ static void audio_task(void *arg)
                     if (encode_time > s_stats.encode_time_us_max) {
                         s_stats.encode_time_us_max = encode_time;
                     }
-                    if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
-                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, false, frame_start_us);
+
+                    bool comfort_update = (opus_bytes > OPUS_DTX_FRAME_MAX_BYTES);
+                    if (comfort_update) {
+                        if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
+                            s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, false,
+                                          frame_start_us);
+                        }
+                    } else {
+                        /* Pure DTX frame: keep the radio quiet. */
+                        s_stats.tx_dtx_suppressed++;
                     }
                 }
             }
@@ -684,6 +710,10 @@ static void audio_task(void *arg)
                             s_stats.jitter_buffer_depth = (uint8_t)items;
                             have_audio_to_play = true;
 
+                            /* Track sender intent so empty polls during a DTX
+                             * silence gap aren't mistaken for packet loss. */
+                            jitter->stream_silent = !rx_item.active;
+
                             int64_t rx_pipe_us = decode_start - rx_item.timestamp_us;
                             if (rx_pipe_us >= 0) {
                                 s_rx_pipe_count++;
@@ -733,7 +763,13 @@ static void audio_task(void *arg)
                         s_stats.grace_empty_polls++;
                         if (jitter->consecutive_empty > GRACE_EMPTY_MAX) {
                             int64_t now_us = esp_timer_get_time();
-                            if (audio_jitter_should_count_underrun(jitter, now_us)) {
+                            if (jitter->stream_silent) {
+                                /* Talker is intentionally silent (DTX gating):
+                                 * empty polls are expected, not loss.  Stop
+                                 * active playout quietly without flagging
+                                 * underruns/glitches. */
+                                jitter->playout_started = false;
+                            } else if (audio_jitter_should_count_underrun(jitter, now_us)) {
                                 s_stats.rx_queue_underruns++;
                                 s_stats.glitches_detected++;
                             } else {
@@ -1070,6 +1106,7 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     rx_item.len = frame->len;
     rx_item.source_id = source_id;
     rx_item.timestamp_us = frame->timestamp_ms * 1000;
+    rx_item.active = frame->active;
 
     if (xQueueSend(s_rx_queue, &rx_item, 0) != pdTRUE) {
         s_stats.frames_dropped++;

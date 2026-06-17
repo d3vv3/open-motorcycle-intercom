@@ -45,8 +45,8 @@ static const char *TAG = "omi";
 #define REDUCED_LOGGING_MODE 1
 
 /* Test knob: bypass VOX gating and always transmit microphone frames.
- * 0 = normal VOX behavior, 1 = force continuous TX. */
-#define FORCE_TX_ALWAYS_FOR_TEST 1
+ * 0 = normal VOX behavior (DTX silence suppression active), 1 = force continuous TX. */
+#define FORCE_TX_ALWAYS_FOR_TEST 0
 
 /* ============================================================================
  * State
@@ -262,6 +262,9 @@ static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_i
     memcpy(frame.data, data, len);
     frame.len = len;
     frame.timestamp_ms = timestamp_us / 1000;
+    /* ESP-NOW path does not surface the per-frame VOX flag here, so treat every
+     * received frame as active (preserves pre-DTX receiver behavior). */
+    frame.active = true;
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
     if (ret != ESP_OK) {
@@ -322,6 +325,9 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     memcpy(frame.data, payload + 2, opus_len);
     frame.len = opus_len;
     frame.timestamp_ms = timestamp_us / 1000;
+    /* data[0] carries the audio_flags byte set by audio_tx_callback; the ACTIVE
+     * bit distinguishes speech from intentional silence/comfort frames. */
+    frame.active = (data[0] & MESH_AUDIO_FLAG_ACTIVE) != 0;
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
     if (ret != ESP_OK) {

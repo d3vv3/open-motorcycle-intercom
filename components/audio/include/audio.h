@@ -163,6 +163,7 @@ typedef struct {
     uint8_t data[64];     /**< Encoded Opus data (max ~40 bytes typical) */
     uint16_t len;         /**< Actual length of encoded data */
     int64_t timestamp_ms; /**< Capture timestamp */
+    bool active;          /**< Sender VOX active (speech) vs intentional silence/comfort frame */
 } audio_frame_t;
 
 /**
@@ -196,6 +197,7 @@ typedef struct {
     uint8_t rx_q_depth_max;      /**< Maximum observed RX queue depth */
     uint32_t task_loops;         /**< Audio task loop count (health indicator) */
     uint32_t adc_overruns;       /**< ADC buffer overrun count */
+    uint32_t tx_dtx_suppressed;  /**< Silence frames dropped before transmit (DTX) */
     bool vox_active;             /**< Current VOX state */
 } audio_stats_t;
 
