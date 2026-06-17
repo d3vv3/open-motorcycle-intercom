@@ -64,6 +64,17 @@ static mesh_peer_info_t s_peers[MESH_MAX_NODES];
 static uint8_t s_peer_count = 0;
 
 static uint8_t s_tx_seq = 0;
+
+/* CONCURRENCY INVARIANT: the mesh state below (peer table, speaker grants,
+ * relay masks, heard/relay bitmaps) is accessed ONLY from the system
+ * workqueue: rx_work_handler, status_work_handler, and the slot callback
+ * (tdma slot_work_handler -> slot_tx_handler) are all k_work items on the
+ * default system workqueue, which runs them serially. The ESB RX path and the
+ * TDMA frame timer run in ISR context but only k_work_submit() - they never
+ * touch this state. Because access is serialized on one thread, no locks are
+ * needed. If you ever access this state from another thread, a second
+ * workqueue, or directly from an ISR, you MUST add synchronization (compare the
+ * ESP-NOW build, which has a genuine timer/task split and uses s_speaker_mux). */
 static uint8_t s_active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static uint8_t s_relay_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static int64_t s_active_speaker_deadline_ms[MESH_MAX_NODES + 1] = {0};
