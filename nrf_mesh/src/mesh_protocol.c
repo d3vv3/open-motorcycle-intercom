@@ -197,6 +197,7 @@ static void apply_speaker_grant(const mesh_speaker_grant_payload_t *grant);
 static void clear_speaker_grants(void);
 static int send_speaker_grant(void);
 static int send_speaker_release(const uint8_t *speaker_ids, uint8_t speaker_count);
+static void check_peer_timeouts(void);
 
 static void update_peer_last_seen(uint8_t node_id, int8_t rssi)
 {
@@ -1016,6 +1017,53 @@ static void join_work_handler(struct k_work *work)
     }
 }
 
+/* Drop peers that have gone silent past MESH_NODE_TIMEOUT_MS.  Liveness is
+ * refreshed by AUDIO / KEEPALIVE / STATUS / JOIN packets (see
+ * update_peer_last_seen()), all of which flow independently of voice activity,
+ * so silence-suppressed nodes stay alive as long as their 1 Hz keepalive lands.
+ * Mirrors the ESP-NOW check_peer_timeouts() in components/mesh/mesh.c. */
+static void check_peer_timeouts(void)
+{
+    int64_t now = k_uptime_get();
+    bool topology_changed = false;
+
+    for (int i = 0; i < MESH_MAX_NODES; i++) {
+        if (!s_peers[i].active) {
+            continue;
+        }
+        /* Never time ourselves out. */
+        if (s_peers[i].node_id == s_node_id) {
+            continue;
+        }
+        /* Coordinator liveness is owned by the SYNC_TIMEOUT_MS path below,
+         * which drives re-election/rescan.  Skip it here to avoid duplicate
+         * teardown and spurious PEER_LEFT events during role transitions. */
+        if (s_peers[i].node_id == s_coordinator_id) {
+            continue;
+        }
+
+        if ((now - s_peers[i].last_seen_ms) > MESH_NODE_TIMEOUT_MS) {
+            uint8_t timed_out_id = s_peers[i].node_id;
+            s_peers[i].active = false;
+            if (s_peer_count > 0) {
+                s_peer_count--;
+            }
+            topology_changed = true;
+            LOG_WRN("Peer %u timed out (silent %lld ms), remaining peers: %u",
+                    timed_out_id, (long long)(now - s_peers[i].last_seen_ms),
+                    s_peer_count);
+
+            /* Notify ESP32 so it can play a disconnect tone. */
+            uart_bridge_send_event(0x03, NULL, 0); /* BRIDGE_EVENT_PEER_LEFT */
+        }
+    }
+
+    /* Re-publish the slot map so survivors learn the freed slot. */
+    if (topology_changed && s_role == MESH_ROLE_COORDINATOR) {
+        send_slot_map();
+    }
+}
+
 static void status_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
@@ -1023,6 +1071,9 @@ static void status_work_handler(struct k_work *work)
     if (s_state != MESH_STATE_ACTIVE) {
         return;
     }
+
+    /* Reap silent peers once per status tick (1 Hz). */
+    check_peer_timeouts();
 
     /* Send status to ESP32 */
     uart_bridge_send_status(s_role, s_peer_count, s_node_id);
