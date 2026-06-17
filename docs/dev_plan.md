@@ -79,7 +79,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 - ESP-NOW provides the transport layer (PHY/MAC)
 - OMI implements TDMA scheduling and routing on top
 - This allows focusing on protocol logic before RF complexity
-- True custom PHY control comes with nRF54 in Phase 6
+- True custom PHY control comes with nRF52840 in Phase 6
 
 ### Measurements
 - Packet loss vs distance
@@ -149,7 +149,7 @@ It is intentionally concrete. Each phase has **exit criteria**. If a phase does 
 
 ---
 
-## Phase 6 – Dual-MCU Prototype (nRF54) (4–6 weeks)
+## Phase 6 – Dual-MCU Prototype (nRF52840) (4–6 weeks)
 
 ### Goals
 - Validate split architecture

@@ -132,7 +132,7 @@ typedef struct {
     audio_adc_config_t adc_config; /**< ADC configuration for mic input */
     audio_vox_config_t vox_config; /**< VOX detection configuration */
     bool enable_hpf;               /**< Enable high-pass filter */
-    float hpf_cutoff_hz;           /**< HPF cutoff frequency (default: 120 Hz) */
+    float hpf_cutoff_hz;           /**< HPF cutoff frequency (default: 80 Hz) */
     bool force_tx_always;          /**< Test mode: always TX mic frame (ignore VOX gating) */
     audio_mode_t mode;             /**< Operating mode (default: LOOPBACK) */
 } audio_config_t;

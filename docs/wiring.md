@@ -2,7 +2,7 @@
 
 ## Microphone Input
 
-### Current Implementation: Analog Microphone via TRRS (ADC)
+### Analog Microphone via TRRS (ADC)
 
 This configuration uses an **analog electret microphone**
 (like a standard headset mic)
@@ -33,7 +33,7 @@ using the MAX 9814 microphone amplifier module.
 - Bit width: 12-bit (ESP32-S3 native)
 - Attenuation: **2.5dB**
 
-### Alternative: I2S Digital Microphone (INMP441)
+### I2S Digital Microphone (INMP441)
 
 The original design planned for an INMP441 I2S digital microphone. If switching to I2S digital:
 

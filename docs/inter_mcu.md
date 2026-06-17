@@ -39,7 +39,7 @@ This MCU owns *audio cadence*.
 
 ---
 
-### 2.2 Radio MCU (nRF54)
+### 2.2 Radio MCU (nRF52840)
 
 Responsibilities:
 - Mesh radio (ESB / custom PHY)
@@ -215,7 +215,7 @@ Current implementation note: current telemetry is mostly push-based; pull-only t
 | Phase | Configuration | Notes |
 |-------|---------------|-------|
 | Phase 1–5 | ESP32-S3 only | Single MCU, ESP-NOW transport |
-| Phase 6 | ESP32-S3 + nRF54 | Dual MCU, ESB transport |
+| Phase 6 | ESP32-S3 + nRF52840 | Dual MCU, ESB transport |
 | Future | nRF54 dual-core | Optional single-chip solution |
 
 The inter-MCU contract remains unchanged across configurations.

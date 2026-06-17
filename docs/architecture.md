@@ -45,7 +45,7 @@ OMI is structured in **four logical layers**:
 +--------------------------------------------------+
 | Radio / Hardware Layer                           |
 |  - ESP32-S3 (Phase 1)                            |
-|  - nRF54 + ESP32-S3 (Phase 2)                    |
+|  - nRF52840 + ESP32-S3 (Phase 2)                    |
 +--------------------------------------------------+
 ```
 
@@ -127,7 +127,7 @@ Phase 2 splits responsibilities across two MCUs.
               SPI / UART (PCM + Control)
                      |
             +-------------------+
-            |      nRF54        |
+            |      nRF52840        |
             |-------------------|
             | ESB Radio         |
             | TDMA Scheduler    |
@@ -135,7 +135,7 @@ Phase 2 splits responsibilities across two MCUs.
             +-------------------+
 ```
 
-### nRF54 Responsibilities
+### nRF52840 Responsibilities
 
 - Raw 2.4 GHz radio (ESB)
 - TDMA timing and synchronization
