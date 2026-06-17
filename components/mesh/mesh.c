@@ -128,6 +128,12 @@ static mesh_stats_t s_stats = {0};
 static uint8_t s_local_mac[6] = {0};
 static uint8_t s_node_id = 0;
 static int8_t s_slot_index = -1;
+/* Speaker-grant state below is touched from both the mesh task and the
+ * esp_timer slot callback (frame_timer_callback -> send_audio_in_slot), so it
+ * cannot use the blocking s_peer_mutex (the timer task must never block).
+ * A short portMUX critical section guards it instead. Critical sections must
+ * stay tiny: only plain array reads/writes, never sends or mutex takes. */
+static portMUX_TYPE s_speaker_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t s_active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static uint8_t s_relay_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static uint8_t s_heard_bitmap = 0;
@@ -292,8 +298,35 @@ static bool enqueue_relay_packet(const uint8_t *data, uint16_t len, uint8_t ttl,
 
 static void clear_speaker_state(void)
 {
+    taskENTER_CRITICAL(&s_speaker_mux);
     memset(s_active_speaker_ids, 0, sizeof(s_active_speaker_ids));
     memset(s_relay_masks, 0, sizeof(s_relay_masks));
+    taskEXIT_CRITICAL(&s_speaker_mux);
+}
+
+/* --- speaker-grant state accessors (all guarded by s_speaker_mux) ---
+ * Keep every critical section tiny: plain array copies only, never a send,
+ * log, or mutex take inside taskENTER_CRITICAL/taskEXIT_CRITICAL. */
+static void speaker_state_get(uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS],
+                              uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS])
+{
+    taskENTER_CRITICAL(&s_speaker_mux);
+    if (ids) {
+        memcpy(ids, s_active_speaker_ids, sizeof(s_active_speaker_ids));
+    }
+    if (masks) {
+        memcpy(masks, s_relay_masks, sizeof(s_relay_masks));
+    }
+    taskEXIT_CRITICAL(&s_speaker_mux);
+}
+
+static void speaker_state_set(const uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS],
+                              const uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS])
+{
+    taskENTER_CRITICAL(&s_speaker_mux);
+    memcpy(s_active_speaker_ids, ids, sizeof(s_active_speaker_ids));
+    memcpy(s_relay_masks, masks, sizeof(s_relay_masks));
+    taskEXIT_CRITICAL(&s_speaker_mux);
 }
 
 static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
@@ -302,8 +335,12 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
         return;
     }
 
-    s_heard_bitmap |= node_bit(src_id);
-    s_active_speaker_deadline_ms[src_id] = (esp_timer_get_time() / 1000) + ACTIVE_SPEAKER_TIMEOUT_MS;
+    uint8_t bit = node_bit(src_id);
+    int64_t deadline = (esp_timer_get_time() / 1000) + ACTIVE_SPEAKER_TIMEOUT_MS;
+    taskENTER_CRITICAL(&s_speaker_mux);
+    s_heard_bitmap |= bit;
+    s_active_speaker_deadline_ms[src_id] = deadline;
+    taskEXIT_CRITICAL(&s_speaker_mux);
 }
 
 static uint8_t compute_relay_mask(uint8_t speaker_id)
@@ -367,15 +404,23 @@ static void update_speaker_grants(void)
     }
 
     uint8_t previous[MESH_MAX_ACTIVE_SPEAKERS];
+    uint8_t prev_masks[MESH_MAX_ACTIVE_SPEAKERS];
     uint8_t selected[MESH_MAX_ACTIVE_SPEAKERS] = {0};
     uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
+    int64_t deadlines[MESH_MAX_NODES + 1];
     size_t idx = 0;
     int64_t now_ms = esp_timer_get_time() / 1000;
 
+    /* Atomically snapshot the shared state, then compute outside the lock
+     * (compute_relay_mask takes s_peer_mutex and must not run under the spinlock). */
+    taskENTER_CRITICAL(&s_speaker_mux);
     memcpy(previous, s_active_speaker_ids, sizeof(previous));
+    memcpy(prev_masks, s_relay_masks, sizeof(prev_masks));
+    memcpy(deadlines, s_active_speaker_deadline_ms, sizeof(deadlines));
+    taskEXIT_CRITICAL(&s_speaker_mux);
 
     for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES && idx < MESH_MAX_ACTIVE_SPEAKERS; node_id++) {
-        if (s_active_speaker_deadline_ms[node_id] > now_ms) {
+        if (deadlines[node_id] > now_ms) {
             selected[idx] = node_id;
             relay_masks[idx] = compute_relay_mask(node_id);
             idx++;
@@ -383,7 +428,7 @@ static void update_speaker_grants(void)
     }
 
     if (memcmp(previous, selected, sizeof(previous)) == 0 &&
-        memcmp(s_relay_masks, relay_masks, sizeof(relay_masks)) == 0) {
+        memcmp(prev_masks, relay_masks, sizeof(prev_masks)) == 0) {
         return;
     }
 
@@ -405,14 +450,13 @@ static void update_speaker_grants(void)
         }
     }
 
-    memcpy(s_active_speaker_ids, selected, sizeof(selected));
-    memcpy(s_relay_masks, relay_masks, sizeof(relay_masks));
+    speaker_state_set(selected, relay_masks);
 
     mesh_speaker_grant_payload_t payload = {0};
-    memcpy(payload.speaker_ids, s_active_speaker_ids, sizeof(payload.speaker_ids));
-    memcpy(payload.relay_masks, s_relay_masks, sizeof(payload.relay_masks));
+    memcpy(payload.speaker_ids, selected, sizeof(payload.speaker_ids));
+    memcpy(payload.relay_masks, relay_masks, sizeof(payload.relay_masks));
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-        if (s_active_speaker_ids[i] != 0) {
+        if (selected[i] != 0) {
             payload.speaker_count++;
         }
     }
@@ -997,7 +1041,9 @@ static void mesh_task(void *arg)
                         update_speaker_grants();
                     }
                     send_status();
+                    taskENTER_CRITICAL(&s_speaker_mux);
                     s_heard_bitmap = 0;
+                    taskEXIT_CRITICAL(&s_speaker_mux);
                     s_relay_bitmap = 0;
                     last_status = now;
                 }
@@ -1159,12 +1205,13 @@ static void handle_packet(const mesh_rx_item_t *rx)
             const mesh_speaker_grant_payload_t *grant =
                 (const mesh_speaker_grant_payload_t *)rx->payload;
 
-            memset(s_active_speaker_ids, 0, sizeof(s_active_speaker_ids));
-            memset(s_relay_masks, 0, sizeof(s_relay_masks));
+            uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
+            uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
             for (uint8_t i = 0; i < grant->speaker_count && i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-                s_active_speaker_ids[i] = grant->speaker_ids[i];
-                s_relay_masks[i] = grant->relay_masks[i];
+                ids[i] = grant->speaker_ids[i];
+                masks[i] = grant->relay_masks[i];
             }
+            speaker_state_set(ids, masks);
         }
         break;
 
@@ -1173,15 +1220,19 @@ static void handle_packet(const mesh_rx_item_t *rx)
             const mesh_speaker_release_payload_t *release =
                 (const mesh_speaker_release_payload_t *)rx->payload;
 
+            uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS];
+            uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS];
+            speaker_state_get(ids, masks);
             for (uint8_t rel = 0; rel < release->speaker_count && rel < MESH_MAX_ACTIVE_SPEAKERS;
                  rel++) {
                 for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-                    if (s_active_speaker_ids[i] == release->speaker_ids[rel]) {
-                        s_active_speaker_ids[i] = 0;
-                        s_relay_masks[i] = 0;
+                    if (ids[i] == release->speaker_ids[rel]) {
+                        ids[i] = 0;
+                        masks[i] = 0;
                     }
                 }
             }
+            speaker_state_set(ids, masks);
         }
         break;
 
@@ -1272,9 +1323,12 @@ static void handle_audio_packet(const mesh_rx_item_t *rx)
 
         if ((rx->header.flags & MESH_FLAG_SPEAKER_GRANTED) != 0) {
             /* Granted audio: check if we are in the relay mask for this speaker */
+            uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS];
+            uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS];
+            speaker_state_get(ids, masks);
             for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-                if (s_active_speaker_ids[i] == rx->header.src_id &&
-                    (s_relay_masks[i] & node_bit(s_node_id)) != 0) {
+                if (ids[i] == rx->header.src_id &&
+                    (masks[i] & node_bit(s_node_id)) != 0) {
                     relay_allowed = true;
                     break;
                 }
@@ -1539,11 +1593,13 @@ static void handle_slot_map_packet(const mesh_rx_item_t *rx)
         }
     }
 
-    clear_speaker_state();
+    uint8_t sm_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
+    uint8_t sm_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
     for (uint8_t i = 0; i < slot_map->active_speaker_count && i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-        s_active_speaker_ids[i] = slot_map->active_speaker_ids[i];
-        s_relay_masks[i] = slot_map->relay_masks[i];
+        sm_ids[i] = slot_map->active_speaker_ids[i];
+        sm_masks[i] = slot_map->relay_masks[i];
     }
+    speaker_state_set(sm_ids, sm_masks);
     xSemaphoreGive(s_peer_mutex);
 }
 
@@ -1690,13 +1746,16 @@ static esp_err_t send_slot_map(void)
     }
     xSemaphoreGive(s_peer_mutex);
 
+    uint8_t sm_ids[MESH_MAX_ACTIVE_SPEAKERS];
+    uint8_t sm_masks[MESH_MAX_ACTIVE_SPEAKERS];
+    speaker_state_get(sm_ids, sm_masks);
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-        if (s_active_speaker_ids[i] != 0) {
+        if (sm_ids[i] != 0) {
             payload.active_speaker_count++;
         }
     }
-    memcpy(payload.active_speaker_ids, s_active_speaker_ids, sizeof(payload.active_speaker_ids));
-    memcpy(payload.relay_masks, s_relay_masks, sizeof(payload.relay_masks));
+    memcpy(payload.active_speaker_ids, sm_ids, sizeof(payload.active_speaker_ids));
+    memcpy(payload.relay_masks, sm_masks, sizeof(payload.relay_masks));
 
     return send_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
 }
@@ -1714,8 +1773,10 @@ static esp_err_t send_status(void)
         .active_speakers = 0,
     };
 
+    uint8_t st_ids[MESH_MAX_ACTIVE_SPEAKERS];
+    speaker_state_get(st_ids, NULL);
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-        if (s_active_speaker_ids[i] != 0) {
+        if (st_ids[i] != 0) {
             payload.active_speakers++;
         }
     }
@@ -1761,8 +1822,10 @@ static esp_err_t send_audio_in_slot(void)
     header->flags = MESH_FLAG_RELAY_REQUEST;
     header->payload_len = 4 + tx_item.len;
 
+    uint8_t slot_ids[MESH_MAX_ACTIVE_SPEAKERS];
+    speaker_state_get(slot_ids, NULL);
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-        if (s_active_speaker_ids[i] == s_node_id) {
+        if (slot_ids[i] == s_node_id) {
             header->flags |= MESH_FLAG_SPEAKER_GRANTED;
             break;
         }
@@ -1871,13 +1934,17 @@ static void check_peer_timeouts(void)
                 timed_out_count++;
 
                 for (int speaker = 0; speaker < MESH_MAX_ACTIVE_SPEAKERS; speaker++) {
-                    if (s_active_speaker_ids[speaker] == timed_out_id) {
+                    bool was_speaker;
+                    taskENTER_CRITICAL(&s_speaker_mux);
+                    was_speaker = (s_active_speaker_ids[speaker] == timed_out_id);
+                    if (was_speaker) {
                         s_active_speaker_ids[speaker] = 0;
                         s_relay_masks[speaker] = 0;
                         s_active_speaker_deadline_ms[timed_out_id] = 0;
-                        if (s_role == MESH_ROLE_COORDINATOR) {
-                            send_speaker_release_for(timed_out_id);
-                        }
+                    }
+                    taskEXIT_CRITICAL(&s_speaker_mux);
+                    if (was_speaker && s_role == MESH_ROLE_COORDINATOR) {
+                        send_speaker_release_for(timed_out_id);
                     }
                 }
 
