@@ -9,139 +9,29 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* ============================================================================
- * Constants (matching ESP32 mesh.h)
- * ============================================================================ */
-
-#define MESH_MAX_NODES             8
-#define MESH_FRAME_MS              20
-#define MESH_SLOT_MS               2
-#define MESH_GUARD_US              200
-#define MESH_SYNC_INTERVAL_FRAMES  10
-#define MESH_NODE_TIMEOUT_MS       3000
-#define MESH_KEEPALIVE_INTERVAL_MS 500
-#define MESH_PROTOCOL_VERSION      0x01
-#define MESH_MAX_AUDIO_PAYLOAD     64
-#define MESH_MAX_ACTIVE_SPEAKERS   2
-#define MESH_AUDIO_TTL_DEFAULT     2
-
-#define MESH_FLAG_RELAY_REQUEST    0x01
-#define MESH_FLAG_RELAYED          0x02
-#define MESH_FLAG_SPEAKER_GRANTED  0x04
-
-#define MESH_AUDIO_FLAG_ACTIVE     0x01
+/* Shared on-air protocol definitions (single source of truth, also used by the
+ * ESP-NOW build). Only nRF/ESB-specific items are defined below. */
+#include "mesh_protocol_defs.h"
 
 /* ============================================================================
- * Packet Types
+ * nRF/ESB-specific protocol types
+ *
+ * Constants, enums (mesh_role_t / mesh_state_t / mesh_pkt_type_t), the packet
+ * header, and payload structs come from shared/mesh_protocol_defs.h (included
+ * above). Only nRF/ESB-specific items are defined here.
  * ============================================================================ */
 
-typedef enum {
-    MESH_PKT_AUDIO = 0x01,
-    MESH_PKT_JOIN = 0x02,
-    MESH_PKT_JOIN_ACK = 0x03,
-    MESH_PKT_LEAVE = 0x04,
-    MESH_PKT_SYNC = 0x05,
-    MESH_PKT_SLOT_MAP = 0x06,
-    MESH_PKT_STATUS = 0x07,
-    MESH_PKT_KEEPALIVE = 0x08,
-    MESH_PKT_SPEAKER_GRANT = 0x09,
-    MESH_PKT_SPEAKER_RELEASE = 0x0A,
-} mesh_pkt_type_t;
-
-/* ============================================================================
- * Packet Header (8 bytes, matching ESP32)
- * ============================================================================ */
-
-typedef struct __attribute__((packed)) {
-    uint8_t version;      /* Protocol version */
-    uint8_t type;         /* Packet type */
-    uint8_t src_id;       /* Source node ID */
-    uint8_t seq;          /* Sequence number */
-    uint8_t ttl;          /* Relay time-to-live */
-    uint8_t flags;        /* Control flags */
-    uint16_t payload_len; /* Payload length */
-} mesh_header_t;
-
-/* ============================================================================
- * Payload Structures
- * ============================================================================ */
-
-typedef struct __attribute__((packed)) {
-    uint8_t codec;
-    uint8_t frame_ms;
-    uint8_t stream_id;
-    uint8_t audio_flags;
-    uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
-} mesh_audio_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t capabilities;
-    uint8_t reserved;
-} mesh_join_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t assigned_id;
-    uint8_t slot_index;
-    uint8_t coordinator_id;
-} mesh_join_ack_payload_t;
-
+/**
+ * @brief SYNC payload - nRF/ESB variant (5-byte ESB address for tiebreaking)
+ *
+ * Not in the shared header: the coordinator address width differs from the
+ * ESP-NOW build (which uses a 6-byte WiFi MAC).
+ */
 typedef struct __attribute__((packed)) {
     uint32_t frame_counter;
     int16_t drift_ppm;
     uint8_t coordinator_addr[5]; /* ESB address for coordinator tiebreaking */
 } mesh_sync_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t battery_pct;
-    uint8_t reserved;
-} mesh_keepalive_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t slot_count;
-    uint8_t slot_ids[MESH_MAX_NODES];
-    uint8_t active_speaker_count;
-    uint8_t active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS];
-    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS];
-} mesh_slot_map_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t battery_pct;
-    int8_t rssi_dbm;
-    uint8_t peer_count;
-    uint8_t fw_version;
-    int8_t temperature_c;
-    uint8_t heard_bitmap;
-    uint8_t relay_bitmap;
-    uint8_t active_speakers;
-} mesh_status_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t speaker_count;
-    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS];
-    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS];
-} mesh_speaker_grant_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t speaker_count;
-    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS];
-} mesh_speaker_release_payload_t;
-
-/* ============================================================================
- * Node State
- * ============================================================================ */
-
-typedef enum {
-    MESH_ROLE_NONE = 0,
-    MESH_ROLE_COORDINATOR,
-    MESH_ROLE_PARTICIPANT,
-} mesh_role_t;
-
-typedef enum {
-    MESH_STATE_IDLE = 0,
-    MESH_STATE_SCANNING,
-    MESH_STATE_JOINING,
-    MESH_STATE_ACTIVE,
-} mesh_state_t;
 
 /* ============================================================================
  * Peer Info

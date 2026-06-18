@@ -3,7 +3,7 @@
 
 idf_component_register(
     SRCS "mesh.c"
-    INCLUDE_DIRS "include"
+    INCLUDE_DIRS "include" "../../shared"
     REQUIRES 
         esp_wifi
         esp_timer
