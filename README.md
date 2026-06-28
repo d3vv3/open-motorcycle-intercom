@@ -5,7 +5,7 @@
     <br/>
     <b>Open Source Mesh and Bluetooth Motorcycle Intercom</b>
     <br/>
-    <a href="https://openhelmet.devve.space">website</a>
+    <a href="https://openhelmet.devve.space">website</a> | <a href="https://discord.gg/XxBSnwSDst">discord</a>
 </p>
 
 OpenHelmet is an **open-source, motorcycle intercom system**
