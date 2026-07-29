@@ -1,0 +1,669 @@
+(footprint "WQFN-16_L3.0-W3.0-P0.50-TL-EP1.6"
+	(version 20241209)
+	(generator "ai-eda-jlc-mcp")
+	(layer "F.Cu")
+	(descr "0.01% 100dB 100dB 2-Channel 2.1mA 2.3V~5.5V 25mWx2@16Ω Automatic mute/no-noise switch、Enable/disable function、ESD protection、Digital programmable gain Class AB WQFN-16-EP(3x3) Audio Amplifiers ROHS")
+	(tags "component")
+	(property "Reference" "REF**"
+		(at 0 -3.65 0)
+		(layer "F.SilkS")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "TPA6132A2RTER"
+		(at 0 3.65 0)
+		(layer "F.Fab")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" "0.01% 100dB 100dB 2-Channel 2.1mA 2.3V~5.5V 25mWx2@16Ω Automatic mute/no-noise switch、Enable/disable function、ESD protection、Digital programmable gain Class AB WQFN-16-EP(3x3) Audio Amplifiers ROHS"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "LCSC" "C69901"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Manufacturer" "TI(德州仪器)"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Power Supply Rejection Ratio (PSRR)" "100dB"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Operating Temperature" "-40℃~+85℃"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Total Harmonic Distortion + Noise (THD+N)" "0.01%"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Output Power" "25mWx2@16Ω"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Voltage - Supply" "2.3V~5.5V"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Quiescent Current" "2.1mA"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Features" "Automatic mute/no-noise switch、Enable/shutdown function、ESD protection、Digitally programmable gain"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Class" "Class AB"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Speaker Channels" "2-Channel"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Signal-to-Noise Ratio" "100dB"
+		(at 0 0 0)
+		(layer "F.Fab")
+		hide
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr smd)
+	(pad "1" smd roundrect
+		(at -1.5 -0.7492 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "2" smd roundrect
+		(at -1.5 -0.2488 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "3" smd roundrect
+		(at -1.5 0.249 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "4" smd roundrect
+		(at -1.5 0.7494 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "5" smd roundrect
+		(at -0.7492 1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "6" smd roundrect
+		(at -0.2488 1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "7" smd roundrect
+		(at 0.249 1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "8" smd roundrect
+		(at 0.7494 1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "9" smd roundrect
+		(at 1.5 0.7494 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "10" smd roundrect
+		(at 1.5 0.249 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "11" smd roundrect
+		(at 1.5 -0.2488 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "12" smd roundrect
+		(at 1.5 -0.7492 90)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "13" smd roundrect
+		(at 0.7494 -1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "14" smd roundrect
+		(at 0.249 -1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "15" smd roundrect
+		(at -0.2488 -1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "16" smd roundrect
+		(at -0.7492 -1.5)
+		(size 0.28 0.8)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(pad "17" smd roundrect
+		(at 0.0001 0.0001)
+		(size 1.6 1.6)
+		(layers "F.Cu" "F.Paste" "F.Mask")
+		(roundrect_rratio 0.25)
+	)
+	(fp_line
+		(start -1.275 1.725)
+		(end -1.7249 1.725)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start -1.7249 1.725)
+		(end -1.7249 1.2751)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start -1.7249 -1.275)
+		(end -1.7249 -1.7249)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start -1.7249 -1.7249)
+		(end -1.275 -1.7249)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start 1.2751 -1.7249)
+		(end 1.725 -1.7249)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start 1.725 -1.7249)
+		(end 1.725 -1.275)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start 1.2751 1.725)
+		(end 1.725 1.725)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_line
+		(start 1.725 1.725)
+		(end 1.725 1.2751)
+		(stroke
+			(width 0.2)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_circle
+		(center -1.4999 -1.4999)
+		(end -1.4699 -1.4999)
+		(stroke
+			(width 0.06)
+			(type solid)
+		)
+		(layer "F.Fab")
+	)
+	(fp_circle
+		(center -2.0573 -0.8127)
+		(end -1.9303 -0.8127)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "Cmts.User")
+	)
+	(fp_arc
+		(start -2.0751 -1.5239)
+		(mid -2.0001 -1.5227)
+		(end -2.0751 -1.5214)
+		(stroke
+			(width 0.3)
+			(type solid)
+		)
+		(layer "F.SilkS")
+	)
+	(fp_poly
+		(pts
+			(xy 0.6094 -1.8999)
+			(xy 0.6094 -1.0999)
+			(xy 0.8894 -1.0999)
+			(xy 0.8894 -1.8999)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 0.109 -1.8999)
+			(xy 0.109 -1.0999)
+			(xy 0.3891 -1.0999)
+			(xy 0.3891 -1.8999)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -0.6092 -1.0999)
+			(xy -0.6092 -1.8999)
+			(xy -0.8892 -1.8999)
+			(xy -0.8892 -1.0999)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -0.1088 -1.0999)
+			(xy -0.1088 -1.8999)
+			(xy -0.3888 -1.8999)
+			(xy -0.3888 -1.0999)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -1.8999 -0.8892)
+			(xy -1.8999 -0.6092)
+			(xy -1.0999 -0.6092)
+			(xy -1.0999 -0.8892)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 1.9 -0.6092)
+			(xy 1.9 -0.8892)
+			(xy 1.1 -0.8892)
+			(xy 1.1 -0.6092)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 0.64 0.64)
+			(xy 0.64 -0.64)
+			(xy -0.64 -0.64)
+			(xy -0.64 0.64)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 1.9 -0.1088)
+			(xy 1.9 -0.3888)
+			(xy 1.1 -0.3888)
+			(xy 1.1 -0.1088)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -1.8999 -0.3888)
+			(xy -1.8999 -0.1088)
+			(xy -1.0999 -0.1088)
+			(xy -1.0999 -0.3888)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 1.9 0.3891)
+			(xy 1.9 0.109)
+			(xy 1.1 0.109)
+			(xy 1.1 0.3891)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -1.8999 0.109)
+			(xy -1.8999 0.3891)
+			(xy -1.0999 0.3891)
+			(xy -1.0999 0.109)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 1.9 0.8894)
+			(xy 1.9 0.6094)
+			(xy 1.1 0.6094)
+			(xy 1.1 0.8894)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -1.0999 0.8894)
+			(xy -1.0999 0.6094)
+			(xy -1.8999 0.6094)
+			(xy -1.8999 0.8894)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -0.8892 1.1)
+			(xy -0.8892 1.9)
+			(xy -0.6092 1.9)
+			(xy -0.6092 1.1)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy -0.3888 1.1)
+			(xy -0.3888 1.9)
+			(xy -0.1088 1.9)
+			(xy -0.1088 1.1)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 0.109 1.1)
+			(xy 0.109 1.9)
+			(xy 0.3891 1.9)
+			(xy 0.3891 1.1)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_poly
+		(pts
+			(xy 0.8894 1.9)
+			(xy 0.8894 1.1)
+			(xy 0.6094 1.1)
+			(xy 0.6094 1.9)
+		)
+		(stroke
+			(width 0)
+			(type solid)
+		)
+		(fill solid)
+		(layer "F.Paste")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(effects
+			(font
+				(size 0.5 0.5)
+				(thickness 0.08)
+			)
+		)
+	)
+	(fp_line
+		(start -2.43 -2.15)
+		(end 2.15 -2.15)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+	)
+	(fp_line
+		(start 2.15 -2.15)
+		(end 2.15 2.15)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+	)
+	(fp_line
+		(start 2.15 2.15)
+		(end -2.43 2.15)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+	)
+	(fp_line
+		(start -2.43 2.15)
+		(end -2.43 -2.15)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+	)
+	(embedded_fonts no)
+	(model "${KIPRJMOD}/libraries/3dmodels/JLC-MCP.3dshapes/TPA6132A2RTER.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)

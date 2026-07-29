@@ -1,0 +1,104 @@
+(version 1)
+
+(rule "nRF52840 RF ball escape"
+  (condition "A.Type == 'Track' && A.NetName == 'NRF_RF_RAW'")
+  (constraint track_width (min 0.10mm)))
+
+(rule "RF 50 ohm candidate geometry"
+  (condition "A.Type == 'Track' && (A.NetName == 'FEM_TRX' || A.NetName == 'FEM_ANT1_RAW' || A.NetName == 'FEM_ANT1_MID' || A.NetName == 'FEM_RF_50R' || A.NetName == 'ANT_TUNED')")
+  (constraint track_width (min 0.35mm) (opt 0.35mm)))
+
+(rule "RF matching component neck-down"
+  (condition "A.Type == 'Track' && A.NetName == 'FEM_RF_50R' && A.intersectsArea('RF matching neck-down')")
+  (constraint track_width (min 0.20mm) (opt 0.20mm)))
+
+(rule "USB data"
+  (condition "A.Type == 'Track' && (A.NetName == 'ESP_USB_D+' || A.NetName == 'ESP_USB_D-' || A.NetName == 'USB_D+_CONN' || A.NetName == 'USB_D-_CONN' || A.NetName == 'USB_D+_PROTECTED' || A.NetName == 'USB_D-_PROTECTED')")
+  (constraint track_width (min 0.18mm) (opt 0.18mm)))
+
+(rule "USB-C edge-mount copper"
+  (condition "A.intersectsArea('USB-C edge mount')")
+  (constraint edge_clearance (min -0.50mm)))
+
+(rule "GND edge stitching vias"
+  (condition "A.Type == 'Via' && A.NetName == 'GND'")
+  (constraint edge_clearance (min 0.40mm)))
+
+(rule "3V3 plane feed"
+  (condition "A.Type == 'Track' && A.NetName == '+3.3V' && A.Layer == 'In2.Cu'")
+  (constraint track_width (min 0.60mm) (opt 0.60mm)))
+
+(rule "3V3 local branch"
+  (condition "A.Type == 'Track' && A.NetName == '+3.3V' && A.Layer != 'In2.Cu'")
+  (constraint track_width (min 0.10mm)))
+
+(rule "Regulator switching-node escape"
+  (condition "A.Type == 'Track' && (A.NetName == 'REG_L1' || A.NetName == 'REG_L2')")
+  (constraint track_width (min 0.20mm)))
+
+(rule "VBUS and SYS_OUT local fanout"
+  (condition "A.Type == 'Track' && (A.NetName == 'VBUS' || A.NetName == 'SYS_OUT') && A.Layer == 'F.Cu'")
+  (constraint track_width (min 0.10mm)))
+
+(rule "VBUS and SYS_OUT trunk"
+  (condition "A.Type == 'Track' && (A.NetName == 'VBUS' || A.NetName == 'SYS_OUT') && A.Layer != 'F.Cu'")
+  (constraint track_width (min 0.40mm) (opt 0.40mm)))
+
+(rule "USB VBUS connector neck-down"
+  (condition "A.Type == 'Track' && A.NetName == 'VBUS' && A.enclosedByArea('USB VBUS connector neck-down')")
+  (constraint track_width (min 0.20mm)))
+
+(rule "VBUS charger neck-down"
+  (condition "A.Type == 'Track' && A.NetName == 'VBUS' && A.enclosedByArea('VBUS charger neck-down')")
+  (constraint track_width (min 0.35mm)))
+
+(rule "Battery local fanout"
+  (condition "A.Type == 'Track' && A.NetName == 'BAT+' && A.Layer == 'F.Cu'")
+  (constraint track_width (min 0.20mm)))
+
+(rule "Battery trunk"
+  (condition "A.Type == 'Track' && A.NetName == 'BAT+' && A.Layer != 'F.Cu'")
+  (constraint track_width (min 0.40mm) (opt 0.40mm)))
+
+(rule "NRF_RX package fanout clearance"
+  (condition "(A.NetName == 'NRF_RX' || B.NetName == 'NRF_RX') && A.intersectsArea('NRF_RX U2 fanout') && B.intersectsArea('NRF_RX U2 fanout')")
+  (constraint clearance (min 0.075mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "NRF_TX package fanout clearance"
+  (condition "(A.NetName == 'NRF_TX' || B.NetName == 'NRF_TX') && A.intersectsArea('NRF_TX U2 fanout') && B.intersectsArea('NRF_TX U2 fanout')")
+  (constraint clearance (min 0.075mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "NRF_SCK package fanout clearance"
+  (condition "(A.NetName == 'NRF_SCK' || B.NetName == 'NRF_SCK') && A.intersectsArea('NRF_SCK U2 fanout') && B.intersectsArea('NRF_SCK U2 fanout')")
+  (constraint clearance (min 0.075mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "NRF_MISO package fanout clearance"
+  (condition "(A.NetName == 'NRF_MISO' || B.NetName == 'NRF_MISO') && A.intersectsArea('NRF_MISO U2 fanout') && B.intersectsArea('NRF_MISO U2 fanout')")
+  (constraint clearance (min 0.075mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "U2 generated-package fanout"
+  (condition "A.intersectsArea('U2 generated fanout') && B.intersectsArea('U2 generated fanout')")
+  (constraint clearance (min 0.074mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "USB-C signal escape"
+  (condition "A.intersectsArea('USB-C edge mount') && B.intersectsArea('USB-C edge mount')")
+  (constraint clearance (min 0.10mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "Microphone analog escape"
+  (condition "A.intersectsArea('Microphone analog fanout') && B.intersectsArea('Microphone analog fanout')")
+  (constraint clearance (min 0.099mm))
+  (constraint hole_clearance (min 0.20mm)))
+
+(rule "Generated QFN and TDFN pads"
+  (condition "A.Type == 'Pad' && B.Type == 'Pad' && ((A.intersectsArea('U4 generated QFN') && B.intersectsArea('U4 generated QFN')) || (A.intersectsArea('U8 generated TDFN') && B.intersectsArea('U8 generated TDFN')))")
+  (constraint clearance (min 0.15mm)))
+
+(rule "RF matching SMD pads"
+  (condition "A.Type == 'Pad' && B.Type == 'Pad' && ((A.intersectsArea('RF front-end matching') && B.intersectsArea('RF front-end matching')) || (A.intersectsArea('Antenna tune matching') && B.intersectsArea('Antenna tune matching')))")
+  (constraint clearance (min 0.15mm)))

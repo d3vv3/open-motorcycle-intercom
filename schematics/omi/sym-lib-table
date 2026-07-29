@@ -1,0 +1,11 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "JLC-MCP")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Misc.kicad_sym")(options "")(descr "JLC-MCP Component Library (LCSC/EasyEDA)"))
+  (lib (name "JLC-MCP-Interface")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Interface.kicad_sym")(options "")(descr "JLCPCB/LCSC interface components"))
+  (lib (name "JLC-MCP-Misc")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Misc.kicad_sym")(options "")(descr "JLCPCB/LCSC RF and miscellaneous components"))
+  (lib (name "JLC-MCP-ICs")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-ICs.kicad_sym")(options "")(descr "JLCPCB/LCSC charging ICs"))
+  (lib (name "JLC-MCP-Connectors")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Connectors.kicad_sym")(options "")(descr "JLCPCB/LCSC connectors"))
+  (lib (name "JLC-MCP-Diodes")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Diodes.kicad_sym")(options "")(descr "JLCPCB/LCSC ESD protection"))
+  (lib (name "JLC-MCP-Power")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Power.kicad_sym")(options "")(descr "JLCPCB/LCSC power converters"))
+  (lib (name "JLC-MCP-Crystals")(type "KiCad")(uri "${KIPRJMOD}/libraries/symbols/JLC-MCP-Crystals.kicad_sym")(options "")(descr "JLCPCB/LCSC crystals"))
+)
