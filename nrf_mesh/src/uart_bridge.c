@@ -403,13 +403,14 @@ int uart_bridge_send_status(uint8_t state, uint8_t role, uint8_t peer_count, uin
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
     bridge_status_payload_t payload = {
+        .role = role,
+        .peer_count = peer_count,
+        .node_id = node_id,
         .version = BRIDGE_PROTOCOL_VERSION,
         .mesh_state = state,
-        .role = role,
-        .node_id = node_id,
         .slot_index = slot_index,
         .coordinator_id = coordinator_id,
-        .peer_count = peer_count,
+        .marker = BRIDGE_STATUS_V2_MARKER,
     };
     uint16_t pkt_len =
         build_packet(pkt, UART_PKT_STATUS, (const uint8_t *)&payload, sizeof(payload));

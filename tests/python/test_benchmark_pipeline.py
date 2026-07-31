@@ -33,8 +33,98 @@ class PipelineLogTest(unittest.TestCase):
     def test_rejects_unknown_or_incomplete_schema(self):
         self.assertIsNone(parse_pipeline_logfmt("PIPE v=2 dev=nrf stage=rf tx_done=1"))
         self.assertIsNone(parse_pipeline_logfmt("PIPE v=1 stage=rf tx_done=1"))
+        self.assertIsNone(
+            parse_pipeline_logfmt("PIPE v=1 dev=nrf stage=rf tx_ok=-1")
+        )
+        self.assertIsNone(
+            parse_pipeline_logfmt("PIPE v=1 dev=nrf stage=tdma node=-1 sync_frame_diff=-2")
+        )
         self.assertIsNone(parse_pipeline_logfmt("ordinary firmware log"))
-        self.assertIsNone(parse_pipeline_logfmt("PIPE v=1 dev=nrf stage=rf tx_ok=-1"))
+
+    def test_parses_complete_signed_tdma_record_as_snapshot_gauges(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        lines = [
+            "PIPE v=1 dev=nrf stage=tdma node=2 slot_due=100 slot_submit_drop=1 "
+            "slot_late_drop=2 control_due=40 control_submit_drop=3 control_late_drop=4 "
+            "discipline_due=50 discipline_submit_drop=5 discipline_capture_drop=6 tune_req=20 "
+            "tune_clamp=7 correction_apply=18 correction_applied_us=-120 "
+            "correction_pending_us=-8 last_correction_us=-4 commanded_period_us=19998 "
+            "measured_interval_us=20011 callback_jitter_us=-11 callback_jitter_max_us=25 "
+            "skipped_frames=8 sync_acquire=9 sync_reacquire=10 sync_history_miss=11 "
+            "sync_frame_diff=-2 sync_phase_us=-35",
+            "PIPE v=1 dev=nrf stage=tdma node=2 slot_due=110 slot_submit_drop=2 "
+            "slot_late_drop=3 control_due=45 control_submit_drop=4 control_late_drop=5 "
+            "discipline_due=55 discipline_submit_drop=6 discipline_capture_drop=7 tune_req=25 "
+            "tune_clamp=8 correction_apply=23 correction_applied_us=-135 "
+            "correction_pending_us=6 last_correction_us=3 commanded_period_us=20001 "
+            "measured_interval_us=19991 callback_jitter_us=9 callback_jitter_max_us=28 "
+            "skipped_frames=9 sync_acquire=10 sync_reacquire=11 sync_history_miss=12 "
+            "sync_frame_diff=1 sync_phase_us=14",
+        ]
+        for line in lines:
+            reader._parse_line(line)
+
+        pipeline = _build_port_json(stats)["pipeline"]["nrf:tdma:2"]
+        self.assertEqual(pipeline["first"]["correction_applied_us"], -120)
+        self.assertEqual(pipeline["first"]["callback_jitter_us"], -11)
+        self.assertEqual(pipeline["first"]["sync_frame_diff"], -2)
+        self.assertEqual(pipeline["first"]["sync_phase_us"], -35)
+        self.assertEqual(pipeline["delta"]["slot_due"], 10)
+        for gauge in (
+            "correction_applied_us",
+            "correction_pending_us",
+            "last_correction_us",
+            "callback_jitter_us",
+            "sync_frame_diff",
+            "sync_phase_us",
+        ):
+            self.assertNotIn(gauge, pipeline["delta"])
+            self.assertNotIn(gauge, pipeline["reset_epochs"])
+
+    def test_parses_complete_current_atune_line(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        lines = [
+            "[00:01:23.456,789] <inf> mesh: [ATUNE] r=2 id=7 q=3 under_d=1 "
+            "skip=12/400 ws_e=76800 ws_n=399 ws_ok=390 ws_no=4 ws_rej=5 "
+            "ws_delta=192 ws_c=-6 ws_d=-143 td_req=390 td_app=388 td_sum=-119 "
+            "td_pend=-8 td_last=-4 td_cmd=19998 td_meas=20011 td_jit=-11 td_jit_max=25",
+            "[00:01:28.456,789] <inf> mesh: [ATUNE] r=2 id=7 q=4 under_d=0 "
+            "skip=14/500 ws_e=96000 ws_n=499 ws_ok=489 ws_no=5 ws_rej=5 "
+            "ws_delta=192 ws_c=3 ws_d=-137 td_req=490 td_app=488 td_sum=-113 "
+            "td_pend=6 td_last=3 td_cmd=20001 td_meas=19991 td_jit=9 td_jit_max=28",
+        ]
+        for line in lines:
+            reader._parse_line(line)
+
+        summary = _build_port_json(stats)
+        self.assertEqual(stats.atune_samples, 2)
+        self.assertEqual(stats.first_atune["ws_corr"], -6)
+        self.assertEqual(stats.first_atune["ws_drift"], -143)
+        self.assertEqual(stats.first_atune["td_sum"], -119)
+        self.assertEqual(stats.first_atune["td_jit"], -11)
+        self.assertEqual(stats.first_atune["skip_pct"], 3.0)
+        self.assertEqual(summary["atune_delta"]["ticks"], 100)
+        for gauge in ("ws_corr", "ws_drift", "td_sum", "td_pend", "td_last", "td_jit"):
+            self.assertNotIn(gauge, summary["atune_delta"])
+            self.assertNotIn(gauge, summary["atune_reset_epochs"])
+
+    def test_parses_current_adaptive_playout_and_per_source_depth_lines(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "I (123456) audio:   Adaptive playout: hold=27 catchup=9 sources=3"
+        )
+        reader._parse_line(
+            "I (123457) audio:   RX queue depth/source: min=1 avg=4 max=7 (total now=12)"
+        )
+
+        self.assertEqual(stats.last_adaptive, {"hold": 27, "catchup": 9, "sources": 3})
+        self.assertEqual(
+            stats.last_rx_depth,
+            {"rx_q_min": 1, "rx_q_avg": 4, "rx_q_max": 7, "rx_q_total": 12},
+        )
 
     def test_records_first_last_and_cumulative_delta(self):
         stats = PortStats(port="test")

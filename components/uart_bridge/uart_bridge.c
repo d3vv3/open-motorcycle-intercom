@@ -45,6 +45,7 @@ static const char *TAG = "spi_bridge";
 #define TX_AUDIO_MAX_AGE_US 120000
 #define COMMAND_ACK_TIMEOUT_MS 300
 #define COMMAND_MAX_ATTEMPTS   3
+#define STATUS_STALE_TIMEOUT_US 3000000
 
 typedef struct {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
@@ -64,6 +65,8 @@ static uart_bridge_event_cb_t s_event_cb = NULL;
 
 static uart_bridge_status_t s_status = {0};
 static bool s_connected = false;
+static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_ack_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_command_in_progress = false;
 static volatile bool s_command_ack_received = false;
 static volatile uint8_t s_command_ack_generation = 0;
@@ -127,17 +130,24 @@ static volatile uint32_t s_ack_timeout_count = 0; /* Forced releases due to time
 static void IRAM_ATTR ack_gpio_isr_handler(void *arg)
 {
     BaseType_t woke = pdFALSE;
+    bool release_slot = false;
 
     (void)arg;
     s_ack_irq_count++;
 
+    portENTER_CRITICAL_ISR(&s_ack_lock);
     if (s_audio_tx_waiting_ack) {
         s_audio_tx_waiting_ack = false;
         s_audio_tx_inflight_valid = false;
         s_ack_release_count++;
-        xSemaphoreGiveFromISR(s_audio_slots_free, &woke);
+        release_slot = true;
     } else {
         s_ack_spurious_count++;
+    }
+    portEXIT_CRITICAL_ISR(&s_ack_lock);
+
+    if (release_slot) {
+        xSemaphoreGiveFromISR(s_audio_slots_free, &woke);
     }
 
     if (woke == pdTRUE) {
@@ -148,6 +158,78 @@ static void IRAM_ATTR ack_gpio_isr_handler(void *arg)
 static uint8_t audio_queue_depth(void)
 {
     return s_audio_slots_used ? (uint8_t)uxSemaphoreGetCount(s_audio_slots_used) : 0;
+}
+
+static void discard_pending_audio(void)
+{
+    if (s_tx_mutex == NULL || s_audio_slots_used == NULL || s_audio_slots_free == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+
+    while (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
+        s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
+        xSemaphoreGive(s_audio_slots_free);
+        s_audio_tx_stale_drop++;
+    }
+    s_audio_head = s_audio_tail;
+
+    bool release_inflight = false;
+    portENTER_CRITICAL(&s_ack_lock);
+    if (s_audio_tx_waiting_ack) {
+        s_audio_tx_waiting_ack = false;
+        release_inflight = true;
+    }
+    s_audio_tx_inflight_valid = false;
+    portEXIT_CRITICAL(&s_ack_lock);
+    if (release_inflight) {
+        xSemaphoreGive(s_audio_slots_free);
+    }
+
+    xSemaphoreGive(s_tx_mutex);
+}
+
+static void discard_audio_for_expired_status(uint32_t generation)
+{
+    if (s_tx_mutex == NULL || s_audio_slots_used == NULL || s_audio_slots_free == NULL) {
+        return;
+    }
+
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    portENTER_CRITICAL(&s_status_lock);
+    bool still_expired = !s_connected && s_status.generation == generation;
+    portEXIT_CRITICAL(&s_status_lock);
+    if (!still_expired) {
+        xSemaphoreGive(s_tx_mutex);
+        return;
+    }
+
+    while (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
+        s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
+        xSemaphoreGive(s_audio_slots_free);
+        s_audio_tx_stale_drop++;
+    }
+    s_audio_head = s_audio_tail;
+
+    bool release_inflight = false;
+    portENTER_CRITICAL(&s_ack_lock);
+    if (s_audio_tx_waiting_ack) {
+        s_audio_tx_waiting_ack = false;
+        release_inflight = true;
+    }
+    s_audio_tx_inflight_valid = false;
+    portEXIT_CRITICAL(&s_ack_lock);
+    if (release_inflight) {
+        xSemaphoreGive(s_audio_slots_free);
+    }
+    xSemaphoreGive(s_tx_mutex);
+}
+
+static bool status_is_fresh_locked(int64_t now_us)
+{
+    return s_connected && s_status.received_at_us > 0 && now_us >= s_status.received_at_us &&
+           now_us - s_status.received_at_us <= STATUS_STALE_TIMEOUT_US;
 }
 
 /* ============================================================================
@@ -169,12 +251,23 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
         if (len == sizeof(bridge_status_payload_t)) {
             bridge_status_payload_t status;
             memcpy(&status, payload, sizeof(status));
+            if (status.version != BRIDGE_PROTOCOL_VERSION ||
+                status.marker != BRIDGE_STATUS_V2_MARKER ||
+                status.mesh_state > BRIDGE_MESH_STATE_ACTIVE) {
+                ESP_LOGW(TAG, "Ignoring invalid bridge v2 status (version=%u marker=0x%02X)",
+                         status.version, status.marker);
+                break;
+            }
+
+            int64_t received_at_us = esp_timer_get_time();
+            portENTER_CRITICAL(&s_status_lock);
             /* Check for changes before updating */
             bool changed = (!s_connected) || (s_status.mesh_state != status.mesh_state) ||
                            (s_status.role != status.role) ||
                            (s_status.peer_count != status.peer_count) ||
                            (s_status.node_id != status.node_id);
 
+            uint32_t generation = s_status.generation + 1;
             memset(&s_status, 0, sizeof(s_status));
             s_status.mesh_state = status.mesh_state;
             s_status.role = status.role;
@@ -183,19 +276,46 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
             s_status.coordinator_id = status.coordinator_id;
             s_status.peer_count = status.peer_count;
             s_status.is_coordinator = status.role == 1;
+            s_status.has_mesh_state = true;
+            s_status.protocol_version = status.version;
+            s_status.generation = generation;
+            s_status.received_at_us = received_at_us;
             s_connected = true;
+            portEXIT_CRITICAL(&s_status_lock);
 
             if (changed) {
                 ESP_LOGI(TAG, "Status: state=%u role=%u node=%u slot=%d coord=%u peers=%u",
                          status.mesh_state, status.role, status.node_id, status.slot_index,
                          status.coordinator_id, status.peer_count);
             }
-        } else if (len >= 3) {
+            if (status.mesh_state != BRIDGE_MESH_STATE_ACTIVE || status.node_id == 0) {
+                discard_pending_audio();
+            }
+        } else if (len == 3) {
+            int64_t received_at_us = esp_timer_get_time();
+            portENTER_CRITICAL(&s_status_lock);
+            uint32_t generation = s_status.generation + 1;
+            memset(&s_status, 0, sizeof(s_status));
             s_status.role = payload[0];
             s_status.is_coordinator = payload[0] == 1;
             s_status.peer_count = payload[1];
             s_status.node_id = payload[2];
+            s_status.mesh_state = payload[0] != 0 && payload[2] != 0
+                                      ? BRIDGE_MESH_STATE_ACTIVE
+                                      : BRIDGE_MESH_STATE_IDLE;
+            s_status.slot_index = UINT8_MAX;
+            s_status.protocol_version = 1;
+            s_status.has_mesh_state = false;
+            s_status.generation = generation;
+            s_status.received_at_us = received_at_us;
             s_connected = true;
+            portEXIT_CRITICAL(&s_status_lock);
+
+            if (payload[0] == 0 || payload[2] == 0) {
+                discard_pending_audio();
+            }
+        } else {
+            ESP_LOGW(TAG, "Ignoring bridge status with invalid length %u", len);
         }
         break;
 
@@ -316,25 +436,26 @@ static void parse_rx(const uint8_t *buf, size_t len)
 /**
  * @brief Prepare the DMA TX buffer for the next SPI transaction.
  *
- * Audio dequeue is lock-free (SPSC ring).  Only the control slot
- * needs the mutex, and it's the low-frequency path.
+ * Audio dequeue and queue purging share the TX mutex so semaphore ownership
+ * and ring indices move together.
  */
 static void prepare_tx_buf(void)
 {
     /* ---- ACK timeout recovery ----
      * If the nRF ACK pulse was missed (noise, reboot, glitch), force-release
      * the inflight frame so the pipeline doesn't deadlock permanently. */
-    if (s_audio_tx_waiting_ack) {
-        int64_t now_us = esp_timer_get_time();
-        if ((now_us - s_ack_wait_start_us) > ACK_TIMEOUT_US) {
-            /* Force-release: give back the slot, clear inflight */
-            portDISABLE_INTERRUPTS();
-            s_audio_tx_waiting_ack = false;
-            s_audio_tx_inflight_valid = false;
-            portENABLE_INTERRUPTS();
-            xSemaphoreGive(s_audio_slots_free);
-            s_ack_timeout_count++;
-        }
+    bool release_timed_out_slot = false;
+    int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_ack_lock);
+    if (s_audio_tx_waiting_ack && (now_us - s_ack_wait_start_us) > ACK_TIMEOUT_US) {
+        s_audio_tx_waiting_ack = false;
+        s_audio_tx_inflight_valid = false;
+        s_ack_timeout_count++;
+        release_timed_out_slot = true;
+    }
+    portEXIT_CRITICAL(&s_ack_lock);
+    if (release_timed_out_slot) {
+        xSemaphoreGive(s_audio_slots_free);
     }
 
     /* Lifecycle controls must pass even while an audio frame awaits ACK. */
@@ -349,24 +470,44 @@ static void prepare_tx_buf(void)
     }
 
     /* Fast path: audio queue with GPIO ACK-driven stop-and-wait. */
+    portENTER_CRITICAL(&s_ack_lock);
     if (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) {
         memcpy(s_tx_dma_buf, s_audio_tx_inflight.buf, BRIDGE_SPI_MAX_XFER);
+        portEXIT_CRITICAL(&s_ack_lock);
         return;
     }
+    portEXIT_CRITICAL(&s_ack_lock);
 
-    while (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
+    while (xSemaphoreTake(s_tx_mutex, 0) == pdTRUE) {
+        if (xSemaphoreTake(s_audio_slots_used, 0) != pdTRUE) {
+            xSemaphoreGive(s_tx_mutex);
+            break;
+        }
+
         uint8_t t = s_audio_tail;
-        __sync_synchronize();
-        tx_entry_t *e = &s_audio_q[t];
+        tx_entry_t entry = s_audio_q[t];
         s_audio_tail = (uint8_t)((t + 1) % TX_AUDIO_QUEUE_SIZE);
 
         int64_t now_us = esp_timer_get_time();
-        uint32_t wait_us = e->queued_at_us > 0 && now_us > e->queued_at_us
-                               ? (uint32_t)(now_us - e->queued_at_us)
+        uint32_t wait_us = entry.queued_at_us > 0 && now_us > entry.queued_at_us
+                               ? (uint32_t)(now_us - entry.queued_at_us)
                                : 0;
         if (wait_us > TX_AUDIO_MAX_AGE_US) {
             s_audio_tx_stale_drop++;
             xSemaphoreGive(s_audio_slots_free);
+            xSemaphoreGive(s_tx_mutex);
+            continue;
+        }
+
+        portENTER_CRITICAL(&s_status_lock);
+        bool mesh_ready = status_is_fresh_locked(now_us) &&
+                          s_status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
+                          s_status.node_id != 0;
+        portEXIT_CRITICAL(&s_status_lock);
+        if (!mesh_ready) {
+            s_audio_tx_stale_drop++;
+            xSemaphoreGive(s_audio_slots_free);
+            xSemaphoreGive(s_tx_mutex);
             continue;
         }
 
@@ -376,20 +517,21 @@ static void prepare_tx_buf(void)
             s_audio_tx_wait_max_us = wait_us;
         }
 
-        memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
+        memcpy(s_tx_dma_buf, entry.buf, BRIDGE_SPI_MAX_XFER);
 
-        memcpy(s_audio_tx_inflight.buf, e->buf, BRIDGE_SPI_MAX_XFER);
-        s_audio_tx_inflight.len = e->len;
+        memcpy(s_audio_tx_inflight.buf, entry.buf, BRIDGE_SPI_MAX_XFER);
+        s_audio_tx_inflight.len = entry.len;
+        s_audio_tx_waiting_ack_seq = entry.buf[2];
+        s_ack_wait_start_us = now_us;
 
         /* Critical section: set inflight + waiting_ack atomically so the
          * ISR cannot see a half-updated state and count a valid ACK as
          * spurious (which would leak a semaphore slot permanently). */
-        portDISABLE_INTERRUPTS();
+        portENTER_CRITICAL(&s_ack_lock);
         s_audio_tx_inflight_valid = true;
         s_audio_tx_waiting_ack = true;
-        portENABLE_INTERRUPTS();
-        s_audio_tx_waiting_ack_seq = e->buf[2];
-        s_ack_wait_start_us = esp_timer_get_time();
+        portEXIT_CRITICAL(&s_ack_lock);
+        xSemaphoreGive(s_tx_mutex);
         return;
     }
 
@@ -617,7 +759,10 @@ void uart_bridge_deinit(void)
     }
 
     s_initialized = false;
+    portENTER_CRITICAL(&s_status_lock);
     s_connected = false;
+    memset(&s_status, 0, sizeof(s_status));
+    portEXIT_CRITICAL(&s_status_lock);
     s_audio_tx_waiting_ack = false;
     s_audio_tx_inflight_valid = false;
     s_command_in_progress = false;
@@ -668,6 +813,9 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (!uart_bridge_is_mesh_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     uint16_t wire_len = (uint16_t)(2 + len);   /* SEQ + TYPE + PAYLOAD */
     uint16_t total = (uint16_t)(3 + wire_len); /* SYNC + LEN + BODY + CRC */
@@ -675,12 +823,16 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    if (xSemaphoreTake(s_audio_slots_free, pdMS_TO_TICKS(20)) != pdTRUE) {
+    if (xSemaphoreTake(s_audio_slots_free, 0) != pdTRUE) {
         s_audio_tx_enqueue_timeout++;
         return ESP_ERR_TIMEOUT;
     }
 
-    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(s_tx_mutex, 0) != pdTRUE) {
+        xSemaphoreGive(s_audio_slots_free);
+        s_audio_tx_enqueue_timeout++;
+        return ESP_ERR_TIMEOUT;
+    }
 
     uint8_t cur_head = s_audio_head;
     uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
@@ -747,17 +899,41 @@ void uart_bridge_set_event_callback(uart_bridge_event_cb_t cb)
 
 esp_err_t uart_bridge_get_status(uart_bridge_status_t *status)
 {
-    if (!s_connected) {
+    if (status == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool expired = false;
+    uint32_t expired_generation = 0;
+    int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_status_lock);
+    if (!status_is_fresh_locked(now_us)) {
+        expired = s_connected;
+        expired_generation = s_status.generation;
+        s_connected = false;
+        portEXIT_CRITICAL(&s_status_lock);
+        if (expired) {
+            discard_audio_for_expired_status(expired_generation);
+        }
         return ESP_ERR_NOT_FOUND;
     }
 
     memcpy(status, &s_status, sizeof(uart_bridge_status_t));
+    portEXIT_CRITICAL(&s_status_lock);
     return ESP_OK;
 }
 
 bool uart_bridge_is_connected(void)
 {
-    return s_connected;
+    uart_bridge_status_t status;
+    return uart_bridge_get_status(&status) == ESP_OK;
+}
+
+bool uart_bridge_is_mesh_ready(void)
+{
+    uart_bridge_status_t status;
+    return uart_bridge_get_status(&status) == ESP_OK &&
+           status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
 }
 
 bool uart_bridge_probe(uint32_t timeout_ms)
@@ -766,7 +942,7 @@ bool uart_bridge_probe(uint32_t timeout_ms)
         return false;
     }
 
-    if (s_connected) {
+    if (uart_bridge_is_connected()) {
         return true;
     }
 
@@ -782,7 +958,7 @@ bool uart_bridge_probe(uint32_t timeout_ms)
         /* Wait for the master to respond with a STATUS packet */
         int64_t start_time = esp_timer_get_time();
         while ((esp_timer_get_time() - start_time) < ((int64_t)timeout_ms * 1000)) {
-            if (s_connected) {
+            if (uart_bridge_is_connected()) {
                 ESP_LOGI(TAG, "nRF52840 probe response received!");
                 return true;
             }
@@ -825,6 +1001,9 @@ static esp_err_t send_mesh_command(bridge_command_t command)
         .generation = ++s_command_generation,
     };
     esp_err_t result = ESP_ERR_TIMEOUT;
+    uart_bridge_status_t initial_status = {0};
+    uint32_t initial_status_generation =
+        uart_bridge_get_status(&initial_status) == ESP_OK ? initial_status.generation : 0;
     __atomic_store_n(&s_command_ack_received, false, __ATOMIC_RELEASE);
 
     for (int attempt = 1; attempt <= COMMAND_MAX_ATTEMPTS; attempt++) {
@@ -840,6 +1019,23 @@ static esp_err_t send_mesh_command(bridge_command_t command)
                 s_command_ack_generation == payload.generation) {
                 result = s_command_ack_result == 0 ? ESP_OK : ESP_FAIL;
                 goto done;
+            }
+
+            uart_bridge_status_t status;
+            if (uart_bridge_get_status(&status) == ESP_OK &&
+                status.generation != initial_status_generation) {
+                bool observed = command == BRIDGE_COMMAND_MESH_START
+                                    ? (status.has_mesh_state
+                                           ? status.mesh_state != BRIDGE_MESH_STATE_IDLE
+                                           : status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
+                                                 status.node_id != 0)
+                                    : status.mesh_state == BRIDGE_MESH_STATE_IDLE;
+                if (observed) {
+                    ESP_LOGI(TAG, "Command 0x%02X confirmed by bridge status (legacy ACK fallback)",
+                             command);
+                    result = ESP_OK;
+                    goto done;
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(5));
         }

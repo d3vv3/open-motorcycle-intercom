@@ -24,6 +24,7 @@
 #include "audio.h"
 #include "button.h"
 #include "mesh.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "power.h"
 #include "rtt_probe.h"
@@ -172,6 +173,15 @@ typedef enum {
 static transport_type_t s_active_transport = TRANSPORT_NONE;
 static bool s_mesh_user_enabled = false;
 
+#define MESH_NVS_NAMESPACE "omi"
+#define MESH_NVS_ENABLED_KEY "mesh_enabled"
+#define NRF_RECONCILE_INTERVAL_MS 2000
+#define NRF_RECONCILE_MAX_ATTEMPTS 3
+
+static uint8_t s_nrf_reconcile_attempts = 0;
+static bool s_nrf_status_observed = false;
+static uint8_t s_nrf_last_mesh_state = BRIDGE_MESH_STATE_IDLE;
+
 /* SYNC_LOST escalation: treat sustained loss as effective peer leave.
  * The nRF SYNC_TIMEOUT is 5 s and after each SYNC_LOST the nRF rescans,
  * so consecutive events are spaced ~7-10 s apart.  Use a 30 s window
@@ -182,6 +192,58 @@ static uint32_t s_sync_lost_window_start_ms = 0;
 static uint8_t s_sync_lost_count = 0;
 static bool s_peer_left_latched = false;
 static int64_t s_mesh_restart_attempt_ms = 0;
+
+static esp_err_t load_mesh_user_intent(void)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(MESH_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        s_mesh_user_enabled = false;
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    uint8_t enabled = 0;
+    ret = nvs_get_u8(handle, MESH_NVS_ENABLED_KEY, &enabled);
+    nvs_close(handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        s_mesh_user_enabled = false;
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (enabled > 1) {
+        ESP_LOGW(TAG, "Invalid persisted mesh intent %u; defaulting to disabled", enabled);
+        enabled = 0;
+    }
+    s_mesh_user_enabled = enabled != 0;
+    return ESP_OK;
+}
+
+static esp_err_t persist_mesh_user_intent(bool enabled)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(MESH_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_u8(handle, MESH_NVS_ENABLED_KEY, enabled ? 1 : 0);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return ret;
+}
+
+static void reset_nrf_reconciliation(void)
+{
+    s_nrf_reconcile_attempts = 0;
+    s_mesh_restart_attempt_ms = 0;
+}
 
 static esp_err_t init_audio_with_test_flags(void)
 {
@@ -210,7 +272,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         s_pipe_source_frames++;
         uint16_t seq = s_e2e_tx_seq++;
         s_e2e_tx_frames++;
-        if (s_mesh_active && uart_bridge_is_connected()) {
+        if (s_mesh_active && uart_bridge_is_mesh_ready()) {
             uint8_t tx_buf[130];
             uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
             if (len > MESH_MAX_OPUS_BYTES) {
@@ -302,6 +364,12 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
                                   int64_t timestamp_us)
 {
     audio_frame_t frame;
+
+    if (!s_mesh_user_enabled || !uart_bridge_is_mesh_ready()) {
+        s_pipe_spi_rx_invalid++;
+        return;
+    }
+
     uint8_t local_node_id = get_bridge_node_id();
 
     s_pipe_spi_rx++;
@@ -424,9 +492,8 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
     case BRIDGE_EVENT_MESH_READY:
         ESP_LOGI(TAG, "nRF52840 mesh ready");
         if (!s_mesh_user_enabled) {
-            /* Enforce boot policy: mesh stays disabled until user enables it. */
-            ESP_LOGI(TAG, "Ignoring mesh-ready while disabled by user policy");
-            (void)uart_bridge_mesh_disable();
+            /* Reconciliation runs in app_main, never in this bridge RX callback. */
+            ESP_LOGI(TAG, "Mesh-ready conflicts with disabled user intent");
             s_mesh_active = false;
             break;
         }
@@ -487,12 +554,19 @@ static void reconcile_nrf_mesh_state(int64_t now_ms)
     uart_bridge_status_t status;
     if (uart_bridge_get_status(&status) != ESP_OK) {
         s_mesh_active = false;
+        s_nrf_status_observed = false;
         return;
     }
 
     bool ready = status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
-    if (ready) {
-        if (s_mesh_user_enabled && !s_mesh_active) {
+    if (!s_nrf_status_observed || status.mesh_state != s_nrf_last_mesh_state) {
+        s_nrf_status_observed = true;
+        s_nrf_last_mesh_state = status.mesh_state;
+        s_nrf_reconcile_attempts = 0;
+    }
+
+    if (s_mesh_user_enabled && ready) {
+        if (!s_mesh_active) {
             s_mesh_active = true;
             (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
         }
@@ -500,13 +574,25 @@ static void reconcile_nrf_mesh_state(int64_t now_ms)
     }
 
     s_mesh_active = false;
-    if (s_mesh_user_enabled && status.mesh_state == BRIDGE_MESH_STATE_IDLE &&
-        now_ms - s_mesh_restart_attempt_ms >= 2000) {
-        s_mesh_restart_attempt_ms = now_ms;
-        esp_err_t ret = uart_bridge_mesh_enable();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Mesh restart retry failed: %s", esp_err_to_name(ret));
-        }
+    bool disabled = status.mesh_state == BRIDGE_MESH_STATE_IDLE;
+    if ((!s_mesh_user_enabled && disabled) ||
+        (s_mesh_user_enabled && status.has_mesh_state && !disabled)) {
+        s_nrf_reconcile_attempts = 0;
+        return;
+    }
+
+    if (s_nrf_reconcile_attempts >= NRF_RECONCILE_MAX_ATTEMPTS ||
+        now_ms - s_mesh_restart_attempt_ms < NRF_RECONCILE_INTERVAL_MS) {
+        return;
+    }
+
+    s_mesh_restart_attempt_ms = now_ms;
+    s_nrf_reconcile_attempts++;
+    esp_err_t ret = s_mesh_user_enabled ? uart_bridge_mesh_enable() : uart_bridge_mesh_disable();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Mesh %s reconcile failed (%u/%u): %s",
+                 s_mesh_user_enabled ? "enable" : "disable", s_nrf_reconcile_attempts,
+                 NRF_RECONCILE_MAX_ATTEMPTS, esp_err_to_name(ret));
     }
 }
 
@@ -517,24 +603,24 @@ static void button_long_press_callback(int gpio)
 {
     ESP_LOGI(TAG, "Button long press detected on GPIO %d - toggling mesh", gpio);
 
-    if (s_mesh_user_enabled) {
+    bool requested_enabled = !s_mesh_user_enabled;
+    esp_err_t ret = persist_mesh_user_intent(requested_enabled);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to persist mesh intent: %s", esp_err_to_name(ret));
+        return;
+    }
+    s_mesh_user_enabled = requested_enabled;
+    reset_nrf_reconciliation();
+
+    if (!requested_enabled) {
         /* Disable mesh */
         ESP_LOGI(TAG, "Disabling mesh networking...");
-        esp_err_t ret = ESP_OK;
-
-        bool was_enabled = s_mesh_user_enabled;
-        s_mesh_user_enabled = false;
 
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_stop();
         } else if (s_active_transport == TRANSPORT_NRF52840) {
-            if (uart_bridge_is_connected()) {
-                /* nRF handles graceful LEAVE broadcast before stopping mesh. */
-                ret = uart_bridge_mesh_disable();
-            } else {
-                ESP_LOGW(TAG, "nRF bridge disconnected; applying local mesh disable policy");
-                ret = ESP_OK;
-            }
+            /* app_main reconciles this intent outside bridge and button callbacks. */
+            ret = ESP_OK;
         }
 
         if (ret == ESP_OK) {
@@ -542,27 +628,23 @@ static void button_long_press_callback(int gpio)
             (void)audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
             ESP_LOGI(TAG, "Mesh disabled");
         } else {
-            s_mesh_user_enabled = was_enabled;
+            s_mesh_user_enabled = true;
+            esp_err_t persist_ret = persist_mesh_user_intent(true);
+            if (persist_ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to restore enabled mesh intent: %s",
+                         esp_err_to_name(persist_ret));
+            }
             ESP_LOGE(TAG, "Failed to stop mesh: %s", esp_err_to_name(ret));
         }
     } else {
         /* Enable mesh */
         ESP_LOGI(TAG, "Enabling mesh networking...");
-        esp_err_t ret = ESP_OK;
-
-        s_mesh_user_enabled = true;
         s_mesh_active = false;
 
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_start();
         } else if (s_active_transport == TRANSPORT_NRF52840) {
-            if (uart_bridge_is_connected()) {
-                /* Send mesh enable command to nRF52840 */
-                ret = uart_bridge_mesh_enable();
-            } else {
-                ESP_LOGW(TAG, "Cannot enable mesh: nRF bridge disconnected");
-                ret = ESP_ERR_INVALID_STATE;
-            }
+            ret = ESP_OK;
         }
 
         if (ret == ESP_OK) {
@@ -573,6 +655,11 @@ static void button_long_press_callback(int gpio)
             ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
         } else {
             s_mesh_user_enabled = false;
+            esp_err_t persist_ret = persist_mesh_user_intent(false);
+            if (persist_ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to restore disabled mesh intent: %s",
+                         esp_err_to_name(persist_ret));
+            }
             s_mesh_active = false;
             ESP_LOGE(TAG, "Failed to start mesh: %s", esp_err_to_name(ret));
         }
@@ -604,6 +691,8 @@ void app_main(void)
     /* Initialize NVS */
     ESP_ERROR_CHECK(init_nvs());
     ESP_LOGI(TAG, "[%" PRId64 " ms] NVS initialized", get_time_ms());
+    ESP_ERROR_CHECK(load_mesh_user_intent());
+    ESP_LOGI(TAG, "Persisted mesh intent: %s", s_mesh_user_enabled ? "enabled" : "disabled");
 
     /* Initialize power management (Phase 3) */
     esp_err_t ret = power_init();
@@ -640,11 +729,8 @@ void app_main(void)
         uart_bridge_set_audio_callback(bridge_audio_callback);
         uart_bridge_set_event_callback(bridge_event_callback);
 
-        /* Enforce startup behavior: always start with mesh disabled.
-         * User must long-press BOOT to enable. */
-        s_mesh_user_enabled = false;
         s_mesh_active = false;
-        (void)uart_bridge_mesh_disable();
+        reset_nrf_reconciliation();
         disable_esp_radios_for_nrf_transport();
     } else {
         /* No nRF52840 - fallback to ESP-NOW */
@@ -685,6 +771,15 @@ void app_main(void)
         mesh_register_audio_callback(mesh_audio_callback);
         mesh_register_state_callback(mesh_state_callback);
         mesh_register_peer_callback(mesh_peer_callback);
+
+        if (s_mesh_user_enabled) {
+            ret = mesh_start();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to restore persisted mesh intent: %s", esp_err_to_name(ret));
+                goto error_halt;
+            }
+            s_mesh_active = true;
+        }
     }
 
     /* Register button callback for mesh toggle */
@@ -724,10 +819,12 @@ void app_main(void)
     }
 
 #if ENABLE_MESH_MODE
-    /* Mesh networking - starts disabled, enabled by holding boot button for 2 seconds */
-    s_mesh_user_enabled = false;
-    s_mesh_active = false;
-    ESP_LOGI(TAG, "Mesh networking ready (hold boot button for 2s to enable)");
+    /* The persisted user policy is reconciled with the selected transport. */
+    if (s_active_transport == TRANSPORT_NRF52840) {
+        s_mesh_active = false;
+    }
+    ESP_LOGI(TAG, "Mesh networking ready (desired state: %s)",
+             s_mesh_user_enabled ? "enabled" : "disabled");
     ESP_LOGI(TAG, "");
 #endif
 

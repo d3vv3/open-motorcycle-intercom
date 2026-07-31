@@ -316,7 +316,6 @@ static esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint1
                                         const uint8_t *dest_mac);
 static bool dequeue_control_packet(control_tx_item_t *item);
 static bool owns_control_window(uint32_t frame_counter);
-static bool control_queue_pending(void);
 
 #define STATS_ADD(field, value)                                                                     \
     do {                                                                                            \
@@ -574,14 +573,6 @@ static bool owns_control_window(uint32_t frame_counter)
                              ? 0
                              : (uint8_t)(frame_counter % MESH_VOICE_SLOTS);
     return s_slot_index == (int8_t)owner_slot;
-}
-
-static bool control_queue_pending(void)
-{
-    taskENTER_CRITICAL(&s_control_queue_mux);
-    bool pending = s_control_queue_count > 0;
-    taskEXIT_CRITICAL(&s_control_queue_mux);
-    return pending;
 }
 
 static void clear_speaker_state(void)
@@ -1712,13 +1703,6 @@ static void service_tx_slot(void)
         return;
     }
 
-    uint32_t frame_counter = mesh_get_frame_counter();
-    bool sync_due = s_role == MESH_ROLE_COORDINATOR &&
-                    (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0;
-    if (owns_control_window(frame_counter) && (sync_due || control_queue_pending())) {
-        return;
-    }
-
     power_radio_slot_start();
     send_audio_in_slot();
     power_radio_slot_end();
@@ -1742,14 +1726,8 @@ static void service_control_window(void)
     if (!owns_control_window(frame_counter)) {
         return;
     }
-
-    if (s_role == MESH_ROLE_COORDINATOR &&
-        (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0) {
-        if (!wait_for_tx_idle(0) || send_sync() != ESP_OK) {
-            STATS_INC(control_queue_drops);
-        }
-        return;
-    }
+    bool sync_due = s_role == MESH_ROLE_COORDINATOR &&
+                    (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0;
 
     if (!wait_for_tx_idle(0)) {
         int64_t remaining_us = control_deadline_us - esp_timer_get_time();
@@ -1757,8 +1735,26 @@ static void service_control_window(void)
                                     ? pdMS_TO_TICKS((remaining_us + 999) / 1000)
                                     : 0;
         if (!wait_for_tx_idle(wait_ticks) || esp_timer_get_time() > control_deadline_us) {
+            if (sync_due) {
+                STATS_INC(control_queue_drops);
+            }
             return;
         }
+    }
+
+    taskENTER_CRITICAL(&s_tdma_mux);
+    valid = s_control_generation == s_tdma_generation;
+    taskEXIT_CRITICAL(&s_tdma_mux);
+    if (!valid || s_state != MESH_STATE_ACTIVE || mesh_get_frame_counter() != frame_counter ||
+        !owns_control_window(frame_counter) || esp_timer_get_time() > control_deadline_us) {
+        return;
+    }
+
+    if (sync_due) {
+        if (send_sync() != ESP_OK) {
+            STATS_INC(control_queue_drops);
+        }
+        return;
     }
 
     control_tx_item_t item;

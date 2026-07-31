@@ -26,6 +26,24 @@ _PIPE_GAUGE_KEYS = {
     "tx_wait_avg_us",
     "tx_wait_max_us",
     "rx_pause_max_us",
+    "correction_applied_us",
+    "correction_pending_us",
+    "last_correction_us",
+    "commanded_period_us",
+    "measured_interval_us",
+    "callback_jitter_us",
+    "callback_jitter_max_us",
+    "sync_frame_diff",
+    "sync_phase_us",
+}
+
+_PIPE_SIGNED_KEYS = {
+    "correction_applied_us",
+    "correction_pending_us",
+    "last_correction_us",
+    "callback_jitter_us",
+    "sync_frame_diff",
+    "sync_phase_us",
 }
 
 _IDENTITY_KEYS = {
@@ -47,15 +65,30 @@ _PIPE_RX_COUNTERS = ("received", "rx", "rx_ok", "rf_rx_ok", "ingress_ok")
 _SNAPSHOT_GAUGE_KEYS = {
     "mesh": {"q"},
     "spi": {"poll_min", "poll_avg", "poll_max"},
-    "adaptive": {"budget"},
+    "adaptive": {"sources"},
     "latency": {"lat_avg_ms", "lat_max_ms"},
     "encode": {"enc_avg_us", "enc_max_us"},
     "decode": {"dec_avg_us", "dec_max_us"},
     "tx_pipeline": {"tx_pipe_avg_us", "tx_pipe_max_us"},
     "rx_pipeline": {"rx_pipe_avg_us", "rx_pipe_max_us"},
     "vox": {"vox_active"},
-    "rx_depth": {"rx_q_min", "rx_q_avg", "rx_q_max"},
-    "atune": {"q", "under_d", "skip_pct", "ws_corr", "ws_drift"},
+    "rx_depth": {"rx_q_min", "rx_q_avg", "rx_q_max", "rx_q_total"},
+    "atune": {
+        "r",
+        "q",
+        "under_d",
+        "skip_pct",
+        "ws_delta",
+        "ws_corr",
+        "ws_drift",
+        "td_sum",
+        "td_pend",
+        "td_last",
+        "td_cmd",
+        "td_meas",
+        "td_jit",
+        "td_jit_max",
+    },
 }
 
 # =============================================================================
@@ -94,7 +127,7 @@ ESP_AUDIO_CONCEAL_RE = re.compile(
 
 ESP_AUDIO_ADAPTIVE_RE = re.compile(
     r"Adaptive playout:\s*hold=(?P<hold>\d+)\s*catchup=(?P<catchup>\d+)\s*"
-    r"budget=(?P<budget>\d+)"
+    r"sources=(?P<sources>\d+)"
 )
 
 ESP_AUDIO_LATENCY_RE = re.compile(
@@ -123,8 +156,8 @@ ESP_AUDIO_VOX_RE = re.compile(
 )
 
 ESP_AUDIO_RX_DEPTH_RE = re.compile(
-    r"RX queue depth:\s*min=(?P<rx_q_min>\d+)\s*avg=(?P<rx_q_avg>\d+)\s*"
-    r"max=(?P<rx_q_max>\d+)"
+    r"RX queue depth/source:\s*min=(?P<rx_q_min>\d+)\s*avg=(?P<rx_q_avg>\d+)\s*"
+    r"max=(?P<rx_q_max>\d+)\s*\(total now=(?P<rx_q_total>\d+)\)"
 )
 
 ESP_AUDIO_ENCODED_RE = re.compile(r"Encoded:\s*(?P<encoded_frames>\d+)\s*frames")
@@ -137,10 +170,17 @@ NRF_UFLOW_RE = re.compile(
 NRF_AUDIO_RX_RE = re.compile(r"uart_bridge: Audio:\s*(?P<rx_pkts>\d+)\s*pkts received")
 
 NRF_ATUNE_RE = re.compile(
-    r"\[ATUNE\].*q=(?P<q>\d+)\s+under_d=(?P<under_d>\d+)\s+"
-    r"skip=(?P<skip>\d+)/(?P<ticks>\d+)"
-    r"(?:\s+ws_e=(?P<ws_edges>\d+)\s+ws_c=(?P<ws_corr>-?\d+)"
-    r"\s+ws_d=(?P<ws_drift>-?\d+))?"
+    r"\[ATUNE\]\s+r=(?P<r>\d+)\s+id=(?P<id>\d+)\s+q=(?P<q>\d+)\s+"
+    r"under_d=(?P<under_d>\d+)\s+skip=(?P<skip>\d+)/(?P<ticks>\d+)\s+"
+    r"ws_e=(?P<ws_edges>\d+)\s+ws_n=(?P<ws_samples>\d+)\s+"
+    r"ws_ok=(?P<ws_valid>\d+)\s+ws_no=(?P<ws_no_signal>\d+)\s+"
+    r"ws_rej=(?P<ws_rejected>\d+)\s+ws_delta=(?P<ws_delta>\d+)\s+"
+    r"ws_c=(?P<ws_corr>-?\d+)\s+ws_d=(?P<ws_drift>-?\d+)\s+"
+    r"td_req=(?P<td_req>\d+)\s+td_app=(?P<td_app>\d+)\s+"
+    r"td_sum=(?P<td_sum>-?\d+)\s+td_pend=(?P<td_pend>-?\d+)\s+"
+    r"td_last=(?P<td_last>-?\d+)\s+td_cmd=(?P<td_cmd>\d+)\s+"
+    r"td_meas=(?P<td_meas>\d+)\s+td_jit=(?P<td_jit>-?\d+)\s+"
+    r"td_jit_max=(?P<td_jit_max>\d+)"
 )
 
 ESP_E2E_RE = re.compile(
@@ -206,7 +246,7 @@ def parse_pipeline_logfmt(line: str) -> dict[str, int | str] | None:
             continue
         try:
             parsed = int(value, 10)
-            if parsed < 0:
+            if parsed < 0 and key not in _PIPE_SIGNED_KEYS:
                 return None
             record[key] = parsed
         except ValueError:
@@ -1007,7 +1047,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         m, d = s.last_adaptive, s.delta("adaptive")
         out.append(
             f"  Last Adaptive: hold={m['hold']} catchup={m['catchup']} "
-            f"budget={m['budget']}"
+            f"sources={m['sources']}"
         )
         if d:
             out.append(
@@ -1082,7 +1122,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         m = s.last_rx_depth
         out.append(
             f"  Last RX depth: min={m['rx_q_min']} avg={m['rx_q_avg']} "
-            f"max={m['rx_q_max']}"
+            f"max={m['rx_q_max']} total={m['rx_q_total']}"
         )
 
     # Frame counts

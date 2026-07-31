@@ -566,6 +566,8 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
         source->jitter.hold_next = false;
         source->jitter.consecutive_empty = 0;
         s_stats.hold_frames++;
+        s_stats.plc_frames++;
+        decode_plc = true;
     } else if (source->jitter.playout_started &&
                xQueueReceive(source->queue, &item, 0) == pdTRUE) {
         source->jitter.last_rx_packet_us = now_us;
@@ -577,8 +579,6 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
         if (remaining == 0 && source->jitter.hold_budget < HOLD_BUDGET_MAX) {
             source->jitter.hold_next = true;
             source->jitter.hold_budget++;
-        } else if (remaining >= 3 && source->jitter.hold_budget > 0) {
-            source->jitter.hold_budget--;
         }
     } else if (source->jitter.playout_started) {
         source->jitter.consecutive_empty++;
@@ -635,6 +635,44 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
 
     for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
         s_mix_frame[i] += s_decode_frame[i];
+    }
+
+    if (have_item) {
+        /* Repay hold debt by decoding in sequence so Opus predictor state stays continuous. */
+        audio_rx_item_t catchup_item;
+        bool have_catchup_item = false;
+
+        if (xSemaphoreTake(s_rx_sources_mutex, 0) == pdTRUE) {
+            if (source->assigned && source->jitter.playout_started &&
+                source->jitter.hold_budget > 0 && uxQueueMessagesWaiting(source->queue) >= 3 &&
+                xQueueReceive(source->queue, &catchup_item, 0) == pdTRUE) {
+                source->jitter.hold_budget--;
+                s_stats.catchup_frames++;
+                have_catchup_item = true;
+            }
+            xSemaphoreGive(s_rx_sources_mutex);
+        }
+
+        if (have_catchup_item) {
+            int catchup_samples =
+                opus_decode(source->decoder, catchup_item.data, catchup_item.len, s_decode_frame,
+                            AUDIO_FRAME_SAMPLES, 0);
+            if (catchup_samples != AUDIO_FRAME_SAMPLES) {
+                s_stats.decode_errors++;
+                ESP_LOGW(TAG, "Catch-up Opus decode failed: %d", catchup_samples);
+
+                if (catchup_samples < 0) {
+                    int plc_samples = opus_decode(source->decoder, NULL, 0, s_decode_frame,
+                                                  AUDIO_FRAME_SAMPLES, 0);
+                    if (plc_samples == AUDIO_FRAME_SAMPLES) {
+                        s_stats.plc_frames++;
+                    } else {
+                        s_stats.decode_errors++;
+                        ESP_LOGW(TAG, "Catch-up PLC failed: %d", plc_samples);
+                    }
+                }
+            }
+        }
     }
     return true;
 }
@@ -873,11 +911,13 @@ static void audio_task(void *arg)
             } else {
                 memset(s_mix_frame, 0, sizeof(s_mix_frame));
                 uint8_t active_sources = 0;
+                uint8_t mixed_sources = 0;
                 uint16_t total_depth = 0;
                 int64_t now_us = esp_timer_get_time();
                 for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
                     if (decode_rx_source(&s_rx_sources[i], now_us, &decode_time_sum)) {
                         have_audio_to_play = true;
+                        mixed_sources++;
                     }
                     if (s_rx_sources[i].assigned) {
                         active_sources++;
@@ -889,6 +929,10 @@ static void audio_task(void *arg)
 
                 for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
                     int32_t sample = s_mix_frame[i];
+                    /* Preserve one-source level; average only sources that produced PCM. */
+                    if (mixed_sources > 1) {
+                        sample /= mixed_sources;
+                    }
                     if (sample > INT16_MAX) {
                         sample = INT16_MAX;
                     } else if (sample < INT16_MIN) {

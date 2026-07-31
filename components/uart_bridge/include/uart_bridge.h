@@ -50,6 +50,10 @@ typedef struct {
     uint8_t mesh_state;
     uint8_t coordinator_id;
     bool is_coordinator;
+    bool has_mesh_state;
+    uint8_t protocol_version;
+    uint32_t generation;
+    int64_t received_at_us;
     int8_t rssi;
 } uart_bridge_status_t;
 
@@ -108,6 +112,11 @@ esp_err_t uart_bridge_get_status(uart_bridge_status_t *status);
  * @return true if connected, false otherwise
  */
 bool uart_bridge_is_connected(void);
+
+/**
+ * @brief Check whether a fresh status reports a mesh-ready nRF52840
+ */
+bool uart_bridge_is_mesh_ready(void);
 
 /**
  * @brief Probe for nRF52840 connection
