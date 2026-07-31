@@ -3,15 +3,8 @@
 #include <string.h>
 
 #include "esp_timer.h"
+#include "rtt_probe_defs.h"
 #include "uart_bridge.h"
-
-#define RTT_MAGIC0 0x4F
-#define RTT_MAGIC1 0x4D
-#define RTT_MAGIC2 0x49
-#define RTT_MAGIC3 0x52
-#define RTT_TYPE_REQ 0x01
-#define RTT_TYPE_RSP 0x02
-#define RTT_PKT_LEN  7
 
 #define RTT_PROBE_INTERVAL_MS 2000
 #define RTT_TIMEOUT_US        5000000

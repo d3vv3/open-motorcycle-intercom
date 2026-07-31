@@ -14,11 +14,19 @@
 #include <zephyr/sys/atomic.h>
 
 #include "esb_radio.h"
+#include "rtt_probe_defs.h"
 #include "tdma.h"
 #include "uart_bridge.h"
 #include "ws_sync.h"
 
 LOG_MODULE_REGISTER(mesh, LOG_LEVEL_INF);
+
+static bool is_rtt_probe_payload(const uint8_t *data, uint8_t len)
+{
+    return len == RTT_PKT_LEN && data[1] == RTT_MAGIC0 && data[2] == RTT_MAGIC1 &&
+           data[3] == RTT_MAGIC2 && data[4] == RTT_MAGIC3 &&
+           (data[5] == RTT_TYPE_REQ || data[5] == RTT_TYPE_RSP);
+}
 
 /* ============================================================================
  * Debug Log Forwarding to ESP32
@@ -780,15 +788,19 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
                 break;
             }
 
+            bool is_diagnostic = is_rtt_probe_payload(audio->data, audio_len);
+
             remember_packet(hdr->type, hdr->src_id, hdr->seq);
             update_peer_last_seen(hdr->src_id, rssi);
-            note_audio_activity(hdr->src_id, audio->audio_flags);
+            if (!is_diagnostic) {
+                note_audio_activity(hdr->src_id, audio->audio_flags);
+            }
 
-            if (s_role == MESH_ROLE_COORDINATOR) {
+            if (!is_diagnostic && s_role == MESH_ROLE_COORDINATOR) {
                 update_speaker_grants();
             }
 
-            if (audio_len >= 2) {
+            if (!is_diagnostic && audio_len >= 2) {
                 uint16_t e2e_seq = ((uint16_t)audio->data[0] << 8) | audio->data[1];
                 struct e2e_src_state *st = &s_e2e_rf_rx_src[hdr->src_id];
                 if (!st->init) {
@@ -814,7 +826,9 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
             s_stat_rf_rx_audio_ok++;
             if (uart_bridge_send_audio(hdr->src_id, bridge_buf, (uint8_t)(audio_len + 1)) == 0) {
                 s_stat_audio_fwd++;
-                s_e2e_spi_out_frames++;
+                if (!is_diagnostic) {
+                    s_e2e_spi_out_frames++;
+                }
                 s_stat_spi_out_ok++;
             } else {
                 s_stat_spi_out_drop++;
@@ -1417,6 +1431,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     if (s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail) {
         /* Peek at tail */
         struct tx_audio_entry *entry = &s_tx_audio_ring[s_tx_tail];
+        bool is_diagnostic = is_rtt_probe_payload(entry->data, entry->len);
         uint8_t tx_flags = MESH_FLAG_RELAY_REQUEST;
 
         mesh_audio_payload_t payload = {
@@ -1435,7 +1450,9 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         }
 
         memcpy(payload.data, entry->data, entry->len);
-        note_audio_activity(s_node_id, entry->audio_flags);
+        if (!is_diagnostic) {
+            note_audio_activity(s_node_id, entry->audio_flags);
+        }
 
         /* Send packet */
         s_stat_rf_audio_try++;
@@ -1444,7 +1461,9 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
 
         if (ret == 0) {
             s_stat_tx_count++;
-            s_e2e_rf_tx_frames++;
+            if (!is_diagnostic) {
+                s_e2e_rf_tx_frames++;
+            }
             s_stat_rf_audio_ok++;
         } else {
             s_stat_tx_fail++;
@@ -1519,7 +1538,9 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
         return -EMSGSIZE;
     }
 
-    if (len >= 2) {
+    bool is_diagnostic = is_rtt_probe_payload(data, len);
+
+    if (!is_diagnostic && len >= 2) {
         uint16_t e2e_seq = ((uint16_t)data[0] << 8) | data[1];
         struct e2e_src_state *st = &s_e2e_spi_in_src[s_node_id];
         if (!st->init) {
@@ -1542,9 +1563,11 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
 
     s_stat_spi_audio_in++;
     s_last_audio_in_time = k_uptime_get_32();
-    note_audio_activity(s_node_id, audio_flags);
+    if (!is_diagnostic) {
+        note_audio_activity(s_node_id, audio_flags);
+    }
 
-    if (s_role == MESH_ROLE_COORDINATOR) {
+    if (!is_diagnostic && s_role == MESH_ROLE_COORDINATOR) {
         update_speaker_grants();
     }
 
