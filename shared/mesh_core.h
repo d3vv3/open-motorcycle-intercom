@@ -74,6 +74,7 @@ void mesh_core_seq16_reset(mesh_core_seq16_t *state);
 mesh_core_seq_result_t mesh_core_seq16_accept(mesh_core_seq16_t *state, uint16_t seq);
 
 int mesh_core_address_compare(const uint8_t *a, const uint8_t *b, size_t address_len);
+int64_t mesh_core_recover_frame_boundary(int64_t expected_us, int64_t now_us, int64_t frame_us);
 
 uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
                              uint8_t local_heard_bitmap,

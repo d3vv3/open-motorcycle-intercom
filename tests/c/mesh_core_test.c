@@ -81,6 +81,22 @@ static void test_election(void)
     assert(mesh_core_address_compare(a6, b6, sizeof(a6)) > 0);
 }
 
+static void test_frame_boundary_recovery(void)
+{
+    const int64_t expected = 1000000;
+    const int64_t frame_us = 20000;
+
+    assert(mesh_core_recover_frame_boundary(expected, expected - 100, frame_us) == expected);
+    assert(mesh_core_recover_frame_boundary(expected, expected + 2100, frame_us) == expected);
+    assert(mesh_core_recover_frame_boundary(expected, expected + 10000, frame_us) == expected);
+    assert(mesh_core_recover_frame_boundary(expected, expected + 20000, frame_us) ==
+           expected + frame_us);
+    assert(mesh_core_recover_frame_boundary(expected, expected + 25000, frame_us) ==
+           expected + frame_us);
+    assert(mesh_core_recover_frame_boundary(expected, expected + 65000, frame_us) ==
+           expected + 3 * frame_us);
+}
+
 static void test_relay_masks(void)
 {
     mesh_core_peer_snapshot_t peers[] = {
@@ -165,6 +181,7 @@ int main(void)
     test_dedupe();
     test_sequences();
     test_election();
+    test_frame_boundary_recovery();
     test_relay_masks();
     test_join_assignments();
     test_slot_maps();

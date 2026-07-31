@@ -191,6 +191,7 @@ static uint32_t s_frame_timer_generation = 0;
 static int64_t s_expected_frame_us = 0;
 static uint32_t s_slot_generation = 0;
 static uint32_t s_control_generation = 0;
+static SemaphoreHandle_t s_frame_timer_mutex = NULL;
 static SemaphoreHandle_t s_slot_semaphore = NULL;
 static SemaphoreHandle_t s_control_semaphore = NULL;
 static QueueHandle_t s_frame_event_queue = NULL;
@@ -289,6 +290,9 @@ static void drain_slot_signal(void);
 static void clear_transient_mesh_state(void);
 static void advance_tdma_generation(void);
 static esp_err_t arm_frame_timer(int64_t delay_us);
+static esp_err_t arm_frame_timer_at(int64_t boundary_us);
+static esp_err_t arm_frame_timer_at_generation(int64_t boundary_us, uint32_t generation);
+static esp_err_t arm_frame_timer_at_generation_locked(int64_t boundary_us, uint32_t generation);
 static bool wait_for_tx_idle(TickType_t timeout_ticks);
 static bool wait_for_rx_quiesced(TickType_t timeout_ticks);
 static esp_err_t init_esp_now_transport(void);
@@ -800,12 +804,13 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     s_task_stopped_semaphore = xSemaphoreCreateBinary();
     s_audio_producer_mutex = xSemaphoreCreateMutex();
     s_stop_mutex = xSemaphoreCreateMutex();
+    s_frame_timer_mutex = xSemaphoreCreateMutex();
     s_frame_event_queue = xQueueCreate(1, sizeof(frame_event_t));
     s_timer_queue_set = xQueueCreateSet(3);
 
     if (!s_peer_mutex || !s_jitter_mutex || !s_slot_semaphore || !s_control_semaphore ||
         !s_tx_done_semaphore || !s_task_stopped_semaphore || !s_audio_producer_mutex ||
-        !s_stop_mutex ||
+        !s_stop_mutex || !s_frame_timer_mutex ||
         !s_frame_event_queue || !s_timer_queue_set) {
         ESP_LOGE(TAG, "Failed to create semaphores");
         return ESP_ERR_NO_MEM;
@@ -974,6 +979,10 @@ esp_err_t mesh_deinit(void)
         vSemaphoreDelete(s_stop_mutex);
         s_stop_mutex = NULL;
     }
+    if (s_frame_timer_mutex) {
+        vSemaphoreDelete(s_frame_timer_mutex);
+        s_frame_timer_mutex = NULL;
+    }
     if (s_frame_event_queue) {
         xQueueRemoveFromSet(s_frame_event_queue, s_timer_queue_set);
         vQueueDelete(s_frame_event_queue);
@@ -1056,11 +1065,12 @@ esp_err_t mesh_stop(void)
     s_rx_enabled = false;
     taskEXIT_CRITICAL(&s_transport_mux);
 
+    xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
     advance_tdma_generation();
-    /* Stop frame timer */
     esp_timer_stop(s_frame_timer);
     esp_timer_stop(s_slot_timer);
     esp_timer_stop(s_control_timer);
+    xSemaphoreGive(s_frame_timer_mutex);
     drain_slot_signal();
 
     /* Wake the task and let it leave its current producer path itself. */
@@ -1608,27 +1618,38 @@ static void frame_timer_callback(void *arg)
     taskENTER_CRITICAL(&s_tdma_mux);
     event.timestamp_us = s_expected_frame_us;
     event.generation = s_frame_timer_generation;
-    bool valid = event.generation == s_tdma_generation &&
-                 llabs(now_us - event.timestamp_us) <= MESH_SLOT_US;
+    bool valid = event.generation == s_tdma_generation;
     if (valid) {
-        s_expected_frame_us += MESH_FRAME_US;
+        event.timestamp_us =
+            mesh_core_recover_frame_boundary(event.timestamp_us, now_us, MESH_FRAME_US);
+        s_expected_frame_us = event.timestamp_us + MESH_FRAME_US;
     }
     taskEXIT_CRITICAL(&s_tdma_mux);
     if (!valid) {
         return;
-    }
-    if (!esp_timer_is_active(s_frame_timer)) {
-        esp_timer_start_periodic(s_frame_timer, MESH_FRAME_US);
     }
     xQueueOverwrite(s_frame_event_queue, &event);
 }
 
 static void service_frame_boundary(const frame_event_t *event)
 {
+    xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
     taskENTER_CRITICAL(&s_tdma_mux);
     bool valid = event->generation == s_tdma_generation;
     taskEXIT_CRITICAL(&s_tdma_mux);
     if (!valid || s_state != MESH_STATE_ACTIVE) {
+        xSemaphoreGive(s_frame_timer_mutex);
+        return;
+    }
+
+    esp_err_t timer_ret = arm_frame_timer_at_generation_locked(
+        event->timestamp_us + MESH_FRAME_US, event->generation);
+    if (timer_ret != ESP_OK) {
+        xSemaphoreGive(s_frame_timer_mutex);
+        if (timer_ret == ESP_ERR_INVALID_STATE) {
+            return;
+        }
+        ESP_LOGE(TAG, "Failed to arm TDMA frame timer: %s", esp_err_to_name(timer_ret));
         return;
     }
 
@@ -1674,6 +1695,7 @@ static void service_frame_boundary(const frame_event_t *event)
         }
     }
 
+    xSemaphoreGive(s_frame_timer_mutex);
 }
 
 static void slot_timer_callback(void *arg)
@@ -1800,10 +1822,47 @@ static void advance_tdma_generation(void)
 
 static esp_err_t arm_frame_timer(int64_t delay_us)
 {
+    return arm_frame_timer_at(esp_timer_get_time() + delay_us);
+}
+
+static esp_err_t arm_frame_timer_at(int64_t boundary_us)
+{
     taskENTER_CRITICAL(&s_tdma_mux);
-    s_frame_timer_generation = s_tdma_generation;
-    s_expected_frame_us = esp_timer_get_time() + delay_us;
+    uint32_t generation = s_tdma_generation;
     taskEXIT_CRITICAL(&s_tdma_mux);
+    return arm_frame_timer_at_generation(boundary_us, generation);
+}
+
+static esp_err_t arm_frame_timer_at_generation(int64_t boundary_us, uint32_t generation)
+{
+    xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
+    esp_err_t ret = arm_frame_timer_at_generation_locked(boundary_us, generation);
+    xSemaphoreGive(s_frame_timer_mutex);
+    return ret;
+}
+
+static esp_err_t arm_frame_timer_at_generation_locked(int64_t boundary_us, uint32_t generation)
+{
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool stopping = s_stopping;
+    taskEXIT_CRITICAL(&s_transport_mux);
+
+    taskENTER_CRITICAL(&s_tdma_mux);
+    uint32_t current_generation = s_tdma_generation;
+    bool valid = !stopping && generation == current_generation;
+    if (valid) {
+        s_frame_timer_generation = current_generation;
+        s_expected_frame_us = boundary_us;
+    }
+    taskEXIT_CRITICAL(&s_tdma_mux);
+    if (!valid) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int64_t delay_us = boundary_us - esp_timer_get_time();
+    if (delay_us < 1) {
+        delay_us = 1;
+    }
     return esp_timer_start_once(s_frame_timer, delay_us);
 }
 

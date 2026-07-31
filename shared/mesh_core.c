@@ -173,6 +173,14 @@ int mesh_core_address_compare(const uint8_t *a, const uint8_t *b, size_t address
     return 0;
 }
 
+int64_t mesh_core_recover_frame_boundary(int64_t expected_us, int64_t now_us, int64_t frame_us)
+{
+    if (frame_us <= 0 || now_us <= expected_us) {
+        return expected_us;
+    }
+    return expected_us + ((now_us - expected_us) / frame_us) * frame_us;
+}
+
 uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
                              uint8_t local_heard_bitmap,
                              const mesh_core_peer_snapshot_t *peers, size_t peer_count)
