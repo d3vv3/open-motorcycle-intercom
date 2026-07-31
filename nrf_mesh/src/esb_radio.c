@@ -8,6 +8,7 @@
 #include <esb.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 
 LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 
@@ -17,7 +18,7 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 #define ESB_ADDR_LEN        5
-#define TX_DONE_TIMEOUT_MS  10 /* Max wait for TX completion */
+#define TX_DONE_TIMEOUT_US  1200
 
 /* RF robustness tuning */
 #ifndef ESB_BITRATE_250KBPS
@@ -28,7 +29,7 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 #endif
 #endif
 
-#define OMI_ESB_BITRATE      ESB_BITRATE_250KBPS
+#define OMI_ESB_BITRATE      ESB_BITRATE_1MBPS
 #define OMI_ESB_TX_POWER_DBM 8
 
 /* Broadcast address for mesh discovery */
@@ -45,14 +46,23 @@ static struct esb_payload s_rx_payload;
 static bool s_initialized = false;
 static bool s_tx_in_progress = false; /* Prevent re-entry during TX */
 static bool s_rx_active = false;      /* Track if RX mode is running */
+static bool s_tx_recovery_pending = false;
+static bool s_recovery_restart_rx = false;
 
 /* ESB TX/RX timing diagnostics */
 static uint32_t s_tx_count = 0;
+static uint32_t s_tx_timing_count = 0;
 static uint32_t s_tx_timeout_count = 0;
+static uint32_t s_tx_busy_count = 0;
+static uint32_t s_tx_write_fail_count = 0;
+static atomic_t s_tx_failed_event_count;
 static uint64_t s_tx_wait_sum_us = 0;
 static uint32_t s_tx_wait_max_us = 0;
 static uint64_t s_rx_pause_sum_us = 0;
 static uint32_t s_rx_pause_max_us = 0;
+static atomic_t s_rx_no_callback_count;
+static atomic_t s_rx_flush_drop_count;
+static uint32_t s_rx_restart_fail_count = 0;
 
 /* Semaphore signaled when TX completes (success or fail) */
 static K_SEM_DEFINE(s_tx_done_sem, 0, 1);
@@ -72,20 +82,26 @@ static void on_esb_event(struct esb_evt const *event)
         break;
 
     case ESB_EVENT_TX_FAILED:
+        atomic_inc(&s_tx_failed_event_count);
         s_last_tx_status = -EIO;
         k_sem_give(&s_tx_done_sem);
         break;
 
     case ESB_EVENT_RX_RECEIVED: {
         int rx_count = 0;
-        while (esb_read_rx_payload(&s_rx_payload) == 0 && rx_count < 8) {
+        while (rx_count < 8 && esb_read_rx_payload(&s_rx_payload) == 0) {
             rx_count++;
             if (s_rx_callback && s_rx_payload.length > 0) {
                 s_rx_callback(s_rx_payload.data, s_rx_payload.length, NULL, s_rx_payload.rssi);
+            } else if (!s_rx_callback) {
+                atomic_inc(&s_rx_no_callback_count);
             }
         }
         /* Flush anything remaining to prevent FIFO buildup */
         if (rx_count >= 8) {
+            while (esb_read_rx_payload(&s_rx_payload) == 0) {
+                atomic_inc(&s_rx_flush_drop_count);
+            }
             esb_flush_rx();
         }
         break;
@@ -129,7 +145,7 @@ int esb_radio_init(uint8_t channel)
     config.bitrate = OMI_ESB_BITRATE;
     config.crc = ESB_CRC_16BIT;
     config.tx_output_power = OMI_ESB_TX_POWER_DBM;
-    config.retransmit_delay = 1500; /* Longer for 250 kbps airtime */
+    config.retransmit_delay = 500;
     config.retransmit_count = 3;
     config.tx_mode = ESB_TXMODE_AUTO;
     config.payload_length = ESB_MAX_PAYLOAD_LEN;
@@ -164,7 +180,7 @@ int esb_radio_init(uint8_t channel)
     }
 
     s_initialized = true;
-    LOG_INF("ESB radio initialized (bitrate=250kbps)");
+    LOG_INF("ESB radio initialized (bitrate=1Mbps)");
 
     return 0;
 }
@@ -203,8 +219,28 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         return -EMSGSIZE;
     }
 
+    if (s_tx_recovery_pending) {
+        if (!esb_is_idle()) {
+            s_tx_busy_count++;
+            return -EBUSY;
+        }
+        k_sem_reset(&s_tx_done_sem);
+        s_tx_recovery_pending = false;
+        if (s_recovery_restart_rx) {
+            if (esb_start_rx() == 0) {
+                s_rx_active = true;
+                s_recovery_restart_rx = false;
+            } else {
+                s_rx_restart_fail_count++;
+                s_tx_recovery_pending = true;
+                return -EIO;
+            }
+        }
+    }
+
     /* Prevent re-entry - if already transmitting, drop this packet */
     if (s_tx_in_progress) {
+        s_tx_busy_count++;
         LOG_WRN("TX busy, dropping packet");
         return -EBUSY;
     }
@@ -227,8 +263,11 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         LOG_ERR("Set TX addr failed: %d", ret);
         s_tx_in_progress = false;
         if (was_rx_active) {
-            esb_start_rx();
-            s_rx_active = true;
+            if (esb_start_rx() == 0) {
+                s_rx_active = true;
+            } else {
+                s_rx_restart_fail_count++;
+            }
         }
         return ret;
     }
@@ -245,24 +284,46 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
     /* Send */
     ret = esb_write_payload(&s_tx_payload);
     if (ret) {
+        s_tx_write_fail_count++;
         LOG_ERR("TX write failed: %d", ret);
         s_tx_in_progress = false;
         if (was_rx_active) {
-            esb_start_rx();
-            s_rx_active = true;
+            if (esb_start_rx() == 0) {
+                s_rx_active = true;
+            } else {
+                s_rx_restart_fail_count++;
+            }
         }
         return ret;
     }
 
-    /* Wait for TX completion via semaphore (signaled by ESB event handler).
-     * With noack=true at 2Mbps, TX completes in <1ms. */
-    if (k_sem_take(&s_tx_done_sem, K_MSEC(TX_DONE_TIMEOUT_MS)) != 0) {
+    /* Keep a lost completion event from occupying more than one TDMA slot. */
+    if (k_sem_take(&s_tx_done_sem, K_USEC(TX_DONE_TIMEOUT_US)) != 0) {
         LOG_ERR("TX timed out");
         s_tx_timeout_count++;
+        s_tx_timing_count++;
+        uint32_t timeout_wait_us =
+            (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - tx_start_us);
+        s_tx_wait_sum_us += timeout_wait_us;
+        if (timeout_wait_us > s_tx_wait_max_us) {
+            s_tx_wait_max_us = timeout_wait_us;
+        }
+        esb_flush_tx();
+        for (int wait = 0; wait < 100 && !esb_is_idle(); wait++) {
+            k_busy_wait(10);
+        }
+        k_sem_reset(&s_tx_done_sem);
+        bool radio_idle = esb_is_idle();
+        s_tx_recovery_pending = !radio_idle;
         s_tx_in_progress = false;
         if (was_rx_active) {
-            esb_start_rx();
-            s_rx_active = true;
+            if (!radio_idle) {
+                s_recovery_restart_rx = true;
+            } else if (esb_start_rx() == 0) {
+                s_rx_active = true;
+            } else {
+                s_rx_restart_fail_count++;
+            }
 
             if (rx_pause_start_us > 0) {
                 uint32_t pause_us =
@@ -300,12 +361,16 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
                 }
             }
         } else {
+            s_rx_restart_fail_count++;
             LOG_ERR("Failed to resume RX after TX: %d", rx_ret);
             s_rx_active = false;
         }
     }
 
-    s_tx_count++;
+    if (s_last_tx_status == 0) {
+        s_tx_count++;
+    }
+    s_tx_timing_count++;
     uint32_t tx_wait_us = (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - tx_start_us);
     s_tx_wait_sum_us += tx_wait_us;
     if (tx_wait_us > s_tx_wait_max_us) {
@@ -358,8 +423,16 @@ void esb_radio_get_timing_stats(esb_radio_timing_stats_t *stats)
 
     stats->tx_count = s_tx_count;
     stats->tx_timeout_count = s_tx_timeout_count;
+    stats->tx_busy_count = s_tx_busy_count;
+    stats->tx_write_fail_count = s_tx_write_fail_count;
+    stats->tx_failed_event_count = (uint32_t)atomic_get(&s_tx_failed_event_count);
     stats->tx_wait_us_max = s_tx_wait_max_us;
-    stats->tx_wait_us_avg = s_tx_count ? (uint32_t)(s_tx_wait_sum_us / s_tx_count) : 0;
+    stats->tx_wait_us_avg =
+        s_tx_timing_count ? (uint32_t)(s_tx_wait_sum_us / s_tx_timing_count) : 0;
     stats->rx_pause_us_max = s_rx_pause_max_us;
-    stats->rx_pause_us_avg = s_tx_count ? (uint32_t)(s_rx_pause_sum_us / s_tx_count) : 0;
+    stats->rx_pause_us_avg =
+        s_tx_timing_count ? (uint32_t)(s_rx_pause_sum_us / s_tx_timing_count) : 0;
+    stats->rx_no_callback_count = (uint32_t)atomic_get(&s_rx_no_callback_count);
+    stats->rx_flush_drop_count = (uint32_t)atomic_get(&s_rx_flush_drop_count);
+    stats->rx_restart_fail_count = s_rx_restart_fail_count;
 }

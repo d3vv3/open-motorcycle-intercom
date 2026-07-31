@@ -489,7 +489,11 @@ static void audio_task(void *arg)
          * ==================================================================== */
 
         /* Wait for ADC data ready notification (with timeout) */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ADC_READ_TIMEOUT_MS));
+        bool capture_notified =
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ADC_READ_TIMEOUT_MS)) != 0;
+        if (!capture_notified) {
+            s_stats.capture_timeouts++;
+        }
 
         static uint8_t adc_buffer[ADC_CONV_FRAME_SIZE]; /* Static to save stack */
         uint32_t bytes_read = 0;
@@ -498,6 +502,11 @@ static void audio_task(void *arg)
         ret = adc_continuous_read(s_adc_handle, adc_buffer, ADC_CONV_FRAME_SIZE, &bytes_read, 0);
 
         if (ret == ESP_OK && bytes_read > 0) {
+            if (bytes_read == ADC_CONV_FRAME_SIZE) {
+                s_stats.capture_frames_ok++;
+            } else {
+                s_stats.capture_short_reads++;
+            }
             /* Calculate number of raw ADC samples available */
             size_t num_adc_samples = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
 
@@ -588,6 +597,7 @@ static void audio_task(void *arg)
                         s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, true, frame_start_us);
                     }
                 } else {
+                    s_stats.encode_errors++;
                     ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(opus_bytes));
                 }
             } else {
@@ -624,6 +634,8 @@ static void audio_task(void *arg)
                         /* Pure DTX frame: keep the radio quiet. */
                         s_stats.tx_dtx_suppressed++;
                     }
+                } else {
+                    s_stats.encode_errors++;
                 }
             }
 
@@ -654,6 +666,7 @@ static void audio_task(void *arg)
                         }
                         have_audio_to_play = true;
                     } else {
+                        s_stats.decode_errors++;
                         ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                     }
                 }
@@ -743,6 +756,7 @@ static void audio_task(void *arg)
                                     int16_t discard_pcm[AUDIO_FRAME_SAMPLES];
                                     if (opus_decode(s_opus_decoder, discard.data, discard.len,
                                                     discard_pcm, AUDIO_FRAME_SAMPLES, 0) < 0) {
+                                        s_stats.decode_errors++;
                                         ESP_LOGW(TAG, "Discard-frame Opus decode failed");
                                     }
                                     jitter->hold_budget--;
@@ -750,6 +764,7 @@ static void audio_task(void *arg)
                                 }
                             }
                         } else {
+                            s_stats.decode_errors++;
                             ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                         }
                     } else if (jitter->playout_started) {
@@ -792,6 +807,7 @@ static void audio_task(void *arg)
                                 }
                                 have_audio_to_play = true;
                             } else {
+                                s_stats.decode_errors++;
                                 ESP_LOGW(TAG, "Opus PLC failed: %d", plc_samples);
                             }
                         }
@@ -830,6 +846,8 @@ static void audio_task(void *arg)
                     ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
                     s_stats.i2s_write_incomplete++;
                     s_stats.glitches_detected++;
+                } else {
+                    s_stats.playback_frames++;
                 }
             }
 
@@ -859,6 +877,9 @@ static void audio_task(void *arg)
 
         } else if (ret == ESP_ERR_TIMEOUT) {
             /* ADC timeout - continue loop */
+            if (capture_notified) {
+                s_stats.capture_timeouts++;
+            }
             vTaskDelay(pdMS_TO_TICKS(1));
         } else {
             ESP_LOGW(TAG, "ADC read error: %s", esp_err_to_name(ret));
@@ -894,6 +915,15 @@ static void audio_task(void *arg)
                      s_stats.hold_frames, s_stats.catchup_frames, jitter->hold_budget);
             ESP_LOGI(TAG, "  RX queue depth: min=%u avg=%u max=%u", s_stats.rx_q_depth_min,
                      s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max);
+            ESP_LOGI(TAG,
+                     "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu rx_q_drop=%lu jitter_drop=%lu decode_ok=%lu decode_err=%lu plc=%lu hold=%lu catchup=%lu play_ok=%lu i2s_err=%lu",
+                     s_stats.capture_frames_ok, s_stats.capture_short_reads,
+                     s_stats.capture_timeouts, s_stats.adc_overruns, s_stats.frames_encoded,
+                     s_stats.encode_errors, s_stats.tx_dtx_suppressed,
+                     s_stats.rx_queue_overflows, s_stats.jitter_trim_frames,
+                     s_stats.frames_decoded, s_stats.decode_errors, s_stats.plc_frames,
+                     s_stats.hold_frames, s_stats.catchup_frames, s_stats.playback_frames,
+                     s_stats.i2s_write_incomplete);
             last_heartbeat = now_ms;
         }
 
@@ -1110,6 +1140,7 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
 
     if (xQueueSend(s_rx_queue, &rx_item, 0) != pdTRUE) {
         s_stats.frames_dropped++;
+        s_stats.rx_queue_overflows++;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1316,9 +1347,11 @@ esp_err_t audio_play_notification(audio_notify_t type)
         i2s_channel_disable(s_tx_chan);
     }
 
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to play notification: %s", esp_err_to_name(ret));
-        return ret;
+    size_t expected_bytes = stereo_samples * sizeof(int16_t);
+    if (ret != ESP_OK || bytes_written != expected_bytes) {
+        ESP_LOGW(TAG, "Failed to play complete notification: %zu/%zu bytes (%s)", bytes_written,
+                 expected_bytes, esp_err_to_name(ret));
+        return ret != ESP_OK ? ret : ESP_ERR_TIMEOUT;
     }
 
     return ESP_OK;

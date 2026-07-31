@@ -69,6 +69,8 @@ typedef struct __attribute__((packed)) {
     uint8_t coordinator_addr[6]; /**< Coordinator MAC address for tiebreaking */
 } mesh_sync_payload_t;
 
+_Static_assert(sizeof(mesh_sync_payload_t) == 12, "ESP-NOW SYNC wire size changed");
+
 /**
  * @brief Mesh configuration
  */
@@ -150,10 +152,11 @@ typedef struct {
  * @param data Opus-encoded audio data
  * @param len Length of audio data
  * @param src_id Source node ID
+ * @param audio_flags Per-frame audio activity flags
  * @param timestamp_us Receive timestamp (microseconds)
  */
 typedef void (*mesh_audio_cb_t)(const uint8_t *data, uint16_t len, uint8_t src_id,
-                                int64_t timestamp_us);
+                                 uint8_t audio_flags, int64_t timestamp_us);
 
 /**
  * @brief Callback for mesh state changes

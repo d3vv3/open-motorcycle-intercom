@@ -11,6 +11,7 @@
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 
 #include "esb_radio.h"
 #include "tdma.h"
@@ -48,6 +49,10 @@ static void mesh_log(const char *fmt, ...)
 #define ACTIVE_SPEAKER_TIMEOUT_MS 1500
 #define SEEN_RING_SIZE     32
 #define RELAY_RING_SIZE    16
+#define CONTROL_RING_SIZE  32
+#define TX_AUDIO_RING_SIZE 16
+#define NRF_SYNC_RX_LATENCY_US 300
+#define MESH_PACKET_PAYLOAD_MAX 128
 
 /* ============================================================================
  * Static Variables
@@ -65,16 +70,9 @@ static uint8_t s_peer_count = 0;
 
 static uint8_t s_tx_seq = 0;
 
-/* CONCURRENCY INVARIANT: the mesh state below (peer table, speaker grants,
- * relay masks, heard/relay bitmaps) is accessed ONLY from the system
- * workqueue: rx_work_handler, status_work_handler, and the slot callback
- * (tdma slot_work_handler -> slot_tx_handler) are all k_work items on the
- * default system workqueue, which runs them serially. The ESB RX path and the
- * TDMA frame timer run in ISR context but only k_work_submit() - they never
- * touch this state. Because access is serialized on one thread, no locks are
- * needed. If you ever access this state from another thread, a second
- * workqueue, or directly from an ISR, you MUST add synchronization (compare the
- * ESP-NOW build, which has a genuine timer/task split and uses s_speaker_mux). */
+/* The system workqueue owns all mesh protocol state. SPI commands are
+ * coalesced atomically, audio is copied through a message queue, and timer or
+ * radio ISR paths only submit work or publish into protected rings. */
 static uint8_t s_active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static uint8_t s_relay_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static int64_t s_active_speaker_deadline_ms[MESH_MAX_NODES + 1] = {0};
@@ -90,6 +88,32 @@ static struct k_work_delayable s_scan_work;
 static struct k_work_delayable s_join_work;
 static struct k_work_delayable s_status_work;
 static struct k_work s_rx_work; /* For deferred RX processing */
+static struct k_work s_command_work;
+static struct k_work s_audio_ingress_work;
+
+struct audio_ingress_entry {
+    uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
+    uint8_t len;
+    uint8_t audio_flags;
+};
+
+struct tx_audio_entry {
+    uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
+    uint8_t len;
+    uint8_t audio_flags;
+};
+
+K_MSGQ_DEFINE(s_audio_ingress_queue, sizeof(struct audio_ingress_entry), 16, 4);
+K_MUTEX_DEFINE(s_audio_ingress_lock);
+static bool s_audio_ingress_enabled = false;
+static uint32_t s_stat_ingress_purge_drop = 0;
+static struct tx_audio_entry s_tx_audio_ring[TX_AUDIO_RING_SIZE];
+static uint8_t s_tx_head = 0;
+static uint8_t s_tx_tail = 0;
+static uint32_t s_stat_tx_purge_drop = 0;
+static atomic_t s_requested_enabled;
+static atomic_t s_control_pending;
+static atomic_t s_status_pending;
 
 static int s_join_attempts = 0;
 
@@ -99,24 +123,39 @@ struct rx_ring_entry {
     uint8_t data[256];
     uint8_t len;
     int8_t rssi;
+    int64_t timestamp_us;
 };
 static struct rx_ring_entry s_rx_ring[RX_RING_SIZE];
-static volatile uint8_t s_rx_ring_head = 0; /* ISR writes here */
-static volatile uint8_t s_rx_ring_tail = 0; /* Work reads here */
+static uint8_t s_rx_ring_head = 0;
+static uint8_t s_rx_ring_tail = 0;
+static struct k_spinlock s_rx_ring_lock;
 
 /* Packet statistics */
 static uint32_t s_stat_tx_count = 0;
 static uint32_t s_stat_tx_fail = 0;
 static uint32_t s_stat_tx_underflow = 0;
 
-/* TX queue depth for ESP->nRF audio handoff */
-#define TX_AUDIO_RING_SIZE 16
-
 static uint32_t s_stat_rx_count = 0;
-static uint32_t s_stat_rx_drop = 0;
+static atomic_t s_stat_rx_drop;
 static uint32_t s_stat_audio_fwd = 0;
-static uint32_t s_stat_tx_overwrite = 0;  /* Audio overwritten before TDMA sent */
+static atomic_t s_stat_tx_overwrite;
 static uint32_t s_stat_spi_audio_in = 0;  /* Audio packets received from ESP32 SPI */
+static uint32_t s_stat_ingress_inactive_drop = 0;
+static atomic_t s_stat_ingress_msgq_drop;
+static uint32_t s_stat_tx_ring_drop = 0;
+static uint32_t s_stat_relay_ring_drop = 0;
+static uint32_t s_stat_control_ring_drop = 0;
+static uint32_t s_stat_rf_audio_try = 0;
+static uint32_t s_stat_rf_audio_ok = 0;
+static uint32_t s_stat_rf_audio_fail = 0;
+static uint32_t s_stat_rf_rx_audio_ok = 0;
+static uint32_t s_stat_rf_rx_malformed = 0;
+static uint32_t s_stat_rf_rx_version_drop = 0;
+static uint32_t s_stat_rf_rx_self_drop = 0;
+static uint32_t s_stat_rf_rx_duplicate_drop = 0;
+static uint32_t s_stat_rf_rx_inactive_drop = 0;
+static uint32_t s_stat_spi_out_ok = 0;
+static uint32_t s_stat_spi_out_drop = 0;
 static uint32_t s_last_audio_in_time = 0; /* Timestamp of last audio packet from ESP32 */
 static uint8_t s_tx_queue_depth_dbg = 0;  /* Current TX queue depth for diagnostics */
 static uint32_t s_under_prev = 0;
@@ -145,7 +184,6 @@ static uint32_t s_e2e_rf_rx_gap_fr = 0;
 static uint32_t s_e2e_rf_rx_reset_evt = 0;
 static uint32_t s_e2e_spi_out_frames = 0;
 
-#define E2E_MAX_FORWARD_GAP 32
 /* Skip-send queue buffering strategy.
  *
  * Problem: PI frame-stretch matched send rate to arrival rate but never built
@@ -178,8 +216,11 @@ struct relay_entry {
 };
 
 static struct relay_entry s_relay_ring[RELAY_RING_SIZE];
-static volatile uint8_t s_relay_head = 0;
-static volatile uint8_t s_relay_tail = 0;
+static uint8_t s_relay_head = 0;
+static uint8_t s_relay_tail = 0;
+static struct relay_entry s_control_ring[CONTROL_RING_SIZE];
+static uint8_t s_control_head = 0;
+static uint8_t s_control_tail = 0;
 
 /* ============================================================================
  * Forward Declarations
@@ -189,7 +230,13 @@ static void scan_work_handler(struct k_work *work);
 static void join_work_handler(struct k_work *work);
 static void status_work_handler(struct k_work *work);
 static void rx_work_handler(struct k_work *work);
-static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi);
+static void command_work_handler(struct k_work *work);
+static void audio_ingress_work_handler(struct k_work *work);
+static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio_flags);
+static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
+                              int64_t timestamp_us);
+static void control_tx_handler(uint32_t frame_counter);
+static void set_audio_ingress_enabled(bool enabled, bool purge);
 static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src_addr, int8_t rssi);
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter);
 static int send_packet_ex(mesh_pkt_type_t type, const void *payload, uint16_t len, uint8_t ttl,
@@ -199,6 +246,27 @@ static bool seen_packet(uint8_t type, uint8_t src_id, uint8_t seq);
 static void remember_packet(uint8_t type, uint8_t src_id, uint8_t seq);
 static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, uint8_t flags);
 static bool relay_queue_empty(void);
+
+static void set_audio_ingress_enabled(bool enabled, bool purge)
+{
+    k_mutex_lock(&s_audio_ingress_lock, K_FOREVER);
+    s_audio_ingress_enabled = enabled;
+    if (purge) {
+        s_stat_ingress_purge_drop += k_msgq_num_used_get(&s_audio_ingress_queue);
+        k_msgq_purge(&s_audio_ingress_queue);
+    }
+    k_mutex_unlock(&s_audio_ingress_lock);
+}
+
+static void purge_tx_audio_ring(void)
+{
+    uint8_t depth = s_tx_head >= s_tx_tail
+                        ? (uint8_t)(s_tx_head - s_tx_tail)
+                        : (uint8_t)(TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head);
+    s_stat_tx_purge_drop += depth;
+    s_tx_head = 0;
+    s_tx_tail = 0;
+}
 static bool relay_permitted_for_source(uint8_t src_id, uint8_t flags);
 static void note_audio_activity(uint8_t src_id, uint8_t audio_flags);
 static bool is_speaker_granted(uint8_t node_id);
@@ -423,6 +491,7 @@ static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, 
 
     uint8_t next_head = (uint8_t)((s_relay_head + 1) % RELAY_RING_SIZE);
     if (next_head == s_relay_tail) {
+        s_stat_relay_ring_drop++;
         s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
     }
 
@@ -442,6 +511,9 @@ static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, 
 static int send_packet_ex(mesh_pkt_type_t type, const void *payload, uint16_t len, uint8_t ttl,
                           uint8_t flags, uint8_t src_id, uint8_t seq)
 {
+    if (len > MESH_PACKET_PAYLOAD_MAX) {
+        return -EMSGSIZE;
+    }
     uint8_t buf[sizeof(mesh_header_t) + 128];
     mesh_header_t *hdr = (mesh_header_t *)buf;
 
@@ -465,14 +537,44 @@ static int send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
     return send_packet_ex(type, payload, len, 0, 0, s_node_id, s_tx_seq++);
 }
 
+static int queue_control_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
+{
+    if (len > MESH_PACKET_PAYLOAD_MAX) {
+        return -EMSGSIZE;
+    }
+
+    uint8_t next_head = (uint8_t)((s_control_head + 1) % CONTROL_RING_SIZE);
+    if (next_head == s_control_tail) {
+        s_stat_control_ring_drop++;
+        return -ENOBUFS;
+    }
+
+    struct relay_entry *entry = &s_control_ring[s_control_head];
+    mesh_header_t *hdr = (mesh_header_t *)entry->data;
+    hdr->version = MESH_PROTOCOL_VERSION;
+    hdr->type = type;
+    hdr->src_id = s_node_id;
+    hdr->seq = s_tx_seq++;
+    hdr->ttl = 0;
+    hdr->flags = 0;
+    hdr->payload_len = len;
+    if (payload != NULL && len > 0) {
+        memcpy(entry->data + sizeof(*hdr), payload, len);
+    }
+    entry->len = (uint8_t)(sizeof(*hdr) + len);
+    s_control_head = next_head;
+    return 0;
+}
+
 static int send_join_request(void)
 {
-    mesh_join_payload_t payload = {
+    mesh_join_v2_payload_t payload = {
         .capabilities = 0x01, /* Has audio */
         .reserved = 0,
     };
+    memcpy(payload.requester_addr, s_local_addr, sizeof(payload.requester_addr));
     LOG_INF("Sending JOIN request");
-    return send_packet(MESH_PKT_JOIN, &payload, sizeof(payload));
+    return send_packet(MESH_PKT_JOIN_V2, &payload, sizeof(payload));
 }
 
 static int send_sync(void)
@@ -491,7 +593,7 @@ static int send_keepalive(void)
         .battery_pct = 255,
         .reserved = 0,
     };
-    return send_packet(MESH_PKT_KEEPALIVE, &payload, sizeof(payload));
+    return queue_control_packet(MESH_PKT_KEEPALIVE, &payload, sizeof(payload));
 }
 
 static int send_slot_map(void)
@@ -513,7 +615,7 @@ static int send_slot_map(void)
     memcpy(payload.active_speaker_ids, s_active_speaker_ids, sizeof(payload.active_speaker_ids));
     memcpy(payload.relay_masks, s_relay_masks, sizeof(payload.relay_masks));
 
-    return send_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
+    return queue_control_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
 }
 
 static int send_status_packet(void)
@@ -535,7 +637,7 @@ static int send_status_packet(void)
         }
     }
 
-    return send_packet(MESH_PKT_STATUS, &payload, sizeof(payload));
+    return queue_control_packet(MESH_PKT_STATUS, &payload, sizeof(payload));
 }
 
 static int send_speaker_grant(void)
@@ -550,7 +652,7 @@ static int send_speaker_grant(void)
         }
     }
 
-    return send_packet(MESH_PKT_SPEAKER_GRANT, &payload, sizeof(payload));
+    return queue_control_packet(MESH_PKT_SPEAKER_GRANT, &payload, sizeof(payload));
 }
 
 static int send_speaker_release(const uint8_t *speaker_ids, uint8_t speaker_count)
@@ -566,18 +668,19 @@ static int send_speaker_release(const uint8_t *speaker_ids, uint8_t speaker_coun
         memcpy(payload.speaker_ids, speaker_ids, speaker_count);
     }
 
-    return send_packet(MESH_PKT_SPEAKER_RELEASE, &payload, sizeof(payload));
+    return queue_control_packet(MESH_PKT_SPEAKER_RELEASE, &payload, sizeof(payload));
 }
 
-static int send_join_ack(uint8_t assigned_id, uint8_t slot_index)
+static int send_join_ack(uint8_t assigned_id, uint8_t slot_index, const uint8_t target_addr[5])
 {
-    mesh_join_ack_payload_t payload = {
+    mesh_join_ack_v2_payload_t payload = {
         .assigned_id = assigned_id,
         .slot_index = slot_index,
         .coordinator_id = s_node_id,
     };
+    memcpy(payload.target_addr, target_addr, sizeof(payload.target_addr));
     LOG_INF("Sending JOIN_ACK: id=%d, slot=%d", assigned_id, slot_index);
-    return send_packet(MESH_PKT_JOIN_ACK, &payload, sizeof(payload));
+    return queue_control_packet(MESH_PKT_JOIN_ACK_V2, &payload, sizeof(payload));
 }
 
 /* ============================================================================
@@ -591,14 +694,11 @@ static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src
 
     /* NOTE: Don't printk here - ISR context, can deadlock with USB/UART */
 
+    k_spinlock_key_t key = k_spin_lock(&s_rx_ring_lock);
     uint8_t next_head = (s_rx_ring_head + 1) % RX_RING_SIZE;
     if (next_head == s_rx_ring_tail) {
-        /* Ring full - drop packet */
-        s_stat_rx_drop++;
-        return;
-    }
-
-    if (len > sizeof(s_rx_ring[0].data)) {
+        atomic_inc(&s_stat_rx_drop);
+        k_spin_unlock(&s_rx_ring_lock, key);
         return;
     }
 
@@ -606,7 +706,9 @@ static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src
     memcpy(entry->data, data, len);
     entry->len = len;
     entry->rssi = rssi;
+    entry->timestamp_us = k_ticks_to_us_floor64(k_uptime_ticks());
     s_rx_ring_head = next_head;
+    k_spin_unlock(&s_rx_ring_lock, key);
 
     /* Submit work to process in thread context */
     k_work_submit(&s_rx_work);
@@ -617,17 +719,26 @@ static void rx_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    while (s_rx_ring_tail != s_rx_ring_head) {
-        struct rx_ring_entry *entry = &s_rx_ring[s_rx_ring_tail];
-        process_rx_packet(entry->data, entry->len, entry->rssi);
+    while (true) {
+        struct rx_ring_entry entry;
+        k_spinlock_key_t key = k_spin_lock(&s_rx_ring_lock);
+        if (s_rx_ring_tail == s_rx_ring_head) {
+            k_spin_unlock(&s_rx_ring_lock, key);
+            break;
+        }
+        entry = s_rx_ring[s_rx_ring_tail];
         s_rx_ring_tail = (s_rx_ring_tail + 1) % RX_RING_SIZE;
+        k_spin_unlock(&s_rx_ring_lock, key);
+        process_rx_packet(entry.data, entry.len, entry.rssi, entry.timestamp_us);
     }
 }
 
 /* Actual packet processing - safe to call kernel functions here */
-static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
+static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
+                              int64_t timestamp_us)
 {
     if (len < sizeof(mesh_header_t)) {
+        s_stat_rf_rx_malformed++;
         return;
     }
 
@@ -635,10 +746,12 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
     const uint8_t *payload = data + sizeof(mesh_header_t);
 
     if (hdr->payload_len > (uint16_t)(len - sizeof(mesh_header_t))) {
+        s_stat_rf_rx_malformed++;
         return;
     }
 
     if (hdr->version != MESH_PROTOCOL_VERSION) {
+        s_stat_rf_rx_version_drop++;
         return;
     }
 
@@ -653,11 +766,17 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
             uint8_t audio_len = hdr->payload_len - 4; /* Subtract header */
             uint8_t bridge_buf[MESH_MAX_AUDIO_PAYLOAD + 1];
 
-            if (hdr->src_id == s_node_id || audio_len > MESH_MAX_AUDIO_PAYLOAD) {
+            if (hdr->src_id == s_node_id) {
+                s_stat_rf_rx_self_drop++;
+                break;
+            }
+            if (audio_len > MESH_MAX_AUDIO_PAYLOAD) {
+                s_stat_rf_rx_malformed++;
                 break;
             }
 
             if (seen_packet(hdr->type, hdr->src_id, hdr->seq)) {
+                s_stat_rf_rx_duplicate_drop++;
                 break;
             }
 
@@ -678,7 +797,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                     uint16_t expected = (uint16_t)(st->last_seq + 1);
                     if (e2e_seq != expected) {
                         int16_t signed_delta = (int16_t)(e2e_seq - expected);
-                        if (signed_delta > 0 && signed_delta <= E2E_MAX_FORWARD_GAP) {
+                        if (signed_delta > 0) {
                             s_e2e_rf_rx_gap_evt++;
                             s_e2e_rf_rx_gap_fr += (uint16_t)signed_delta;
                         } else {
@@ -692,9 +811,14 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
 
             bridge_buf[0] = audio->audio_flags;
             memcpy(&bridge_buf[1], audio->data, audio_len);
-            uart_bridge_send_audio(hdr->src_id, bridge_buf, (uint8_t)(audio_len + 1));
-            s_stat_audio_fwd++;
-            s_e2e_spi_out_frames++;
+            s_stat_rf_rx_audio_ok++;
+            if (uart_bridge_send_audio(hdr->src_id, bridge_buf, (uint8_t)(audio_len + 1)) == 0) {
+                s_stat_audio_fwd++;
+                s_e2e_spi_out_frames++;
+                s_stat_spi_out_ok++;
+            } else {
+                s_stat_spi_out_drop++;
+            }
 
             if (hdr->ttl > 0 && (hdr->flags & MESH_FLAG_RELAY_REQUEST) != 0 &&
                 relay_permitted_for_source(hdr->src_id, hdr->flags)) {
@@ -702,10 +826,18 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                                            (uint8_t)(hdr->ttl - 1),
                                            (uint8_t)(hdr->flags | MESH_FLAG_RELAYED));
             }
+        } else if (s_state != MESH_STATE_ACTIVE) {
+            s_stat_rf_rx_inactive_drop++;
+        } else {
+            s_stat_rf_rx_malformed++;
         }
         break;
 
     case MESH_PKT_SYNC:
+        if (hdr->payload_len != sizeof(mesh_sync_payload_t) || hdr->src_id == 0 ||
+            hdr->src_id > MESH_MAX_NODES) {
+            break;
+        }
         if (s_state == MESH_STATE_SCANNING) {
             /* Found existing mesh */
             LOG_INF("Found mesh, coordinator=%d", hdr->src_id);
@@ -715,9 +847,14 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
             k_work_cancel_delayable(&s_scan_work);
             k_work_schedule(&s_join_work, K_NO_WAIT);
         } else if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_PARTICIPANT) {
+            if (hdr->src_id != s_coordinator_id) {
+                break;
+            }
             /* Sync to coordinator timing */
             const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
-            tdma_sync(sync->frame_counter, sync->drift_ppm);
+            int64_t frame_start_us = timestamp_us - (MESH_MAX_NODES * MESH_SLOT_MS * 1000) -
+                                     NRF_SYNC_RX_LATENCY_US;
+            tdma_sync(sync->frame_counter, sync->drift_ppm, frame_start_us);
             s_last_sync_time = k_uptime_get_32();
         } else if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_COORDINATOR) {
             /* Dual-coordinator conflict: lower MAC address wins */
@@ -725,9 +862,10 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
             int cmp = memcmp(sync->coordinator_addr, s_local_addr, 5);
             if (cmp < 0) {
                 /* Other coordinator has lower MAC — we demote */
-                LOG_WRN("Dual coordinator detected, other MAC is lower — demoting to scan");
+                LOG_WRN("Dual coordinator detected, other MAC is lower - demoting to scan");
                 mesh_log("MESH: Dual coordinator, demoting (lower MAC wins)");
 
+                set_audio_ingress_enabled(false, false);
                 tdma_stop();
                 s_state = MESH_STATE_SCANNING;
                 s_role = MESH_ROLE_NONE;
@@ -735,6 +873,19 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                 s_slot_index = -1;
                 s_peer_count = 0;
                 memset(s_peers, 0, sizeof(s_peers));
+                memset(s_seen_ring, 0, sizeof(s_seen_ring));
+                memset(s_relay_ring, 0, sizeof(s_relay_ring));
+                memset(s_control_ring, 0, sizeof(s_control_ring));
+                memset(s_active_speaker_deadline_ms, 0,
+                       sizeof(s_active_speaker_deadline_ms));
+                clear_speaker_grants();
+                s_seen_head = 0;
+                s_relay_head = 0;
+                s_relay_tail = 0;
+                s_control_head = 0;
+                s_control_tail = 0;
+                purge_tx_audio_ring();
+                set_audio_ingress_enabled(false, true);
 
                 k_work_cancel_delayable(&s_status_work);
                 k_work_schedule(&s_scan_work, K_NO_WAIT);
@@ -745,114 +896,99 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
         }
         break;
 
-    case MESH_PKT_JOIN:
-        if (s_role == MESH_ROLE_COORDINATOR) {
-            /* Deduplication: if we recently assigned a slot and the new peer
-             * hasn't confirmed (sent KEEPALIVE), assume this is a retry from
-             * the same joiner and resend the previous JOIN_ACK. */
-            static uint8_t s_last_join_id = 0;
-            static int8_t s_last_join_slot = -1;
-            static int64_t s_last_join_time = 0;
+    case MESH_PKT_JOIN_V2:
+        if (s_role == MESH_ROLE_COORDINATOR && hdr->src_id == 0 &&
+            hdr->payload_len == sizeof(mesh_join_v2_payload_t)) {
+            const mesh_join_v2_payload_t *join = (const mesh_join_v2_payload_t *)payload;
+            uint8_t assigned_id = 0;
+            int8_t assigned_slot = -1;
 
-            int64_t now = k_uptime_get();
-            if (s_last_join_id != 0 && (now - s_last_join_time) < 10000) {
-                /* Check if the last assigned peer ever sent anything back */
-                bool last_peer_confirmed = false;
-                for (int i = 0; i < MESH_MAX_NODES; i++) {
-                    if (s_peers[i].active && s_peers[i].node_id == s_last_join_id) {
-                        /* If last_seen hasn't changed from assignment time,
-                         * it's the same joiner retrying */
-                        if ((now - s_peers[i].last_seen_ms) < 10000) {
-                            last_peer_confirmed = false;
+            for (int i = 0; i < MESH_MAX_NODES; i++) {
+                if (s_peers[i].active &&
+                    memcmp(s_peers[i].esb_addr, join->requester_addr,
+                           sizeof(join->requester_addr)) == 0) {
+                    assigned_id = s_peers[i].node_id;
+                    assigned_slot = s_peers[i].slot_index;
+                    s_peers[i].last_seen_ms = k_uptime_get();
+                    break;
+                }
+            }
+
+            if (assigned_id == 0) {
+                for (int slot = 1; slot < MESH_MAX_NODES; slot++) {
+                    bool slot_used = false;
+                    for (int i = 0; i < MESH_MAX_NODES; i++) {
+                        if (s_peers[i].active && s_peers[i].slot_index == slot) {
+                            slot_used = true;
+                            break;
                         }
+                    }
+                    if (!slot_used) {
+                        assigned_slot = slot;
+                        assigned_id = (uint8_t)(slot + 1);
                         break;
                     }
                 }
 
-                if (!last_peer_confirmed) {
-                    LOG_INF("JOIN retry, resending ACK: id=%d slot=%d", s_last_join_id,
-                            s_last_join_slot);
-                    send_join_ack(s_last_join_id, s_last_join_slot);
-                    send_slot_map();
-                    break;
-                }
-            }
-
-            /* Find next available slot and ID for new node */
-            uint8_t new_id = 0;
-            int8_t new_slot = -1;
-
-            /* Find first free slot (start at 1, slot 0 is coordinator) */
-            for (int i = 1; i < MESH_MAX_NODES; i++) {
-                bool slot_used = false;
-                for (int j = 0; j < MESH_MAX_NODES; j++) {
-                    if (s_peers[j].active && s_peers[j].slot_index == i) {
-                        slot_used = true;
+                for (int i = 0; assigned_id != 0 && i < MESH_MAX_NODES; i++) {
+                    if (!s_peers[i].active) {
+                        s_peers[i].node_id = assigned_id;
+                        s_peers[i].slot_index = assigned_slot;
+                        memcpy(s_peers[i].esb_addr, join->requester_addr,
+                               sizeof(s_peers[i].esb_addr));
+                        s_peers[i].last_seen_ms = k_uptime_get();
+                        s_peers[i].active = true;
+                        s_peer_count++;
+                        uart_bridge_send_event(0x02, NULL, 0);
                         break;
                     }
                 }
-                if (!slot_used) {
-                    new_slot = i;
-                    new_id = i + 1; /* ID = slot + 1 */
-                    break;
-                }
             }
 
-            if (new_slot < 0) {
+            if (assigned_id == 0) {
                 LOG_WRN("No free slots for new node");
                 break;
             }
 
-            LOG_INF("Received JOIN, assigning id=%d slot=%d", new_id, new_slot);
-
-            /* Add new peer to our list */
-            for (int i = 0; i < MESH_MAX_NODES; i++) {
-                if (!s_peers[i].active) {
-                    s_peers[i].node_id = new_id;
-                    s_peers[i].slot_index = new_slot;
-                    s_peers[i].active = true;
-                    s_peers[i].last_seen_ms = k_uptime_get();
-                    s_peer_count++;
-                    break;
-                }
-            }
-
-            /* Track this assignment for dedup */
-            s_last_join_id = new_id;
-            s_last_join_slot = new_slot;
-            s_last_join_time = k_uptime_get();
-
-            /* Send JOIN_ACK to the new node */
-            send_join_ack(new_id, new_slot);
+            send_join_ack(assigned_id, (uint8_t)assigned_slot, join->requester_addr);
             send_slot_map();
-
-            /* Notify ESP32 of new peer joining */
-            uart_bridge_send_event(0x02, NULL, 0); /* BRIDGE_EVENT_PEER_JOINED */
         }
         break;
 
-    case MESH_PKT_JOIN_ACK:
-        if (s_state == MESH_STATE_JOINING) {
-            const mesh_join_ack_payload_t *ack = (const mesh_join_ack_payload_t *)payload;
+    case MESH_PKT_JOIN_ACK_V2:
+        if (s_state == MESH_STATE_JOINING &&
+            hdr->payload_len == sizeof(mesh_join_ack_v2_payload_t)) {
+            const mesh_join_ack_v2_payload_t *ack = (const mesh_join_ack_v2_payload_t *)payload;
+            if (memcmp(ack->target_addr, s_local_addr, sizeof(ack->target_addr)) != 0 ||
+                ack->assigned_id == 0 || ack->assigned_id > MESH_MAX_NODES ||
+                ack->slot_index == 0 || ack->slot_index >= MESH_MAX_NODES ||
+                ack->coordinator_id == 0 || ack->coordinator_id > MESH_MAX_NODES ||
+                ack->assigned_id == ack->coordinator_id || hdr->src_id != ack->coordinator_id ||
+                ack->coordinator_id != s_coordinator_id) {
+                break;
+            }
+
             s_node_id = ack->assigned_id;
             s_slot_index = ack->slot_index;
             s_coordinator_id = ack->coordinator_id;
-
+            purge_tx_audio_ring();
+            set_audio_ingress_enabled(false, true);
             LOG_INF("JOIN_ACK: node_id=%d, slot=%d", s_node_id, s_slot_index);
-
             s_state = MESH_STATE_ACTIVE;
             s_role = MESH_ROLE_PARTICIPANT;
-
+            set_audio_ingress_enabled(true, false);
             k_work_cancel_delayable(&s_join_work);
-            tdma_start(s_slot_index);
-
-            /* Start periodic status updates */
+            tdma_start(s_slot_index, false);
             s_last_sync_time = k_uptime_get_32();
             k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
-
-            /* Notify ESP32 that we joined the mesh */
-            uart_bridge_send_event(0x02, NULL, 0); /* BRIDGE_EVENT_PEER_JOINED */
+            uart_bridge_send_event(0x02, NULL, 0);
         }
+        break;
+
+    case MESH_PKT_JOIN:
+    case MESH_PKT_JOIN_ACK:
+        /* Legacy nRF JOIN packets have no requester identity and cannot be
+         * safely deduplicated or targeted. */
         break;
 
     case MESH_PKT_KEEPALIVE:
@@ -879,14 +1015,46 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
         break;
 
     case MESH_PKT_SLOT_MAP:
-        if (hdr->payload_len >= sizeof(uint8_t)) {
+        if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_PARTICIPANT &&
+            hdr->src_id == s_coordinator_id &&
+            hdr->payload_len == sizeof(mesh_slot_map_payload_t)) {
             const mesh_slot_map_payload_t *slot_map = (const mesh_slot_map_payload_t *)payload;
             uint8_t slot_count = slot_map->slot_count;
-            if (slot_count > MESH_MAX_NODES) {
-                slot_count = MESH_MAX_NODES;
+            if (slot_count == 0 || slot_count > MESH_MAX_NODES ||
+                slot_map->slot_ids[0] != s_coordinator_id ||
+                slot_map->active_speaker_count > MESH_MAX_ACTIVE_SPEAKERS) {
+                break;
             }
 
-            if (hdr->payload_len < (uint16_t)(1 + slot_count)) {
+            uint16_t seen_ids = 0;
+            int8_t assigned_slot = -1;
+            bool valid_map = true;
+            for (uint8_t slot = 0; slot < slot_count; slot++) {
+                uint8_t node_id = slot_map->slot_ids[slot];
+                if (node_id == 0) {
+                    continue;
+                }
+                if (node_id > MESH_MAX_NODES) {
+                    valid_map = false;
+                    break;
+                }
+                uint16_t bit = (uint16_t)(1U << (node_id - 1));
+                if ((seen_ids & bit) != 0) {
+                    valid_map = false;
+                    break;
+                }
+                seen_ids |= bit;
+                if (node_id == s_node_id) {
+                    assigned_slot = (int8_t)slot;
+                }
+            }
+            for (uint8_t i = 0; valid_map && i < slot_map->active_speaker_count; i++) {
+                if (slot_map->active_speaker_ids[i] == 0 ||
+                    slot_map->active_speaker_ids[i] > MESH_MAX_NODES) {
+                    valid_map = false;
+                }
+            }
+            if (!valid_map || assigned_slot <= 0) {
                 break;
             }
 
@@ -896,10 +1064,6 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                     continue;
                 }
 
-                if (node_id == s_node_id) {
-                    s_slot_index = (int8_t)slot;
-                }
-
                 for (int i = 0; i < MESH_MAX_NODES; i++) {
                     if (s_peers[i].active && s_peers[i].node_id == node_id) {
                         s_peers[i].slot_index = (int8_t)slot;
@@ -907,6 +1071,8 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
                     }
                 }
             }
+            s_slot_index = assigned_slot;
+            tdma_set_slot_index(assigned_slot);
 
             clear_speaker_grants();
             for (uint8_t i = 0; i < slot_map->active_speaker_count && i < MESH_MAX_ACTIVE_SPEAKERS;
@@ -918,13 +1084,15 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
         break;
 
     case MESH_PKT_SPEAKER_GRANT:
-        if (hdr->payload_len >= sizeof(mesh_speaker_grant_payload_t)) {
+        if (hdr->src_id == s_coordinator_id &&
+            hdr->payload_len == sizeof(mesh_speaker_grant_payload_t)) {
             apply_speaker_grant((const mesh_speaker_grant_payload_t *)payload);
         }
         break;
 
     case MESH_PKT_SPEAKER_RELEASE:
-        if (hdr->payload_len >= sizeof(mesh_speaker_release_payload_t)) {
+        if (hdr->src_id == s_coordinator_id &&
+            hdr->payload_len == sizeof(mesh_speaker_release_payload_t)) {
             const mesh_speaker_release_payload_t *release =
                 (const mesh_speaker_release_payload_t *)payload;
 
@@ -985,6 +1153,7 @@ static void scan_work_handler(struct k_work *work)
     s_slot_index = 0;
     s_coordinator_id = 1;
     s_state = MESH_STATE_ACTIVE;
+    set_audio_ingress_enabled(true, false);
 
     /* Add self to peer list */
     s_peers[0].node_id = 1;
@@ -997,7 +1166,7 @@ static void scan_work_handler(struct k_work *work)
     /* RX is already running from scanning phase */
 
     /* Start TDMA */
-    tdma_start(s_slot_index);
+    tdma_start(s_slot_index, true);
 
     /* Start periodic status updates */
     k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
@@ -1093,20 +1262,25 @@ static void status_work_handler(struct k_work *work)
     if (s_role == MESH_ROLE_COORDINATOR) {
         update_speaker_grants();
     }
-    send_status_packet();
+    int status_ret = send_status_packet();
     send_keepalive();
-    s_heard_bitmap = 0;
-    s_relay_bitmap = 0;
+    if (status_ret == 0) {
+        s_heard_bitmap = 0;
+        s_relay_bitmap = 0;
+    }
 
     /* Log packet stats */
     esb_radio_timing_stats_t esb_stats = {0};
     esb_radio_get_timing_stats(&esb_stats);
+    tdma_stats_t tdma_stats = {0};
+    tdma_get_stats(&tdma_stats);
 
     bool log_now = ((s_status_log_decim++ % 2) == 0);
     if (log_now) {
         printk("[MESH] r=%u id=%u sl=%d tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u under=%u q=%u\n",
                s_role, s_node_id, s_slot_index, s_stat_tx_count, s_stat_tx_fail, s_stat_rx_count,
-               s_stat_rx_drop, s_stat_audio_fwd, s_stat_spi_audio_in, s_stat_tx_overwrite,
+               (uint32_t)atomic_get(&s_stat_rx_drop), s_stat_audio_fwd, s_stat_spi_audio_in,
+               (uint32_t)atomic_get(&s_stat_tx_overwrite),
                s_stat_tx_underflow, s_tx_queue_depth_dbg);
         printk("[ESB_TIM] tx=%u to=%u txwait=%u/%u rxpause=%u/%u us\n", esb_stats.tx_count,
                esb_stats.tx_timeout_count, esb_stats.tx_wait_us_avg, esb_stats.tx_wait_us_max,
@@ -1131,20 +1305,36 @@ static void status_work_handler(struct k_work *work)
                s_e2e_spi_in_frames, s_e2e_spi_in_gap_evt, s_e2e_spi_in_gap_fr, s_e2e_spi_in_reset_evt,
                s_e2e_rf_tx_frames, s_e2e_rf_rx_frames, s_e2e_rf_rx_gap_evt, s_e2e_rf_rx_gap_fr,
                s_e2e_rf_rx_reset_evt,
-               s_e2e_spi_out_frames);
+                s_e2e_spi_out_frames);
+        printk("PIPE v=1 dev=nrf stage=mesh node=%u ingress_ok=%u ingress_inactive_drop=%u ingress_q_drop=%u ingress_purge_drop=%u tx_ring_drop=%u tx_purge_drop=%u prefill_skip=%u rf_tx_try=%u rf_tx_ok=%u rf_tx_fail=%u rf_rx_ok=%u rf_rx_ring_drop=%u rf_rx_malformed=%u rf_rx_version_drop=%u rf_rx_self_drop=%u rf_rx_dup_drop=%u rf_rx_inactive_drop=%u relay_q_drop=%u control_q_drop=%u spi_out_ok=%u spi_out_drop=%u q_depth=%u\n",
+               s_node_id, s_stat_spi_audio_in, s_stat_ingress_inactive_drop,
+               (uint32_t)atomic_get(&s_stat_ingress_msgq_drop), s_stat_ingress_purge_drop,
+               s_stat_tx_ring_drop, s_stat_tx_purge_drop, s_skip_count,
+               s_stat_rf_audio_try, s_stat_rf_audio_ok,
+               s_stat_rf_audio_fail, s_stat_rf_rx_audio_ok,
+               (uint32_t)atomic_get(&s_stat_rx_drop), s_stat_rf_rx_malformed,
+               s_stat_rf_rx_version_drop, s_stat_rf_rx_self_drop,
+               s_stat_rf_rx_duplicate_drop, s_stat_rf_rx_inactive_drop,
+               s_stat_relay_ring_drop, s_stat_control_ring_drop, s_stat_spi_out_ok,
+               s_stat_spi_out_drop, s_tx_queue_depth_dbg);
+        printk("PIPE v=1 dev=nrf stage=tdma node=%u slot_due=%u slot_submit_drop=%u slot_late_drop=%u control_due=%u control_submit_drop=%u control_late_drop=%u\n",
+               s_node_id, tdma_stats.slot_due, tdma_stats.slot_submit_drop,
+               tdma_stats.slot_late_drop, tdma_stats.control_due,
+               tdma_stats.control_submit_drop, tdma_stats.control_late_drop);
+        printk("PIPE v=1 dev=nrf stage=rf node=%u tx_ok=%u tx_timeout=%u tx_busy=%u tx_write_drop=%u tx_event_fail=%u rx_no_callback=%u rx_flush_drop=%u rx_restart_drop=%u tx_wait_max_us=%u rx_pause_max_us=%u\n",
+               s_node_id, esb_stats.tx_count, esb_stats.tx_timeout_count,
+               esb_stats.tx_busy_count, esb_stats.tx_write_fail_count,
+               esb_stats.tx_failed_event_count, esb_stats.rx_no_callback_count,
+               esb_stats.rx_flush_drop_count, esb_stats.rx_restart_fail_count,
+               esb_stats.tx_wait_us_max, esb_stats.rx_pause_us_max);
     }
 
-    /* Coordinator sends SYNC on every status update for discovery */
-    if (s_role == MESH_ROLE_COORDINATOR) {
-        static uint8_t sync_decim = 0;
-        if ((sync_decim++ % 2) == 0) {
-            send_sync();
-        }
-    } else if (s_role == MESH_ROLE_PARTICIPANT) {
+    if (s_role == MESH_ROLE_PARTICIPANT) {
         /* Check for coordinator timeout */
         if (k_uptime_get_32() - s_last_sync_time > SYNC_TIMEOUT_MS) {
             LOG_WRN("Coordinator lost (timeout), rescanning...");
             mesh_log("MESH: Coordinator lost, rescanning");
+            set_audio_ingress_enabled(false, false);
 
             /* Notify ESP32 that coordinator sync was lost.
              * Do NOT emit PEER_LEFT here: this path can be transient (role
@@ -1154,6 +1344,23 @@ static void status_work_handler(struct k_work *work)
 
             /* Stop TDMA */
             tdma_stop();
+
+            memset(s_peers, 0, sizeof(s_peers));
+            memset(s_seen_ring, 0, sizeof(s_seen_ring));
+            memset(s_relay_ring, 0, sizeof(s_relay_ring));
+            memset(s_control_ring, 0, sizeof(s_control_ring));
+            memset(s_active_speaker_deadline_ms, 0, sizeof(s_active_speaker_deadline_ms));
+            clear_speaker_grants();
+            s_heard_bitmap = 0;
+            s_relay_bitmap = 0;
+            s_peer_count = 0;
+            s_seen_head = 0;
+            s_relay_head = 0;
+            s_relay_tail = 0;
+            s_control_head = 0;
+            s_control_tail = 0;
+            purge_tx_audio_ring();
+            set_audio_ingress_enabled(false, true);
 
             /* Return to scanning */
             s_state = MESH_STATE_SCANNING;
@@ -1169,16 +1376,6 @@ static void status_work_handler(struct k_work *work)
     /* Reschedule */
     k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
 }
-
-struct tx_audio_entry {
-    uint8_t data[MESH_MAX_AUDIO_PAYLOAD];
-    uint8_t len;
-    uint8_t audio_flags;
-};
-
-static struct tx_audio_entry s_tx_audio_ring[TX_AUDIO_RING_SIZE];
-static volatile uint8_t s_tx_head = 0;
-static volatile uint8_t s_tx_tail = 0;
 
 static uint8_t tx_queue_depth(void)
 {
@@ -1208,10 +1405,12 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         if (depth >= QUEUE_HI) {
             s_skip_mode = false;
         } else {
+            s_skip_count++;
             return;
         }
     } else if (depth < QUEUE_LO) {
         s_skip_mode = true;
+        s_skip_count++;
         return;
     }
 
@@ -1239,14 +1438,17 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         note_audio_activity(s_node_id, entry->audio_flags);
 
         /* Send packet */
+        s_stat_rf_audio_try++;
         int ret = send_packet_ex(MESH_PKT_AUDIO, &payload, 4 + entry->len, MESH_AUDIO_TTL_DEFAULT,
                                  tx_flags, s_node_id, s_tx_seq++);
 
         if (ret == 0) {
             s_stat_tx_count++;
             s_e2e_rf_tx_frames++;
+            s_stat_rf_audio_ok++;
         } else {
             s_stat_tx_fail++;
+            s_stat_rf_audio_fail++;
         }
 
         /* always consume */
@@ -1283,8 +1485,36 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     }
 }
 
-int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags)
+static void control_tx_handler(uint32_t frame_counter)
 {
+    if ((frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0) {
+        if (s_role == MESH_ROLE_COORDINATOR) {
+            send_sync();
+        }
+        return;
+    }
+
+    if ((frame_counter % MESH_MAX_NODES) != (uint32_t)s_slot_index) {
+        return;
+    }
+
+    if (s_control_tail != s_control_head) {
+        struct relay_entry *entry = &s_control_ring[s_control_tail];
+        int ret = esb_radio_send(entry->data, entry->len);
+        if (ret == 0) {
+            s_control_tail = (uint8_t)((s_control_tail + 1) % CONTROL_RING_SIZE);
+        } else {
+            s_stat_tx_fail++;
+        }
+    }
+}
+
+static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio_flags)
+{
+    if (s_state != MESH_STATE_ACTIVE) {
+        s_stat_ingress_inactive_drop++;
+        return -EAGAIN;
+    }
     if (len > MESH_MAX_AUDIO_PAYLOAD) {
         return -EMSGSIZE;
     }
@@ -1298,7 +1528,7 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_fla
             uint16_t expected = (uint16_t)(st->last_seq + 1);
             if (e2e_seq != expected) {
                 int16_t signed_delta = (int16_t)(e2e_seq - expected);
-                if (signed_delta > 0 && signed_delta <= E2E_MAX_FORWARD_GAP) {
+                if (signed_delta > 0) {
                     s_e2e_spi_in_gap_evt++;
                     s_e2e_spi_in_gap_fr += (uint16_t)signed_delta;
                 } else {
@@ -1322,8 +1552,8 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_fla
 
     if (next_head == s_tx_tail) {
         /* Buffer full: drop oldest and keep newest to bound latency growth. */
+        s_stat_tx_ring_drop++;
         s_tx_tail = (s_tx_tail + 1) % TX_AUDIO_RING_SIZE;
-        s_stat_tx_overwrite++;
     }
 
     struct tx_audio_entry *entry = &s_tx_audio_ring[s_tx_head];
@@ -1342,6 +1572,91 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_fla
     return 0;
 }
 
+int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags)
+{
+    if (data == NULL || len == 0 || len > MESH_MAX_AUDIO_PAYLOAD) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&s_audio_ingress_lock, K_FOREVER);
+    if (!s_audio_ingress_enabled) {
+        k_mutex_unlock(&s_audio_ingress_lock);
+        return -EAGAIN;
+    }
+
+    struct audio_ingress_entry entry = {
+        .len = len,
+        .audio_flags = audio_flags,
+    };
+    memcpy(entry.data, data, len);
+
+    if (k_msgq_put(&s_audio_ingress_queue, &entry, K_NO_WAIT) != 0) {
+        struct audio_ingress_entry dropped;
+        if (k_msgq_get(&s_audio_ingress_queue, &dropped, K_NO_WAIT) == 0) {
+            atomic_inc(&s_stat_ingress_msgq_drop);
+            atomic_inc(&s_stat_tx_overwrite);
+        }
+        if (k_msgq_put(&s_audio_ingress_queue, &entry, K_NO_WAIT) != 0) {
+            atomic_inc(&s_stat_ingress_msgq_drop);
+            k_mutex_unlock(&s_audio_ingress_lock);
+            return -ENOBUFS;
+        }
+    }
+
+    k_work_submit(&s_audio_ingress_work);
+    k_mutex_unlock(&s_audio_ingress_lock);
+    return 0;
+}
+
+static void audio_ingress_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    struct audio_ingress_entry entry;
+
+    while (k_msgq_get(&s_audio_ingress_queue, &entry, K_NO_WAIT) == 0) {
+        (void)process_audio_ingress(entry.data, entry.len, entry.audio_flags);
+    }
+}
+
+static void command_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    do {
+        if (atomic_set(&s_control_pending, 0) != 0) {
+            bool enable = atomic_get(&s_requested_enabled) != 0;
+            if (enable && s_state == MESH_STATE_IDLE) {
+                (void)mesh_protocol_start();
+            } else if (!enable && s_state != MESH_STATE_IDLE) {
+                mesh_protocol_stop();
+            }
+        }
+        if (atomic_set(&s_status_pending, 0) != 0) {
+            uart_bridge_send_status(s_role, s_peer_count, s_node_id);
+        }
+    } while (atomic_get(&s_control_pending) != 0 || atomic_get(&s_status_pending) != 0);
+}
+
+void mesh_protocol_request_start(void)
+{
+    atomic_set(&s_requested_enabled, 1);
+    atomic_set(&s_control_pending, 1);
+    k_work_submit(&s_command_work);
+}
+
+void mesh_protocol_request_stop(void)
+{
+    atomic_set(&s_requested_enabled, 0);
+    atomic_set(&s_control_pending, 1);
+    k_work_submit(&s_command_work);
+}
+
+void mesh_protocol_request_status(void)
+{
+    atomic_set(&s_status_pending, 1);
+    k_work_submit(&s_command_work);
+}
+
 /* ============================================================================
  * Public Functions
  * ============================================================================ */
@@ -1355,15 +1670,19 @@ int mesh_protocol_init(void)
     k_work_init_delayable(&s_join_work, join_work_handler);
     k_work_init_delayable(&s_status_work, status_work_handler);
     k_work_init(&s_rx_work, rx_work_handler);
+    k_work_init(&s_command_work, command_work_handler);
+    k_work_init(&s_audio_ingress_work, audio_ingress_work_handler);
 
     /* Set callbacks */
     esb_radio_set_rx_callback(esb_rx_callback);
     tdma_set_slot_callback(slot_tx_handler);
+    tdma_set_control_callback(control_tx_handler);
 
     /* Get local address */
     esb_radio_get_address(s_local_addr);
 
     s_state = MESH_STATE_IDLE;
+    set_audio_ingress_enabled(false, false);
     return 0;
 }
 
@@ -1392,6 +1711,7 @@ void mesh_protocol_stop(void)
 {
     LOG_INF("Stopping mesh protocol");
 
+    set_audio_ingress_enabled(false, false);
     k_work_cancel_delayable(&s_scan_work);
     k_work_cancel_delayable(&s_join_work);
     k_work_cancel_delayable(&s_status_work);
@@ -1402,12 +1722,20 @@ void mesh_protocol_stop(void)
         uart_bridge_send_event(0x03, NULL, 0); /* BRIDGE_EVENT_PEER_LEFT */
     }
 
+    s_state = MESH_STATE_IDLE;
     tdma_stop();
     esb_radio_stop_rx();
+    k_work_cancel(&s_rx_work);
+    k_work_cancel(&s_audio_ingress_work);
+    k_spinlock_key_t rx_key = k_spin_lock(&s_rx_ring_lock);
+    s_rx_ring_head = 0;
+    s_rx_ring_tail = 0;
+    k_spin_unlock(&s_rx_ring_lock, rx_key);
 
     memset(s_peers, 0, sizeof(s_peers));
     memset(s_seen_ring, 0, sizeof(s_seen_ring));
     memset(s_relay_ring, 0, sizeof(s_relay_ring));
+    memset(s_control_ring, 0, sizeof(s_control_ring));
     memset(s_active_speaker_deadline_ms, 0, sizeof(s_active_speaker_deadline_ms));
     clear_speaker_grants();
     s_heard_bitmap = 0;
@@ -1416,12 +1744,13 @@ void mesh_protocol_stop(void)
     s_seen_head = 0;
     s_relay_head = 0;
     s_relay_tail = 0;
-    s_tx_head = 0;
-    s_tx_tail = 0;
+    s_control_head = 0;
+    s_control_tail = 0;
+    purge_tx_audio_ring();
+    set_audio_ingress_enabled(false, true);
     s_skip_mode = true;
     s_skip_count = 0;
 
-    s_state = MESH_STATE_IDLE;
     s_role = MESH_ROLE_NONE;
     s_node_id = 0;
     s_slot_index = -1;

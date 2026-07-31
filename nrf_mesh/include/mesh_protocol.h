@@ -33,6 +33,23 @@ typedef struct __attribute__((packed)) {
     uint8_t coordinator_addr[5]; /* ESB address for coordinator tiebreaking */
 } mesh_sync_payload_t;
 
+typedef struct __attribute__((packed)) {
+    uint8_t capabilities;
+    uint8_t reserved;
+    uint8_t requester_addr[5];
+} mesh_join_v2_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t assigned_id;
+    uint8_t slot_index;
+    uint8_t coordinator_id;
+    uint8_t target_addr[5];
+} mesh_join_ack_v2_payload_t;
+
+_Static_assert(sizeof(mesh_sync_payload_t) == 11, "nRF SYNC wire size changed");
+_Static_assert(sizeof(mesh_join_v2_payload_t) == 7, "nRF JOIN_V2 wire size changed");
+_Static_assert(sizeof(mesh_join_ack_v2_payload_t) == 8, "nRF JOIN_ACK_V2 wire size changed");
+
 /* ============================================================================
  * Peer Info
  * ============================================================================ */
@@ -59,6 +76,10 @@ typedef struct {
  * @return 0 on success
  */
 int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags);
+
+void mesh_protocol_request_start(void);
+void mesh_protocol_request_stop(void);
+void mesh_protocol_request_status(void);
 
 /**
  * @brief Initialize mesh protocol

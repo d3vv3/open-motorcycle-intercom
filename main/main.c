@@ -61,6 +61,18 @@ static uint32_t s_e2e_rx_frames = 0;
 static uint32_t s_e2e_rx_gap_events = 0;
 static uint32_t s_e2e_rx_gap_frames = 0;
 static uint32_t s_e2e_rx_reset_events = 0;
+static uint32_t s_pipe_source_frames = 0;
+static uint32_t s_pipe_gate_drops = 0;
+static uint32_t s_pipe_spi_attempts = 0;
+static uint32_t s_pipe_spi_enqueue_ok = 0;
+static uint32_t s_pipe_spi_enqueue_fail = 0;
+static uint32_t s_pipe_spi_oversize = 0;
+static uint32_t s_pipe_spi_rx = 0;
+static uint32_t s_pipe_spi_rx_invalid = 0;
+static uint32_t s_pipe_spi_rx_self = 0;
+static uint32_t s_pipe_probe_rx = 0;
+static uint32_t s_pipe_play_queue_ok = 0;
+static uint32_t s_pipe_play_queue_drop = 0;
 
 typedef struct {
     bool initialized;
@@ -69,7 +81,6 @@ typedef struct {
 
 static e2e_rx_seq_state_t s_e2e_rx_seq_state[256] = {0};
 
-#define E2E_MAX_FORWARD_GAP 32
 
 /* RTT log cadence while using nRF transport */
 #define RTT_LOG_INTERVAL_MS 10000
@@ -196,31 +207,35 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         break;
 
     case TRANSPORT_NRF52840:
+        s_pipe_source_frames++;
+        uint16_t seq = s_e2e_tx_seq++;
+        s_e2e_tx_frames++;
         if (s_mesh_active && uart_bridge_is_connected()) {
             uint8_t tx_buf[130];
             uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
-            if (len > (sizeof(tx_buf) - 3)) {
+            if (len > MESH_MAX_OPUS_BYTES) {
+                s_pipe_spi_oversize++;
                 ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
                 break;
             }
 
             /* Bridge payload format: [audio_flags][e2e_seq_hi][e2e_seq_lo][opus...] */
-            uint16_t seq = s_e2e_tx_seq;
             tx_buf[0] = audio_flags;
             tx_buf[1] = (uint8_t)(seq >> 8);
             tx_buf[2] = (uint8_t)(seq & 0xFF);
             memcpy(&tx_buf[3], data, len);
 
+            s_pipe_spi_attempts++;
             esp_err_t ret = uart_bridge_send_audio(tx_buf, (uint16_t)(len + 3));
             if (ret != ESP_OK) {
+                s_pipe_spi_enqueue_fail++;
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
             } else {
+                s_pipe_spi_enqueue_ok++;
                 int64_t now_us = esp_timer_get_time();
                 if (now_us >= timestamp_us) {
                     (void)audio_record_tx_pipeline_latency_us((uint32_t)(now_us - timestamp_us));
                 }
-                s_e2e_tx_seq++;
-                s_e2e_tx_frames++;
                 /* Rate limit logs */
                 static int64_t last_log = 0;
                 int64_t now = now_us;
@@ -230,6 +245,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
                 }
             }
         } else {
+            s_pipe_gate_drops++;
             /* Log if we're trying to send but bridge thinks it's disconnected */
             static int64_t last_log = 0;
             int64_t now = esp_timer_get_time();
@@ -250,7 +266,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
  * @brief Callback from mesh subsystem when audio frame is received (ESP-NOW)
  */
 static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_id,
-                                int64_t timestamp_us)
+                                 uint8_t audio_flags, int64_t timestamp_us)
 {
     audio_frame_t frame;
 
@@ -262,9 +278,7 @@ static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_i
     memcpy(frame.data, data, len);
     frame.len = len;
     frame.timestamp_ms = timestamp_us / 1000;
-    /* ESP-NOW path does not surface the per-frame VOX flag here, so treat every
-     * received frame as active (preserves pre-DTX receiver behavior). */
-    frame.active = true;
+    frame.active = (audio_flags & MESH_AUDIO_FLAG_ACTIVE) != 0;
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
     if (ret != ESP_OK) {
@@ -281,11 +295,14 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     audio_frame_t frame;
     uint8_t local_node_id = get_bridge_node_id();
 
+    s_pipe_spi_rx++;
     if (len < 4) {
+        s_pipe_spi_rx_invalid++;
         return;
     }
 
     if (local_node_id != 0 && src_id == local_node_id) {
+        s_pipe_spi_rx_self++;
         return;
     }
 
@@ -293,6 +310,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     uint16_t payload_len = (uint16_t)(len - 1);
 
     if (rtt_probe_handle_packet(src_id, payload, payload_len)) {
+        s_pipe_probe_rx++;
         return;
     }
 
@@ -304,7 +322,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
         uint16_t expected = (uint16_t)(seq_state->last_seq + 1);
         if (e2e_seq != expected) {
             int16_t signed_delta = (int16_t)(e2e_seq - expected);
-            if (signed_delta > 0 && signed_delta <= E2E_MAX_FORWARD_GAP) {
+            if (signed_delta > 0) {
                 s_e2e_rx_gap_events++;
                 s_e2e_rx_gap_frames += (uint16_t)signed_delta;
             } else {
@@ -318,6 +336,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 
     uint16_t opus_len = (uint16_t)(payload_len - 2);
     if (opus_len > sizeof(frame.data)) {
+        s_pipe_spi_rx_invalid++;
         ESP_LOGW(TAG, "Audio frame too large: %u bytes", opus_len);
         return;
     }
@@ -331,7 +350,10 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
     if (ret != ESP_OK) {
+        s_pipe_play_queue_drop++;
         ESP_LOGD(TAG, "Failed to queue RX audio: %s", esp_err_to_name(ret));
+    } else {
+        s_pipe_play_queue_ok++;
     }
 }
 
@@ -673,14 +695,17 @@ void app_main(void)
 #endif
     ESP_LOGI(TAG, "");
 
+    /* Play before the audio task starts writing silence to the same I2S channel. */
+    ret = audio_play_notification(AUDIO_NOTIFY_STARTUP);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to play startup notification: %s", esp_err_to_name(ret));
+    }
+
     ret = audio_start();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start audio: %s", esp_err_to_name(ret));
         goto error_halt;
     }
-
-    /* Play startup sound (after I2S TX is enabled) */
-    audio_play_notification(AUDIO_NOTIFY_STARTUP);
 
 #if ENABLE_MESH_MODE
     /* Mesh networking - starts disabled, enabled by holding boot button for 2 seconds */
@@ -780,6 +805,13 @@ void app_main(void)
                          "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu",
                          s_e2e_tx_frames, s_e2e_rx_frames, s_e2e_rx_gap_events,
                          s_e2e_rx_gap_frames, s_e2e_rx_reset_events);
+                ESP_LOGI(TAG,
+                         "PIPE v=1 dev=esp stage=transport node=%u source=%lu gate_drop=%lu spi_try=%lu spi_ok=%lu spi_fail=%lu spi_oversize=%lu spi_rx=%lu spi_gap=%lu spi_invalid=%lu spi_self=%lu probe_rx=%lu play_q_ok=%lu play_q_drop=%lu",
+                         get_bridge_node_id(), s_pipe_source_frames, s_pipe_gate_drops,
+                         s_pipe_spi_attempts, s_pipe_spi_enqueue_ok, s_pipe_spi_enqueue_fail,
+                         s_pipe_spi_oversize, s_pipe_spi_rx, s_e2e_rx_gap_frames,
+                         s_pipe_spi_rx_invalid, s_pipe_spi_rx_self, s_pipe_probe_rx,
+                         s_pipe_play_queue_ok, s_pipe_play_queue_drop);
                 last_rtt_log_ms = now_ms;
             }
         }

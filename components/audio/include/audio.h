@@ -198,6 +198,14 @@ typedef struct {
     uint32_t task_loops;         /**< Audio task loop count (health indicator) */
     uint32_t adc_overruns;       /**< ADC buffer overrun count */
     uint32_t tx_dtx_suppressed;  /**< Silence frames dropped before transmit (DTX) */
+    uint32_t capture_frames_ok;  /**< Complete ADC capture frames */
+    uint32_t capture_short_reads; /**< Partial ADC capture frames */
+    uint32_t capture_timeouts;   /**< ADC notification/read timeouts */
+    uint32_t encode_errors;      /**< Opus encode failures */
+    uint32_t decode_errors;      /**< Opus decode and PLC failures */
+    uint32_t rx_queue_overflows; /**< Frames rejected by the playback queue */
+    uint32_t jitter_trim_frames; /**< Frames discarded to reduce playback backlog */
+    uint32_t playback_frames;    /**< Complete I2S playback writes */
     bool vox_active;             /**< Current VOX state */
 } audio_stats_t;
 

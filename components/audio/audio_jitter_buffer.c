@@ -64,6 +64,7 @@ void audio_jitter_trim_backlog(QueueHandle_t queue, audio_jitter_state_t *state,
     while (items > MESH_RX_MAX_TARGET_FRAMES) {
         if (xQueueReceive(queue, scratch_item, 0) == pdTRUE) {
             stats->frames_dropped++;
+            stats->jitter_trim_frames++;
             items = uxQueueMessagesWaiting(queue);
         } else {
             break;
