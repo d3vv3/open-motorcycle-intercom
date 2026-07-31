@@ -392,35 +392,33 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
 
 static uint8_t compute_relay_mask(uint8_t speaker_id)
 {
-    /* Relay permission mask: nodes that heard the speaker are permitted to relay
-     * its audio (they have the data).  Nodes that did NOT hear the speaker are
-     * the intended *recipients* of relays, not relayers.
-     *
-     * Fallback: if no peer reported hearing the speaker yet (bitmap cold-start),
-     * permit all peers to relay so the first frames still propagate. */
     uint8_t speaker_bit = node_bit(speaker_id);
-    uint8_t mask = 0;
+    uint8_t members = 0;
+    uint8_t heard = 0;
+    uint8_t member_count = 0;
 
     for (int i = 0; i < MESH_MAX_NODES; i++) {
         if (!s_peers[i].active || s_peers[i].node_id == 0 || s_peers[i].node_id == speaker_id) {
             continue;
         }
 
-        if (s_peers[i].heard_bitmap & speaker_bit) {
-            mask |= node_bit(s_peers[i].node_id);
+        uint8_t peer_bit = node_bit(s_peers[i].node_id);
+        members |= peer_bit;
+        member_count++;
+
+        uint8_t heard_bitmap = s_peers[i].node_id == s_node_id
+                                   ? s_heard_bitmap
+                                   : s_peers[i].heard_bitmap;
+        if ((heard_bitmap & speaker_bit) != 0) {
+            heard |= peer_bit;
         }
     }
 
-    if (mask == 0) {
-        for (int i = 0; i < MESH_MAX_NODES; i++) {
-            if (!s_peers[i].active || s_peers[i].node_id == 0 || s_peers[i].node_id == speaker_id) {
-                continue;
-            }
-            mask |= node_bit(s_peers[i].node_id);
-        }
+    if (member_count <= 1 || (members & (uint8_t)~heard) == 0) {
+        return 0;
     }
 
-    return mask;
+    return heard != 0 ? heard : members;
 }
 
 static void apply_speaker_grant(const mesh_speaker_grant_payload_t *grant)
