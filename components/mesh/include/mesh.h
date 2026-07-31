@@ -25,227 +25,51 @@
 
 #include "esp_err.h"
 
+/* Shared on-air protocol definitions (single source of truth, also used by the
+ * nRF52840/ESB build). Only ESP-NOW-specific items are defined below. */
+#include "mesh_protocol_defs.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* ============================================================================
  * Constants
+ *
+ * Wire-protocol constants, enums (mesh_role_t / mesh_state_t / mesh_pkt_type_t),
+ * the packet header, and payload structs come from shared/mesh_protocol_defs.h
+ * (included above). Only ESP-NOW-specific items are defined here.
  * ============================================================================ */
 
-/**
- * @brief Maximum number of nodes in mesh
- */
-#define MESH_MAX_NODES 8
-
-/**
- * @brief TDMA frame duration in milliseconds (aligned with Opus)
- */
-#define MESH_FRAME_MS 20
-
-/**
- * @brief TDMA slot duration in milliseconds
- */
-#define MESH_SLOT_MS 2
-
-/**
- * @brief Guard time in microseconds (between slots)
- */
-#define MESH_GUARD_US 200
-
-/**
- * @brief Control window duration in milliseconds
- */
+/** @brief Control window duration in milliseconds */
 #define MESH_CONTROL_MS 2
 
-/**
- * @brief Number of voice slots per frame
- */
+/** @brief Number of voice slots per frame */
 #define MESH_VOICE_SLOTS 8
 
-/**
- * @brief SYNC broadcast interval (every N frames)
- */
-#define MESH_SYNC_INTERVAL_FRAMES 10
-
-/**
- * @brief Node timeout in milliseconds (no KEEPALIVE/AUDIO)
- */
-#define MESH_NODE_TIMEOUT_MS 3000
-
-/**
- * @brief KEEPALIVE interval in milliseconds
- */
-#define MESH_KEEPALIVE_INTERVAL_MS 500
-
-/**
- * @brief JOIN request retry interval in milliseconds
- */
+/** @brief JOIN request retry interval in milliseconds */
 #define MESH_JOIN_RETRY_MS 500
 
-/**
- * @brief Protocol version
- */
-#define MESH_PROTOCOL_VERSION 0x01
-
-/**
- * @brief Jitter buffer depth (number of frames)
- */
+/** @brief Jitter buffer depth (number of frames) */
 #define MESH_JITTER_BUFFER_DEPTH 4
 
-/**
- * @brief Maximum audio payload size (Opus frame)
- */
-#define MESH_MAX_AUDIO_PAYLOAD 64
-
-/**
- * @brief Maximum number of simultaneous speakers granted for relay
- */
-#define MESH_MAX_ACTIVE_SPEAKERS 2
-
-/**
- * @brief Default relay TTL for granted audio and control updates
- */
-#define MESH_AUDIO_TTL_DEFAULT 2
-
-#define MESH_FLAG_RELAY_REQUEST   0x01
-#define MESH_FLAG_RELAYED         0x02
-#define MESH_FLAG_SPEAKER_GRANTED 0x04
-
-#define MESH_AUDIO_FLAG_ACTIVE    0x01
-
 /* ============================================================================
- * Type Definitions
+ * ESP-NOW-specific protocol types
  * ============================================================================ */
 
 /**
- * @brief Node roles in the mesh
- */
-typedef enum {
-    MESH_ROLE_NONE = 0,    /**< Not connected to mesh */
-    MESH_ROLE_COORDINATOR, /**< Time master / coordinator */
-    MESH_ROLE_PARTICIPANT, /**< Time slave / participant */
-} mesh_role_t;
-
-/**
- * @brief Mesh node state
- */
-typedef enum {
-    MESH_STATE_IDLE = 0, /**< Not started */
-    MESH_STATE_SCANNING, /**< Listening for existing mesh */
-    MESH_STATE_JOINING,  /**< Sending JOIN requests */
-    MESH_STATE_ACTIVE,   /**< Connected and active */
-} mesh_state_t;
-
-/**
- * @brief Mesh packet types (from protocol.md)
- */
-typedef enum {
-    MESH_PKT_AUDIO = 0x01,     /**< Opus audio data */
-    MESH_PKT_JOIN = 0x02,      /**< Request to join mesh */
-    MESH_PKT_JOIN_ACK = 0x03,  /**< Join response with assigned ID */
-    MESH_PKT_LEAVE = 0x04,     /**< Graceful leave (optional) */
-    MESH_PKT_SYNC = 0x05,      /**< TDMA timing sync */
-    MESH_PKT_SLOT_MAP = 0x06,  /**< Slot assignment broadcast */
-    MESH_PKT_STATUS = 0x07,    /**< Battery / health */
-    MESH_PKT_KEEPALIVE = 0x08, /**< Presence check */
-    MESH_PKT_SPEAKER_GRANT = 0x09,   /**< Relay grant broadcast */
-    MESH_PKT_SPEAKER_RELEASE = 0x0A, /**< Relay grant release */
-} mesh_pkt_type_t;
-
-/**
- * @brief Mesh packet header (8 bytes, from protocol.md)
+ * @brief SYNC payload - ESP-NOW variant (6-byte WiFi MAC for tiebreaking)
+ *
+ * Not in the shared header: the coordinator address width differs from the
+ * nRF/ESB build (which uses a 5-byte ESB address).
  */
 typedef struct __attribute__((packed)) {
-    uint8_t version;      /**< Protocol version */
-    uint8_t type;         /**< Packet type (mesh_pkt_type_t) */
-    uint8_t src_id;       /**< Source node ID (0 = unassigned) */
-    uint8_t seq;          /**< Sequence number */
-    uint8_t ttl;          /**< Relay time-to-live */
-    uint8_t flags;        /**< Control flags */
-    uint16_t payload_len; /**< Payload length in bytes */
-} mesh_header_t;
-
-/**
- * @brief Audio packet payload (4 + N bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint8_t codec;     /**< Codec ID (0x01 = Opus) */
-    uint8_t frame_ms;  /**< Frame duration (20) */
-    uint8_t stream_id; /**< Stream identifier */
-    uint8_t audio_flags; /**< Audio activity flags */
-    uint8_t data[MESH_MAX_AUDIO_PAYLOAD]; /**< Opus encoded data */
-} mesh_audio_payload_t;
-
-/**
- * @brief JOIN request payload (2 bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint8_t capabilities; /**< Node capabilities bitmap */
-    uint8_t reserved;
-} mesh_join_payload_t;
-
-/**
- * @brief JOIN_ACK payload (3 bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint8_t assigned_id;    /**< Assigned node ID (1-8) */
-    uint8_t slot_index;     /**< Assigned TDMA slot */
-    uint8_t coordinator_id; /**< Current coordinator ID */
-} mesh_join_ack_payload_t;
-
-/**
- * @brief SYNC payload (6 bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint32_t frame_counter; /**< Current TDMA frame number */
-    int16_t drift_ppm;      /**< Estimated clock drift */
+    uint32_t frame_counter;      /**< Current TDMA frame number */
+    int16_t drift_ppm;           /**< Estimated clock drift */
     uint8_t coordinator_addr[6]; /**< Coordinator MAC address for tiebreaking */
 } mesh_sync_payload_t;
 
-/**
- * @brief KEEPALIVE payload (2 bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint8_t battery_pct; /**< Battery percentage (0-100) */
-    uint8_t reserved;
-} mesh_keepalive_payload_t;
-
-/**
- * @brief SLOT_MAP payload (1 + N bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint8_t slot_count;               /**< Number of active slots */
-    uint8_t slot_ids[MESH_MAX_NODES]; /**< Node ID for each slot (0 = empty) */
-    uint8_t active_speaker_count;     /**< Number of granted speakers */
-    uint8_t active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /**< Granted speaker IDs */
-    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS]; /**< Relay bitmap per speaker */
-} mesh_slot_map_payload_t;
-
-/**
- * @brief STATUS payload (6 bytes)
- */
-typedef struct __attribute__((packed)) {
-    uint8_t battery_pct;  /**< Battery percentage (0-100, 255=unknown) */
-    int8_t rssi_dbm;      /**< Last measured RSSI (dBm) */
-    uint8_t peer_count;   /**< Number of active peers */
-    uint8_t fw_version;   /**< Firmware version byte */
-    int8_t temperature_c; /**< Temperature in Celsius (127=unknown) */
-    uint8_t heard_bitmap; /**< Bitmap of source IDs heard recently */
-    uint8_t relay_bitmap; /**< Bitmap of source IDs relayed recently */
-    uint8_t active_speakers; /**< Count of active/granted speakers */
-} mesh_status_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t speaker_count; /**< Number of granted speakers */
-    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /**< Granted speaker IDs */
-    uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS]; /**< Relay bitmap per speaker */
-} mesh_speaker_grant_payload_t;
-
-typedef struct __attribute__((packed)) {
-    uint8_t speaker_count; /**< Number of released speakers */
-    uint8_t speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /**< Released speaker IDs */
-} mesh_speaker_release_payload_t;
+_Static_assert(sizeof(mesh_sync_payload_t) == 12, "ESP-NOW SYNC wire size changed");
 
 /**
  * @brief Mesh configuration
@@ -328,10 +152,11 @@ typedef struct {
  * @param data Opus-encoded audio data
  * @param len Length of audio data
  * @param src_id Source node ID
+ * @param audio_flags Per-frame audio activity flags
  * @param timestamp_us Receive timestamp (microseconds)
  */
 typedef void (*mesh_audio_cb_t)(const uint8_t *data, uint16_t len, uint8_t src_id,
-                                int64_t timestamp_us);
+                                 uint8_t audio_flags, int64_t timestamp_us);
 
 /**
  * @brief Callback for mesh state changes

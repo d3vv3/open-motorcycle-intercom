@@ -63,6 +63,13 @@ static const char *TAG = "audio";
 /* Maximum Opus packet size */
 #define MAX_OPUS_PACKET_SIZE 64
 
+/* With DTX enabled, opus_encode() returns a 1-2 byte frame when it has nothing
+ * to send (pure silence between comfort-noise updates).  Frames at or below
+ * this size are dropped before transmit so the radio stays quiet during
+ * silence; larger frames (speech or periodic SID/comfort-noise updates) are
+ * sent so the receiver can sustain comfort noise. */
+#define OPUS_DTX_FRAME_MAX_BYTES 2
+
 /* ============================================================================
  * Type Definitions
  * ============================================================================ */
@@ -331,6 +338,12 @@ static esp_err_t opus_init(const audio_config_t *config)
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_COMPLEXITY(5));
+    /* Discontinuous transmission: during silence the encoder emits a periodic
+     * comfort-noise (SID) frame and otherwise returns a 1-2 byte DTX frame that
+     * we drop at the transport layer (see audio_task TX gating).  The decoder
+     * generates comfort noise from the last SID, so receivers hear a natural
+     * quiet rather than a dead link. */
+    opus_encoder_ctl(s_opus_encoder, OPUS_SET_DTX(1));
 
     /* Create Opus decoder */
     s_opus_decoder = opus_decoder_create(config->sample_rate, config->channels, &error);
@@ -476,7 +489,11 @@ static void audio_task(void *arg)
          * ==================================================================== */
 
         /* Wait for ADC data ready notification (with timeout) */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ADC_READ_TIMEOUT_MS));
+        bool capture_notified =
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ADC_READ_TIMEOUT_MS)) != 0;
+        if (!capture_notified) {
+            s_stats.capture_timeouts++;
+        }
 
         static uint8_t adc_buffer[ADC_CONV_FRAME_SIZE]; /* Static to save stack */
         uint32_t bytes_read = 0;
@@ -485,6 +502,11 @@ static void audio_task(void *arg)
         ret = adc_continuous_read(s_adc_handle, adc_buffer, ADC_CONV_FRAME_SIZE, &bytes_read, 0);
 
         if (ret == ESP_OK && bytes_read > 0) {
+            if (bytes_read == ADC_CONV_FRAME_SIZE) {
+                s_stats.capture_frames_ok++;
+            } else {
+                s_stats.capture_short_reads++;
+            }
             /* Calculate number of raw ADC samples available */
             size_t num_adc_samples = bytes_read / SOC_ADC_DIGI_RESULT_BYTES;
 
@@ -575,13 +597,19 @@ static void audio_task(void *arg)
                         s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, true, frame_start_us);
                     }
                 } else {
+                    s_stats.encode_errors++;
                     ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(opus_bytes));
                 }
             } else {
-                /* VOX inactive — encode and send a silence comfort frame to keep
-                 * the stream at a steady 50 fps.  Opus compresses silence to
-                 * ~3-6 bytes, so this adds negligible bandwidth while preventing
-                 * receiver starvation from VOX gaps. */
+                /* VOX inactive - feed a zeroed frame through the DTX-enabled
+                 * encoder.  Opus emits a small comfort-noise (SID) update at the
+                 * start of the silence period and roughly every 400 ms after,
+                 * returning a 1-2 byte DTX frame in between.  We transmit only
+                 * the comfort-noise updates and drop the DTX frames, so the
+                 * radio goes silent during silence while the receiver still has
+                 * enough to generate comfort noise.  The audio_flags inactive
+                 * bit (active=false) tells the receiver this is intentional
+                 * silence, not packet loss. */
                 static int16_t s_silence_frame[AUDIO_FRAME_SAMPLES]; /* BSS-zeroed */
                 int64_t encode_start = esp_timer_get_time();
                 opus_bytes = opus_encode(s_opus_encoder, s_silence_frame, AUDIO_FRAME_SAMPLES,
@@ -595,9 +623,19 @@ static void audio_task(void *arg)
                     if (encode_time > s_stats.encode_time_us_max) {
                         s_stats.encode_time_us_max = encode_time;
                     }
-                    if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
-                        s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, false, frame_start_us);
+
+                    bool comfort_update = (opus_bytes > OPUS_DTX_FRAME_MAX_BYTES);
+                    if (comfort_update) {
+                        if (s_config.mode == AUDIO_MODE_MESH && s_tx_callback != NULL) {
+                            s_tx_callback(s_opus_buffer, (uint16_t)opus_bytes, false,
+                                          frame_start_us);
+                        }
+                    } else {
+                        /* Pure DTX frame: keep the radio quiet. */
+                        s_stats.tx_dtx_suppressed++;
                     }
+                } else {
+                    s_stats.encode_errors++;
                 }
             }
 
@@ -628,6 +666,7 @@ static void audio_task(void *arg)
                         }
                         have_audio_to_play = true;
                     } else {
+                        s_stats.decode_errors++;
                         ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                     }
                 }
@@ -684,6 +723,10 @@ static void audio_task(void *arg)
                             s_stats.jitter_buffer_depth = (uint8_t)items;
                             have_audio_to_play = true;
 
+                            /* Track sender intent so empty polls during a DTX
+                             * silence gap aren't mistaken for packet loss. */
+                            jitter->stream_silent = !rx_item.active;
+
                             int64_t rx_pipe_us = decode_start - rx_item.timestamp_us;
                             if (rx_pipe_us >= 0) {
                                 s_rx_pipe_count++;
@@ -713,6 +756,7 @@ static void audio_task(void *arg)
                                     int16_t discard_pcm[AUDIO_FRAME_SAMPLES];
                                     if (opus_decode(s_opus_decoder, discard.data, discard.len,
                                                     discard_pcm, AUDIO_FRAME_SAMPLES, 0) < 0) {
+                                        s_stats.decode_errors++;
                                         ESP_LOGW(TAG, "Discard-frame Opus decode failed");
                                     }
                                     jitter->hold_budget--;
@@ -720,6 +764,7 @@ static void audio_task(void *arg)
                                 }
                             }
                         } else {
+                            s_stats.decode_errors++;
                             ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
                         }
                     } else if (jitter->playout_started) {
@@ -733,7 +778,13 @@ static void audio_task(void *arg)
                         s_stats.grace_empty_polls++;
                         if (jitter->consecutive_empty > GRACE_EMPTY_MAX) {
                             int64_t now_us = esp_timer_get_time();
-                            if (audio_jitter_should_count_underrun(jitter, now_us)) {
+                            if (jitter->stream_silent) {
+                                /* Talker is intentionally silent (DTX gating):
+                                 * empty polls are expected, not loss.  Stop
+                                 * active playout quietly without flagging
+                                 * underruns/glitches. */
+                                jitter->playout_started = false;
+                            } else if (audio_jitter_should_count_underrun(jitter, now_us)) {
                                 s_stats.rx_queue_underruns++;
                                 s_stats.glitches_detected++;
                             } else {
@@ -756,6 +807,7 @@ static void audio_task(void *arg)
                                 }
                                 have_audio_to_play = true;
                             } else {
+                                s_stats.decode_errors++;
                                 ESP_LOGW(TAG, "Opus PLC failed: %d", plc_samples);
                             }
                         }
@@ -794,6 +846,8 @@ static void audio_task(void *arg)
                     ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
                     s_stats.i2s_write_incomplete++;
                     s_stats.glitches_detected++;
+                } else {
+                    s_stats.playback_frames++;
                 }
             }
 
@@ -823,6 +877,9 @@ static void audio_task(void *arg)
 
         } else if (ret == ESP_ERR_TIMEOUT) {
             /* ADC timeout - continue loop */
+            if (capture_notified) {
+                s_stats.capture_timeouts++;
+            }
             vTaskDelay(pdMS_TO_TICKS(1));
         } else {
             ESP_LOGW(TAG, "ADC read error: %s", esp_err_to_name(ret));
@@ -858,6 +915,15 @@ static void audio_task(void *arg)
                      s_stats.hold_frames, s_stats.catchup_frames, jitter->hold_budget);
             ESP_LOGI(TAG, "  RX queue depth: min=%u avg=%u max=%u", s_stats.rx_q_depth_min,
                      s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max);
+            ESP_LOGI(TAG,
+                     "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu rx_q_drop=%lu jitter_drop=%lu decode_ok=%lu decode_err=%lu plc=%lu hold=%lu catchup=%lu play_ok=%lu i2s_err=%lu",
+                     s_stats.capture_frames_ok, s_stats.capture_short_reads,
+                     s_stats.capture_timeouts, s_stats.adc_overruns, s_stats.frames_encoded,
+                     s_stats.encode_errors, s_stats.tx_dtx_suppressed,
+                     s_stats.rx_queue_overflows, s_stats.jitter_trim_frames,
+                     s_stats.frames_decoded, s_stats.decode_errors, s_stats.plc_frames,
+                     s_stats.hold_frames, s_stats.catchup_frames, s_stats.playback_frames,
+                     s_stats.i2s_write_incomplete);
             last_heartbeat = now_ms;
         }
 
@@ -1070,9 +1136,11 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     rx_item.len = frame->len;
     rx_item.source_id = source_id;
     rx_item.timestamp_us = frame->timestamp_ms * 1000;
+    rx_item.active = frame->active;
 
     if (xQueueSend(s_rx_queue, &rx_item, 0) != pdTRUE) {
         s_stats.frames_dropped++;
+        s_stats.rx_queue_overflows++;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1279,9 +1347,11 @@ esp_err_t audio_play_notification(audio_notify_t type)
         i2s_channel_disable(s_tx_chan);
     }
 
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to play notification: %s", esp_err_to_name(ret));
-        return ret;
+    size_t expected_bytes = stereo_samples * sizeof(int16_t);
+    if (ret != ESP_OK || bytes_written != expected_bytes) {
+        ESP_LOGW(TAG, "Failed to play complete notification: %zu/%zu bytes (%s)", bytes_written,
+                 expected_bytes, esp_err_to_name(ret));
+        return ret != ESP_OK ? ret : ESP_ERR_TIMEOUT;
     }
 
     return ESP_OK;

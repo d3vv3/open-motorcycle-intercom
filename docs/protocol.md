@@ -86,6 +86,8 @@ All fields are little-endian.
 | 0x08 | KEEPALIVE | Presence check |
 | 0x09 | SPEAKER_GRANT | Coordinator grants a speaker a relay/transmit slot |
 | 0x0A | SPEAKER_RELEASE | Coordinator releases a previously granted speaker |
+| 0x0B | JOIN_V2 | nRF/ESB join request with requester identity |
+| 0x0C | JOIN_ACK_V2 | nRF/ESB targeted join response |
 
 ---
 
@@ -106,12 +108,15 @@ Carries exactly **one Opus frame**.
 | 4 | N | OpusData | Encoded audio (Opus, may be a small DTX comfort-noise frame) |
 
 Typical payload size:
-- 20-40 bytes @ 12 kbps active speech
+- 20-40 bytes @ 12 kbps active speech, up to 64 Opus bytes
 - 1-6 bytes for comfort-noise (DTX) frames during silence
 
 `AudioFlags` lets the receiver distinguish intentional silence from packet loss
-(see [audio.md](audio.md#51-silence-suppression-opus-dtx)). Pure 1-2 byte DTX frames are dropped before transmission, so
+(see audio.md §5.1). Pure 1-2 byte DTX frames are dropped before transmission, so
 the radio stays quiet during silence.
+
+The nRF transport prepends a two-byte end-to-end frame sequence to Opus data.
+Its mesh audio capacity is therefore 66 bytes, while the codec limit remains 64 bytes.
 
 ### Rules
 
@@ -125,7 +130,7 @@ the radio stays quiet during silence.
 ### Frame Parameters
 
 - Frame duration: 20 ms
-- Slot duration: configurable (1-3 ms)
+- Slot duration: configurable (1–3 ms)
 - Guard time: implementation-defined
 
 ### Slot Ownership
@@ -137,7 +142,7 @@ the radio stays quiet during silence.
 
 - One AUDIO packet per slot
 - Silence = suppressed: only periodic comfort-noise (DTX) frames are sent, and pure
-  1-2 byte DTX frames are dropped before TX (see [audio.md](audio.md#51-silence-suppression-opus-dtx))
+  1-2 byte DTX frames are dropped before TX (see audio.md §5.1)
 - No retransmissions
 
 ---
@@ -175,8 +180,8 @@ sequenceDiagram
     Note over N: Listen passively
     C-->>N: SYNC (frame counter, drift, coordinator addr)
     Note over N: Learn frame timing
-    N->>C: JOIN (capabilities)
-    C->>N: JOIN_ACK (assigned ID, slot, coordinator ID)
+    N->>C: JOIN / JOIN_V2
+    C->>N: JOIN_ACK / JOIN_ACK_V2
     C-->>N: SLOT_MAP (broadcast)
     Note over N: Begin TX in assigned slot
     loop Every frame / interval
@@ -192,7 +197,10 @@ KEEPALIVE/STATUS keep the node's `last_seen` fresh so it is not timed out
 
 ## Control Plane (CSMA)
 
-Control packets are transmitted **outside TDMA slots** using contention-based access.
+Control packets are transmitted **outside TDMA voice slots**. ESP-NOW uses the
+control window for SYNC and contention-based control traffic. On nRF/ESB, SYNC
+frames are reserved for the coordinator and other frames assign the control
+window to one node (`FrameCounter mod 8 == SlotIndex`), avoiding ESB collisions.
 
 ### JOIN Packet
 
@@ -213,6 +221,17 @@ Payload:
 | 1 | 1 | SlotIndex | TDMA slot |
 | 2 | 1 | CoordinatorID | Current coordinator (time master) |
 
+ESP-NOW uses JOIN/JOIN_ACK because the receive callback supplies the sender MAC.
+Nordic ESB does not expose a transmitter address, so it uses identity-bearing
+JOIN_V2 and targeted JOIN_ACK_V2 packets instead:
+
+| Packet | Additional field | Description |
+|------|----|------|
+| JOIN_V2 | RequesterAddr (5 bytes) | Stable nRF device/ESB identity used to deduplicate retries |
+| JOIN_ACK_V2 | TargetAddr (5 bytes) | Only the matching requester accepts the broadcast ACK |
+
+All nRF boards in a mesh must run firmware using the same JOIN handshake.
+
 ---
 
 ## Time Synchronization (SYNC)
@@ -229,7 +248,7 @@ Payload:
 
 ### Behavior
 
-- Master sends SYNC periodically
+- Master sends SYNC every 10 frames in the 16-18 ms control window
 - Slaves phase-lock
 - Loss of SYNC triggers re-election
 
@@ -246,7 +265,10 @@ Payload:
 | Offset | Size | Field | Description |
 |------|----|------|------------|
 | 0 | 1 | SlotCount | Number of slots |
-| 1 | N | SlotIDs | Ordered list of node IDs |
+| 1 | 8 | SlotIDs | Ordered node IDs, zero for an unused slot |
+| 9 | 1 | ActiveSpeakerCount | Number of relay-granted speakers |
+| 10 | 2 | ActiveSpeakerIDs | Relay-granted node IDs |
+| 12 | 2 | RelayMasks | Per-speaker relay-node bitmaps |
 
 ---
 
@@ -263,7 +285,9 @@ Payload:
 | 2 | 1 | PeerCount | Active peer count |
 | 3 | 1 | FwVersion | Firmware protocol version |
 | 4 | 1 | TemperatureC | Temperature in C (127=unknown) |
-| 5 | 1 | Reserved | Future use |
+| 5 | 1 | HeardBitmap | Sources heard during the reporting interval |
+| 6 | 1 | RelayBitmap | Sources relayed during the reporting interval |
+| 7 | 1 | ActiveSpeakers | Number of active/granted speakers |
 
 ### KEEPALIVE Packet
 
@@ -292,7 +316,7 @@ Payload:
 - Implemented on both transports (ESP-NOW and nRF52840/ESB).
 - Liveness is independent of voice activity: KEEPALIVE/STATUS continue during
   silence (every 500 ms on ESP-NOW, ~1000 ms on nRF52840), so a silent node is
-  **not** dropped even though its audio TX is suppressed (see [audio.md](audio.md#51-silence-suppression-opus-dtx)).
+  **not** dropped even though its audio TX is suppressed (see audio.md §5.1).
 
 ### Master Loss
 

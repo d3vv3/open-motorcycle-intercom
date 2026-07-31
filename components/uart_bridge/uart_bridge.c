@@ -42,10 +42,12 @@ static const char *TAG = "spi_bridge";
 #define RX_TASK_PRIORITY   5
 #define RX_TASK_CORE       0
 #define TX_AUDIO_QUEUE_SIZE 16
+#define TX_AUDIO_MAX_AGE_US 120000
 
 typedef struct {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
     uint16_t len;
+    int64_t queued_at_us;
 } tx_entry_t;
 
 /* ============================================================================
@@ -71,13 +73,10 @@ static WORD_ALIGNED_ATTR uint8_t s_tx_buf[BRIDGE_SPI_MAX_XFER];     /* Staging b
 static WORD_ALIGNED_ATTR uint8_t s_tx_dma_buf[BRIDGE_SPI_MAX_XFER]; /* DMA buffer */
 static WORD_ALIGNED_ATTR uint8_t s_rx_buf[BRIDGE_SPI_MAX_XFER];
 
-/* Mutex protecting s_tx_buf between the app thread and the SPI task */
+/* Mutex protecting packet construction and the multi-producer audio ring head. */
 static SemaphoreHandle_t s_tx_mutex;
 
-/* TX audio ring: lock-free SPSC (single-producer, single-consumer).
- * Producer = audio callback thread (uart_bridge_send_audio).
- * Consumer = SPI slave task (prepare_tx_buf).
- * head/tail are volatile so each side sees the other's updates. */
+/* TX audio ring. Producers share s_tx_mutex; the SPI task is the sole consumer. */
 static tx_entry_t s_audio_q[TX_AUDIO_QUEUE_SIZE];
 static volatile uint8_t s_audio_head = 0;
 static volatile uint8_t s_audio_tail = 0;
@@ -91,6 +90,12 @@ static volatile bool s_ctrl_pending_valid = false;
 /* Pipeline diagnostics */
 static uint32_t s_audio_tx_queued = 0;    /* Audio frames queued for SPI TX */
 static uint32_t s_audio_tx_overwrite = 0; /* Audio frames that overwrote unsent ones */
+static uint32_t s_audio_tx_enqueue_timeout = 0;
+static uint32_t s_audio_tx_invalid_size = 0;
+static uint32_t s_audio_tx_stale_drop = 0;
+static uint32_t s_audio_tx_wait_count = 0;
+static uint64_t s_audio_tx_wait_sum_us = 0;
+static uint32_t s_audio_tx_wait_max_us = 0;
 static uint32_t s_audio_rx_count = 0;     /* Audio frames received from nRF */
 static uint8_t s_bridge_tx_seq = 0;
 static uint8_t s_bridge_rx_expected = 0;
@@ -109,7 +114,6 @@ static volatile uint32_t s_ack_release_count = 0;
 static volatile uint32_t s_ack_spurious_count = 0;
 static int64_t s_ack_wait_start_us = 0;          /* Timestamp when waiting_ack was set */
 static volatile uint32_t s_ack_timeout_count = 0; /* Forced releases due to timeout */
-static volatile uint32_t s_ack_repair_count = 0;  /* Semaphore self-repairs */
 #define ACK_TIMEOUT_US  50000  /* 50 ms — force-release if ACK not received */
 
 static void IRAM_ATTR ack_gpio_isr_handler(void *arg)
@@ -135,12 +139,7 @@ static void IRAM_ATTR ack_gpio_isr_handler(void *arg)
 
 static uint8_t audio_queue_depth(void)
 {
-    uint8_t h = s_audio_head;
-    uint8_t t = s_audio_tail;
-    if (h >= t) {
-        return (uint8_t)(h - t);
-    }
-    return (uint8_t)(TX_AUDIO_QUEUE_SIZE - t + h);
+    return s_audio_slots_used ? (uint8_t)uxSemaphoreGetCount(s_audio_slots_used) : 0;
 }
 
 /* ============================================================================
@@ -230,7 +229,9 @@ static void parse_rx(const uint8_t *buf, size_t len)
         return;
     }
 
-    /* Idle frame from master (all zeros or no sync byte) */
+    if (buf[0] == 0) {
+        return;
+    }
     if (buf[0] != SYNC_BYTE) {
         s_bridge_rx_bad_sync++;
         return;
@@ -310,12 +311,29 @@ static void prepare_tx_buf(void)
         return;
     }
 
-    if (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
+    while (xSemaphoreTake(s_audio_slots_used, 0) == pdTRUE) {
         uint8_t t = s_audio_tail;
         __sync_synchronize();
         tx_entry_t *e = &s_audio_q[t];
-        memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
         s_audio_tail = (uint8_t)((t + 1) % TX_AUDIO_QUEUE_SIZE);
+
+        int64_t now_us = esp_timer_get_time();
+        uint32_t wait_us = e->queued_at_us > 0 && now_us > e->queued_at_us
+                               ? (uint32_t)(now_us - e->queued_at_us)
+                               : 0;
+        if (wait_us > TX_AUDIO_MAX_AGE_US) {
+            s_audio_tx_stale_drop++;
+            xSemaphoreGive(s_audio_slots_free);
+            continue;
+        }
+
+        s_audio_tx_wait_count++;
+        s_audio_tx_wait_sum_us += wait_us;
+        if (wait_us > s_audio_tx_wait_max_us) {
+            s_audio_tx_wait_max_us = wait_us;
+        }
+
+        memcpy(s_tx_dma_buf, e->buf, BRIDGE_SPI_MAX_XFER);
 
         memcpy(s_audio_tx_inflight.buf, e->buf, BRIDGE_SPI_MAX_XFER);
         s_audio_tx_inflight.len = e->len;
@@ -587,6 +605,7 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
     uint16_t wire_len = (uint16_t)(2 + len);   /* SEQ + TYPE + PAYLOAD */
     uint16_t total = (uint16_t)(3 + wire_len); /* SYNC + LEN + BODY + CRC */
     if (total > BRIDGE_SPI_MAX_XFER) {
+        s_audio_tx_invalid_size++;
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -624,10 +643,12 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     }
 
     if (xSemaphoreTake(s_audio_slots_free, pdMS_TO_TICKS(20)) != pdTRUE) {
+        s_audio_tx_enqueue_timeout++;
         return ESP_ERR_TIMEOUT;
     }
 
-    /* Lock-free SPSC enqueue: only this thread writes s_audio_head */
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+
     uint8_t cur_head = s_audio_head;
     uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
 
@@ -642,6 +663,7 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     }
     entry->buf[2 + wire_len] = crc8_compute(&entry->buf[1], (size_t)(wire_len + 1));
     entry->len = total;
+    entry->queued_at_us = esp_timer_get_time();
 
     /* Memory barrier: ensure all writes to entry are visible before
      * the consumer sees the new head. On ESP32 (Xtensa) this is implicit
@@ -650,41 +672,30 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     __sync_synchronize();
     s_audio_head = next_head;
     xSemaphoreGive(s_audio_slots_used);
-
     s_audio_tx_queued++;
+    xSemaphoreGive(s_tx_mutex);
 
     /* Log stats periodically — OUTSIDE any critical section */
     static int64_t last_log = 0;
     int64_t now = esp_timer_get_time();
     if (now - last_log > 5000000) { /* Every 5s */
-        /* ---- Semaphore self-repair audit ----
-         * The counting semaphore pair (free + used) must always sum to
-         * TX_AUDIO_QUEUE_SIZE - 1.  If a race or missed ACK leaked a
-         * slot, detect it here and inject the missing tokens. */
-        UBaseType_t sem_free = uxSemaphoreGetCount(s_audio_slots_free);
-        UBaseType_t sem_used = uxSemaphoreGetCount(s_audio_slots_used);
-        UBaseType_t expected_total = TX_AUDIO_QUEUE_SIZE - 1;
-        int inflight = (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) ? 1 : 0;
-        UBaseType_t actual_total = sem_free + sem_used + inflight;
-        if (actual_total < expected_total) {
-            UBaseType_t deficit = expected_total - actual_total;
-            for (UBaseType_t i = 0; i < deficit; i++) {
-                xSemaphoreGive(s_audio_slots_free);
-            }
-            s_ack_repair_count += deficit;
-            ESP_LOGW(TAG, "Semaphore repair: injected %u free slots (was free=%u used=%u inflight=%d)",
-                     (unsigned)deficit, (unsigned)sem_free, (unsigned)sem_used, inflight);
-        }
-
         ESP_LOGI(TAG,
-                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu ack_spur=%lu ack_to=%lu ack_fix=%lu waiting=%d",
+                 "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu ack_spur=%lu ack_to=%lu waiting=%d",
                  s_audio_tx_queued, s_audio_tx_overwrite, s_audio_rx_count,
                  audio_queue_depth(), s_ctrl_pending_valid ? 1 : 0,
                  s_bridge_rx_bad_sync, s_bridge_rx_bad_len, s_bridge_rx_trunc,
                  s_bridge_rx_crc_fail, s_bridge_rx_seq_gaps, s_ack_irq_count,
-                 s_ack_release_count, s_ack_spurious_count,
-                 s_ack_timeout_count, s_ack_repair_count,
+                 s_ack_release_count, s_ack_spurious_count, s_ack_timeout_count,
                  s_audio_tx_waiting_ack ? 1 : 0);
+        ESP_LOGI(TAG,
+                 "PIPE v=1 dev=esp stage=spi tx_q_ok=%lu tx_q_timeout=%lu tx_size_drop=%lu tx_stale_drop=%lu tx_wait_avg_us=%lu tx_wait_max_us=%lu rx_ok=%lu crc_drop=%lu sync_drop=%lu len_drop=%lu trunc_drop=%lu seq_gap=%lu ack_timeout=%lu q_depth=%u",
+                 s_audio_tx_queued, s_audio_tx_enqueue_timeout, s_audio_tx_invalid_size,
+                 s_audio_tx_stale_drop,
+                 s_audio_tx_wait_count ? (uint32_t)(s_audio_tx_wait_sum_us / s_audio_tx_wait_count) : 0,
+                 s_audio_tx_wait_max_us,
+                 s_audio_rx_count, s_bridge_rx_crc_fail, s_bridge_rx_bad_sync,
+                 s_bridge_rx_bad_len, s_bridge_rx_trunc, s_bridge_rx_seq_gaps,
+                 s_ack_timeout_count, audio_queue_depth());
         last_log = now;
     }
 

@@ -58,10 +58,6 @@ static void spi_bridge_thread(void *arg1, void *arg2, void *arg3)
     }
 }
 
-/* External functions from mesh_protocol.c */
-extern int mesh_protocol_init(void);
-extern int mesh_protocol_start(void);
-
 int main(void)
 {
     int ret;
@@ -85,9 +81,6 @@ int main(void)
         printk("[DIAG] UART bridge init FAILED\n");
     } else {
         printk("[DIAG] UART bridge init OK\n");
-        /* Clock out the queued STATUS packet now that USB is ready for logging */
-        uart_bridge_process();
-        printk("[DIAG] First SPI transaction done\n");
     }
 
     /* Initialize ESB radio */
@@ -95,7 +88,7 @@ int main(void)
     ret = esb_radio_init(RF_CHANNEL);
     if (ret) {
         printk("[DIAG] ESB radio init FAILED: %d\n", ret);
-        goto run_spi_only;
+        return ret;
     }
     printk("[DIAG] ESB radio OK\n");
 
@@ -104,7 +97,7 @@ int main(void)
     ret = tdma_init();
     if (ret) {
         printk("[DIAG] TDMA init FAILED: %d\n", ret);
-        goto run_spi_only;
+        return ret;
     }
     printk("[DIAG] TDMA OK\n");
 
@@ -123,7 +116,7 @@ int main(void)
     ret = mesh_protocol_init();
     if (ret) {
         printk("[DIAG] Mesh protocol init FAILED: %d\n", ret);
-        goto run_spi_only;
+        return ret;
     }
     printk("[DIAG] Mesh protocol OK\n");
 
@@ -132,7 +125,6 @@ int main(void)
      * ensuring proper coordinator election. */
     printk("[DIAG] Mesh initialized, waiting for ESP32 enable command\n");
 
-run_spi_only:
     /* Start dedicated SPI polling thread and let main loop stay lightweight */
     k_thread_create(&s_spi_thread, s_spi_thread_stack, K_THREAD_STACK_SIZEOF(s_spi_thread_stack),
                     spi_bridge_thread, NULL, NULL, NULL, SPI_THREAD_PRIORITY, 0, K_NO_WAIT);

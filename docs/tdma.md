@@ -14,7 +14,7 @@ This is not a generic TDMA design. It is purpose-built for **small, mobile, real
 
 Voice intercoms fail when latency spikes or packets collide.
 
-CSMA-based systems (Wi-Fi, BLE) suffer from:
+CSMA-based systems (Wi‑Fi, BLE) suffer from:
 - Random backoff delays
 - Collision probability increasing with nodes
 - Unbounded worst-case latency
@@ -39,8 +39,8 @@ Motorcycle groups are **small and slow-changing**, which makes TDMA viable and r
 ### Slot Duration
 
 - Nominal slot length: **2 ms**
-- Configurable range: 1.5-2.5 ms
-- Per-slot guard time: ~100-200 µs (included in slot duration)
+- Configurable range: 1.5–2.5 ms
+- Per-slot guard time: 500 us (included in slot duration)
 
 ### Capacity Example
 
@@ -49,7 +49,7 @@ Motorcycle groups are **small and slow-changing**, which makes TDMA viable and r
 | Component | Duration | Purpose |
 |-----------|----------|---------|
 | Voice slots | 16 ms | 8 × 2 ms slots |
-| Control window | 2 ms | CSMA for join/leave/sync |
+| Control window | 2 ms | Join/leave/status/sync control traffic |
 | Frame guard | 2 ms | Clock drift absorption |
 
 Slot capacity by configuration:
@@ -60,7 +60,7 @@ Slot capacity by configuration:
 | 2 ms | 16 ms | 2 ms + 2 ms | ~8 |
 | 2.5 ms | 15 ms | 2.5 ms + 2.5 ms | ~6 |
 
-Default configuration targets **6-8 nodes** with 2 ms slots.
+Default configuration targets **6–8 nodes** with 2 ms slots.
 
 ---
 
@@ -97,10 +97,11 @@ The master **does not route more traffic** than others. It only coordinates time
 
 ### SYNC Transmission
 
-- Sent periodically by the master. Cadence differs by transport: ESP-NOW sends
-  every `MESH_SYNC_INTERVAL_FRAMES` (10 frames ~= 200 ms); the nRF52840/ESB build
-  sends on alternating status ticks (~= 1 s).
+- Sent every `MESH_SYNC_INTERVAL_FRAMES` (10 frames, approximately 200 ms) by
+  the master on both transports.
 - Broadcast during control (CSMA) window
+- On nRF/ESB, SYNC frames are coordinator-only; queued control traffic is sent
+  by one slot owner per non-SYNC frame.
 
 ### Synchronization Fields
 
@@ -110,10 +111,13 @@ The master **does not route more traffic** than others. It only coordinates time
 ### Slave Behavior
 
 - Phase-lock local timer to master
-- Apply slow drift correction
-- Never jump time abruptly
+- Rephase the next local frame boundary from the received control-window SYNC
+- Suppress participant slot transmission until the first valid SYNC
 
-Target sync accuracy: **<100 µs**
+The current software-timer implementation targets sub-slot synchronization;
+hardware capture is required before claiming sub-100-us over-the-air accuracy.
+Transport-specific receive-latency compensation (500 us for ESP-NOW and 300 us
+for ESB) is provisional and must be calibrated from over-the-air measurements.
 
 ---
 
@@ -134,7 +138,7 @@ Slots are **logical**, not tied to Node IDs.
 - Transmit **at most one AUDIO packet per frame**
 - Only inside own slot
 - Silence = suppressed via Opus DTX: only periodic comfort-noise frames are sent;
-  pure 1-2 byte DTX frames are dropped before TX (see [audio.md](audio.md#51-silence-suppression-opus-dtx))
+  pure 1-2 byte DTX frames are dropped before TX (see audio.md §5.1)
 
 ### Forwarding
 
@@ -157,7 +161,7 @@ Guard time absorbs:
 - Processing jitter
 
 Typical guard time:
-- 100-300 µs
+- 100–300 µs
 
 Guard time is included in slot duration.
 

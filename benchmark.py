@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import threading
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,16 @@ from datetime import datetime, timezone
 from typing import Any
 
 import serial
+
+_PIPE_GAUGE_KEYS = {
+    "v",
+    "node",
+    "q_depth",
+    "poll_max_us",
+    "tx_wait_avg_us",
+    "tx_wait_max_us",
+    "rx_pause_max_us",
+}
 
 # =============================================================================
 # Regex patterns
@@ -145,6 +156,35 @@ def _sanitize_port(port: str) -> str:
     return port.replace("/", "_")
 
 
+def parse_pipeline_logfmt(line: str) -> dict[str, int | str] | None:
+    """Parse one versioned PIPE logfmt record from a prefixed serial line."""
+    marker = "PIPE "
+    start = line.find(marker)
+    if start < 0:
+        return None
+    record: dict[str, int | str] = {}
+    try:
+        tokens = shlex.split(line[start + len(marker) :])
+    except ValueError:
+        return None
+    for token in tokens:
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        if not key:
+            continue
+        try:
+            parsed = int(value, 10)
+            if parsed < 0:
+                return None
+            record[key] = parsed
+        except ValueError:
+            record[key] = value
+    if record.get("v") != 1 or "dev" not in record or "stage" not in record:
+        return None
+    return record
+
+
 def _dict_delta(first: dict, last: dict) -> dict:
     """Compute per-key integer delta between two snapshots."""
     if not first or not last:
@@ -156,6 +196,14 @@ def _dict_delta(first: dict, last: dict) -> dict:
         except (TypeError, ValueError):
             pass
     return out
+
+
+def _pipeline_delta(first: dict, last: dict) -> dict:
+    return {
+        key: value
+        for key, value in _dict_delta(first, last).items()
+        if key not in _PIPE_GAUGE_KEYS
+    }
 
 
 def _scalar_delta(first: int | None, last: int | None) -> int | None:
@@ -256,6 +304,9 @@ class PortStats:
     last_e2e_nrf: dict = field(default_factory=dict)
     first_atune: dict = field(default_factory=dict)
     last_atune: dict = field(default_factory=dict)
+    first_pipe: dict[str, dict] = field(default_factory=dict)
+    last_pipe: dict[str, dict] = field(default_factory=dict)
+    pipe_samples: dict[str, int] = field(default_factory=dict)
 
     # Scalars
     latency_max_peak_ms: int = 0
@@ -380,6 +431,16 @@ class PortReader(threading.Thread):
 
     def _parse_line(self, line: str) -> None:
         s = self.stats
+
+        pipe = parse_pipeline_logfmt(line)
+        if pipe is not None:
+            node = pipe.get("node", "na")
+            name = f"{pipe['dev']}:{pipe['stage']}:{node}"
+            values = {k: v for k, v in pipe.items() if isinstance(v, int)}
+            if name not in s.first_pipe:
+                s.first_pipe[name] = values.copy()
+            s.last_pipe[name] = values
+            s.pipe_samples[name] = s.pipe_samples.get(name, 0) + 1
 
         # Simple first/last int-dict parsers
         for regex, name in _SIMPLE_PARSERS:
@@ -519,6 +580,15 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
         "atune_samples": s.atune_samples,
         "e2e_esp_samples": s.e2e_esp_samples,
         "e2e_nrf_samples": s.e2e_nrf_samples,
+        "pipeline_samples": s.pipe_samples,
+        "pipeline": {
+            name: {
+                "first": s.first_pipe[name],
+                "last": s.last_pipe.get(name, {}),
+                "delta": _pipeline_delta(s.first_pipe[name], s.last_pipe.get(name, {})),
+            }
+            for name in sorted(s.first_pipe)
+        },
     }
     for name in _SNAPSHOT_NAMES:
         d.update(_snapshot_json(s, name))
@@ -589,6 +659,10 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         f"atune={s.atune_samples} e2e_esp={s.e2e_esp_samples} "
         f"e2e_nrf={s.e2e_nrf_samples}"
     )
+    for name in sorted(s.first_pipe):
+        delta = _pipeline_delta(s.first_pipe[name], s.last_pipe.get(name, {}))
+        fields = " ".join(f"{key}={value}" for key, value in delta.items() if value != 0)
+        out.append(f"  PIPE {name} samples={s.pipe_samples.get(name, 0)} {fields}".rstrip())
 
     # Mesh
     if s.last_mesh:

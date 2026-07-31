@@ -127,7 +127,11 @@ bool rtt_probe_handle_packet(uint8_t src_id, const uint8_t *data, uint16_t len)
         return true;
     }
 
-    if (type == RTT_TYPE_RSP && s_pending[id]) {
+    if (type == RTT_TYPE_RSP) {
+        if (!s_pending[id]) {
+            return true;
+        }
+
         int64_t now_us = esp_timer_get_time();
         int64_t start_us = s_send_ts_us[id];
         s_pending[id] = false;

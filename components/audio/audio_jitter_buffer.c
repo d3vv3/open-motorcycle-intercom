@@ -15,6 +15,7 @@ void audio_jitter_reset(audio_jitter_state_t *state)
     state->consecutive_empty = 0;
     state->hold_next = false;
     state->hold_budget = 0;
+    state->stream_silent = false;
 }
 
 void audio_jitter_record_depth(audio_jitter_state_t *state, audio_stats_t *stats, UBaseType_t items)
@@ -63,6 +64,7 @@ void audio_jitter_trim_backlog(QueueHandle_t queue, audio_jitter_state_t *state,
     while (items > MESH_RX_MAX_TARGET_FRAMES) {
         if (xQueueReceive(queue, scratch_item, 0) == pdTRUE) {
             stats->frames_dropped++;
+            stats->jitter_trim_frames++;
             items = uxQueueMessagesWaiting(queue);
         } else {
             break;

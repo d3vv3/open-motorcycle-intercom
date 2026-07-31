@@ -18,10 +18,16 @@ typedef void (*esb_rx_callback_t)(const uint8_t *data, uint8_t len, const uint8_
 typedef struct {
     uint32_t tx_count;
     uint32_t tx_timeout_count;
+    uint32_t tx_busy_count;
+    uint32_t tx_write_fail_count;
+    uint32_t tx_failed_event_count;
     uint32_t tx_wait_us_avg;
     uint32_t tx_wait_us_max;
     uint32_t rx_pause_us_avg;
     uint32_t rx_pause_us_max;
+    uint32_t rx_no_callback_count;
+    uint32_t rx_flush_drop_count;
+    uint32_t rx_restart_fail_count;
 } esb_radio_timing_stats_t;
 
 /**
