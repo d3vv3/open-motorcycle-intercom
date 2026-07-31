@@ -181,6 +181,7 @@ static bool s_mesh_user_enabled = false;
 static uint32_t s_sync_lost_window_start_ms = 0;
 static uint8_t s_sync_lost_count = 0;
 static bool s_peer_left_latched = false;
+static int64_t s_mesh_restart_attempt_ms = 0;
 
 static esp_err_t init_audio_with_test_flags(void)
 {
@@ -478,6 +479,34 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
         break;
     default:
         break;
+    }
+}
+
+static void reconcile_nrf_mesh_state(int64_t now_ms)
+{
+    uart_bridge_status_t status;
+    if (uart_bridge_get_status(&status) != ESP_OK) {
+        s_mesh_active = false;
+        return;
+    }
+
+    bool ready = status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
+    if (ready) {
+        if (s_mesh_user_enabled && !s_mesh_active) {
+            s_mesh_active = true;
+            (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+        }
+        return;
+    }
+
+    s_mesh_active = false;
+    if (s_mesh_user_enabled && status.mesh_state == BRIDGE_MESH_STATE_IDLE &&
+        now_ms - s_mesh_restart_attempt_ms >= 2000) {
+        s_mesh_restart_attempt_ms = now_ms;
+        esp_err_t ret = uart_bridge_mesh_enable();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Mesh restart retry failed: %s", esp_err_to_name(ret));
+        }
     }
 }
 
@@ -779,6 +808,7 @@ void app_main(void)
         if (s_active_transport == TRANSPORT_NRF52840) {
             static int64_t last_rtt_log_ms = 0;
 
+            reconcile_nrf_mesh_state(now_ms);
             rtt_probe_tick(now_ms, s_mesh_active, uart_bridge_is_connected());
 
             if ((now_ms - last_rtt_log_ms) >= RTT_LOG_INTERVAL_MS) {
