@@ -121,7 +121,7 @@ Its mesh audio capacity is therefore 66 bytes, while the codec limit remains 64 
 ### Rules
 
 - AUDIO packets **must only be sent in TDMA slots**
-- Packets received outside slot are dropped
+- Late local slot work is dropped before submission; receivers validate packet format, state, source, and deduplication rather than reconstructing sender slot time
 
 ---
 
@@ -195,12 +195,14 @@ KEEPALIVE/STATUS keep the node's `last_seen` fresh so it is not timed out
 
 ---
 
-## Control Plane (CSMA)
+## Control Plane
 
-Control packets are transmitted **outside TDMA voice slots**. ESP-NOW uses the
-control window for SYNC and contention-based control traffic. On nRF/ESB, SYNC
-frames are reserved for the coordinator and other frames assign the control
-window to one node (`FrameCounter mod 8 == SlotIndex`), avoiding ESB collisions.
+Control packets are transmitted outside TDMA voice slots. For joined nodes, both
+transports rotate control-window ownership by frame; every tenth frame is
+reserved for coordinator SYNC. ESP-NOW keeps non-SYNC control in a bounded
+priority queue and sends one item in an owned window. Before assignment,
+ESP-NOW JOIN requests transmit directly with a minimum interval and random
+jitter. ESP-NOW LEAVE also transmits directly during shutdown.
 
 ### JOIN Packet
 
@@ -229,6 +231,7 @@ JOIN_V2 and targeted JOIN_ACK_V2 packets instead:
 |------|----|------|
 | JOIN_V2 | RequesterAddr (5 bytes) | Stable nRF device/ESB identity used to deduplicate retries |
 | JOIN_ACK_V2 | TargetAddr (5 bytes) | Only the matching requester accepts the broadcast ACK |
+| LEAVE | SenderAddr (5 bytes, nRF) | Confirms that the departing node ID belongs to this ESB identity |
 
 All nRF boards in a mesh must run firmware using the same JOIN handshake.
 
@@ -249,7 +252,7 @@ Payload:
 ### Behavior
 
 - Master sends SYNC every 10 frames in the 16-18 ms control window
-- Slaves phase-lock
+- Participants derive a frame epoch from valid coordinator SYNC, maintain frame history, apply bounded phase/rate correction, and reacquire after a large frame-counter difference
 - Loss of SYNC triggers re-election
 
 ---
@@ -342,6 +345,18 @@ Payload:
 | COMMAND | 0x04 | ESP → nRF | Mesh commands |
 | LOG | 0x05 | nRF → ESP | Debug logs |
 
+The packet IDs and packed control/status payloads are shared in
+`shared/bridge_protocol_defs.h`. Mesh START and STOP carry an 8-bit generation.
+The ESP permits one lifecycle command at a time and retries that same generation
+until a matching command ACK arrives or the attempt limit expires. ACK means the
+nRF command worker applied the requested transition; readiness is reported
+separately through STATUS and MESH_READY/MESH_STOPPED events.
+
+STATUS reports protocol version, explicit `IDLE`, `SCANNING`, `JOINING`, or
+`ACTIVE` state, role, node ID, slot, coordinator ID, and peer count. PEER_JOINED
+and PEER_LEFT describe topology changes only and are not lifecycle readiness
+signals.
+
 ### Frame Format
 
 ```
@@ -351,25 +366,18 @@ Payload:
 - LEN covers: `SEQ + TYPE + PAYLOAD`
 - CRC8 covers: `LEN + SEQ + TYPE + PAYLOAD`
 
+SPI is full duplex. ESP-to-nRF audio is retained as a single in-flight frame and
+re-presented until the nRF admission ACK pulse or a bounded timeout. Lifecycle
+control can pass while audio awaits ACK. The nRF prioritizes outbound control and
+only advances its control/audio queue after a successful SPI transfer, so a
+failed transaction is retryable rather than destructive.
+
 ### Audio Message
 
 | Offset | Size | Field |
 |------|----|------|
 | 0 | 1 | SrcID |
 | 1 | N | OpusData |
-
----
-
-## Security (Deferred)
-
-Initial versions focus on correctness and performance.
-
-Planned:
-- Group pre-shared key
-- Packet authentication
-- Optional encryption
-
-Security must not compromise latency.
 
 ---
 
@@ -383,6 +391,5 @@ Security must not compromise latency.
 
 ## Status
 
-This document defines **Protocol v0.1**.
-
-It is expected to evolve, but backward compatibility should be preserved where practical.
+The current wire version is `0x01`. Shared layouts are compile-time size checked;
+there is no implemented optional-field negotiation or encrypted/authenticated mode.

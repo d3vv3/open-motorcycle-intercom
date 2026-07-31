@@ -1,238 +1,70 @@
-# Inter-MCU Architecture & Contract
+# Inter-MCU Contract
 
-This document defines the **strict contract** between MCUs in the Open Motorcycle Intercom (OMI).
+This document records the implemented ESP32-S3/nRF52840 contract.
 
-The goal is not performance maximalism - it is **fault isolation, power efficiency, and timing determinism**.
+## Ownership
 
-[TOC]
+The ESP32-S3 owns audio I/O and cadence, Opus encode/decode, VOX, source mixing,
+notifications, user policy, and the bridge SPI-slave task. The nRF52840 owns ESB,
+mesh state, RF slot/control deadlines, and the bridge SPI-master polling loop.
 
----
+`shared/bridge_protocol_defs.h` is the source of truth for bridge packet IDs,
+commands, command ACKs, lifecycle/topology events, readiness states, and status
+payload. `shared/mesh_protocol_defs.h` and `shared/mesh_core.c` own common on-air
+layouts and transport-neutral mesh rules.
 
-## 1. Why Dual MCU?
+## Physical Link
 
-A single MCU *can* do everything - until it can’t.
+- 4 MHz SPI, nRF master and ESP slave
+- one full-duplex 256-byte transaction every 5 ms
+- CRC8 and an 8-bit frame sequence in each framed packet
+- separate nRF-to-ESP GPIO pulse acknowledging durable ESP audio admission
+- ESP 16 kHz I2S WS connected to the nRF counter input for clock discipline
 
-Problems avoided by splitting:
-- RF stack jitter breaking audio timing
-- Bluetooth firmware crashes killing mesh
-- Power-hungry radios preventing deep sleep
-- Vendor lock-in
+The frame format is:
 
-**Rule:** Audio timing must never depend on Bluetooth or mesh firmware behavior.
-
----
-
-## 2. MCU Roles
-
-### 2.1 Application MCU (ESP32-S3 initially)
-
-Responsibilities:
-- Audio I/O (ADC/DAC)
-- Opus encode/decode
-- VOX / PTT logic
-- Audio mixing
-- TDMA scheduler (logical)
-- User interface
-- Bridge to the FSC-BT1026D Bluetooth Classic (HFP/A2DP) SoC (the ESP32-S3 has no BT Classic radio)
-
-This MCU owns *audio cadence*.
-
----
-
-### 2.2 Radio MCU (nRF52840)
-
-Responsibilities:
-- Mesh radio (ESB / custom PHY)
-- Slot-level TX/RX
-- Time sync enforcement
-- Low-power sleep scheduling
-- Encryption / authentication
-
-This MCU owns *RF correctness*.
-
----
-
-## 3. Clock Ownership & Time Model
-
-- Application MCU defines **audio frame cadence** (20 ms)
-- Radio MCU currently runs the TDMA timer and adapts cadence based on bridge buffer depth
-
-Current implementation note: strict clock ownership is deferred; alignment is enforced indirectly via adaptive timing.
-
-Time flows:
-```
-Audio frame tick → TDMA slot → RF TX/RX
+```text
+| Sync 0xAA | Length | Sequence | Type | Payload | CRC8 |
 ```
 
----
+## Audio Transfer
 
-## 4. Interconnect Options
+ESP-to-nRF audio uses a bounded queue and one retained in-flight frame. While
+waiting for the GPIO ACK, the ESP re-presents the same frame on subsequent SPI
+transactions. A 50 ms timeout releases it so a lost pulse cannot deadlock the
+pipeline; stale queued audio is dropped rather than sent after its useful window.
 
-Preferred:
-- SPI (10-20 MHz target)
+Lifecycle control can pass while audio awaits ACK. Control has a separate pending
+slot, so it does not consume an audio queue entry.
 
-Fallback:
-- UART (DMA only, no interrupts)
+The nRF maintains separate bounded outbound control and audio queues, selects
+control first, and advances the selected queue only after a successful SPI
+transfer. A failed transaction therefore leaves that packet available for retry.
 
-I2C is explicitly rejected.
+## Lifecycle Commands
 
-Current implementation note: SPI runs at 4 MHz today due to ESP32 SPI-slave CS timing constraints.
+START and STOP carry an 8-bit generation. The ESP permits one lifecycle command
+at a time and retries the same command/generation for a bounded number of 300 ms
+ACK waits. It accepts only a matching command and generation ACK.
 
----
+The nRF applies the requested transition in its command worker, then sends the
+ACK and a status snapshot. The ACK reports command application, not mesh RF
+readiness.
 
-## 5. Message Framing
+Status carries protocol version and explicit `IDLE`, `SCANNING`, `JOINING`, or
+`ACTIVE` state plus role, node ID, slot, coordinator ID, and peer count.
+MESH_READY/MESH_STOPPED report lifecycle readiness. PEER_JOINED/PEER_LEFT report
+topology changes only; a node becoming coordinator is not a peer-join event.
 
-All messages use fixed headers:
+## Timing
 
-```
-| Sync(0xAA) | Length | Seq | Type | Payload | CRC8 |
-```
+Audio remains fixed at 16 kHz mono, 16-bit samples, and 20 ms frames. The nRF owns
+RF scheduling. When it is coordinator, valid ESP WS edge samples discipline its
+local TDMA period. Participants use coordinator SYNC for frame phase and rate.
+The Zephyr timer has 100 us correction resolution in the current configuration.
 
-Rules:
-- No dynamic allocation
-- No variable-length queues
-- Explicit backpressure
+## Telemetry
 
----
-
-## 6. Data Classes
-
-### 6.1 Real-Time Audio Frames
-
-- Exactly one Opus frame per message
-- Must arrive before slot deadline
-
-Late frames are dropped silently.
-
----
-
-### 6.2 Control Messages
-
-Examples:
-- Slot assignment
-- Peer join/leave
-- RSSI reports
-- Status snapshots
-
-Lower priority than audio.
-
----
-
-### 6.3 Management Messages
-
-Examples:
-- Firmware update
-- Debug logging
-- Diagnostics
-
-May be throttled aggressively.
-
----
-
-## 7. Backpressure & Flow Control
-
-Rules:
-- Radio MCU advertises available TX slots
-- Application MCU may only enqueue when slots exist
-
-If queue is full:
-- Drop oldest non-audio
-- Never block audio pipeline
-
-Current implementation note: explicit TX-slot advertisement is deferred. Audio remains prioritized and oldest queued audio may be dropped under sustained pressure.
-
----
-
-## 8. Failure Isolation
-
-### Radio MCU Failure
-
-Symptoms:
-- Slot loss
-- No RF ACKs
-
-Response:
-- Application MCU continues local audio
-- Rejoin attempt after timeout
-
----
-
-### Application MCU Failure
-
-Symptoms:
-- No frames
-- No control messages
-
-Response:
-- Radio MCU enters low-power idle
-
-Current implementation note: app MCU fail timeout and radio idle transition are deferred.
-
----
-
-## 9. Power Coordination
-
-Radio MCU controls RF sleep states.
-
-Application MCU signals:
-- Active audio
-- Idle
-- Deep sleep request
-
-Radio MCU may reject deep sleep if mesh timing requires wake.
-
-Current implementation note: cross-MCU power signaling is deferred.
-
----
-
-## 10. Security Boundary
-
-- Keys stored only on Radio MCU
-- Application MCU never sees mesh keys
-
-This prevents Bluetooth compromise from leaking mesh credentials.
-
-Current implementation note: cryptographic keying/encryption is deferred.
-
----
-
-## 11. Debug & Telemetry
-
-Mandatory counters:
-- Late audio frames
-- Slot misses
-- SPI underruns
-- Clock drift
-
-Telemetry must be pull-based.
-
-Current implementation note: current telemetry is mostly push-based; pull-only telemetry is deferred.
-
----
-
-## 12. Migration Path
-
-| Stage | Configuration | Notes |
-|-------|---------------|-------|
-| Current | ESP32-S3 only | Single MCU, ESP-NOW transport |
-| Next | ESP32-S3 + nRF52840 | Dual MCU, ESB transport |
-| Future | nRF54 dual-core | Optional single-chip solution |
-
-The inter-MCU contract remains unchanged across configurations.
-
----
-
-## 13. Design Rationale Summary
-
-- Audio owns time
-- RF owns correctness
-- Backpressure is explicit
-- Failures degrade gracefully
-
-This contract is intentionally strict.
-
----
-
-## 14. Status
-
-This document defines the **non-negotiable MCU interface** for OMI.
+Firmware periodically emits bridge admission/drop counters, retry/ACK timeouts,
+TDMA deadlines and correction state, ESB outcomes, and audio queue/decode
+counters. See `pipeline_telemetry.md` for reporting limitations.

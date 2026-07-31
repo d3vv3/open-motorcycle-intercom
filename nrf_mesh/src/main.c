@@ -64,7 +64,7 @@ int main(void)
 
     /* Initialize UART bridge FIRST - must be ready before ESP32 sends probe.
      * ESP32 sends PING within ~200ms of boot, so this must happen immediately. */
-    ret = uart_bridge_init();
+    int bridge_ret = uart_bridge_init();
 
     /* Enable USB subsystem for logging (works even without a USB host) */
     ret = usb_enable(NULL);
@@ -76,6 +76,11 @@ int main(void)
     k_sleep(K_MSEC(1000));
 
     printk("\n\n*** OMI Mesh Firmware booted ***\n\n");
+
+    if (bridge_ret != 0 && bridge_ret != -EALREADY) {
+        printk("[DIAG] UART bridge init FAILED: %d\n", bridge_ret);
+        return bridge_ret;
+    }
 
     if (!uart_bridge_is_initialized()) {
         printk("[DIAG] UART bridge init FAILED\n");

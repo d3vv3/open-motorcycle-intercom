@@ -43,6 +43,8 @@ static const char *TAG = "spi_bridge";
 #define RX_TASK_CORE       0
 #define TX_AUDIO_QUEUE_SIZE 16
 #define TX_AUDIO_MAX_AGE_US 120000
+#define COMMAND_ACK_TIMEOUT_MS 300
+#define COMMAND_MAX_ATTEMPTS   3
 
 typedef struct {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
@@ -62,6 +64,12 @@ static uart_bridge_event_cb_t s_event_cb = NULL;
 
 static uart_bridge_status_t s_status = {0};
 static bool s_connected = false;
+static volatile bool s_command_in_progress = false;
+static volatile bool s_command_ack_received = false;
+static volatile uint8_t s_command_ack_generation = 0;
+static volatile uint8_t s_command_ack_command = 0;
+static volatile int8_t s_command_ack_result = 0;
+static uint8_t s_command_generation = 0;
 
 /*
  * TX double-buffer: s_tx_buf is the staging area where the app writes
@@ -158,25 +166,49 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
         break;
 
     case BRIDGE_PKT_STATUS:
-        if (len >= 3) {
+        if (len == sizeof(bridge_status_payload_t)) {
+            bridge_status_payload_t status;
+            memcpy(&status, payload, sizeof(status));
             /* Check for changes before updating */
-            bool changed = (!s_connected) || (s_status.is_coordinator != (payload[0] != 0)) ||
-                           (s_status.peer_count != payload[1]) || (s_status.node_id != payload[2]);
+            bool changed = (!s_connected) || (s_status.mesh_state != status.mesh_state) ||
+                           (s_status.role != status.role) ||
+                           (s_status.peer_count != status.peer_count) ||
+                           (s_status.node_id != status.node_id);
 
             memset(&s_status, 0, sizeof(s_status));
-            s_status.is_coordinator = (payload[0] != 0);
-            s_status.peer_count = payload[1];
-            s_status.node_id = payload[2];
+            s_status.mesh_state = status.mesh_state;
+            s_status.role = status.role;
+            s_status.node_id = status.node_id;
+            s_status.slot_index = (uint8_t)status.slot_index;
+            s_status.coordinator_id = status.coordinator_id;
+            s_status.peer_count = status.peer_count;
+            s_status.is_coordinator = status.role == 1;
             s_connected = true;
 
             if (changed) {
-                ESP_LOGI(TAG, "Status: node=%d peers=%d coordinator=%d", s_status.node_id,
-                         s_status.peer_count, s_status.is_coordinator);
+                ESP_LOGI(TAG, "Status: state=%u role=%u node=%u slot=%d coord=%u peers=%u",
+                         status.mesh_state, status.role, status.node_id, status.slot_index,
+                         status.coordinator_id, status.peer_count);
             }
+        } else if (len >= 3) {
+            s_status.role = payload[0];
+            s_status.is_coordinator = payload[0] == 1;
+            s_status.peer_count = payload[1];
+            s_status.node_id = payload[2];
+            s_connected = true;
         }
         break;
 
     case BRIDGE_PKT_MESH_EVENT:
+        if (len > 0 && payload[0] == BRIDGE_EVENT_COMMAND_ACK &&
+            len >= 1 + sizeof(bridge_command_ack_payload_t)) {
+            bridge_command_ack_payload_t ack;
+            memcpy(&ack, payload + 1, sizeof(ack));
+            s_command_ack_command = ack.command;
+            s_command_ack_generation = ack.generation;
+            s_command_ack_result = ack.result;
+            __atomic_store_n(&s_command_ack_received, true, __ATOMIC_RELEASE);
+        }
         if (s_event_cb && len > 0) {
             uart_bridge_event_t event = (uart_bridge_event_t)payload[0];
             s_event_cb(event, payload + 1, len - 1);
@@ -305,6 +337,17 @@ static void prepare_tx_buf(void)
         }
     }
 
+    /* Lifecycle controls must pass even while an audio frame awaits ACK. */
+    if (s_ctrl_pending_valid && xSemaphoreTake(s_tx_mutex, 0) == pdTRUE) {
+        if (s_ctrl_pending_valid) {
+            memcpy(s_tx_dma_buf, s_ctrl_pending.buf, BRIDGE_SPI_MAX_XFER);
+            s_ctrl_pending_valid = false;
+            xSemaphoreGive(s_tx_mutex);
+            return;
+        }
+        xSemaphoreGive(s_tx_mutex);
+    }
+
     /* Fast path: audio queue with GPIO ACK-driven stop-and-wait. */
     if (s_audio_tx_waiting_ack && s_audio_tx_inflight_valid) {
         memcpy(s_tx_dma_buf, s_audio_tx_inflight.buf, BRIDGE_SPI_MAX_XFER);
@@ -348,20 +391,6 @@ static void prepare_tx_buf(void)
         s_audio_tx_waiting_ack_seq = e->buf[2];
         s_ack_wait_start_us = esp_timer_get_time();
         return;
-    }
-
-    /* Slow path: control packet (needs mutex, but very rare) */
-    if (s_ctrl_pending_valid) {
-        if (xSemaphoreTake(s_tx_mutex, 0) == pdTRUE) {
-            if (s_ctrl_pending_valid) {
-                memcpy(s_tx_dma_buf, s_ctrl_pending.buf, BRIDGE_SPI_MAX_XFER);
-                s_ctrl_pending_valid = false;
-            } else {
-                memset(s_tx_dma_buf, 0, BRIDGE_SPI_MAX_XFER);
-            }
-            xSemaphoreGive(s_tx_mutex);
-            return;
-        }
     }
 
     /* Nothing pending, send idle frame */
@@ -551,6 +580,8 @@ esp_err_t uart_bridge_init(void)
     s_audio_tx_waiting_ack = false;
     s_audio_tx_waiting_ack_seq = 0;
     s_audio_tx_inflight_valid = false;
+    s_command_in_progress = false;
+    s_command_ack_received = false;
     ESP_LOGI(TAG, "SPI bridge initialized (MOSI=%d, MISO=%d, SCK=%d, CS=%d)", BRIDGE_SPI_MOSI_PIN,
              BRIDGE_SPI_MISO_PIN, BRIDGE_SPI_SCLK_PIN, BRIDGE_SPI_CS_PIN);
 
@@ -589,6 +620,8 @@ void uart_bridge_deinit(void)
     s_connected = false;
     s_audio_tx_waiting_ack = false;
     s_audio_tx_inflight_valid = false;
+    s_command_in_progress = false;
+    s_command_ack_received = false;
 
     ESP_LOGI(TAG, "SPI bridge deinitialized");
 }
@@ -777,24 +810,56 @@ bool uart_bridge_probe(uint32_t timeout_ms)
     return false;
 }
 
-esp_err_t uart_bridge_mesh_enable(void)
+static esp_err_t send_mesh_command(bridge_command_t command)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    ESP_LOGI(TAG, "Sending mesh enable command to nRF52840");
-    uint8_t cmd_payload[] = {0x01}; /* CMD_ID = Enable Mesh */
-    return queue_tx_packet(BRIDGE_PKT_CONTROL, cmd_payload, sizeof(cmd_payload));
+    if (__atomic_exchange_n(&s_command_in_progress, true, __ATOMIC_ACQUIRE)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bridge_command_payload_t payload = {
+        .command = command,
+        .generation = ++s_command_generation,
+    };
+    esp_err_t result = ESP_ERR_TIMEOUT;
+    __atomic_store_n(&s_command_ack_received, false, __ATOMIC_RELEASE);
+
+    for (int attempt = 1; attempt <= COMMAND_MAX_ATTEMPTS; attempt++) {
+        result = queue_tx_packet(BRIDGE_PKT_CONTROL, (const uint8_t *)&payload, sizeof(payload));
+        if (result != ESP_OK) {
+            break;
+        }
+
+        int64_t deadline_us = esp_timer_get_time() + COMMAND_ACK_TIMEOUT_MS * 1000LL;
+        while (esp_timer_get_time() < deadline_us) {
+            if (__atomic_load_n(&s_command_ack_received, __ATOMIC_ACQUIRE) &&
+                s_command_ack_command == command &&
+                s_command_ack_generation == payload.generation) {
+                result = s_command_ack_result == 0 ? ESP_OK : ESP_FAIL;
+                goto done;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        ESP_LOGW(TAG, "Command 0x%02X generation %u ACK timeout (%d/%d)", command,
+                 payload.generation, attempt, COMMAND_MAX_ATTEMPTS);
+    }
+
+done:
+    __atomic_store_n(&s_command_in_progress, false, __ATOMIC_RELEASE);
+    return result;
+}
+
+esp_err_t uart_bridge_mesh_enable(void)
+{
+    ESP_LOGI(TAG, "Requesting mesh enable from nRF52840");
+    return send_mesh_command(BRIDGE_COMMAND_MESH_START);
 }
 
 esp_err_t uart_bridge_mesh_disable(void)
 {
-    if (!s_initialized) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(TAG, "Sending mesh disable command to nRF52840");
-    uint8_t cmd_payload[] = {0x02}; /* CMD_ID = Disable Mesh */
-    return queue_tx_packet(BRIDGE_PKT_CONTROL, cmd_payload, sizeof(cmd_payload));
+    ESP_LOGI(TAG, "Requesting mesh disable from nRF52840");
+    return send_mesh_command(BRIDGE_COMMAND_MESH_STOP);
 }

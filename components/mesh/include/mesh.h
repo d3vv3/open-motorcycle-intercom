@@ -53,6 +53,9 @@ extern "C" {
 /** @brief Jitter buffer depth (number of frames) */
 #define MESH_JITTER_BUFFER_DEPTH 4
 
+/** @brief Maximum pending ESP-NOW control packets */
+#define MESH_CONTROL_QUEUE_CAPACITY 12
+
 /* ============================================================================
  * ESP-NOW-specific protocol types
  * ============================================================================ */
@@ -141,9 +144,14 @@ typedef struct {
     uint32_t latency_avg_us; /**< Average latency (EMA) */
 
     /* Protocol */
-    uint32_t join_attempts;  /**< JOIN requests sent */
-    uint32_t join_successes; /**< Successful joins */
-    uint32_t node_timeouts;  /**< Peer timeout events */
+    uint32_t join_attempts;               /**< JOIN requests sent */
+    uint32_t join_successes;              /**< Successful joins */
+    uint32_t node_timeouts;               /**< Peer timeout events */
+    uint32_t control_queue_drops;         /**< Control packets dropped or evicted */
+    uint8_t control_queue_depth;          /**< Current queued control packet count */
+    uint8_t control_queue_high_watermark; /**< Maximum queued control packet count */
+    uint32_t contention_tx;               /**< Unassigned JOIN contention transmissions */
+    uint32_t contention_deferred;         /**< JOIN attempts deferred by contention pacing */
 } mesh_stats_t;
 
 /**

@@ -54,7 +54,7 @@ As a result, OpenHelmet is designed around **custom real-time audio transport**.
 
 - [x] **ESP32-S3 + Nordic nRF52 52840**
 - [x] TDMA mesh protocol over [ESB](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html) radio with custom PHY control
-  > ESB runs at 250 kbps with 8 dBm TX power (`OMI_ESB_BITRATE` / `OMI_ESB_TX_POWER_DBM`).
+  > The firmware configures ESB at 1 Mbps with 8 dBm TX power (`OMI_ESB_BITRATE` / `OMI_ESB_TX_POWER_DBM`).
 - [x] SPI audio & control bridge between MCUs
   > Needed to make the SPI handling to take place only in 1 core of the ESP32
 - [x] Noise supression, echo cancellation
@@ -101,39 +101,41 @@ These technologies are unsuitable for real-time group voice.
 
 ## Custom Mesh Strategy
 
-### Hybrid TDMA + CSMA
+### Scheduled Voice and Control
 
-OpenHelmet uses a **hybrid MAC design**:
+OpenHelmet divides each 20 ms frame into scheduled voice slots and a control window:
 
 - **TDMA** for voice frames
-- **CSMA** for control traffic
+- A rotating owner for joined-node control traffic; coordinator SYNC frames have a reserved window
+- Bounded randomized contention for unjoined ESP-NOW JOIN requests
 
 #### TDMA (Voice)
 
 - Fixed time slots per node
-- Deterministic latency
-- Zero collisions
-- Linear scaling with rider count
+- One bounded transmission opportunity per active node and frame
+- Deadline checks drop late work rather than transmitting outside its window
 
 Frame structure (20 ms frame, 8 riders):
 
 ```
-| Slot 1 | Slot 2 | Slot 3 | ... | Slot 8 | Control | Guard |
+| Slot 1 | Slot 2 | Slot 3 | ... | Slot 8 | Control | Margin |
 |  2 ms  |  2 ms  |  2 ms  | ... |  2 ms  |   2 ms  |  2 ms |
 ```
 
 - Voice slots: 8 × 2 ms = 16 ms
-- Control window: 2 ms (CSMA for join/leave/sync)
-- Guard time: 2 ms (absorbs clock drift)
+- Control window: 2 ms (scheduled sync/topology/status traffic)
+- Frame margin: 2 ms; each voice/control deadline also reserves a 500 us guard
 
 Motorcycle groups are small and topology changes slowly, making TDMA practical.
 
-#### CSMA (Control)
+#### Control
 
 Used for:
 - Joining/leaving the group
 - Topology updates
-- Slot renegotiation
+- Slot maps and synchronization
+
+ESP-NOW queues joined-node control packets in a bounded, priority-aware queue and sends at most one when the node owns the control window. Unassigned JOIN requests use a minimum interval plus random jitter; JOIN during discovery and graceful LEAVE during shutdown are immediate exceptions because the sender does not yet have, or is relinquishing, a schedule.
 
 ---
 
@@ -157,6 +159,9 @@ source ~/esp/esp-idf/export.sh
 # Build firmware
 idf.py build
 ```
+
+CI builds both the ESP32-S3 and XIAO nRF52840 firmware. It also runs the Python
+tests, compiles the shared wire headers, and runs the host `mesh_core` tests.
 
 ### Flash
 

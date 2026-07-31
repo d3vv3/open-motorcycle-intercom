@@ -11,6 +11,7 @@
  */
 
 #include "mesh.h"
+#include "mesh_core.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -23,10 +24,10 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_now.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 
-#include "audio.h"
 #include "power.h"
 
 static const char *TAG = "mesh";
@@ -41,15 +42,17 @@ static const char *TAG = "mesh";
 
 #define MESH_TX_QUEUE_SIZE 4
 #define MESH_RX_QUEUE_SIZE 32 /* Increased to handle packet floods during join */
-
 #define MESH_SCAN_TIMEOUT_MS  2000 /* Time to listen before becoming coordinator */
 #define MESH_JOIN_TIMEOUT_MS  5000 /* Time to wait for JOIN_ACK */
-#define MESH_JOIN_RETRY_COUNT 10
 #define MESH_STATUS_INTERVAL_MS 1000
-#define SEEN_RING_SIZE          32
 #define RELAY_RING_SIZE         16
-#define TX_COMPLETION_RING_SIZE 16
 #define ACTIVE_SPEAKER_TIMEOUT_MS 1500
+#define CONTENTION_MIN_INTERVAL_MS 100
+#define CONTENTION_JITTER_MS       100
+#define TX_QUIESCE_TIMEOUT_MS      250
+#define RX_QUIESCE_TIMEOUT_MS      50
+#define TASK_QUIESCE_TIMEOUT_MS    250
+#define CONTROL_MAX_PRIORITY_WAIT_MS 500
 
 /* Frame timing in microseconds */
 #define MESH_FRAME_US   (MESH_FRAME_MS * 1000)
@@ -100,17 +103,10 @@ typedef struct {
  */
 typedef struct {
     mesh_peer_info_t info;
-    uint8_t last_seq; /* Last sequence number seen */
+    mesh_core_seq8_t rx_seq;
     uint32_t packets_received;
     uint32_t packets_lost;
 } peer_tracking_t;
-
-typedef struct {
-    uint8_t type;
-    uint8_t src_id;
-    uint8_t seq;
-    bool valid;
-} seen_entry_t;
 
 typedef struct {
     uint8_t data[sizeof(mesh_header_t) + sizeof(mesh_audio_payload_t)];
@@ -126,8 +122,26 @@ typedef struct {
     uint8_t type;
     uint8_t heard_bitmap;
     uint8_t relay_bitmap;
-    bool valid;
-} tx_completion_entry_t;
+    bool audio_origin;
+    bool active;
+} tx_inflight_t;
+
+typedef enum {
+    CONTROL_PRIORITY_PERIODIC = 1,
+    CONTROL_PRIORITY_TOPOLOGY,
+    CONTROL_PRIORITY_LIFECYCLE,
+    CONTROL_PRIORITY_SYNC,
+} control_priority_t;
+
+typedef struct {
+    uint8_t data[sizeof(mesh_header_t) + sizeof(mesh_slot_map_payload_t)];
+    uint8_t dest_mac[6];
+    uint16_t len;
+    uint32_t order;
+    int64_t enqueued_us;
+    uint8_t type;
+    uint8_t priority;
+} control_tx_item_t;
 
 /* ============================================================================
  * Static Variables
@@ -139,6 +153,7 @@ static mesh_config_t s_config = MESH_CONFIG_DEFAULT();
 static mesh_state_t s_state = MESH_STATE_IDLE;
 static mesh_role_t s_role = MESH_ROLE_NONE;
 static mesh_stats_t s_stats = {0};
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* Identity */
 static uint8_t s_local_mac[6] = {0};
@@ -184,16 +199,33 @@ static QueueSetHandle_t s_timer_queue_set = NULL;
 /* Queues */
 static QueueHandle_t s_tx_queue = NULL;
 static QueueHandle_t s_rx_queue = NULL;
+static portMUX_TYPE s_control_queue_mux = portMUX_INITIALIZER_UNLOCKED;
+static control_tx_item_t s_control_queue[MESH_CONTROL_QUEUE_CAPACITY] = {0};
+static uint8_t s_control_queue_count = 0;
+static uint32_t s_control_queue_order = 0;
+static int64_t s_contention_next_tx_us = 0;
+
+/* ESP-NOW callbacks run in the Wi-Fi task. This gate serializes every sender
+ * and lets shutdown exclude callbacks before queues are reset. */
+static portMUX_TYPE s_transport_mux = portMUX_INITIALIZER_UNLOCKED;
+static tx_inflight_t s_tx_inflight = {0};
+static SemaphoreHandle_t s_tx_done_semaphore = NULL;
+static SemaphoreHandle_t s_task_stopped_semaphore = NULL;
+static SemaphoreHandle_t s_audio_producer_mutex = NULL;
+static SemaphoreHandle_t s_stop_mutex = NULL;
+static bool s_stopping = false;
+static bool s_rx_enabled = false;
+static uint8_t s_rx_callbacks_active = 0;
+static bool s_send_callback_enabled = false;
+static uint8_t s_tx_callbacks_active = 0;
+static bool s_esp_now_ready = false;
+static esp_now_send_status_t s_last_tx_status = ESP_NOW_SEND_SUCCESS;
 
 /* Multi-hop state */
-static seen_entry_t s_seen_ring[SEEN_RING_SIZE] = {0};
-static uint8_t s_seen_head = 0;
+static mesh_core_dedupe_t s_dedupe = {0};
 static relay_entry_t s_relay_ring[RELAY_RING_SIZE] = {0};
 static uint8_t s_relay_head = 0;
 static uint8_t s_relay_tail = 0;
-static tx_completion_entry_t s_tx_completion_ring[TX_COMPLETION_RING_SIZE] = {0};
-static uint8_t s_tx_completion_head = 0;
-static uint8_t s_tx_completion_tail = 0;
 
 /* Jitter buffer */
 static jitter_entry_t s_jitter_buffer[MESH_JITTER_BUFFER_DEPTH] = {0};
@@ -212,8 +244,9 @@ static TaskHandle_t s_mesh_task = NULL;
 /* ESP-NOW */
 static const uint8_t s_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-/* Protocol sequence numbers */
-static uint8_t s_tx_seq = 0;
+/* Control and locally-originated audio have independent loss domains. */
+static uint8_t s_control_tx_seq = 0;
+static uint8_t s_audio_tx_seq = 0;
 
 /* ============================================================================
  * Forward Declarations
@@ -236,9 +269,11 @@ static void handle_slot_map_packet(const mesh_rx_item_t *rx);
 static void handle_status_packet(const mesh_rx_item_t *rx);
 
 static esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len);
-static esp_err_t tracked_esp_now_send(const uint8_t *dest_mac, const uint8_t *data, size_t len,
-                                      uint8_t type, uint8_t heard_bitmap,
-                                      uint8_t relay_bitmap);
+static esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint16_t len,
+                                       const uint8_t *dest_mac);
+static esp_err_t tracked_esp_now_send(const uint8_t *dest_mac, uint8_t *data, size_t len,
+                                      uint8_t type, uint8_t heard_bitmap, uint8_t relay_bitmap,
+                                      uint8_t *sequence, bool audio_origin);
 static esp_err_t send_join_request(void);
 static esp_err_t send_join_ack(uint8_t node_id, uint8_t slot, const uint8_t *dest_mac);
 static esp_err_t send_sync(void);
@@ -248,26 +283,25 @@ static esp_err_t send_status(void);
 static esp_err_t send_audio_in_slot(void);
 static void service_tx_slot(void);
 static void service_control_window(void);
+static void reset_control_queue(void);
 static void service_frame_boundary(const frame_event_t *event);
 static void drain_slot_signal(void);
 static void clear_transient_mesh_state(void);
 static void advance_tdma_generation(void);
 static esp_err_t arm_frame_timer(int64_t delay_us);
+static bool wait_for_tx_idle(TickType_t timeout_ticks);
+static bool wait_for_rx_quiesced(TickType_t timeout_ticks);
+static esp_err_t init_esp_now_transport(void);
+static void force_cleanup_esp_now_transport(void);
 
 static void set_state(mesh_state_t new_state);
-static uint8_t assign_node_id(const uint8_t *mac);
-static int8_t assign_slot(uint8_t node_id);
 static void check_peer_timeouts(void);
 static void jitter_buffer_insert(const uint8_t *data, uint16_t len, uint8_t src_id, uint8_t seq,
                                  uint8_t audio_flags);
 static bool jitter_buffer_pop(uint8_t *data, uint16_t *len, uint8_t *src_id,
                               uint8_t *audio_flags);
 
-static int compare_mac(const uint8_t *a, const uint8_t *b);
 static void demote_to_participant(const uint8_t *coordinator_mac, uint8_t coordinator_id);
-static uint8_t node_bit(uint8_t node_id);
-static bool seen_packet(uint8_t type, uint8_t src_id, uint8_t seq);
-static void remember_packet(uint8_t type, uint8_t src_id, uint8_t seq);
 static bool relay_queue_empty(void);
 static bool enqueue_relay_packet(const uint8_t *data, uint16_t len, uint8_t ttl, uint8_t flags);
 static void clear_speaker_state(void);
@@ -276,39 +310,29 @@ static uint8_t compute_relay_mask(uint8_t speaker_id);
 static void send_speaker_release_for(uint8_t speaker_id);
 static void update_speaker_grants(void);
 
-static uint8_t node_bit(uint8_t node_id)
-{
-    if (node_id == 0 || node_id > MESH_MAX_NODES) {
-        return 0;
-    }
+static control_priority_t control_priority(uint8_t type);
+static bool control_type_replaceable(uint8_t type);
+static esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len,
+                                        const uint8_t *dest_mac);
+static bool dequeue_control_packet(control_tx_item_t *item);
+static bool owns_control_window(uint32_t frame_counter);
+static bool control_queue_pending(void);
 
-    return (uint8_t)(1U << (node_id - 1));
-}
+#define STATS_ADD(field, value)                                                                     \
+    do {                                                                                            \
+        taskENTER_CRITICAL(&s_stats_mux);                                                           \
+        s_stats.field += (value);                                                                   \
+        taskEXIT_CRITICAL(&s_stats_mux);                                                            \
+    } while (0)
 
-static bool seen_packet(uint8_t type, uint8_t src_id, uint8_t seq)
-{
-    for (size_t i = 0; i < SEEN_RING_SIZE; i++) {
-        if (!s_seen_ring[i].valid) {
-            continue;
-        }
+#define STATS_INC(field) STATS_ADD(field, 1)
 
-        if (s_seen_ring[i].type == type && s_seen_ring[i].src_id == src_id &&
-            s_seen_ring[i].seq == seq) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void remember_packet(uint8_t type, uint8_t src_id, uint8_t seq)
-{
-    s_seen_ring[s_seen_head].type = type;
-    s_seen_ring[s_seen_head].src_id = src_id;
-    s_seen_ring[s_seen_head].seq = seq;
-    s_seen_ring[s_seen_head].valid = true;
-    s_seen_head = (uint8_t)((s_seen_head + 1) % SEEN_RING_SIZE);
-}
+#define STATS_SET(field, value)                                                                     \
+    do {                                                                                            \
+        taskENTER_CRITICAL(&s_stats_mux);                                                           \
+        s_stats.field = (value);                                                                    \
+        taskEXIT_CRITICAL(&s_stats_mux);                                                            \
+    } while (0)
 
 static bool relay_queue_empty(void)
 {
@@ -340,6 +364,224 @@ static bool enqueue_relay_packet(const uint8_t *data, uint16_t len, uint8_t ttl,
 
     s_relay_head = next_head;
     return true;
+}
+
+static control_priority_t control_priority(uint8_t type)
+{
+    switch (type) {
+    case MESH_PKT_SYNC:
+        return CONTROL_PRIORITY_SYNC;
+    case MESH_PKT_JOIN_ACK:
+    case MESH_PKT_LEAVE:
+        return CONTROL_PRIORITY_LIFECYCLE;
+    case MESH_PKT_SLOT_MAP:
+    case MESH_PKT_SPEAKER_GRANT:
+    case MESH_PKT_SPEAKER_RELEASE:
+        return CONTROL_PRIORITY_TOPOLOGY;
+    default:
+        return CONTROL_PRIORITY_PERIODIC;
+    }
+}
+
+static bool control_type_replaceable(uint8_t type)
+{
+    return type == MESH_PKT_STATUS || type == MESH_PKT_KEEPALIVE ||
+           type == MESH_PKT_SLOT_MAP || type == MESH_PKT_SPEAKER_GRANT ||
+           type == MESH_PKT_JOIN_ACK;
+}
+
+static void stats_set_control_depth(uint8_t depth, bool update_high_watermark)
+{
+    taskENTER_CRITICAL(&s_stats_mux);
+    s_stats.control_queue_depth = depth;
+    if (update_high_watermark && depth > s_stats.control_queue_high_watermark) {
+        s_stats.control_queue_high_watermark = depth;
+    }
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
+static void restore_status_bitmaps(const control_tx_item_t *item)
+{
+    if (item == NULL || item->type != MESH_PKT_STATUS ||
+        item->len != sizeof(mesh_header_t) + sizeof(mesh_status_payload_t)) {
+        return;
+    }
+
+    const mesh_status_payload_t *status =
+        (const mesh_status_payload_t *)(item->data + sizeof(mesh_header_t));
+    taskENTER_CRITICAL(&s_speaker_mux);
+    s_heard_bitmap |= status->heard_bitmap;
+    s_relay_bitmap |= status->relay_bitmap;
+    taskEXIT_CRITICAL(&s_speaker_mux);
+}
+
+static esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len,
+                                        const uint8_t *dest_mac)
+{
+    if (type == MESH_PKT_SYNC) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (len > sizeof(s_control_queue[0].data) - sizeof(mesh_header_t) ||
+        (len > 0 && payload == NULL) || dest_mac == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool stopping = s_stopping;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    if (stopping) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    control_tx_item_t item = {
+        .len = (uint16_t)(sizeof(mesh_header_t) + len),
+        .enqueued_us = esp_timer_get_time(),
+        .type = type,
+        .priority = control_priority(type),
+    };
+    memcpy(item.dest_mac, dest_mac, sizeof(item.dest_mac));
+    mesh_header_t *header = (mesh_header_t *)item.data;
+    *header = (mesh_header_t){
+        .version = MESH_PROTOCOL_VERSION,
+        .type = type,
+        .src_id = s_node_id,
+        .seq = 0,
+        .ttl = 0,
+        .flags = 0,
+        .payload_len = len,
+    };
+    if (len > 0) {
+        memcpy(item.data + sizeof(mesh_header_t), payload, len);
+    }
+
+    control_tx_item_t evicted = {0};
+    bool have_evicted = false;
+    esp_err_t result = ESP_OK;
+
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    if (control_type_replaceable(type)) {
+        for (uint8_t i = 0; i < s_control_queue_count; i++) {
+            control_tx_item_t *queued = &s_control_queue[i];
+            if (queued->type != type ||
+                memcmp(queued->dest_mac, dest_mac, sizeof(queued->dest_mac)) != 0) {
+                continue;
+            }
+
+            if (type == MESH_PKT_STATUS) {
+                mesh_status_payload_t *new_status =
+                    (mesh_status_payload_t *)(item.data + sizeof(mesh_header_t));
+                const mesh_status_payload_t *old_status =
+                    (const mesh_status_payload_t *)(queued->data + sizeof(mesh_header_t));
+                new_status->heard_bitmap |= old_status->heard_bitmap;
+                new_status->relay_bitmap |= old_status->relay_bitmap;
+            }
+            item.order = queued->order;
+            item.enqueued_us = queued->enqueued_us;
+            *queued = item;
+            taskEXIT_CRITICAL(&s_control_queue_mux);
+            return ESP_OK;
+        }
+    }
+
+    if (s_control_queue_count == MESH_CONTROL_QUEUE_CAPACITY) {
+        uint8_t victim = 0;
+        for (uint8_t i = 1; i < s_control_queue_count; i++) {
+            if (s_control_queue[i].priority < s_control_queue[victim].priority ||
+                (s_control_queue[i].priority == s_control_queue[victim].priority &&
+                 s_control_queue[i].order < s_control_queue[victim].order)) {
+                victim = i;
+            }
+        }
+        if (s_control_queue[victim].priority > item.priority ||
+            (s_control_queue[victim].priority == item.priority &&
+             item.priority == CONTROL_PRIORITY_PERIODIC)) {
+            STATS_INC(control_queue_drops);
+            result = ESP_ERR_NO_MEM;
+        } else {
+            evicted = s_control_queue[victim];
+            have_evicted = true;
+            s_control_queue[victim] = s_control_queue[--s_control_queue_count];
+            STATS_INC(control_queue_drops);
+        }
+    }
+
+    if (result == ESP_OK) {
+        item.order = s_control_queue_order++;
+        s_control_queue[s_control_queue_count++] = item;
+    }
+    uint8_t depth = s_control_queue_count;
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+
+    stats_set_control_depth(depth, result == ESP_OK);
+
+    if (have_evicted) {
+        restore_status_bitmaps(&evicted);
+    }
+    return result;
+}
+
+static bool dequeue_control_packet(control_tx_item_t *item)
+{
+    if (item == NULL) {
+        return false;
+    }
+
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    if (s_control_queue_count == 0) {
+        taskEXIT_CRITICAL(&s_control_queue_mux);
+        return false;
+    }
+
+    uint8_t selected = 0;
+    int64_t now_us = esp_timer_get_time();
+    bool selected_overdue =
+        (now_us - s_control_queue[0].enqueued_us) >= (CONTROL_MAX_PRIORITY_WAIT_MS * 1000);
+    for (uint8_t i = 1; i < s_control_queue_count; i++) {
+        bool overdue =
+            (now_us - s_control_queue[i].enqueued_us) >= (CONTROL_MAX_PRIORITY_WAIT_MS * 1000);
+        if ((overdue && !selected_overdue) ||
+            (overdue == selected_overdue && overdue &&
+             s_control_queue[i].order < s_control_queue[selected].order) ||
+            (!overdue && !selected_overdue &&
+             (s_control_queue[i].priority > s_control_queue[selected].priority ||
+              (s_control_queue[i].priority == s_control_queue[selected].priority &&
+               s_control_queue[i].order < s_control_queue[selected].order)))) {
+            selected = i;
+            selected_overdue = overdue;
+        }
+    }
+    *item = s_control_queue[selected];
+    s_control_queue[selected] = s_control_queue[--s_control_queue_count];
+    uint8_t depth = s_control_queue_count;
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+    stats_set_control_depth(depth, false);
+    return true;
+}
+
+static void reset_control_queue(void)
+{
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    memset(s_control_queue, 0, sizeof(s_control_queue));
+    s_control_queue_count = 0;
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+    stats_set_control_depth(0, false);
+}
+
+static bool owns_control_window(uint32_t frame_counter)
+{
+    /* Slot ownership rotates by frame. Every sync frame is reserved for the
+     * coordinator in slot 0 so participants never contend with timing sync. */
+    uint8_t owner_slot = (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0
+                             ? 0
+                             : (uint8_t)(frame_counter % MESH_VOICE_SLOTS);
+    return s_slot_index == (int8_t)owner_slot;
+}
+
+static bool control_queue_pending(void)
+{
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    bool pending = s_control_queue_count > 0;
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+    return pending;
 }
 
 static void clear_speaker_state(void)
@@ -391,7 +633,7 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
         return;
     }
 
-    uint8_t bit = node_bit(src_id);
+    uint8_t bit = mesh_core_node_bit(src_id);
     int64_t deadline = (esp_timer_get_time() / 1000) + ACTIVE_SPEAKER_TIMEOUT_MS;
     taskENTER_CRITICAL(&s_speaker_mux);
     s_heard_bitmap |= bit;
@@ -401,10 +643,7 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
 
 static uint8_t compute_relay_mask(uint8_t speaker_id)
 {
-    uint8_t speaker_mask = node_bit(speaker_id);
-    uint8_t members = 0;
-    uint8_t heard = 0;
-    uint8_t member_count = 0;
+    mesh_core_peer_snapshot_t peers[MESH_MAX_NODES];
     uint8_t local_heard;
 
     taskENTER_CRITICAL(&s_speaker_mux);
@@ -413,29 +652,14 @@ static uint8_t compute_relay_mask(uint8_t speaker_id)
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (!s_peers[i].info.active || s_peers[i].info.node_id == 0 ||
-            s_peers[i].info.node_id == speaker_id) {
-            continue;
-        }
-
-        uint8_t peer_bit = node_bit(s_peers[i].info.node_id);
-        members |= peer_bit;
-        member_count++;
-
-        uint8_t heard_bitmap = s_peers[i].info.node_id == s_node_id
-                                   ? local_heard
-                                   : s_peers[i].info.heard_bitmap;
-        if ((heard_bitmap & speaker_mask) != 0) {
-            heard |= peer_bit;
-        }
+        peers[i] = (mesh_core_peer_snapshot_t){
+            .node_id = s_peers[i].info.node_id,
+            .heard_bitmap = s_peers[i].info.heard_bitmap,
+            .active = s_peers[i].info.active,
+        };
     }
     xSemaphoreGive(s_peer_mutex);
-
-    if (member_count <= 1 || (members & (uint8_t)~heard) == 0) {
-        return 0;
-    }
-
-    return heard != 0 ? heard : members;
+    return mesh_core_relay_mask(speaker_id, s_node_id, local_heard, peers, MESH_MAX_NODES);
 }
 
 static void send_speaker_release_for(uint8_t speaker_id)
@@ -519,6 +743,37 @@ static void update_speaker_grants(void)
     (void)send_packet(MESH_PKT_SPEAKER_GRANT, &payload, sizeof(payload));
 }
 
+static esp_err_t init_esp_now_transport(void)
+{
+    esp_err_t ret = esp_now_init();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if ((ret = esp_now_register_recv_cb(esp_now_recv_cb)) != ESP_OK ||
+        (ret = esp_now_register_send_cb(esp_now_send_cb)) != ESP_OK) {
+        esp_now_deinit();
+        return ret;
+    }
+
+    esp_now_peer_info_t peer = {0};
+    memcpy(peer.peer_addr, s_broadcast_mac, sizeof(peer.peer_addr));
+    peer.channel = s_config.channel;
+    peer.ifidx = WIFI_IF_STA;
+    peer.encrypt = false;
+    if ((ret = esp_now_add_peer(&peer)) != ESP_OK) {
+        esp_now_unregister_recv_cb();
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
+        return ret;
+    }
+
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_send_callback_enabled = true;
+    s_esp_now_ready = true;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    return ESP_OK;
+}
+
 /* ============================================================================
  * Public Functions
  * ============================================================================ */
@@ -550,10 +805,16 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     s_jitter_mutex = xSemaphoreCreateMutex();
     s_slot_semaphore = xSemaphoreCreateBinary();
     s_control_semaphore = xSemaphoreCreateBinary();
+    s_tx_done_semaphore = xSemaphoreCreateBinary();
+    s_task_stopped_semaphore = xSemaphoreCreateBinary();
+    s_audio_producer_mutex = xSemaphoreCreateMutex();
+    s_stop_mutex = xSemaphoreCreateMutex();
     s_frame_event_queue = xQueueCreate(1, sizeof(frame_event_t));
     s_timer_queue_set = xQueueCreateSet(3);
 
     if (!s_peer_mutex || !s_jitter_mutex || !s_slot_semaphore || !s_control_semaphore ||
+        !s_tx_done_semaphore || !s_task_stopped_semaphore || !s_audio_producer_mutex ||
+        !s_stop_mutex ||
         !s_frame_event_queue || !s_timer_queue_set) {
         ESP_LOGE(TAG, "Failed to create semaphores");
         return ESP_ERR_NO_MEM;
@@ -586,17 +847,7 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(s_config.tx_power * 4)); /* Unit: 0.25 dBm */
 
     /* Initialize ESP-NOW */
-    ESP_ERROR_CHECK(esp_now_init());
-    ESP_ERROR_CHECK(esp_now_register_recv_cb(esp_now_recv_cb));
-    ESP_ERROR_CHECK(esp_now_register_send_cb(esp_now_send_cb));
-
-    /* Add broadcast peer */
-    esp_now_peer_info_t peer = {0};
-    memcpy(peer.peer_addr, s_broadcast_mac, 6);
-    peer.channel = s_config.channel;
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    ESP_ERROR_CHECK(init_esp_now_transport());
 
     /* Create frame timer */
     esp_timer_create_args_t timer_args = {
@@ -624,8 +875,18 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     ESP_ERROR_CHECK(esp_timer_create(&control_timer_args, &s_control_timer));
 
     /* Clear stats */
+    taskENTER_CRITICAL(&s_stats_mux);
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.latency_min_us = UINT32_MAX;
+    taskEXIT_CRITICAL(&s_stats_mux);
+    reset_control_queue();
+    s_contention_next_tx_us = 0;
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_tx_inflight = (tx_inflight_t){0};
+    s_stopping = false;
+    s_rx_enabled = false;
+    s_rx_callbacks_active = 0;
+    taskEXIT_CRITICAL(&s_transport_mux);
 
     s_initialized = true;
     ESP_LOGI(TAG, "Mesh subsystem initialized");
@@ -641,9 +902,10 @@ esp_err_t mesh_deinit(void)
 
     ESP_LOGI(TAG, "Deinitializing mesh subsystem");
 
+    esp_err_t result = ESP_OK;
     /* Stop if running */
     if (s_state != MESH_STATE_IDLE) {
-        mesh_stop();
+        result = mesh_stop();
     }
 
     /* Cleanup timer */
@@ -661,9 +923,15 @@ esp_err_t mesh_deinit(void)
     }
 
     /* Cleanup ESP-NOW */
-    esp_now_unregister_recv_cb();
-    esp_now_unregister_send_cb();
-    esp_now_deinit();
+    if (s_esp_now_ready) {
+        esp_now_unregister_recv_cb();
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
+        taskENTER_CRITICAL(&s_transport_mux);
+        s_send_callback_enabled = false;
+        s_esp_now_ready = false;
+        taskEXIT_CRITICAL(&s_transport_mux);
+    }
 
     /* Cleanup WiFi */
     esp_wifi_stop();
@@ -678,6 +946,7 @@ esp_err_t mesh_deinit(void)
         vQueueDelete(s_rx_queue);
         s_rx_queue = NULL;
     }
+    reset_control_queue();
 
     /* Cleanup semaphores */
     if (s_peer_mutex) {
@@ -698,6 +967,22 @@ esp_err_t mesh_deinit(void)
         vSemaphoreDelete(s_control_semaphore);
         s_control_semaphore = NULL;
     }
+    if (s_tx_done_semaphore) {
+        vSemaphoreDelete(s_tx_done_semaphore);
+        s_tx_done_semaphore = NULL;
+    }
+    if (s_task_stopped_semaphore) {
+        vSemaphoreDelete(s_task_stopped_semaphore);
+        s_task_stopped_semaphore = NULL;
+    }
+    if (s_audio_producer_mutex) {
+        vSemaphoreDelete(s_audio_producer_mutex);
+        s_audio_producer_mutex = NULL;
+    }
+    if (s_stop_mutex) {
+        vSemaphoreDelete(s_stop_mutex);
+        s_stop_mutex = NULL;
+    }
     if (s_frame_event_queue) {
         xQueueRemoveFromSet(s_frame_event_queue, s_timer_queue_set);
         vQueueDelete(s_frame_event_queue);
@@ -713,7 +998,7 @@ esp_err_t mesh_deinit(void)
     s_node_id = 0;
     s_slot_index = -1;
 
-    return ESP_OK;
+    return result;
 }
 
 esp_err_t mesh_start(void)
@@ -729,27 +1014,56 @@ esp_err_t mesh_start(void)
 
     ESP_LOGI(TAG, "Starting mesh networking");
 
+    if (!s_esp_now_ready) {
+        esp_err_t ret = init_esp_now_transport();
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_stopping = false;
+    s_rx_enabled = true;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    set_state(MESH_STATE_SCANNING);
+    (void)xSemaphoreTake(s_task_stopped_semaphore, 0);
+
     /* Create mesh task */
     BaseType_t ret = xTaskCreatePinnedToCore(mesh_task, "mesh", MESH_TASK_STACK_SIZE, NULL,
                                              MESH_TASK_PRIORITY, &s_mesh_task, MESH_TASK_CORE);
 
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create mesh task");
+        taskENTER_CRITICAL(&s_transport_mux);
+        s_rx_enabled = false;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        set_state(MESH_STATE_IDLE);
         return ESP_ERR_NO_MEM;
     }
-
-    set_state(MESH_STATE_SCANNING);
 
     return ESP_OK;
 }
 
 esp_err_t mesh_stop(void)
 {
-    if (!s_initialized || s_state == MESH_STATE_IDLE) {
+    if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    xSemaphoreTake(s_stop_mutex, portMAX_DELAY);
+    if (s_state == MESH_STATE_IDLE && !s_stopping) {
+        xSemaphoreGive(s_stop_mutex);
+        return ESP_OK;
+    }
+
     ESP_LOGI(TAG, "Stopping mesh networking");
+
+    esp_err_t result = ESP_OK;
+    bool was_active = s_state == MESH_STATE_ACTIVE;
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_stopping = true;
+    s_rx_enabled = false;
+    taskEXIT_CRITICAL(&s_transport_mux);
 
     advance_tdma_generation();
     /* Stop frame timer */
@@ -758,18 +1072,56 @@ esp_err_t mesh_stop(void)
     esp_timer_stop(s_control_timer);
     drain_slot_signal();
 
-    /* Send LEAVE if we were active */
-    if (s_state == MESH_STATE_ACTIVE) {
-        /* Send leave notification (best effort) */
-        send_packet(MESH_PKT_LEAVE, NULL, 0);
-    }
-
-    /* Stop task */
-    if (s_mesh_task) {
-        vTaskDelete(s_mesh_task);
+    /* Wake the task and let it leave its current producer path itself. */
+    xSemaphoreGive(s_slot_semaphore);
+    xSemaphoreGive(s_control_semaphore);
+    if (s_mesh_task != NULL &&
+        xSemaphoreTake(s_task_stopped_semaphore, pdMS_TO_TICKS(TASK_QUIESCE_TIMEOUT_MS)) !=
+            pdTRUE) {
+        ESP_LOGE(TAG, "Timed out stopping mesh task");
+        TaskHandle_t task = s_mesh_task;
         s_mesh_task = NULL;
+        if (task != NULL) {
+            vTaskDelete(task);
+        }
+        result = ESP_ERR_TIMEOUT;
     }
 
+    /* Exclude a mesh_send_audio() call admitted immediately before stopping. */
+    xSemaphoreTake(s_audio_producer_mutex, portMAX_DELAY);
+    xSemaphoreGive(s_audio_producer_mutex);
+
+    bool force_transport_cleanup = false;
+    if (!wait_for_rx_quiesced(pdMS_TO_TICKS(RX_QUIESCE_TIMEOUT_MS)) ||
+        !wait_for_tx_idle(pdMS_TO_TICKS(TX_QUIESCE_TIMEOUT_MS))) {
+        ESP_LOGE(TAG, "Timed out quiescing ESP-NOW callbacks");
+        result = ESP_ERR_TIMEOUT;
+        force_transport_cleanup = true;
+    }
+
+    if (was_active && !force_transport_cleanup) {
+        esp_err_t leave_ret = send_packet_immediate(MESH_PKT_LEAVE, NULL, 0, s_broadcast_mac);
+        if (leave_ret != ESP_OK) {
+            result = leave_ret;
+        } else if (!wait_for_tx_idle(pdMS_TO_TICKS(TX_QUIESCE_TIMEOUT_MS))) {
+            ESP_LOGE(TAG, "Timed out waiting for LEAVE completion");
+            result = ESP_ERR_TIMEOUT;
+            force_transport_cleanup = true;
+        } else {
+            taskENTER_CRITICAL(&s_transport_mux);
+            esp_now_send_status_t leave_status = s_last_tx_status;
+            taskEXIT_CRITICAL(&s_transport_mux);
+            if (leave_status != ESP_NOW_SEND_SUCCESS) {
+                result = ESP_FAIL;
+            }
+        }
+    }
+
+    if (force_transport_cleanup) {
+        force_cleanup_esp_now_transport();
+    }
+
+    /* Shared cleanup epilogue: no producer or admitted callback can reach a queue. */
     xQueueReset(s_rx_queue);
     clear_transient_mesh_state();
 
@@ -782,9 +1134,8 @@ esp_err_t mesh_stop(void)
     clear_speaker_state();
     taskENTER_CRITICAL(&s_speaker_mux);
     memset(s_active_speaker_deadline_ms, 0, sizeof(s_active_speaker_deadline_ms));
-    memset(s_seen_ring, 0, sizeof(s_seen_ring));
+    mesh_core_dedupe_reset(&s_dedupe);
     memset(s_relay_ring, 0, sizeof(s_relay_ring));
-    s_seen_head = 0;
     s_relay_head = 0;
     s_relay_tail = 0;
     s_heard_bitmap = 0;
@@ -798,10 +1149,16 @@ esp_err_t mesh_stop(void)
     s_frame_counter = 0;
     s_coordinator_id = 0;
     memset(s_coordinator_mac, 0, sizeof(s_coordinator_mac));
+    s_control_tx_seq = 0;
+    s_audio_tx_seq = 0;
 
     set_state(MESH_STATE_IDLE);
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_stopping = false;
+    taskEXIT_CRITICAL(&s_transport_mux);
 
-    return ESP_OK;
+    xSemaphoreGive(s_stop_mutex);
+    return result;
 }
 
 bool mesh_is_initialized(void)
@@ -873,11 +1230,17 @@ esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (s_state != MESH_STATE_ACTIVE) {
+    xSemaphoreTake(s_audio_producer_mutex, portMAX_DELAY);
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool stopping = s_stopping;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    if (stopping || s_state != MESH_STATE_ACTIVE) {
+        xSemaphoreGive(s_audio_producer_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
     if (len > MESH_MAX_OPUS_BYTES) {
+        xSemaphoreGive(s_audio_producer_mutex);
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -888,10 +1251,12 @@ esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags
     item.timestamp_us = esp_timer_get_time();
 
     if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
-        s_stats.packets_dropped++;
+        STATS_INC(packets_dropped);
+        xSemaphoreGive(s_audio_producer_mutex);
         return ESP_ERR_NO_MEM;
     }
 
+    xSemaphoreGive(s_audio_producer_mutex);
     return ESP_OK;
 }
 
@@ -919,14 +1284,24 @@ esp_err_t mesh_get_stats(mesh_stats_t *stats)
         return ESP_ERR_INVALID_ARG;
     }
 
+    taskENTER_CRITICAL(&s_stats_mux);
     *stats = s_stats;
+    taskEXIT_CRITICAL(&s_stats_mux);
     return ESP_OK;
 }
 
 esp_err_t mesh_reset_stats(void)
 {
+    uint8_t control_depth;
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    control_depth = s_control_queue_count;
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+    taskENTER_CRITICAL(&s_stats_mux);
     memset(&s_stats, 0, sizeof(s_stats));
     s_stats.latency_min_us = UINT32_MAX;
+    s_stats.control_queue_depth = control_depth;
+    s_stats.control_queue_high_watermark = control_depth;
+    taskEXIT_CRITICAL(&s_stats_mux);
     return ESP_OK;
 }
 
@@ -975,14 +1350,23 @@ static void mesh_task(void *arg)
 
     int64_t scan_start = esp_timer_get_time();
     int64_t last_join_attempt = 0;
+    int64_t join_deadline = 0;
     int64_t last_keepalive = 0;
     int64_t last_status = 0;
     int64_t last_beacon = 0;
     int join_attempts = 0;
     bool saw_lower_mac = false;        /* Track if we saw a node with lower MAC */
     mesh_state_t prev_state = s_state; /* Track state changes for resets */
+    s_contention_next_tx_us = scan_start + (esp_random() % (CONTENTION_JITTER_MS + 1)) * 1000;
 
     while (1) {
+        taskENTER_CRITICAL(&s_transport_mux);
+        bool stopping = s_stopping;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        if (stopping) {
+            break;
+        }
+
         int64_t now = esp_timer_get_time();
 
         /* Reset scan variables when transitioning TO scanning state */
@@ -991,10 +1375,12 @@ static void mesh_task(void *arg)
             scan_start = now;
             saw_lower_mac = false;
             last_beacon = 0;
+            s_contention_next_tx_us = now + (esp_random() % (CONTENTION_JITTER_MS + 1)) * 1000;
         }
         if (s_state == MESH_STATE_JOINING && prev_state != MESH_STATE_JOINING) {
             join_attempts = 0;
             last_join_attempt = 0;
+            join_deadline = now + (MESH_JOIN_TIMEOUT_MS * 1000);
         }
         prev_state = s_state;
 
@@ -1029,7 +1415,8 @@ static void mesh_task(void *arg)
                     /* If we see a JOIN from another scanning node, check MAC for election */
                     else if (rx.header.type == MESH_PKT_JOIN) {
                         /* Compare MAC addresses - lower MAC will become coordinator */
-                        if (memcmp(rx.src_mac, s_local_mac, 6) < 0) {
+                        if (mesh_core_address_compare(rx.src_mac, s_local_mac,
+                                                      sizeof(s_local_mac)) < 0) {
                             ESP_LOGI(TAG,
                                      "SCAN: Saw node with lower MAC, deferring coordinator role");
                             saw_lower_mac = true;
@@ -1049,9 +1436,10 @@ static void mesh_task(void *arg)
                 /* Send periodic beacon (JOIN request) for discovery */
                 /* Beacons help other scanning nodes discover us */
                 if ((now - last_beacon) > (300 * 1000)) { /* Every 300ms */
-                    send_join_request();
-                    last_beacon = now;
-                    ESP_LOGD(TAG, "SCAN: Sent beacon (JOIN request)");
+                    if (send_join_request() == ESP_OK) {
+                        last_beacon = now;
+                        ESP_LOGD(TAG, "SCAN: Sent beacon (JOIN request)");
+                    }
                 }
 
                 /* Timeout - become coordinator */
@@ -1106,38 +1494,29 @@ static void mesh_task(void *arg)
                     break;
                 }
 
+                if (now >= join_deadline) {
+                    ESP_LOGW(TAG, "JOIN deadline expired, returning to election scan");
+                    clear_transient_mesh_state();
+                    xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
+                    memset(s_peers, 0, sizeof(s_peers));
+                    s_peer_count = 0;
+                    xSemaphoreGive(s_peer_mutex);
+                    s_role = MESH_ROLE_NONE;
+                    s_node_id = 0;
+                    s_slot_index = -1;
+                    s_coordinator_id = 0;
+                    memset(s_coordinator_mac, 0, sizeof(s_coordinator_mac));
+                    set_state(MESH_STATE_SCANNING);
+                    break;
+                }
+
                 /* Send JOIN request periodically */
                 if ((now - last_join_attempt) > (MESH_JOIN_RETRY_MS * 1000)) {
-                    if (join_attempts < MESH_JOIN_RETRY_COUNT) {
-                        send_join_request();
+                    last_join_attempt = now;
+                    if (send_join_request() == ESP_OK) {
                         join_attempts++;
-                        s_stats.join_attempts++;
-                        last_join_attempt = now;
+                        STATS_INC(join_attempts);
                         ESP_LOGI(TAG, "JOIN request #%d sent", join_attempts);
-                    } else {
-                        /* Give up and become coordinator */
-                        ESP_LOGW(TAG, "JOIN timeout, becoming coordinator");
-                        clear_transient_mesh_state();
-                        s_role = MESH_ROLE_COORDINATOR;
-                        s_node_id = 1;
-                        s_slot_index = 0;
-                        s_coordinator_id = 1;
-
-                        xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
-                        memset(s_peers, 0, sizeof(s_peers));
-                        s_peers[0].info.node_id = 1;
-                        memcpy(s_peers[0].info.mac_addr, s_local_mac, 6);
-                        s_peers[0].info.slot_index = 0;
-                        s_peers[0].info.active = true;
-                        s_peers[0].info.last_seen_ms = now / 1000;
-                        s_peer_count = 1;
-                        xSemaphoreGive(s_peer_mutex);
-
-                        advance_tdma_generation();
-                        s_frame_start_us = esp_timer_get_time();
-                        arm_frame_timer(MESH_FRAME_US);
-
-                        set_state(MESH_STATE_ACTIVE);
                     }
                 }
 
@@ -1220,6 +1599,10 @@ static void mesh_task(void *arg)
             break;
         }
     }
+
+    xSemaphoreGive(s_task_stopped_semaphore);
+    s_mesh_task = NULL;
+    vTaskDelete(NULL);
 }
 
 /* ============================================================================
@@ -1269,8 +1652,7 @@ static void service_frame_boundary(const frame_event_t *event)
     s_frame_start_us = frame_start_us;
     taskEXIT_CRITICAL(&s_tdma_mux);
 
-    if (s_role == MESH_ROLE_COORDINATOR &&
-        (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0) {
+    if (owns_control_window(frame_counter)) {
         taskENTER_CRITICAL(&s_tdma_mux);
         s_control_start_us = frame_start_us + (MESH_VOICE_SLOTS * MESH_SLOT_US);
         s_control_deadline_us = s_control_start_us + MESH_CONTROL_US - MESH_GUARD_US;
@@ -1297,7 +1679,7 @@ static void service_frame_boundary(const frame_event_t *event)
         if (slot_delay_us <= 0) {
             xSemaphoreGive(s_slot_semaphore);
         } else if (esp_timer_start_once(s_slot_timer, slot_delay_us) != ESP_OK) {
-            s_stats.slot_misses++;
+            STATS_INC(slot_misses);
         }
     }
 
@@ -1326,7 +1708,14 @@ static void service_tx_slot(void)
     int64_t now_us = esp_timer_get_time();
     if (!valid || s_state != MESH_STATE_ACTIVE || s_slot_index < 0 || now_us < slot_start_us ||
         now_us > deadline_us) {
-        s_stats.slot_misses++;
+        STATS_INC(slot_misses);
+        return;
+    }
+
+    uint32_t frame_counter = mesh_get_frame_counter();
+    bool sync_due = s_role == MESH_ROLE_COORDINATOR &&
+                    (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0;
+    if (owns_control_window(frame_counter) && (sync_due || control_queue_pending())) {
         return;
     }
 
@@ -1344,9 +1733,52 @@ static void service_control_window(void)
     taskEXIT_CRITICAL(&s_tdma_mux);
 
     int64_t now_us = esp_timer_get_time();
-    if (valid && s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_COORDINATOR &&
-        now_us >= control_start_us && now_us <= control_deadline_us) {
-        send_sync();
+    if (!valid || s_state != MESH_STATE_ACTIVE || now_us < control_start_us ||
+        now_us > control_deadline_us) {
+        return;
+    }
+
+    uint32_t frame_counter = mesh_get_frame_counter();
+    if (!owns_control_window(frame_counter)) {
+        return;
+    }
+
+    if (s_role == MESH_ROLE_COORDINATOR &&
+        (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0) {
+        if (!wait_for_tx_idle(0) || send_sync() != ESP_OK) {
+            STATS_INC(control_queue_drops);
+        }
+        return;
+    }
+
+    if (!wait_for_tx_idle(0)) {
+        int64_t remaining_us = control_deadline_us - esp_timer_get_time();
+        TickType_t wait_ticks = remaining_us > 0
+                                    ? pdMS_TO_TICKS((remaining_us + 999) / 1000)
+                                    : 0;
+        if (!wait_for_tx_idle(wait_ticks) || esp_timer_get_time() > control_deadline_us) {
+            return;
+        }
+    }
+
+    control_tx_item_t item;
+    if (wait_for_tx_idle(0) && dequeue_control_packet(&item)) {
+        const mesh_status_payload_t *status = NULL;
+        uint8_t heard_bitmap = 0;
+        uint8_t relay_bitmap = 0;
+        if (item.type == MESH_PKT_STATUS &&
+            item.len == sizeof(mesh_header_t) + sizeof(mesh_status_payload_t)) {
+            status = (const mesh_status_payload_t *)(item.data + sizeof(mesh_header_t));
+            heard_bitmap = status->heard_bitmap;
+            relay_bitmap = status->relay_bitmap;
+        }
+        esp_err_t ret = tracked_esp_now_send(item.dest_mac, item.data, item.len, item.type,
+                                             heard_bitmap, relay_bitmap, &s_control_tx_seq, false);
+        if (ret != ESP_OK) {
+            restore_status_bitmaps(&item);
+            STATS_INC(control_queue_drops);
+            STATS_INC(packets_dropped);
+        }
     }
 }
 
@@ -1384,9 +1816,8 @@ static void clear_transient_mesh_state(void)
     clear_speaker_state();
     taskENTER_CRITICAL(&s_speaker_mux);
     memset(s_active_speaker_deadline_ms, 0, sizeof(s_active_speaker_deadline_ms));
-    memset(s_seen_ring, 0, sizeof(s_seen_ring));
+    mesh_core_dedupe_reset(&s_dedupe);
     memset(s_relay_ring, 0, sizeof(s_relay_ring));
-    s_seen_head = 0;
     s_relay_head = 0;
     s_relay_tail = 0;
     s_heard_bitmap = 0;
@@ -1399,6 +1830,7 @@ static void clear_transient_mesh_state(void)
     s_jitter_write_idx = 0;
     xSemaphoreGive(s_jitter_mutex);
     xQueueReset(s_tx_queue);
+    reset_control_queue();
 }
 
 /* ============================================================================
@@ -1407,14 +1839,16 @@ static void clear_transient_mesh_state(void)
 
 static void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
-    /* Discard packets if mesh is not active (prevents queue overflow) */
-    if (s_state == MESH_STATE_IDLE) {
+    taskENTER_CRITICAL(&s_transport_mux);
+    if (!s_rx_enabled) {
+        taskEXIT_CRITICAL(&s_transport_mux);
         return;
     }
+    s_rx_callbacks_active++;
+    taskEXIT_CRITICAL(&s_transport_mux);
 
     if (len < sizeof(mesh_header_t)) {
-        ESP_LOGW(TAG, "RX: packet too short (%d bytes)", len);
-        return;
+        goto done;
     }
 
     mesh_rx_item_t rx;
@@ -1425,68 +1859,72 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data
 
     /* Validate header */
     if (rx.header.version != MESH_PROTOCOL_VERSION) {
-        ESP_LOGW(TAG, "RX: invalid version 0x%02X (expected 0x%02X)", rx.header.version,
-                 MESH_PROTOCOL_VERSION);
-        return;
+        goto done;
     }
 
     /* Copy payload */
     uint16_t payload_len = rx.header.payload_len;
     if (payload_len > sizeof(rx.payload) ||
         payload_len > (uint16_t)(len - sizeof(mesh_header_t))) {
-        ESP_LOGW(TAG, "RX: invalid payload length %u for %d-byte packet", payload_len, len);
-        return;
+        goto done;
     }
     if (payload_len > 0) {
         memcpy(rx.payload, data + sizeof(mesh_header_t), payload_len);
     }
 
-    s_stats.packets_rx++;
-
-    /* Only log non-audio packets at INFO level to reduce noise */
-    if (rx.header.type != MESH_PKT_AUDIO) {
-        ESP_LOGI(TAG, "RX: type=0x%02X src=%d seq=%d from " MACSTR " RSSI=%d", rx.header.type,
-                 rx.header.src_id, rx.header.seq, MAC2STR(rx.src_mac), rx.rssi);
-    } else {
-        ESP_LOGD(TAG, "RX: AUDIO src=%d seq=%d RSSI=%d", rx.header.src_id, rx.header.seq, rx.rssi);
-    }
+    STATS_INC(packets_rx);
 
     /* Queue for processing */
-    if (xQueueSendFromISR(s_rx_queue, &rx, NULL) != pdTRUE) {
-        s_stats.rx_queue_overflows++;
-        /* Only log occasionally to avoid log flooding */
-        if ((s_stats.rx_queue_overflows % 10) == 1) {
-            ESP_LOGW(TAG, "RX queue full! (total overflows: %lu)", s_stats.rx_queue_overflows);
-        }
+    if (xQueueSend(s_rx_queue, &rx, 0) != pdTRUE) {
+        STATS_INC(rx_queue_overflows);
     }
+
+done:
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_rx_callbacks_active--;
+    taskEXIT_CRITICAL(&s_transport_mux);
 }
 
 static void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status)
 {
-    (void)send_info; /* Unused in Phase 2 */
+    (void)send_info;
 
-    tx_completion_entry_t completion = {0};
-    taskENTER_CRITICAL(&s_speaker_mux);
-    while (s_tx_completion_tail != s_tx_completion_head) {
-        tx_completion_entry_t *entry = &s_tx_completion_ring[s_tx_completion_tail];
-        s_tx_completion_tail = (uint8_t)((s_tx_completion_tail + 1) % TX_COMPLETION_RING_SIZE);
-        if (entry->valid) {
-            completion = *entry;
-            entry->valid = false;
-            break;
-        }
+    taskENTER_CRITICAL(&s_transport_mux);
+    if (!s_send_callback_enabled) {
+        taskEXIT_CRITICAL(&s_transport_mux);
+        return;
     }
+    s_tx_callbacks_active++;
+    if (!s_tx_inflight.active) {
+        s_tx_callbacks_active--;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        return;
+    }
+    tx_inflight_t completion = s_tx_inflight;
+
     if (status != ESP_NOW_SEND_SUCCESS && completion.type == MESH_PKT_STATUS) {
+        taskENTER_CRITICAL(&s_speaker_mux);
         s_heard_bitmap |= completion.heard_bitmap;
         s_relay_bitmap |= completion.relay_bitmap;
+        taskEXIT_CRITICAL(&s_speaker_mux);
     }
-    taskEXIT_CRITICAL(&s_speaker_mux);
 
+    taskENTER_CRITICAL(&s_stats_mux);
     if (status == ESP_NOW_SEND_SUCCESS) {
         s_stats.packets_tx++;
+        if (completion.audio_origin) {
+            s_stats.audio_frames_tx++;
+        }
     } else {
         s_stats.packets_dropped++;
     }
+    taskEXIT_CRITICAL(&s_stats_mux);
+
+    s_last_tx_status = status;
+    s_tx_inflight.active = false;
+    s_tx_callbacks_active--;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    xSemaphoreGive(s_tx_done_semaphore);
 }
 
 /* ============================================================================
@@ -1578,8 +2016,8 @@ static void handle_packet(const mesh_rx_item_t *rx)
             }
         }
         xSemaphoreGive(s_peer_mutex);
+        mesh_core_dedupe_purge_node(&s_dedupe, rx->header.src_id);
         if (peer_removed) {
-            audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
             if (s_peer_cb) {
                 s_peer_cb(&removed_peer, false);
             }
@@ -1613,10 +2051,10 @@ static void handle_audio_packet(const mesh_rx_item_t *rx)
         return;
     }
 
-    if (seen_packet(rx->header.type, rx->header.src_id, rx->header.seq)) {
+    if (!mesh_core_dedupe_accept(&s_dedupe, rx->header.type, rx->header.src_id,
+                                 rx->header.seq)) {
         return;
     }
-    remember_packet(rx->header.type, rx->header.src_id, rx->header.seq);
 
     note_audio_activity(rx->header.src_id, audio->audio_flags);
     if (s_role == MESH_ROLE_COORDINATOR) {
@@ -1630,13 +2068,12 @@ static void handle_audio_packet(const mesh_rx_item_t *rx)
             s_peers[i].info.last_seen_ms = rx->timestamp_us / 1000;
 
             /* Track packet loss */
-            uint8_t expected_seq = s_peers[i].last_seq + 1;
-            if (rx->header.seq != expected_seq && s_peers[i].packets_received > 0) {
-                int lost = (rx->header.seq - expected_seq) & 0xFF;
-                s_peers[i].packets_lost += lost;
-                s_stats.audio_frames_lost += lost;
+            mesh_core_seq_result_t sequence =
+                mesh_core_seq8_accept(&s_peers[i].rx_seq, rx->header.seq);
+            if (sequence.classification == MESH_CORE_SEQ_GAP) {
+                s_peers[i].packets_lost += sequence.gap;
+                STATS_ADD(audio_frames_lost, sequence.gap);
             }
-            s_peers[i].last_seq = rx->header.seq;
             s_peers[i].packets_received++;
             break;
         }
@@ -1657,7 +2094,7 @@ static void handle_audio_packet(const mesh_rx_item_t *rx)
             speaker_state_get(ids, masks);
             for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
                 if (ids[i] == rx->header.src_id &&
-                    (masks[i] & node_bit(s_node_id)) != 0) {
+                    (masks[i] & mesh_core_node_bit(s_node_id)) != 0) {
                     relay_allowed = true;
                     break;
                 }
@@ -1672,7 +2109,7 @@ static void handle_audio_packet(const mesh_rx_item_t *rx)
         }
     }
 
-    s_stats.audio_frames_rx++;
+    STATS_INC(audio_frames_rx);
 
     /* Calculate latency (frame timestamp to receive time) */
     /* For now we just track receive timestamp - proper latency requires TX timestamp in packet */
@@ -1700,20 +2137,31 @@ static void handle_join_packet(const mesh_rx_item_t *rx)
             already_joined = true;
             existing_id = s_peers[i].info.node_id;
             existing_slot = s_peers[i].info.slot_index;
+            s_peers[i].info.last_seen_ms = rx->timestamp_us / 1000;
+            mesh_core_seq8_reset(&s_peers[i].rx_seq);
+            s_peers[i].packets_received = 0;
+            s_peers[i].packets_lost = 0;
             break;
         }
     }
 
     if (already_joined) {
         xSemaphoreGive(s_peer_mutex);
+        mesh_core_dedupe_purge_node(&s_dedupe, existing_id);
         /* Re-send ACK in case previous was lost */
         send_join_ack(existing_id, existing_slot, rx->src_mac);
         return;
     }
 
     /* Assign new node ID and slot */
-    uint8_t new_id = assign_node_id(rx->src_mac);
-    int8_t new_slot = assign_slot(new_id);
+    uint8_t occupied = mesh_core_node_bit(s_node_id);
+    for (int i = 0; i < MESH_MAX_NODES; i++) {
+        if (s_peers[i].info.active) {
+            occupied |= mesh_core_node_bit(s_peers[i].info.node_id);
+        }
+    }
+    uint8_t new_id = mesh_core_first_free_node_id(occupied);
+    int8_t new_slot = mesh_core_slot_for_node_id(new_id);
 
     if (new_id == 0 || new_slot < 0) {
         xSemaphoreGive(s_peer_mutex);
@@ -1731,7 +2179,7 @@ static void handle_join_packet(const mesh_rx_item_t *rx)
             s_peers[i].info.slot_index = new_slot;
             s_peers[i].info.active = true;
             s_peers[i].info.last_seen_ms = rx->timestamp_us / 1000;
-            s_peers[i].last_seq = 0;
+            mesh_core_seq8_reset(&s_peers[i].rx_seq);
             s_peers[i].packets_received = 0;
             s_peers[i].packets_lost = 0;
             s_peer_count++;
@@ -1748,7 +2196,6 @@ static void handle_join_packet(const mesh_rx_item_t *rx)
     xSemaphoreGive(s_peer_mutex);
 
     if (peer_added) {
-        audio_play_notification(AUDIO_NOTIFY_PEER_JOIN);
         if (s_peer_cb) {
             s_peer_cb(&added_peer, true);
         }
@@ -1773,10 +2220,9 @@ static void handle_join_ack_packet(const mesh_rx_item_t *rx)
     }
 
     const mesh_join_ack_payload_t *ack = (const mesh_join_ack_payload_t *)rx->payload;
-    if (ack->assigned_id == 0 || ack->assigned_id > MESH_MAX_NODES ||
-        ack->slot_index == 0 || ack->slot_index >= MESH_VOICE_SLOTS ||
-        ack->coordinator_id == 0 || ack->coordinator_id > MESH_MAX_NODES ||
-        rx->header.src_id != ack->coordinator_id ||
+    uint8_t expected_coordinator = s_state == MESH_STATE_JOINING ? s_coordinator_id : 0;
+    if (!mesh_core_join_assignment_valid(ack, rx->header.src_id, expected_coordinator,
+                                         MESH_VOICE_SLOTS) ||
         (s_state == MESH_STATE_JOINING &&
          memcmp(rx->src_mac, s_coordinator_mac, sizeof(s_coordinator_mac)) != 0)) {
         return;
@@ -1809,7 +2255,7 @@ static void handle_join_ack_packet(const mesh_rx_item_t *rx)
     peer.encrypt = false;
     esp_now_add_peer(&peer);
 
-    s_stats.join_successes++;
+    STATS_INC(join_successes);
     set_state(MESH_STATE_ACTIVE);
 
     ESP_LOGI(TAG, "ACTIVE as participant, node_id=%d, slot=%d", s_node_id, s_slot_index);
@@ -1833,14 +2279,14 @@ static void handle_sync_packet(const mesh_rx_item_t *rx)
         return;
     }
 
-    s_stats.sync_received++;
+    STATS_INC(sync_received);
 
     /* Coordinator conflict resolution - if we're coordinator and receive SYNC from another node,
      * the node with lower MAC wins. Loser demotes to participant. */
     if (s_role == MESH_ROLE_COORDINATOR && rx->header.src_id != s_node_id) {
         const uint8_t *remote_addr = rx->src_mac;
 
-        if (compare_mac(remote_addr, s_local_mac) < 0) {
+        if (mesh_core_address_compare(remote_addr, s_local_mac, sizeof(s_local_mac)) < 0) {
             ESP_LOGW(TAG, "Coordinator conflict detected! Node %d has lower MAC - demoting",
                      rx->header.src_id);
             demote_to_participant(remote_addr, rx->header.src_id);
@@ -1887,10 +2333,10 @@ static void handle_sync_packet(const mesh_rx_item_t *rx)
         int64_t next_frame_us = MESH_FRAME_US - elapsed_us;
         esp_timer_stop(s_frame_timer);
         arm_frame_timer(next_frame_us);
-        s_stats.clock_drift_us = drift_us;
+        STATS_SET(clock_drift_us, drift_us);
 
         if (abs(drift_us) > 100) {
-            s_stats.sync_errors++;
+            STATS_INC(sync_errors);
             ESP_LOGD(TAG, "SYNC drift: %d us", drift_us);
         }
     }
@@ -1928,25 +2374,23 @@ static void handle_keepalive_packet(const mesh_rx_item_t *rx)
 
 static void handle_slot_map_packet(const mesh_rx_item_t *rx)
 {
-    if (rx->header.payload_len != sizeof(mesh_slot_map_payload_t)) {
+    if (s_state != MESH_STATE_ACTIVE || s_role != MESH_ROLE_PARTICIPANT ||
+        rx->header.src_id != s_coordinator_id ||
+        rx->header.payload_len != sizeof(mesh_slot_map_payload_t)) {
         return;
     }
 
     const mesh_slot_map_payload_t *slot_map = (const mesh_slot_map_payload_t *)rx->payload;
-    uint8_t slot_count = slot_map->slot_count;
-    if (slot_count > MESH_MAX_NODES) {
-        slot_count = MESH_MAX_NODES;
+    mesh_core_slot_map_result_t parsed;
+    if (!mesh_core_slot_map_valid(slot_map, s_node_id, s_coordinator_id, &parsed)) {
+        return;
     }
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
-    for (uint8_t slot = 0; slot < slot_count; slot++) {
+    for (uint8_t slot = 0; slot < slot_map->slot_count; slot++) {
         uint8_t node_id = slot_map->slot_ids[slot];
         if (node_id == 0) {
             continue;
-        }
-
-        if (node_id == s_node_id) {
-            s_slot_index = (int8_t)slot;
         }
 
         for (int i = 0; i < MESH_MAX_NODES; i++) {
@@ -1956,6 +2400,8 @@ static void handle_slot_map_packet(const mesh_rx_item_t *rx)
             }
         }
     }
+    s_slot_index = parsed.local_slot;
+    s_peer_count = (uint8_t)(parsed.member_count - 1U);
 
     uint8_t sm_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
     uint8_t sm_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
@@ -1998,68 +2444,162 @@ static void handle_status_packet(const mesh_rx_item_t *rx)
 
 static esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
 {
-    uint8_t buffer[256];
-    mesh_header_t *header = (mesh_header_t *)buffer;
-
-    header->version = MESH_PROTOCOL_VERSION;
-    header->type = type;
-    header->src_id = s_node_id;
-    header->seq = s_tx_seq++;
-    header->ttl = 0;
-    header->flags = 0;
-    header->payload_len = len;
-
-    if (payload && len > 0) {
-        memcpy(buffer + sizeof(mesh_header_t), payload, len);
-    }
-
-    uint8_t heard_bitmap = 0;
-    uint8_t relay_bitmap = 0;
-    if (type == MESH_PKT_STATUS && len == sizeof(mesh_status_payload_t)) {
-        const mesh_status_payload_t *status = (const mesh_status_payload_t *)payload;
-        heard_bitmap = status->heard_bitmap;
-        relay_bitmap = status->relay_bitmap;
-    }
-    esp_err_t ret = tracked_esp_now_send(s_broadcast_mac, buffer, sizeof(mesh_header_t) + len,
-                                         type, heard_bitmap, relay_bitmap);
-    return ret;
+    return enqueue_control_packet(type, payload, len, s_broadcast_mac);
 }
 
-static esp_err_t tracked_esp_now_send(const uint8_t *dest_mac, const uint8_t *data, size_t len,
-                                      uint8_t type, uint8_t heard_bitmap, uint8_t relay_bitmap)
+static esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint16_t len,
+                                       const uint8_t *dest_mac)
 {
-    taskENTER_CRITICAL(&s_speaker_mux);
-    uint8_t entry_index = s_tx_completion_head;
-    uint8_t next_head = (uint8_t)((entry_index + 1) % TX_COMPLETION_RING_SIZE);
-    if (next_head == s_tx_completion_tail) {
-        taskEXIT_CRITICAL(&s_speaker_mux);
-        return ESP_ERR_NO_MEM;
+    if (len > sizeof(s_control_queue[0].data) - sizeof(mesh_header_t) ||
+        (len > 0 && payload == NULL) || dest_mac == NULL) {
+        return ESP_ERR_INVALID_ARG;
     }
-    s_tx_completion_ring[entry_index] = (tx_completion_entry_t){
+
+    uint8_t buffer[sizeof(s_control_queue[0].data)];
+    mesh_header_t *header = (mesh_header_t *)buffer;
+    *header = (mesh_header_t){
+        .version = MESH_PROTOCOL_VERSION,
+        .type = type,
+        .src_id = s_node_id,
+        .seq = 0,
+        .ttl = 0,
+        .flags = 0,
+        .payload_len = len,
+    };
+    if (len > 0) {
+        memcpy(buffer + sizeof(mesh_header_t), payload, len);
+    }
+    return tracked_esp_now_send(dest_mac, buffer, sizeof(mesh_header_t) + len, type, 0, 0,
+                                &s_control_tx_seq, false);
+}
+
+static esp_err_t tracked_esp_now_send(const uint8_t *dest_mac, uint8_t *data, size_t len,
+                                      uint8_t type, uint8_t heard_bitmap, uint8_t relay_bitmap,
+                                      uint8_t *sequence, bool audio_origin)
+{
+    if (dest_mac == NULL || data == NULL || len < sizeof(mesh_header_t)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    taskENTER_CRITICAL(&s_transport_mux);
+    if (s_tx_inflight.active || (s_stopping && type != MESH_PKT_LEAVE)) {
+        taskEXIT_CRITICAL(&s_transport_mux);
+        return ESP_ERR_INVALID_STATE;
+    }
+    mesh_header_t *header = (mesh_header_t *)data;
+    if (sequence != NULL) {
+        header->seq = *sequence;
+        (*sequence)++;
+    }
+    s_tx_inflight = (tx_inflight_t){
         .type = type,
         .heard_bitmap = heard_bitmap,
         .relay_bitmap = relay_bitmap,
-        .valid = true,
+        .audio_origin = audio_origin,
+        .active = true,
     };
-    s_tx_completion_head = next_head;
-    taskEXIT_CRITICAL(&s_speaker_mux);
+    taskEXIT_CRITICAL(&s_transport_mux);
 
     esp_err_t ret = esp_now_send(dest_mac, data, len);
     if (ret != ESP_OK) {
-        taskENTER_CRITICAL(&s_speaker_mux);
-        s_tx_completion_ring[entry_index].valid = false;
-        while (s_tx_completion_tail != s_tx_completion_head &&
-               !s_tx_completion_ring[s_tx_completion_tail].valid) {
-            s_tx_completion_tail =
-                (uint8_t)((s_tx_completion_tail + 1) % TX_COMPLETION_RING_SIZE);
+        taskENTER_CRITICAL(&s_transport_mux);
+        s_tx_inflight.active = false;
+        if (sequence != NULL) {
+            (*sequence)--;
         }
-        taskEXIT_CRITICAL(&s_speaker_mux);
+        taskEXIT_CRITICAL(&s_transport_mux);
     }
     return ret;
+}
+
+static bool wait_for_tx_idle(TickType_t timeout_ticks)
+{
+    TickType_t start = xTaskGetTickCount();
+    while (true) {
+        taskENTER_CRITICAL(&s_transport_mux);
+        bool active = s_tx_inflight.active;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        if (!active) {
+            return true;
+        }
+
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= timeout_ticks ||
+            xSemaphoreTake(s_tx_done_semaphore, timeout_ticks - elapsed) != pdTRUE) {
+            return false;
+        }
+    }
+}
+
+static bool wait_for_rx_quiesced(TickType_t timeout_ticks)
+{
+    TickType_t start = xTaskGetTickCount();
+    while (true) {
+        taskENTER_CRITICAL(&s_transport_mux);
+        uint8_t active = s_rx_callbacks_active;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        if (active == 0) {
+            return true;
+        }
+        if ((xTaskGetTickCount() - start) >= timeout_ticks) {
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
+
+static void force_cleanup_esp_now_transport(void)
+{
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool ready = s_esp_now_ready;
+    s_rx_enabled = false;
+    s_send_callback_enabled = false;
+    taskEXIT_CRITICAL(&s_transport_mux);
+
+    if (ready) {
+        esp_now_unregister_recv_cb();
+        esp_now_unregister_send_cb();
+        esp_now_deinit();
+    }
+
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(RX_QUIESCE_TIMEOUT_MS);
+    while (true) {
+        taskENTER_CRITICAL(&s_transport_mux);
+        uint8_t callbacks_active = s_rx_callbacks_active + s_tx_callbacks_active;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        if (callbacks_active == 0 || xTaskGetTickCount() >= deadline) {
+            break;
+        }
+        vTaskDelay(1);
+    }
+
+    taskENTER_CRITICAL(&s_transport_mux);
+    tx_inflight_t abandoned = s_tx_inflight;
+    s_tx_inflight = (tx_inflight_t){0};
+    s_esp_now_ready = false;
+    taskEXIT_CRITICAL(&s_transport_mux);
+
+    if (abandoned.active && abandoned.type == MESH_PKT_STATUS) {
+        taskENTER_CRITICAL(&s_speaker_mux);
+        s_heard_bitmap |= abandoned.heard_bitmap;
+        s_relay_bitmap |= abandoned.relay_bitmap;
+        taskEXIT_CRITICAL(&s_speaker_mux);
+    }
+    xSemaphoreGive(s_tx_done_semaphore);
 }
 
 static esp_err_t send_join_request(void)
 {
+    if (s_state != MESH_STATE_SCANNING && s_state != MESH_STATE_JOINING) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (now_us < s_contention_next_tx_us) {
+        STATS_INC(contention_deferred);
+        return ESP_ERR_TIMEOUT;
+    }
+
     mesh_join_payload_t payload = {
         .capabilities = 0x01, /* Basic Opus support */
         .reserved = 0,
@@ -2072,14 +2612,22 @@ static esp_err_t send_join_request(void)
     header->version = MESH_PROTOCOL_VERSION;
     header->type = MESH_PKT_JOIN;
     header->src_id = 0; /* Unassigned */
-    header->seq = s_tx_seq++;
+    header->seq = 0;
     header->ttl = 0;
     header->flags = 0;
     header->payload_len = sizeof(payload);
 
     memcpy(buffer + sizeof(mesh_header_t), &payload, sizeof(payload));
 
-    return tracked_esp_now_send(s_broadcast_mac, buffer, sizeof(buffer), MESH_PKT_JOIN, 0, 0);
+    esp_err_t ret = tracked_esp_now_send(s_broadcast_mac, buffer, sizeof(buffer), MESH_PKT_JOIN, 0,
+                                         0, &s_control_tx_seq, false);
+    uint32_t jitter_ms = esp_random() % (CONTENTION_JITTER_MS + 1);
+    s_contention_next_tx_us = now_us +
+                              ((CONTENTION_MIN_INTERVAL_MS + jitter_ms) * 1000);
+    if (ret == ESP_OK) {
+        STATS_INC(contention_tx);
+    }
+    return ret;
 }
 
 static esp_err_t send_join_ack(uint8_t node_id, uint8_t slot, const uint8_t *dest_mac)
@@ -2100,20 +2648,7 @@ static esp_err_t send_join_ack(uint8_t node_id, uint8_t slot, const uint8_t *des
         esp_now_add_peer(&peer);
     }
 
-    uint8_t buffer[sizeof(mesh_header_t) + sizeof(mesh_join_ack_payload_t)];
-    mesh_header_t *header = (mesh_header_t *)buffer;
-
-    header->version = MESH_PROTOCOL_VERSION;
-    header->type = MESH_PKT_JOIN_ACK;
-    header->src_id = s_node_id;
-    header->seq = s_tx_seq++;
-    header->ttl = 0;
-    header->flags = 0;
-    header->payload_len = sizeof(payload);
-
-    memcpy(buffer + sizeof(mesh_header_t), &payload, sizeof(payload));
-
-    return tracked_esp_now_send(dest_mac, buffer, sizeof(buffer), MESH_PKT_JOIN_ACK, 0, 0);
+    return enqueue_control_packet(MESH_PKT_JOIN_ACK, &payload, sizeof(payload), dest_mac);
 }
 
 static esp_err_t send_sync(void)
@@ -2127,7 +2662,7 @@ static esp_err_t send_sync(void)
     };
     memcpy(payload.coordinator_addr, s_local_mac, sizeof(payload.coordinator_addr));
 
-    return send_packet(MESH_PKT_SYNC, &payload, sizeof(payload));
+    return send_packet_immediate(MESH_PKT_SYNC, &payload, sizeof(payload), s_broadcast_mac);
 }
 
 static esp_err_t send_keepalive(void)
@@ -2207,24 +2742,28 @@ static esp_err_t send_audio_in_slot(void)
 {
     mesh_tx_item_t tx_item;
 
+    if (!wait_for_tx_idle(0)) {
+        STATS_INC(slot_misses);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     /* Check if we have audio to send */
-    if (xQueueReceive(s_tx_queue, &tx_item, 0) != pdTRUE) {
+    if (xQueuePeek(s_tx_queue, &tx_item, 0) != pdTRUE) {
         if (!relay_queue_empty()) {
             relay_entry_t *entry = &s_relay_ring[s_relay_tail];
             mesh_header_t *relay_header = (mesh_header_t *)entry->data;
             esp_err_t relay_ret = tracked_esp_now_send(
                 s_broadcast_mac, entry->data, entry->len,
-                ((const mesh_header_t *)entry->data)->type, 0, 0);
+                ((const mesh_header_t *)entry->data)->type, 0, 0, NULL, false);
 
             if (relay_ret == ESP_OK) {
                 taskENTER_CRITICAL(&s_speaker_mux);
-                s_relay_bitmap |= node_bit(relay_header->src_id);
+                s_relay_bitmap |= mesh_core_node_bit(relay_header->src_id);
                 taskEXIT_CRITICAL(&s_speaker_mux);
+                s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
             } else {
-                s_stats.slot_misses++;
+                STATS_INC(slot_misses);
             }
-
-            s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
             return relay_ret;
         }
 
@@ -2240,7 +2779,7 @@ static esp_err_t send_audio_in_slot(void)
     header->version = MESH_PROTOCOL_VERSION;
     header->type = MESH_PKT_AUDIO;
     header->src_id = s_node_id;
-    header->seq = s_tx_seq++;
+    header->seq = 0;
     header->ttl = MESH_AUDIO_TTL_DEFAULT;
     header->flags = MESH_FLAG_RELAY_REQUEST;
     header->payload_len = 4 + tx_item.len;
@@ -2254,11 +2793,6 @@ static esp_err_t send_audio_in_slot(void)
         }
     }
 
-    note_audio_activity(s_node_id, tx_item.audio_flags);
-    if (s_role == MESH_ROLE_COORDINATOR) {
-        update_speaker_grants();
-    }
-
     audio->codec = 0x01; /* Opus */
     audio->frame_ms = MESH_FRAME_MS;
     audio->stream_id = s_node_id;
@@ -2267,12 +2801,16 @@ static esp_err_t send_audio_in_slot(void)
 
     esp_err_t ret = tracked_esp_now_send(s_broadcast_mac, buffer,
                                          sizeof(mesh_header_t) + 4 + tx_item.len,
-                                         MESH_PKT_AUDIO, 0, 0);
+                                         MESH_PKT_AUDIO, 0, 0, &s_audio_tx_seq, true);
 
     if (ret == ESP_OK) {
-        s_stats.audio_frames_tx++;
+        (void)xQueueReceive(s_tx_queue, &tx_item, 0);
+        note_audio_activity(s_node_id, tx_item.audio_flags);
+        if (s_role == MESH_ROLE_COORDINATOR) {
+            update_speaker_grants();
+        }
     } else {
-        s_stats.slot_misses++;
+        STATS_INC(slot_misses);
     }
 
     return ret;
@@ -2292,40 +2830,6 @@ static void set_state(mesh_state_t new_state)
     }
 
     ESP_LOGI(TAG, "State: %d -> %d", old_state, new_state);
-}
-
-static uint8_t assign_node_id(const uint8_t *mac)
-{
-    /* Find first available ID (1-8) */
-    /* NOTE: Caller must hold s_peer_mutex! */
-    bool used[MESH_MAX_NODES + 1] = {false};
-
-    used[s_node_id] = true; /* Our ID is used */
-
-    for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (s_peers[i].info.active && s_peers[i].info.node_id <= MESH_MAX_NODES) {
-            used[s_peers[i].info.node_id] = true;
-        }
-    }
-
-    for (uint8_t id = 1; id <= MESH_MAX_NODES; id++) {
-        if (!used[id]) {
-            return id;
-        }
-    }
-
-    return 0; /* No ID available */
-}
-
-static int8_t assign_slot(uint8_t node_id)
-{
-    /* Simple slot assignment: node_id - 1 maps to slot */
-    /* This can be made more sophisticated in Phase 4 */
-    if (node_id == 0 || node_id > MESH_MAX_NODES) {
-        return -1;
-    }
-
-    return (int8_t)(node_id - 1);
 }
 
 static void check_peer_timeouts(void)
@@ -2358,13 +2862,14 @@ static void check_peer_timeouts(void)
         if (s_peer_count > 0) {
             s_peer_count--;
         }
-        s_stats.node_timeouts++;
+        STATS_INC(node_timeouts);
     }
 
     xSemaphoreGive(s_peer_mutex);
 
     for (int t = 0; t < timed_out_count; t++) {
         uint8_t timed_out_id = timed_out[t].node_id;
+        mesh_core_dedupe_purge_node(&s_dedupe, timed_out_id);
         bool was_speaker = false;
         taskENTER_CRITICAL(&s_speaker_mux);
         s_active_speaker_deadline_ms[timed_out_id] = 0;
@@ -2380,7 +2885,6 @@ static void check_peer_timeouts(void)
         if (was_speaker && s_role == MESH_ROLE_COORDINATOR) {
             send_speaker_release_for(timed_out_id);
         }
-        audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
         if (s_peer_cb) {
             s_peer_cb(&timed_out[t], false);
         }
@@ -2423,7 +2927,7 @@ static void jitter_buffer_insert(const uint8_t *data, uint16_t len, uint8_t src_
 
     if (entry->valid) {
         /* Overwriting unread entry - buffer overrun */
-        s_stats.jitter_overruns++;
+        STATS_INC(jitter_overruns);
     }
 
     memcpy(entry->data, data, len);
@@ -2442,7 +2946,7 @@ static void jitter_buffer_insert(const uint8_t *data, uint16_t len, uint8_t src_
         if (s_jitter_buffer[i].valid)
             depth++;
     }
-    s_stats.jitter_depth = depth;
+    STATS_SET(jitter_depth, depth);
 
     xSemaphoreGive(s_jitter_mutex);
 }
@@ -2456,14 +2960,14 @@ static bool jitter_buffer_pop(uint8_t *data, uint16_t *len, uint8_t *src_id,
 
     if (!entry->valid) {
         xSemaphoreGive(s_jitter_mutex);
-        s_stats.jitter_underruns++;
+        STATS_INC(jitter_underruns);
         return false;
     }
 
     /* Check if packet is too old (more than 2 frames late) */
     int64_t age_us = esp_timer_get_time() - entry->timestamp_us;
     if (age_us > (MESH_FRAME_US * 3)) {
-        s_stats.audio_frames_late++;
+        STATS_INC(audio_frames_late);
         entry->valid = false;
         s_jitter_read_idx = (s_jitter_read_idx + 1) % MESH_JITTER_BUFFER_DEPTH;
         xSemaphoreGive(s_jitter_mutex);
@@ -2480,11 +2984,6 @@ static bool jitter_buffer_pop(uint8_t *data, uint16_t *len, uint8_t *src_id,
 
     xSemaphoreGive(s_jitter_mutex);
     return true;
-}
-
-static int compare_mac(const uint8_t *a, const uint8_t *b)
-{
-    return memcmp(a, b, 6);
 }
 
 static void demote_to_participant(const uint8_t *coordinator_mac, uint8_t coordinator_id)

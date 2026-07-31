@@ -12,12 +12,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Packet types used by SPI bridge protocol */
-#define UART_PKT_AUDIO   0x01 /* Audio Data (Bidirectional) */
-#define UART_PKT_STATUS  0x02 /* Mesh status -> ESP32 */
-#define UART_PKT_EVENT   0x03 /* Mesh event -> ESP32 */
-#define UART_PKT_COMMAND 0x04 /* Command ESP32 -> nRF */
-#define UART_PKT_LOG     0x05 /* Debug log -> ESP32 */
+#include "bridge_protocol_defs.h"
+
+#define UART_PKT_AUDIO   BRIDGE_PKT_AUDIO
+#define UART_PKT_STATUS  BRIDGE_PKT_STATUS
+#define UART_PKT_EVENT   BRIDGE_PKT_MESH_EVENT
+#define UART_PKT_COMMAND BRIDGE_PKT_CONTROL
+#define UART_PKT_LOG     BRIDGE_PKT_LOG
 
 /* Packet sync byte */
 #define UART_SYNC_BYTE 0xAA
@@ -62,7 +63,10 @@ int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
  * @param peer_count Number of peers
  * @param node_id Local node ID
  */
-int uart_bridge_send_status(uint8_t role, uint8_t peer_count, uint8_t node_id);
+int uart_bridge_send_status(uint8_t state, uint8_t role, uint8_t peer_count, uint8_t node_id,
+                            int8_t slot_index, uint8_t coordinator_id);
+
+int uart_bridge_send_command_ack(uint8_t command, uint8_t generation, int result);
 
 /**
  * @brief Process incoming SPI data (call from main loop)

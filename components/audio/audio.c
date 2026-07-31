@@ -15,6 +15,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_adc/adc_continuous.h"
@@ -25,7 +26,6 @@
 
 #include "hal/adc_types.h"
 #include "opus.h"
-#include "power.h"
 #include "soc/soc.h"
 
 static const char *TAG = "audio";
@@ -70,6 +70,15 @@ static const char *TAG = "audio";
  * sent so the receiver can sustain comfort noise. */
 #define OPUS_DTX_FRAME_MAX_BYTES 2
 
+#define RX_SOURCE_IDLE_TIMEOUT_US 1000000
+#define HOLD_BUDGET_MAX           1
+#define GRACE_EMPTY_MAX           5
+
+#define NOTIFICATION_QUEUE_SIZE   4
+#define NOTIFICATION_BEEP_SAMPLES 1600
+#define NOTIFICATION_GAP_SAMPLES  400
+#define NOTIFICATION_AMPLITUDE    0.3f
+
 /* ============================================================================
  * Type Definitions
  * ============================================================================ */
@@ -84,13 +93,33 @@ typedef struct {
     float a1, a2;     /* Denominator coefficients (a0 = 1) */
 } hpf_state_t;
 
+typedef struct {
+    bool assigned;
+    uint8_t source_id;
+    int64_t last_enqueue_us;
+    OpusDecoder *decoder;
+    QueueHandle_t queue;
+    audio_jitter_state_t jitter;
+} audio_rx_source_t;
+
+typedef struct {
+    uint8_t type;
+} audio_notification_request_t;
+
+typedef struct {
+    bool active;
+    audio_notify_t type;
+    uint8_t tone_index;
+    uint16_t segment_sample;
+    bool in_gap;
+} audio_notification_state_t;
+
 /* ============================================================================
  * Static Variables
  * ============================================================================ */
 
 static bool s_initialized = false;
 static volatile bool s_running = false;
-static volatile bool s_beep_playing = false;
 static audio_config_t s_config = AUDIO_CONFIG_DEFAULT();
 static audio_stats_t s_stats = {0};
 
@@ -102,13 +131,14 @@ static adc_continuous_handle_t s_adc_handle = NULL;
 
 /* Audio task handle */
 static TaskHandle_t s_audio_task = NULL;
+static SemaphoreHandle_t s_audio_task_done = NULL;
 
 /* ADC notification handle */
 static TaskHandle_t s_adc_notify_task = NULL;
 
-/* Opus encoder/decoder */
+/* Opus encoder and dedicated loopback decoder */
 static OpusEncoder *s_opus_encoder = NULL;
-static OpusDecoder *s_opus_decoder = NULL;
+static OpusDecoder *s_loopback_decoder = NULL;
 
 /* Audio processing state */
 static hpf_state_t s_hpf_state = {0};
@@ -124,10 +154,15 @@ static int16_t s_pcm_output[AUDIO_FRAME_SAMPLES];
 static int16_t s_pcm_stereo[AUDIO_FRAME_SAMPLES * 2]; /* Stereo output for I2S */
 static uint8_t s_opus_buffer[MAX_OPUS_PACKET_SIZE];
 static int16_t s_far_ref_frame[AUDIO_FRAME_SAMPLES];
+static int16_t s_decode_frame[AUDIO_FRAME_SAMPLES];
+static int32_t s_mix_frame[AUDIO_FRAME_SAMPLES];
 static voice_cleanup_state_t s_voice_cleanup = {0};
 
-/* RX jitter/playout state */
-static audio_jitter_state_t s_jitter_state = {0};
+/* RX source slots and notification playback are owned by the audio task. */
+static audio_rx_source_t s_rx_sources[AUDIO_MAX_RX_SOURCES] = {0};
+static SemaphoreHandle_t s_rx_sources_mutex = NULL;
+static QueueHandle_t s_notification_queue = NULL;
+static audio_notification_state_t s_notification = {0};
 
 /* Pipeline latency accumulators (microseconds) */
 static uint64_t s_tx_pipe_sum_us = 0;
@@ -137,7 +172,7 @@ static uint32_t s_rx_pipe_count = 0;
 
 /* Phase 2: Mesh mode support */
 static audio_tx_cb_t s_tx_callback = NULL;
-static QueueHandle_t s_rx_queue = NULL;
+static audio_activity_cb_t s_activity_callback = NULL;
 
 /* ============================================================================
  * Private Function Prototypes
@@ -152,6 +187,11 @@ static void opus_deinit(void);
 static void hpf_init(hpf_state_t *state, float cutoff_hz, float sample_rate);
 static void hpf_process(hpf_state_t *state, int16_t *samples, size_t count);
 static void audio_task(void *arg);
+static void audio_task_await_delete(void);
+static void reset_rx_sources(void);
+static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
+                             int64_t *decode_time_sum);
+static void mix_notification_frame(void);
 
 /* ============================================================================
  * ADC Callbacks
@@ -345,17 +385,29 @@ static esp_err_t opus_init(const audio_config_t *config)
      * quiet rather than a dead link. */
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_DTX(1));
 
-    /* Create Opus decoder */
-    s_opus_decoder = opus_decoder_create(config->sample_rate, config->channels, &error);
+    /* Loopback must not share decoder state with any remote source. */
+    s_loopback_decoder = opus_decoder_create(config->sample_rate, config->channels, &error);
 
-    if (error != OPUS_OK || s_opus_decoder == NULL) {
-        ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(error));
+    if (error != OPUS_OK || s_loopback_decoder == NULL) {
+        ESP_LOGE(TAG, "Failed to create loopback Opus decoder: %s", opus_strerror(error));
         opus_encoder_destroy(s_opus_encoder);
         s_opus_encoder = NULL;
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Opus encoder/decoder initialized");
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+        s_rx_sources[i].decoder =
+            opus_decoder_create(config->sample_rate, config->channels, &error);
+        if (error != OPUS_OK || s_rx_sources[i].decoder == NULL) {
+            ESP_LOGE(TAG, "Failed to create source Opus decoder %zu: %s", i,
+                     opus_strerror(error));
+            opus_deinit();
+            return ESP_FAIL;
+        }
+    }
+
+    ESP_LOGI(TAG, "Opus encoder and %u independent decoders initialized",
+             AUDIO_MAX_RX_SOURCES + 1);
     ESP_LOGI(TAG, "  Version: %s", opus_get_version_string());
     ESP_LOGI(TAG, "  Mode: VoIP");
     ESP_LOGI(TAG, "  Bitrate: %lu bps", config->opus_bitrate);
@@ -370,11 +422,17 @@ static void opus_deinit(void)
         opus_encoder_destroy(s_opus_encoder);
         s_opus_encoder = NULL;
     }
-    if (s_opus_decoder) {
-        opus_decoder_destroy(s_opus_decoder);
-        s_opus_decoder = NULL;
+    if (s_loopback_decoder) {
+        opus_decoder_destroy(s_loopback_decoder);
+        s_loopback_decoder = NULL;
     }
-    ESP_LOGI(TAG, "Opus encoder/decoder destroyed");
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+        if (s_rx_sources[i].decoder) {
+            opus_decoder_destroy(s_rx_sources[i].decoder);
+            s_rx_sources[i].decoder = NULL;
+        }
+    }
+    ESP_LOGI(TAG, "Opus encoder/decoders destroyed");
 }
 
 /* ============================================================================
@@ -441,6 +499,155 @@ static void hpf_process(hpf_state_t *state, int16_t *samples, size_t count)
     }
 }
 
+static void reset_rx_sources(void)
+{
+    if (s_rx_sources_mutex) {
+        xSemaphoreTake(s_rx_sources_mutex, portMAX_DELAY);
+    }
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+        audio_rx_source_t *source = &s_rx_sources[i];
+        source->assigned = false;
+        source->source_id = 0;
+        source->last_enqueue_us = 0;
+        audio_jitter_reset(&source->jitter);
+        if (source->queue) {
+            xQueueReset(source->queue);
+        }
+        if (source->decoder) {
+            opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+        }
+    }
+    if (s_rx_sources_mutex) {
+        xSemaphoreGive(s_rx_sources_mutex);
+    }
+}
+
+static void record_decode_result(int samples, int64_t decode_time, int64_t *decode_time_sum)
+{
+    if (samples == AUDIO_FRAME_SAMPLES) {
+        s_stats.frames_decoded++;
+        *decode_time_sum += decode_time;
+        s_stats.decode_time_us_avg = *decode_time_sum / s_stats.frames_decoded;
+        if (decode_time > s_stats.decode_time_us_max) {
+            s_stats.decode_time_us_max = decode_time;
+        }
+    } else {
+        s_stats.decode_errors++;
+        ESP_LOGW(TAG, "Opus decode failed: %d", samples);
+    }
+}
+
+static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
+                             int64_t *decode_time_sum)
+{
+    audio_rx_item_t item;
+    bool decode_plc = false;
+    bool have_item = false;
+
+    if (xSemaphoreTake(s_rx_sources_mutex, 0) != pdTRUE) {
+        return false;
+    }
+    if (!source->assigned) {
+        xSemaphoreGive(s_rx_sources_mutex);
+        return false;
+    }
+
+    UBaseType_t items = uxQueueMessagesWaiting(source->queue);
+    audio_jitter_record_depth(&source->jitter, &s_stats, items);
+    audio_jitter_update_playout_start(&source->jitter, items);
+    uint32_t trim_count = s_stats.jitter_trim_frames;
+    audio_jitter_trim_backlog(source->queue, &source->jitter, &s_stats, &item);
+    if (s_stats.jitter_trim_frames != trim_count) {
+        opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+    }
+    items = uxQueueMessagesWaiting(source->queue);
+
+    if (source->jitter.playout_started && source->jitter.hold_next) {
+        source->jitter.hold_next = false;
+        source->jitter.consecutive_empty = 0;
+        s_stats.hold_frames++;
+    } else if (source->jitter.playout_started &&
+               xQueueReceive(source->queue, &item, 0) == pdTRUE) {
+        source->jitter.last_rx_packet_us = now_us;
+        source->jitter.consecutive_empty = 0;
+        source->jitter.stream_silent = !item.active;
+        have_item = true;
+
+        UBaseType_t remaining = uxQueueMessagesWaiting(source->queue);
+        if (remaining == 0 && source->jitter.hold_budget < HOLD_BUDGET_MAX) {
+            source->jitter.hold_next = true;
+            source->jitter.hold_budget++;
+        } else if (remaining >= 3 && source->jitter.hold_budget > 0) {
+            source->jitter.hold_budget--;
+        }
+    } else if (source->jitter.playout_started) {
+        source->jitter.consecutive_empty++;
+        s_stats.grace_empty_polls++;
+        if (source->jitter.consecutive_empty <= GRACE_EMPTY_MAX) {
+            decode_plc = true;
+            s_stats.plc_frames++;
+        } else if (source->jitter.stream_silent) {
+            source->jitter.playout_started = false;
+        } else if (audio_jitter_should_count_underrun(&source->jitter, now_us)) {
+            s_stats.rx_queue_underruns++;
+            s_stats.glitches_detected++;
+            source->jitter.playout_started = false;
+        } else {
+            source->jitter.playout_started = false;
+        }
+    }
+
+    if (!source->jitter.playout_started && items == 0 &&
+        now_us - source->last_enqueue_us >= RX_SOURCE_IDLE_TIMEOUT_US) {
+        source->assigned = false;
+        source->source_id = 0;
+        audio_jitter_reset(&source->jitter);
+        opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+    }
+    xSemaphoreGive(s_rx_sources_mutex);
+
+    if (!have_item && !decode_plc) {
+        return false;
+    }
+
+    int64_t decode_start = esp_timer_get_time();
+    int samples = have_item ? opus_decode(source->decoder, item.data, item.len, s_decode_frame,
+                                          AUDIO_FRAME_SAMPLES, 0)
+                            : opus_decode(source->decoder, NULL, 0, s_decode_frame,
+                                          AUDIO_FRAME_SAMPLES, 0);
+    int64_t decode_time = esp_timer_get_time() - decode_start;
+    record_decode_result(samples, decode_time, decode_time_sum);
+    if (samples != AUDIO_FRAME_SAMPLES) {
+        return false;
+    }
+
+    if (have_item) {
+        int64_t rx_pipe_us = decode_start - item.timestamp_us;
+        if (rx_pipe_us >= 0) {
+            s_rx_pipe_count++;
+            s_rx_pipe_sum_us += (uint64_t)rx_pipe_us;
+            s_stats.rx_pipe_us_avg = (uint32_t)(s_rx_pipe_sum_us / s_rx_pipe_count);
+            if ((uint32_t)rx_pipe_us > s_stats.rx_pipe_us_max) {
+                s_stats.rx_pipe_us_max = (uint32_t)rx_pipe_us;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+        s_mix_frame[i] += s_decode_frame[i];
+    }
+    return true;
+}
+
+static void audio_task_await_delete(void)
+{
+    s_adc_notify_task = NULL;
+    s_running = false;
+    s_audio_task = NULL;
+    xSemaphoreGive(s_audio_task_done);
+    vTaskDelete(NULL);
+}
+
 /* ============================================================================
  * Audio Task - Main Processing Loop
  * ============================================================================ */
@@ -463,8 +670,7 @@ static void audio_task(void *arg)
     esp_err_t ret = adc_continuous_start(s_adc_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start ADC: %s", esp_err_to_name(ret));
-        vTaskDelete(NULL);
-        return;
+        audio_task_await_delete();
     }
 
     /* Start I2S TX */
@@ -472,13 +678,10 @@ static void audio_task(void *arg)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to enable I2S TX: %s", esp_err_to_name(ret));
         adc_continuous_stop(s_adc_handle);
-        vTaskDelete(NULL);
-        return;
+        audio_task_await_delete();
     }
 
     ESP_LOGI(TAG, "Audio pipeline active");
-
-    audio_jitter_state_t *jitter = &s_jitter_state;
 
     while (s_running) {
         int64_t frame_start_us = esp_timer_get_time();
@@ -567,7 +770,11 @@ static void audio_task(void *arg)
             /* ================================================================
              * STEP 3: VOX Detection
              * ================================================================ */
+            bool was_vox_active = s_vox_state.active;
             bool vox_active = vox_process(&s_vox_state, s_pcm_input, AUDIO_FRAME_SAMPLES);
+            if (vox_active != was_vox_active && s_activity_callback != NULL) {
+                s_activity_callback(vox_active);
+            }
             bool tx_active = vox_active || s_config.force_tx_always;
             s_stats.vox_active = vox_active;
             s_stats.vox_activations = s_vox_state.activation_count;
@@ -644,7 +851,6 @@ static void audio_task(void *arg)
              * In loopback mode: decode our own encoded audio
              * In mesh mode: decode from RX queue (received from other nodes)
              * ================================================================ */
-            int samples_decoded = 0;
             bool have_audio_to_play = false;
 
             if (s_config.mode == AUDIO_MODE_LOOPBACK) {
@@ -652,166 +858,43 @@ static void audio_task(void *arg)
                 if (opus_bytes > 0) {
                     int64_t decode_start = esp_timer_get_time();
 
-                    samples_decoded = opus_decode(s_opus_decoder, s_opus_buffer, opus_bytes,
-                                                  s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
+                    int samples_decoded = opus_decode(s_loopback_decoder, s_opus_buffer, opus_bytes,
+                                                      s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
 
                     int64_t decode_time = esp_timer_get_time() - decode_start;
 
                     if (samples_decoded == AUDIO_FRAME_SAMPLES) {
-                        s_stats.frames_decoded++;
-                        decode_time_sum += decode_time;
-                        s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
-                        if (decode_time > s_stats.decode_time_us_max) {
-                            s_stats.decode_time_us_max = decode_time;
-                        }
+                        record_decode_result(samples_decoded, decode_time, &decode_time_sum);
                         have_audio_to_play = true;
                     } else {
-                        s_stats.decode_errors++;
-                        ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
+                        record_decode_result(samples_decoded, decode_time, &decode_time_sum);
                     }
                 }
             } else {
-                /* Mesh mode: check RX queue for incoming audio */
-                audio_rx_item_t rx_item;
-                if (s_rx_queue != NULL) {
-                    UBaseType_t items = uxQueueMessagesWaiting(s_rx_queue);
-                    audio_jitter_record_depth(jitter, &s_stats, items);
-                    audio_jitter_update_playout_start(jitter, items);
-                    audio_jitter_trim_backlog(s_rx_queue, jitter, &s_stats, &rx_item);
-
-                    /* ---- Adaptive playout: hold / normal / catch-up ---- */
-                    #define HOLD_BUDGET_MAX  1  /* Allow one refill hold before forcing catch-up */
-                    #define CATCHUP_DEPTH    3  /* Burn off latency once queue grows beyond steady state */
-
-                    if (jitter->playout_started && jitter->hold_next) {
-                        /* Hold iteration: output PLC to let queue refill.
-                         * We don't dequeue — just generate concealment.  */
-                        jitter->hold_next = false;
-                        s_stats.hold_frames++;
-                        int64_t plc_start = esp_timer_get_time();
-                        int plc_samples = opus_decode(s_opus_decoder, NULL, 0,
-                                                      s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
-                        int64_t plc_time = esp_timer_get_time() - plc_start;
-                        if (plc_samples == AUDIO_FRAME_SAMPLES) {
-                            s_stats.frames_decoded++;
-                            decode_time_sum += plc_time;
-                            s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
-                            if (plc_time > s_stats.decode_time_us_max) {
-                                s_stats.decode_time_us_max = plc_time;
-                            }
-                            have_audio_to_play = true;
-                        }
-                        /* Reset consecutive_empty since this was intentional */
-                        jitter->consecutive_empty = 0;
-                    } else if (jitter->playout_started && xQueueReceive(s_rx_queue, &rx_item, 0) == pdTRUE) {
-                        int64_t decode_start = esp_timer_get_time();
-                        jitter->last_rx_packet_us = decode_start;
-                        jitter->consecutive_empty = 0; /* Reset miss counter */
-
-                        samples_decoded = opus_decode(s_opus_decoder, rx_item.data, rx_item.len,
-                                                      s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
-
-                        int64_t decode_time = esp_timer_get_time() - decode_start;
-
-                        if (samples_decoded == AUDIO_FRAME_SAMPLES) {
-                            s_stats.frames_decoded++;
-                            decode_time_sum += decode_time;
-                            s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
-                            if (decode_time > s_stats.decode_time_us_max) {
-                                s_stats.decode_time_us_max = decode_time;
-                            }
-                            s_stats.jitter_buffer_depth = (uint8_t)items;
-                            have_audio_to_play = true;
-
-                            /* Track sender intent so empty polls during a DTX
-                             * silence gap aren't mistaken for packet loss. */
-                            jitter->stream_silent = !rx_item.active;
-
-                            int64_t rx_pipe_us = decode_start - rx_item.timestamp_us;
-                            if (rx_pipe_us >= 0) {
-                                s_rx_pipe_count++;
-                                s_rx_pipe_sum_us += (uint64_t)rx_pipe_us;
-                                s_stats.rx_pipe_us_avg = (uint32_t)(s_rx_pipe_sum_us / s_rx_pipe_count);
-                                if ((uint32_t)rx_pipe_us > s_stats.rx_pipe_us_max) {
-                                    s_stats.rx_pipe_us_max = (uint32_t)rx_pipe_us;
-                                }
-                            }
-
-                            /* Check remaining depth after dequeue */
-                            UBaseType_t remaining = uxQueueMessagesWaiting(s_rx_queue);
-
-                            /* If queue just emptied, trigger hold next iteration */
-                            if (remaining == 0 && jitter->hold_budget < HOLD_BUDGET_MAX) {
-                                jitter->hold_next = true;
-                                jitter->hold_budget++;
-                            }
-
-                            /* If queue is healthy and we have hold debt, catch up
-                             * by discarding one extra frame to reduce latency. */
-                            if (remaining >= CATCHUP_DEPTH && jitter->hold_budget > 0) {
-                                audio_rx_item_t discard;
-                                if (xQueueReceive(s_rx_queue, &discard, 0) == pdTRUE) {
-                                    /* Decode the discard frame to keep Opus state correct,
-                                     * but throw away the output. */
-                                    int16_t discard_pcm[AUDIO_FRAME_SAMPLES];
-                                    if (opus_decode(s_opus_decoder, discard.data, discard.len,
-                                                    discard_pcm, AUDIO_FRAME_SAMPLES, 0) < 0) {
-                                        s_stats.decode_errors++;
-                                        ESP_LOGW(TAG, "Discard-frame Opus decode failed");
-                                    }
-                                    jitter->hold_budget--;
-                                    s_stats.catchup_frames++;
-                                }
-                            }
-                        } else {
-                            s_stats.decode_errors++;
-                            ESP_LOGW(TAG, "Opus decode failed: %d", samples_decoded);
-                        }
-                    } else if (jitter->playout_started) {
-                        /* Queue empty during active playout.
-                         * ADC and mesh clocks are independent, so a single
-                         * empty poll is expected when clocks are near phase.
-                         * During grace, use Opus PLC instead of frame replay
-                         * to reduce robotic artifacts on short gaps. */
-                        #define GRACE_EMPTY_MAX 5  /* 5 x 20ms = 100ms grace */
-                        jitter->consecutive_empty++;
-                        s_stats.grace_empty_polls++;
-                        if (jitter->consecutive_empty > GRACE_EMPTY_MAX) {
-                            int64_t now_us = esp_timer_get_time();
-                            if (jitter->stream_silent) {
-                                /* Talker is intentionally silent (DTX gating):
-                                 * empty polls are expected, not loss.  Stop
-                                 * active playout quietly without flagging
-                                 * underruns/glitches. */
-                                jitter->playout_started = false;
-                            } else if (audio_jitter_should_count_underrun(jitter, now_us)) {
-                                s_stats.rx_queue_underruns++;
-                                s_stats.glitches_detected++;
-                            } else {
-                                jitter->playout_started = false;
-                            }
-                        }
-                        if (jitter->consecutive_empty <= GRACE_EMPTY_MAX) {
-                            int64_t plc_start = esp_timer_get_time();
-                            int plc_samples = opus_decode(s_opus_decoder, NULL, 0,
-                                                          s_pcm_output, AUDIO_FRAME_SAMPLES, 0);
-                            int64_t plc_time = esp_timer_get_time() - plc_start;
-
-                            if (plc_samples == AUDIO_FRAME_SAMPLES) {
-                                s_stats.plc_frames++;
-                                s_stats.frames_decoded++;
-                                decode_time_sum += plc_time;
-                                s_stats.decode_time_us_avg = decode_time_sum / s_stats.frames_decoded;
-                                if (plc_time > s_stats.decode_time_us_max) {
-                                    s_stats.decode_time_us_max = plc_time;
-                                }
-                                have_audio_to_play = true;
-                            } else {
-                                s_stats.decode_errors++;
-                                ESP_LOGW(TAG, "Opus PLC failed: %d", plc_samples);
-                            }
-                        }
+                memset(s_mix_frame, 0, sizeof(s_mix_frame));
+                uint8_t active_sources = 0;
+                uint16_t total_depth = 0;
+                int64_t now_us = esp_timer_get_time();
+                for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+                    if (decode_rx_source(&s_rx_sources[i], now_us, &decode_time_sum)) {
+                        have_audio_to_play = true;
                     }
+                    if (s_rx_sources[i].assigned) {
+                        active_sources++;
+                        total_depth += uxQueueMessagesWaiting(s_rx_sources[i].queue);
+                    }
+                }
+                s_stats.active_rx_sources = active_sources;
+                s_stats.jitter_buffer_depth = total_depth > UINT8_MAX ? UINT8_MAX : total_depth;
+
+                for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+                    int32_t sample = s_mix_frame[i];
+                    if (sample > INT16_MAX) {
+                        sample = INT16_MAX;
+                    } else if (sample < INT16_MIN) {
+                        sample = INT16_MIN;
+                    }
+                    s_pcm_output[i] = (int16_t)sample;
                 }
             }
 
@@ -820,12 +903,10 @@ static void audio_task(void *arg)
                 memset(s_pcm_output, 0, AUDIO_FRAME_SAMPLES * sizeof(int16_t));
             }
 
-            /* Keep far-end reference for next mic frame AEC */
-            if (have_audio_to_play) {
-                memcpy(s_far_ref_frame, s_pcm_output, sizeof(s_far_ref_frame));
-            } else {
-                memset(s_far_ref_frame, 0, sizeof(s_far_ref_frame));
-            }
+            mix_notification_frame();
+
+            /* Keep the final speaker mix as the next mic frame's AEC reference. */
+            memcpy(s_far_ref_frame, s_pcm_output, sizeof(s_far_ref_frame));
 
             /* ================================================================
              * STEP 6: Write to I2S (speaker)
@@ -837,18 +918,16 @@ static void audio_task(void *arg)
             }
 
             size_t bytes_written = 0;
-            if (!s_beep_playing) {
-                ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
-                                        AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
-                                        pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
+            ret = i2s_channel_write(s_tx_chan, s_pcm_stereo,
+                                    AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t), &bytes_written,
+                                    pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
 
-                if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t)) {
-                    ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
-                    s_stats.i2s_write_incomplete++;
-                    s_stats.glitches_detected++;
-                } else {
-                    s_stats.playback_frames++;
-                }
+            if (ret != ESP_OK || bytes_written != AUDIO_FRAME_SAMPLES * 2 * sizeof(int16_t)) {
+                ESP_LOGW(TAG, "I2S write incomplete: %zu bytes", bytes_written);
+                s_stats.i2s_write_incomplete++;
+                s_stats.glitches_detected++;
+            } else {
+                s_stats.playback_frames++;
             }
 
             /* ================================================================
@@ -911,19 +990,21 @@ static void audio_task(void *arg)
                      s_stats.i2s_write_incomplete, s_stats.adc_overruns);
             ESP_LOGI(TAG, "  Concealment: plc=%lu grace_empty=%lu",
                      s_stats.plc_frames, s_stats.grace_empty_polls);
-            ESP_LOGI(TAG, "  Adaptive playout: hold=%lu catchup=%lu budget=%u",
-                     s_stats.hold_frames, s_stats.catchup_frames, jitter->hold_budget);
-            ESP_LOGI(TAG, "  RX queue depth: min=%u avg=%u max=%u", s_stats.rx_q_depth_min,
-                     s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max);
+            ESP_LOGI(TAG, "  Adaptive playout: hold=%lu catchup=%lu sources=%u",
+                     s_stats.hold_frames, s_stats.catchup_frames, s_stats.active_rx_sources);
+            ESP_LOGI(TAG, "  RX queue depth/source: min=%u avg=%u max=%u (total now=%u)",
+                     s_stats.rx_q_depth_min, s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max,
+                     s_stats.jitter_buffer_depth);
             ESP_LOGI(TAG,
-                     "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu rx_q_drop=%lu jitter_drop=%lu decode_ok=%lu decode_err=%lu plc=%lu hold=%lu catchup=%lu play_ok=%lu i2s_err=%lu",
+                     "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu rx_q_drop=%lu rx_src_drop=%lu jitter_drop=%lu decode_ok=%lu decode_err=%lu plc=%lu hold=%lu catchup=%lu play_ok=%lu i2s_err=%lu notify_drop=%lu rx_sources=%u",
                      s_stats.capture_frames_ok, s_stats.capture_short_reads,
                      s_stats.capture_timeouts, s_stats.adc_overruns, s_stats.frames_encoded,
                      s_stats.encode_errors, s_stats.tx_dtx_suppressed,
-                     s_stats.rx_queue_overflows, s_stats.jitter_trim_frames,
-                     s_stats.frames_decoded, s_stats.decode_errors, s_stats.plc_frames,
-                     s_stats.hold_frames, s_stats.catchup_frames, s_stats.playback_frames,
-                     s_stats.i2s_write_incomplete);
+                     s_stats.rx_queue_overflows, s_stats.rx_source_rejections,
+                     s_stats.jitter_trim_frames, s_stats.frames_decoded, s_stats.decode_errors,
+                     s_stats.plc_frames, s_stats.hold_frames, s_stats.catchup_frames,
+                     s_stats.playback_frames, s_stats.i2s_write_incomplete,
+                     s_stats.notification_queue_overflows, s_stats.active_rx_sources);
             last_heartbeat = now_ms;
         }
 
@@ -935,12 +1016,12 @@ static void audio_task(void *arg)
          */
     }
 
-    /* Stop audio */
+    /* Stop audio before signalling completion so teardown cannot race drivers. */
     adc_continuous_stop(s_adc_handle);
     i2s_channel_disable(s_tx_chan);
 
     ESP_LOGI(TAG, "Audio task stopped");
-    vTaskDelete(NULL);
+    audio_task_await_delete();
 }
 
 /* ============================================================================
@@ -959,10 +1040,23 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Apply configuration */
+    audio_config_t requested = AUDIO_CONFIG_DEFAULT();
     if (config != NULL) {
-        s_config = *config;
+        requested = *config;
     }
+
+    /* Buffers and hardware setup are fixed for 16 kHz mono, 16-bit, 20 ms frames. */
+    if (requested.sample_rate != 16000 || requested.channels != 1 ||
+        requested.bits_per_sample != 16 || requested.frame_size_ms != 20) {
+        ESP_LOGE(TAG, "Unsupported audio format (requires 16kHz mono 16-bit 20ms)");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (requested.mode != AUDIO_MODE_LOOPBACK && requested.mode != AUDIO_MODE_MESH) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Apply configuration */
+    s_config = requested;
 
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "Initializing Audio Subsystem - Phase 1");
@@ -1010,7 +1104,53 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
 
     /* Reset statistics */
     memset(&s_stats, 0, sizeof(s_stats));
-    audio_jitter_reset(&s_jitter_state);
+
+    s_audio_task_done = xSemaphoreCreateBinary();
+    s_rx_sources_mutex = xSemaphoreCreateMutex();
+    s_notification_queue =
+        xQueueCreate(NOTIFICATION_QUEUE_SIZE, sizeof(audio_notification_request_t));
+    if (!s_audio_task_done || !s_rx_sources_mutex || !s_notification_queue) {
+        ESP_LOGE(TAG, "Failed to create audio synchronization resources");
+        if (s_audio_task_done) {
+            vSemaphoreDelete(s_audio_task_done);
+            s_audio_task_done = NULL;
+        }
+        if (s_rx_sources_mutex) {
+            vSemaphoreDelete(s_rx_sources_mutex);
+            s_rx_sources_mutex = NULL;
+        }
+        if (s_notification_queue) {
+            vQueueDelete(s_notification_queue);
+            s_notification_queue = NULL;
+        }
+        opus_deinit();
+        i2s_deinit_channels();
+        adc_deinit();
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+        s_rx_sources[i].queue = xQueueCreate(AUDIO_RX_QUEUE_SIZE, sizeof(audio_rx_item_t));
+        if (s_rx_sources[i].queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create RX source queue %zu", i);
+            for (size_t j = 0; j < i; j++) {
+                vQueueDelete(s_rx_sources[j].queue);
+                s_rx_sources[j].queue = NULL;
+            }
+            vQueueDelete(s_notification_queue);
+            s_notification_queue = NULL;
+            vSemaphoreDelete(s_rx_sources_mutex);
+            s_rx_sources_mutex = NULL;
+            vSemaphoreDelete(s_audio_task_done);
+            s_audio_task_done = NULL;
+            opus_deinit();
+            i2s_deinit_channels();
+            adc_deinit();
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    memset(&s_notification, 0, sizeof(s_notification));
+    reset_rx_sources();
 
     s_initialized = true;
     ESP_LOGI(TAG, "========================================");
@@ -1029,8 +1169,23 @@ esp_err_t audio_deinit(void)
     ESP_LOGI(TAG, "Deinitializing audio subsystem");
 
     /* Stop if running */
-    if (s_running) {
-        audio_stop();
+    if (s_running || s_audio_task != NULL) {
+        esp_err_t stop_ret = audio_stop();
+        if (stop_ret != ESP_OK) {
+            return stop_ret;
+        }
+    }
+
+    reset_rx_sources();
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+        if (s_rx_sources[i].queue) {
+            vQueueDelete(s_rx_sources[i].queue);
+            s_rx_sources[i].queue = NULL;
+        }
+    }
+    if (s_notification_queue) {
+        vQueueDelete(s_notification_queue);
+        s_notification_queue = NULL;
     }
 
     /* Destroy Opus encoder/decoder */
@@ -1042,6 +1197,15 @@ esp_err_t audio_deinit(void)
     /* Deinitialize ADC */
     adc_deinit();
 
+    if (s_rx_sources_mutex) {
+        vSemaphoreDelete(s_rx_sources_mutex);
+        s_rx_sources_mutex = NULL;
+    }
+    if (s_audio_task_done) {
+        vSemaphoreDelete(s_audio_task_done);
+        s_audio_task_done = NULL;
+    }
+
     s_initialized = false;
     return ESP_OK;
 }
@@ -1052,13 +1216,14 @@ esp_err_t audio_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_running) {
+    if (s_running || s_audio_task != NULL) {
         ESP_LOGW(TAG, "Already running");
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "Starting audio pipeline");
 
+    xSemaphoreTake(s_audio_task_done, 0);
     s_running = true;
 
     /* Create audio task */
@@ -1080,7 +1245,7 @@ esp_err_t audio_stop(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!s_running) {
+    if (!s_running && s_audio_task == NULL) {
         return ESP_OK;
     }
 
@@ -1088,11 +1253,18 @@ esp_err_t audio_stop(void)
 
     s_running = false;
 
-    /* Wait for task to finish */
-    if (s_audio_task) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        s_audio_task = NULL;
+    /* Wake the ADC wait and wait for the task's explicit completion signal. */
+    TaskHandle_t task = s_audio_task;
+    if (task) {
+        xTaskNotifyGive(task);
+        xSemaphoreTake(s_audio_task_done, portMAX_DELAY);
     }
+
+    reset_rx_sources();
+    xQueueReset(s_notification_queue);
+    memset(&s_notification, 0, sizeof(s_notification));
+    opus_encoder_ctl(s_opus_encoder, OPUS_RESET_STATE);
+    opus_decoder_ctl(s_loopback_decoder, OPUS_RESET_STATE);
 
     return ESP_OK;
 }
@@ -1118,12 +1290,15 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     if (!s_initialized || frame == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!s_running || source_id == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     if (s_config.mode != AUDIO_MODE_MESH) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_rx_queue == NULL) {
+    if (s_rx_sources_mutex == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1131,18 +1306,54 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    audio_rx_item_t rx_item;
+    audio_rx_item_t rx_item = {0};
     memcpy(rx_item.data, frame->data, frame->len);
     rx_item.len = frame->len;
     rx_item.source_id = source_id;
     rx_item.timestamp_us = frame->timestamp_ms * 1000;
     rx_item.active = frame->active;
 
-    if (xQueueSend(s_rx_queue, &rx_item, 0) != pdTRUE) {
+    if (xSemaphoreTake(s_rx_sources_mutex, 0) != pdTRUE) {
         s_stats.frames_dropped++;
         s_stats.rx_queue_overflows++;
         return ESP_ERR_NO_MEM;
     }
+
+    audio_rx_source_t *source = NULL;
+    audio_rx_source_t *free_source = NULL;
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; i++) {
+        if (s_rx_sources[i].assigned && s_rx_sources[i].source_id == source_id) {
+            source = &s_rx_sources[i];
+            break;
+        }
+        if (!s_rx_sources[i].assigned && free_source == NULL) {
+            free_source = &s_rx_sources[i];
+        }
+    }
+
+    if (source == NULL) {
+        source = free_source;
+        if (source == NULL) {
+            xSemaphoreGive(s_rx_sources_mutex);
+            s_stats.frames_dropped++;
+            s_stats.rx_source_rejections++;
+            return ESP_ERR_NO_MEM;
+        }
+        source->assigned = true;
+        source->source_id = source_id;
+        audio_jitter_reset(&source->jitter);
+        xQueueReset(source->queue);
+        opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+    }
+    source->last_enqueue_us = esp_timer_get_time();
+
+    if (xQueueSend(source->queue, &rx_item, 0) != pdTRUE) {
+        xSemaphoreGive(s_rx_sources_mutex);
+        s_stats.frames_dropped++;
+        s_stats.rx_queue_overflows++;
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreGive(s_rx_sources_mutex);
 
     return ESP_OK;
 }
@@ -1153,6 +1364,15 @@ esp_err_t audio_register_tx_callback(audio_tx_cb_t cb)
     return ESP_OK;
 }
 
+esp_err_t audio_register_activity_callback(audio_activity_cb_t cb)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_activity_callback = cb;
+    return ESP_OK;
+}
+
 esp_err_t audio_set_mode(audio_mode_t mode)
 {
     if (s_running) {
@@ -1160,17 +1380,18 @@ esp_err_t audio_set_mode(audio_mode_t mode)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (mode != AUDIO_MODE_LOOPBACK && mode != AUDIO_MODE_MESH) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     s_config.mode = mode;
 
-    /* Create RX queue for mesh mode */
-    if (mode == AUDIO_MODE_MESH && s_rx_queue == NULL) {
-        s_rx_queue = xQueueCreate(AUDIO_RX_QUEUE_SIZE, sizeof(audio_rx_item_t));
-        if (s_rx_queue == NULL) {
-            ESP_LOGE(TAG, "Failed to create RX queue");
-            return ESP_ERR_NO_MEM;
-        }
+    /* Queues, decoder, and jitter state remain slot-local. */
+    if (mode == AUDIO_MODE_MESH) {
+        reset_rx_sources();
         ESP_LOGI(TAG, "Audio mode set to MESH");
     } else if (mode == AUDIO_MODE_LOOPBACK) {
+        reset_rx_sources();
         ESP_LOGI(TAG, "Audio mode set to LOOPBACK");
     }
 
@@ -1207,152 +1428,105 @@ esp_err_t audio_record_tx_pipeline_latency_us(uint32_t latency_us)
  * Notification Sounds
  * ============================================================================ */
 
-/**
- * @brief Generate a sine wave tone into a buffer
- *
- * @param buffer Output buffer for PCM samples
- * @param samples Number of samples to generate
- * @param freq_hz Tone frequency in Hz
- * @param sample_rate Sample rate in Hz
- * @param amplitude Amplitude (0.0-1.0)
- */
-static void generate_tone(int16_t *buffer, size_t samples, float freq_hz, uint32_t sample_rate,
-                          float amplitude)
+static uint8_t notification_tone_count(audio_notify_t type)
 {
-    for (size_t i = 0; i < samples; i++) {
-        float t = (float)i / (float)sample_rate;
-        float value = amplitude * sinf(2.0f * M_PI * freq_hz * t);
-        buffer[i] = (int16_t)(value * 32767.0f);
+    if (type == AUDIO_NOTIFY_STARTUP) {
+        return 3;
+    }
+    if (type == AUDIO_NOTIFY_PEER_JOIN || type == AUDIO_NOTIFY_PEER_LEAVE) {
+        return 2;
+    }
+    return 1;
+}
+
+static float notification_frequency(audio_notify_t type, uint8_t tone_index)
+{
+    static const float startup[] = {261.63f, 329.63f, 392.00f};
+    static const float join[] = {440.0f, 880.0f};
+    static const float leave[] = {880.0f, 440.0f};
+
+    switch (type) {
+    case AUDIO_NOTIFY_STARTUP:
+        return startup[tone_index];
+    case AUDIO_NOTIFY_PEER_JOIN:
+        return join[tone_index];
+    case AUDIO_NOTIFY_PEER_LEAVE:
+        return leave[tone_index];
+    case AUDIO_NOTIFY_MESH_ENABLED:
+        return 329.63f;
+    case AUDIO_NOTIFY_MESH_DISABLED:
+        return 261.63f;
+    default:
+        return 0.0f;
+    }
+}
+
+static void mix_notification_frame(void)
+{
+    for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; i++) {
+        if (!s_notification.active) {
+            audio_notification_request_t request;
+            if (xQueueReceive(s_notification_queue, &request, 0) != pdTRUE) {
+                return;
+            }
+            s_notification.active = true;
+            s_notification.type = (audio_notify_t)request.type;
+            s_notification.tone_index = 0;
+            s_notification.segment_sample = 0;
+            s_notification.in_gap = false;
+            ESP_LOGI(TAG, "Playing notification type %u", request.type);
+        }
+
+        int32_t notification_sample = 0;
+        if (!s_notification.in_gap) {
+            float phase = 2.0f * M_PI * notification_frequency(s_notification.type,
+                                                               s_notification.tone_index) *
+                          s_notification.segment_sample / s_config.sample_rate;
+            notification_sample =
+                (int32_t)(NOTIFICATION_AMPLITUDE * 32767.0f * sinf(phase));
+        }
+
+        int32_t mixed = (int32_t)s_pcm_output[i] + notification_sample;
+        if (mixed > INT16_MAX) {
+            mixed = INT16_MAX;
+        } else if (mixed < INT16_MIN) {
+            mixed = INT16_MIN;
+        }
+        s_pcm_output[i] = (int16_t)mixed;
+
+        s_notification.segment_sample++;
+        uint16_t segment_length = s_notification.in_gap ? NOTIFICATION_GAP_SAMPLES
+                                                        : NOTIFICATION_BEEP_SAMPLES;
+        if (s_notification.segment_sample < segment_length) {
+            continue;
+        }
+
+        s_notification.segment_sample = 0;
+        if (s_notification.in_gap) {
+            s_notification.in_gap = false;
+            s_notification.tone_index++;
+        } else if (s_notification.tone_index + 1 <
+                   notification_tone_count(s_notification.type)) {
+            s_notification.in_gap = true;
+        } else {
+            s_notification.active = false;
+        }
     }
 }
 
 esp_err_t audio_play_notification(audio_notify_t type)
 {
-    if (!s_initialized || s_tx_chan == NULL) {
-        ESP_LOGW(TAG, "Audio not initialized, cannot play notification");
+    if (!s_initialized || s_notification_queue == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    /* Tone configuration */
-    const float FREQ_C4 = 261.63f;    /* C4 */
-    const float FREQ_E4 = 329.63f;    /* E4 */
-    const float FREQ_G4 = 392.00f;    /* G4 */
-    const float FREQ_LOW = 440.0f;    /* A4 */
-    const float FREQ_HIGH = 880.0f;   /* A5 */
-    const size_t BEEP_SAMPLES = 1600; /* 100ms @ 16kHz */
-    const size_t GAP_SAMPLES = 400;   /* 25ms gap between beeps */
-    const float AMPLITUDE = 0.3f;     /* 30% volume */
-
-    size_t mono_samples;
-    size_t num_tones;
-    float freqs[3];
-
-    /* Configure tones based on notification type */
-    if (type == AUDIO_NOTIFY_STARTUP) {
-        /* 3-tone ascending arpeggio: C-E-G */
-        num_tones = 3;
-        freqs[0] = FREQ_C4;
-        freqs[1] = FREQ_E4;
-        freqs[2] = FREQ_G4;
-        mono_samples = (BEEP_SAMPLES * 3) + (GAP_SAMPLES * 2);
-        ESP_LOGI(TAG, "Playing STARTUP notification (C-E-G)");
-    } else if (type == AUDIO_NOTIFY_PEER_JOIN) {
-        /* 2-tone ascending: low-high */
-        num_tones = 2;
-        freqs[0] = FREQ_LOW;
-        freqs[1] = FREQ_HIGH;
-        mono_samples = (BEEP_SAMPLES * 2) + GAP_SAMPLES;
-        ESP_LOGI(TAG, "Playing peer JOIN notification (low-high)");
-    } else if (type == AUDIO_NOTIFY_PEER_LEAVE) {
-        /* 2-tone descending: high-low */
-        num_tones = 2;
-        freqs[0] = FREQ_HIGH;
-        freqs[1] = FREQ_LOW;
-        mono_samples = (BEEP_SAMPLES * 2) + GAP_SAMPLES;
-        ESP_LOGI(TAG, "Playing peer LEAVE notification (high-low)");
-    } else if (type == AUDIO_NOTIFY_MESH_ENABLED) {
-        /* Single beep: mid-frequency */
-        num_tones = 1;
-        freqs[0] = FREQ_E4;
-        mono_samples = BEEP_SAMPLES;
-        ESP_LOGI(TAG, "Playing MESH ENABLED notification (single beep)");
-    } else if (type == AUDIO_NOTIFY_MESH_DISABLED) {
-        /* Single beep: lower frequency */
-        num_tones = 1;
-        freqs[0] = FREQ_C4;
-        mono_samples = BEEP_SAMPLES;
-        ESP_LOGI(TAG, "Playing MESH DISABLED notification (single beep)");
-    } else {
-        ESP_LOGW(TAG, "Unknown notification type: %d", type);
+    if (type < AUDIO_NOTIFY_STARTUP || type > AUDIO_NOTIFY_MESH_DISABLED) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Allocate mono buffer */
-    int16_t *mono_buffer = malloc(mono_samples * sizeof(int16_t));
-    if (mono_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate notification buffer");
+    audio_notification_request_t request = {.type = (uint8_t)type};
+    if (xQueueSend(s_notification_queue, &request, 0) != pdTRUE) {
+        s_stats.notification_queue_overflows++;
         return ESP_ERR_NO_MEM;
     }
-
-    /* Generate tones with gaps */
-    size_t offset = 0;
-    for (size_t t = 0; t < num_tones; t++) {
-        generate_tone(mono_buffer + offset, BEEP_SAMPLES, freqs[t], s_config.sample_rate,
-                      AMPLITUDE);
-        offset += BEEP_SAMPLES;
-        if (t < num_tones - 1) {
-            memset(mono_buffer + offset, 0, GAP_SAMPLES * sizeof(int16_t));
-            offset += GAP_SAMPLES;
-        }
-    }
-
-    /* Convert to stereo (interleaved L-R samples) for PCM5102A */
-    size_t stereo_samples = mono_samples * 2;
-    int16_t *stereo_buffer = malloc(stereo_samples * sizeof(int16_t));
-    if (stereo_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate stereo buffer");
-        free(mono_buffer);
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* Duplicate mono samples to both L and R channels */
-    for (size_t i = 0; i < mono_samples; i++) {
-        stereo_buffer[i * 2] = mono_buffer[i];     /* Left */
-        stereo_buffer[i * 2 + 1] = mono_buffer[i]; /* Right */
-    }
-    free(mono_buffer);
-
-    /* Check if we need to enable I2S TX for this notification.
-     * We only enable it if the main audio task is not running. */
-    bool need_enable = !s_running;
-    if (need_enable) {
-        esp_err_t en_ret = i2s_channel_enable(s_tx_chan);
-        if (en_ret != ESP_OK && en_ret != ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "Failed to enable I2S for notification: %s", esp_err_to_name(en_ret));
-            free(stereo_buffer);
-            return en_ret;
-        }
-    }
-
-    /* Write stereo buffer to I2S (blocking) */
-    size_t bytes_written = 0;
-    s_beep_playing = true;
-    esp_err_t ret = i2s_channel_write(s_tx_chan, stereo_buffer, stereo_samples * sizeof(int16_t),
-                                      &bytes_written, 500);
-    s_beep_playing = false;
-
-    free(stereo_buffer);
-
-    if (need_enable) {
-        i2s_channel_disable(s_tx_chan);
-    }
-
-    size_t expected_bytes = stereo_samples * sizeof(int16_t);
-    if (ret != ESP_OK || bytes_written != expected_bytes) {
-        ESP_LOGW(TAG, "Failed to play complete notification: %zu/%zu bytes (%s)", bytes_written,
-                 expected_bytes, esp_err_to_name(ret));
-        return ret != ESP_OK ? ret : ESP_ERR_TIMEOUT;
-    }
-
     return ESP_OK;
 }

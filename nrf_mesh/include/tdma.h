@@ -22,6 +22,25 @@ typedef struct {
     uint32_t control_due;
     uint32_t control_submit_drop;
     uint32_t control_late_drop;
+    uint32_t discipline_due;
+    uint32_t discipline_submit_drop;
+    uint32_t discipline_capture_drop;
+    uint32_t tune_request_count;
+    uint32_t tune_clamp_count;
+    uint32_t correction_apply_count;
+    uint32_t skipped_frame_count;
+    uint32_t sync_acquire_count;
+    uint32_t sync_reacquire_count;
+    uint32_t sync_history_miss_count;
+    int64_t correction_applied_us;
+    int32_t correction_pending_us;
+    int32_t last_correction_us;
+    int32_t sync_frame_diff;
+    int32_t sync_phase_correction_us;
+    uint32_t commanded_period_us;
+    uint32_t measured_interval_us;
+    int32_t callback_jitter_us;
+    uint32_t callback_jitter_max_us;
 } tdma_stats_t;
 
 /**
@@ -62,13 +81,13 @@ int32_t tdma_get_time_to_slot_us(void);
 /**
  * @brief Synchronize to coordinator timing
  * @param frame_counter Coordinator's frame counter
- * @param drift_ppm Clock drift correction
+ * @param drift_ppm Coordinator period correction in ppm; positive is longer.
  */
 void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us);
 
 /**
- * @brief Tune the next frame interval by adding offset_us
- * @param offset_us Microseconds to add (can be negative, though implementation might clamp)
+ * @brief Queue a bounded phase correction for upcoming frame periods.
+ * @param offset_us Positive stretches upcoming periods; negative shortens them.
  */
 void tdma_tune_timing(int32_t offset_us);
 

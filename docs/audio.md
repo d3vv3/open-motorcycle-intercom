@@ -1,296 +1,74 @@
-# Audio Pipeline & Voice Processing
+# Audio Pipeline
 
-This document defines the **audio architecture** of the Open Motorcycle Intercom (OMI).
+The ESP32-S3 owns capture, processing, Opus, remote-source playback,
+notifications, and I2S output in both radio configurations.
 
-Audio is the product. Everything else exists to serve it. The system is optimized for **clear speech, low latency, and robustness under packet loss**, not hi-fi quality.
+## Supported Format
 
-[TOC]
+The PCM/frame format is fixed:
 
----
-
-## 1. Audio Design Goals
-
-- End-to-end latency < 80 ms
-- Intelligible speech at highway speeds
-- Graceful degradation under packet loss
-- Minimal CPU and power usage
-- Simple, deterministic processing pipeline
-
-Music playback and stereo quality are explicitly out of scope.
-
----
-
-## 2. Audio Signal Chain (Local)
-
-```mermaid
-flowchart TD
-    MIC["Microphone"] --> PRE["Preamp"]
-    PRE --> ADC["ADC @ 16 kHz"]
-    ADC --> DC["DC blocker"]
-    DC --> LPF["Low-pass filter"]
-    LPF --> HPF["High-pass filter (~80 Hz)"]
-    HPF --> NS["AEC + noise suppression<br/>(mesh mode only)"]
-    NS --> VOX{"VOX active?"}
-    VOX -- "yes (speech)" --> ENC["Opus encode frame"]
-    ENC --> TX["Transmit in TDMA slot<br/>active flag set"]
-    VOX -- "no (silence)" --> DTX["Opus DTX encode"]
-    DTX --> SID{"Comfort-noise<br/>update? (>2 bytes)"}
-    SID -- "yes" --> TXC["Transmit comfort frame<br/>active flag clear"]
-    SID -- "no (1-2 byte DTX)" --> DROP["Drop frame -<br/>radio stays quiet"]
-```
-
-The reverse chain applies for received audio (Opus decode -> jitter buffer ->
-PLC/comfort-noise -> DAC). The AEC/noise-suppression stage runs only in mesh mode
-(it needs the far-end reference from decoded peer audio).
-
----
-
-## 3. Sampling Parameters
-
-| Parameter | Value | Rationale |
-|---------|------|-----------|
-| Sample rate | 16 kHz | Speech-optimized, low CPU |
-| Channels | Mono | No spatial benefit in helmets |
-| Bit depth | 16-bit | Internal processing |
-
-16 kHz is the lowest rate that preserves consonant clarity.
-
----
-
-## 4. Microphone Considerations
-
-Recommended:
-- Electret or MEMS mic with good wind tolerance
-- Directional or noise-canceling if possible
-
-Hardware assumptions:
-- Wind noise is unavoidable
-- DSP must tolerate broadband noise
-
-A **high-pass filter (~80 Hz, default)** removes engine rumble.
-
----
-
-## 5. VOX & Push-To-Talk (PTT)
-
-### VOX Behavior
-
-- Default activation method
-- Energy-based (RMS) threshold with hysteresis
-- Activation threshold ~0.03 RMS, deactivation ~0.010 RMS (defaults)
-- Hangover timer (500 ms default) and a minimum-active duration (500 ms default)
-  to avoid clipping word tails and chattering
-
-Rules:
-- VOX gates **transmission**, not the codec: when VOX is inactive the encoder
-  still runs (in DTX mode) but the radio is kept quiet - see [Silence Suppression](#51-silence-suppression-opus-dtx).
-- A test knob (`FORCE_TX_ALWAYS_FOR_TEST`, default **0**) can force continuous
-  TX for bring-up/debugging.
-
-### 5.1 Silence Suppression (Opus DTX)
-
-Continuous transmission during silence wastes airtime and power, so the encoder
-runs with **Opus DTX (discontinuous transmission)** enabled:
-
-- While VOX is active, every 20 ms frame is encoded and transmitted (active flag set).
-- While VOX is inactive, a zeroed frame is fed to the DTX encoder. Opus emits a
-  small **comfort-noise (SID) update** at the start of the silence period and
-  roughly every 400 ms thereafter, returning a 1-2 byte DTX frame in between.
-- Only the comfort-noise updates are transmitted; the 1-2 byte DTX frames are
-  **dropped before TX**, so the radio goes quiet during silence.
-- Each frame carries an `active` flag. The receiver uses it to treat a gap as
-  **intentional silence** (output comfort noise / true silence, no false
-  underrun/glitch accounting) rather than packet loss.
-
-Liveness does not depend on audio: KEEPALIVE/STATUS/SYNC continue on their own
-cadence, so a silent node is **not** dropped from the mesh (see protocol.md).
-
-### PTT Behavior
-
-- Overrides VOX
-- Forces continuous TX while pressed
-
-Both methods feed the same pipeline.
-
----
-
-## 6. Opus Codec Configuration
-
-Opus is mandatory. No fallback codecs are planned.
-
-### Encoder Settings
-
-| Setting | Value |
-|------|------|
-| Mode | VoIP |
+| Parameter | Value |
+|---|---:|
 | Sample rate | 16 kHz |
-| Channels | 1 |
-| Frame size | 20 ms |
-| Bitrate | 12 kbps (default; `opus_bitrate` configurable) |
-| VBR | Enabled |
-| FEC | Enabled (inband) |
-| DTX | Enabled (silence suppression - see [details](#51-silence-suppression-opus-dtx)) |
-| Complexity | 5 (medium) |
+| Channels | mono |
+| Sample width | 16-bit |
+| Frame duration | 20 ms / 320 samples |
+| Opus mode | VoIP, VBR, in-band FEC, DTX, complexity 5 |
+| Opus bitrate | 12 kbps default, configurable |
 
-Lower bitrates reduce range reliability; higher bitrates waste power.
+Initialization rejects other sample rates, channel counts, widths, and frame
+durations. Encoded packets are bounded to 64 Opus bytes and are not fragmented.
 
----
+## Capture and Transmission
 
-## 7. Opus Framing & Packetization
+Each complete ADC frame passes through DC blocking, low-pass and optional 80 Hz
+high-pass filtering. Mesh mode also applies the implemented voice-cleanup stage
+using the previous final speaker mix as its far-end reference. VOX uses RMS
+hysteresis, minimum-active time, and hangover.
 
-- Exactly **one Opus frame per TDMA frame**
-- No fragmentation
-- No aggregation
+During active speech, each 20 ms frame is Opus encoded and offered to the selected
+mesh transport with the active flag. During silence, the encoder remains in DTX
+mode: periodic comfort-noise updates larger than two bytes are offered with the
+active flag clear, while one- and two-byte DTX frames are suppressed. Mesh
+KEEPALIVE/STATUS maintain liveness independently of this audio gating.
 
-This enforces deterministic timing and simplifies buffering.
+## Remote Playback
 
----
+The playback path admits at most **two remote source IDs**. Each source owns an
+independent bounded eight-frame queue, jitter state, and Opus decoder. Decoder
+state is never shared between remote talkers or the dedicated loopback decoder.
+A third concurrent source is rejected until a source slot becomes idle.
 
-## 8. Jitter Buffer Design
+Playout begins after two queued frames. Backlog above the configured target is
+trimmed, a bounded hold can refill a shallow queue, and short active-stream gaps
+use Opus PLC. Intentional DTX silence does not count as an underrun. An idle empty
+source slot is released and its decoder reset.
 
-### Purpose
+Each 20 ms cycle decodes admitted sources into a 32-bit accumulator. The result
+is saturated to signed 16-bit PCM, which bounds both source count and output
+range.
 
-Absorbs:
-- Slot timing jitter
-- Multi-hop delay variation
+## Notifications
 
-### Configuration
+Startup, mesh lifecycle, and peer tones are non-blocking requests in a bounded
+queue. The audio task owns tone generation and mixes notifications into the same
+saturating playback path. Mesh and bridge callbacks do not write I2S directly.
 
-- RX queue size: 8 frames
-- Prefill before playout starts: 2 frames
-- Max target depth (backlog trimmed above this): 4 frames
+Peer notifications are separate from lifecycle notifications: PEER_JOINED and
+PEER_LEFT enqueue peer tones, while MESH_READY and user disable enqueue mesh
+lifecycle tones. Transient SYNC_LOST does not immediately produce a peer-leave
+tone.
 
-### Behavior
+## Teardown
 
-- Playout starts once the prefill threshold is reached.
-- Adaptive playout: a one-frame **hold** (PLC fill) lets the queue refill when it
-  empties, and a **catch-up** discard burns off latency when the queue grows past
-  the steady-state depth.
-- Late/backlogged packets above the max target are dropped.
-- Empty polls during active playout fall back to Opus PLC for a grace window
-  (~100 ms) before counting an underrun. Underruns are only counted when a packet
-  arrived recently (<200 ms); during **intentional silence** (DTX, see [Silence Suppression](#51-silence-suppression-opus-dtx)) empty
-  polls are expected and are not counted as underruns or glitches.
+Audio stop clears the run flag, wakes the task, and waits for its explicit
+completion semaphore. Only after the task exits does stop reset source queues,
+notification state, and Opus state. Deinitialization performs the synchronized
+stop before deleting queues, semaphores, codecs, ADC, or I2S resources.
 
-Buffer growth is tightly bounded to protect latency.
+## Telemetry
 
----
-
-## 9. Packet Loss Concealment (PLC)
-
-Opus PLC is relied upon heavily.
-
-Expected behavior:
-- Single packet loss: barely audible
-- Burst loss: brief muffling, not silence
-
-No retransmissions are attempted.
-
----
-
-## 10. Audio Mixing Model
-
-### Mesh Audio
-
-- One active speaker at a time (typical usage)
-- Multiple streams possible but discouraged
-
-Mixing strategy:
-- Simple summation
-- Soft limiter to prevent clipping
-
-### Bluetooth Audio Integration
-
-Bluetooth audio appears as an additional input stream.
-
-Rules:
-- Bluetooth stream is mixed at lower priority
-- Mesh audio always takes precedence
-
----
-
-## 11. Priority & Ducking
-
-When mesh audio is active:
-- Bluetooth audio is attenuated or muted
-
-When Bluetooth call is active:
-- Mesh audio may be mixed or paused (configurable)
-
-This avoids cognitive overload.
-
----
-
-## 12. Latency Budget (Audio Path)
-
-| Stage | Typical Latency |
-|-----|----------------|
-| ADC + prefilter | 2-3 ms |
-| VOX decision | <1 ms |
-| Opus encode | 5-10 ms |
-| TDMA wait | 0-20 ms |
-| Opus decode | 5-8 ms |
-| DAC + output | 2-3 ms |
-| **Total** | **<80 ms** |
-
-Worst-case latency is bounded by design.
-
----
-
-## 13. CPU Load Estimates
-
-### ESP32-S3
-
-- Opus encode: ~10-15% CPU
-- Opus decode: ~8-12% CPU
-- Mixing + VOX: <5%
-
-### nRF52840
-
-- Significantly lower relative load
-
-Audio processing fits comfortably within budget.
-
----
-
-## 14. Failure Modes & Degradation
-
-| Condition | Result |
-|--------|-------|
-| High packet loss | PLC smoothing |
-| CPU overload | Audio drop (preferred) |
-| Buffer overrun | Packet drop |
-
-Distortion is avoided even if silence occurs.
-
----
-
-## 15. Audio Debugging Hooks
-
-Recommended metrics:
-- Encode time per frame
-- Jitter buffer depth
-- Packet loss rate
-- PLC activation count
-
-These are essential for field tuning.
-
----
-
-## 16. Design Rationale Summary
-
-- 16 kHz mono is sufficient and efficient
-- One frame per slot simplifies everything
-- PLC beats retransmission
-- Mixing is intentionally simple
-
-Clarity beats cleverness.
-
----
-
-## 17. Status
-
-This document defines the **authoritative audio behavior** for OMI.
-
-Any changes must preserve latency and power guarantees.
-
+Emitted counters cover capture completion/timeouts, encode/decode failures,
+suppressed DTX frames, source admission rejection, queue overflow/underrun,
+PLC/hold/trim behavior, active sources, notification overflow, I2S completion,
+and capture-to-transport / receive-to-playback latency.

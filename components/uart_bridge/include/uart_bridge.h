@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "bridge_protocol_defs.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -37,27 +38,17 @@ extern "C" {
 #define BRIDGE_SPI_DMA_CHAN SPI_DMA_CH_AUTO
 #define BRIDGE_SPI_HOST     SPI2_HOST
 
-/* Packet types matching nRF52840 bridge protocol */
-#define BRIDGE_PKT_AUDIO      0x01
-#define BRIDGE_PKT_STATUS     0x02
-#define BRIDGE_PKT_MESH_EVENT 0x03
-#define BRIDGE_PKT_CONTROL    0x04
-#define BRIDGE_PKT_LOG        0x05
-
 /* Mesh events received from nRF52840 */
-typedef enum {
-    BRIDGE_EVENT_MESH_READY = 0x01,
-    BRIDGE_EVENT_PEER_JOINED = 0x02,
-    BRIDGE_EVENT_PEER_LEFT = 0x03,
-    BRIDGE_EVENT_BECAME_COORDINATOR = 0x04,
-    BRIDGE_EVENT_SYNC_LOST = 0x05,
-} uart_bridge_event_t;
+typedef bridge_event_t uart_bridge_event_t;
 
 /* Status info from nRF52840 */
 typedef struct {
     uint8_t node_id;
     uint8_t slot_index;
     uint8_t peer_count;
+    uint8_t role;
+    uint8_t mesh_state;
+    uint8_t coordinator_id;
     bool is_coordinator;
     int8_t rssi;
 } uart_bridge_status_t;

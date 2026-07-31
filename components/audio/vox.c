@@ -4,7 +4,6 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "power.h"
 
 #define VOX_FRAME_MS 20U
 
@@ -59,7 +58,6 @@ bool vox_process(vox_state_t *state, const int16_t *samples, size_t count)
             state->active = true;
             state->activation_count++;
             state->min_active_counter = state->min_active_frames;
-            power_notify_voice_start();
             ESP_LOGD(TAG, "Activated (RMS: %.4f)", rms);
         }
         state->hangover_counter = state->hangover_frames;
@@ -74,7 +72,6 @@ bool vox_process(vox_state_t *state, const int16_t *samples, size_t count)
                     state->hangover_counter--;
                 } else {
                     state->active = false;
-                    power_notify_voice_end();
                     ESP_LOGD(TAG, "Deactivated");
                 }
             }

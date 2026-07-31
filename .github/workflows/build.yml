@@ -1,9 +1,3 @@
-# OMI - Open Motorcycle Intercom
-# Build verification workflow
-#
-# Triggers on all branches and pull requests
-# Uses ESP-IDF v5.5 Docker image for consistent builds
-
 name: Build
 
 on:
@@ -12,37 +6,105 @@ on:
   pull_request:
     branches: ['**']
 
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Build Firmware
+  esp-idf:
+    name: ESP-IDF firmware
     runs-on: ubuntu-latest
-    
     container:
       image: espressif/idf:v5.5
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
 
-      - name: Build firmware
+      - name: Build ESP32-S3 firmware
         shell: bash
         run: |
-          . $IDF_PATH/export.sh
-          idf.py build
+          . "$IDF_PATH/export.sh"
+          idf.py -C "$GITHUB_WORKSPACE" build
 
       - name: Report build size
         shell: bash
         run: |
-          . $IDF_PATH/export.sh
-          idf.py size
+          . "$IDF_PATH/export.sh"
+          idf.py -C "$GITHUB_WORKSPACE" size
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload ESP32-S3 artifacts
+        uses: actions/upload-artifact@v4.6.2
         with:
-          name: firmware
+          name: esp32s3-firmware
           path: |
             build/omi.bin
             build/omi.elf
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
+          retention-days: 7
+
+  python:
+    name: Python and shared headers
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tests/python/requirements.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r tests/python/requirements.txt
+
+      - name: Run repository Python tests
+        run: python -m pytest tests/python
+
+      - name: Compile shared wire headers
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -fsyntax-only tests/c/wire_headers_compile.c
+
+      - name: Run shared mesh core tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/mesh_core_test && /tmp/mesh_core_test
+
+  nrf-zephyr:
+    name: nRF52840 Zephyr firmware
+    runs-on: ubuntu-latest
+    # NCS supplies the Nordic ESB module used by this app; the matching toolchain
+    # image and sdk-nrf v2.7.0 commit keep the hosted build reproducible.
+    container:
+      image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.7.0@sha256:b481467f39ed524a2cb23fed8b9dcdc1e4f60972988b913c386538953c929247
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Initialize nRF Connect SDK v2.7.0
+        shell: bash
+        run: |
+          west init -m https://github.com/nrfconnect/sdk-nrf.git \
+            --mr 5cb85570ca43bc344d3145c2338128eacf4b48ec \
+            "$GITHUB_WORKSPACE/.ncs"
+          cd "$GITHUB_WORKSPACE/.ncs"
+          west update --narrow -o=--depth=1
+          west zephyr-export
+
+      - name: Build XIAO nRF52840 firmware
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE/.ncs"
+          west build -b xiao_ble/nrf52840 "$GITHUB_WORKSPACE/nrf_mesh" \
+            -d "$GITHUB_WORKSPACE/build-nrf"
+
+      - name: Upload nRF52840 artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: nrf52840-firmware
+          path: |
+            build-nrf/zephyr/zephyr.elf
+            build-nrf/zephyr/zephyr.hex
+            build-nrf/zephyr/zephyr.uf2
           retention-days: 7

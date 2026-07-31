@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import serial
+from serial.tools import list_ports
 
 _PIPE_GAUGE_KEYS = {
     "v",
@@ -25,6 +26,36 @@ _PIPE_GAUGE_KEYS = {
     "tx_wait_avg_us",
     "tx_wait_max_us",
     "rx_pause_max_us",
+}
+
+_IDENTITY_KEYS = {
+    "v",
+    "node",
+    "id",
+    "session",
+    "src",
+    "src_node",
+    "dst",
+    "dst_node",
+    "peer",
+    "peer_node",
+}
+
+_PIPE_TX_COUNTERS = ("sent", "tx", "tx_ok", "rf_tx_ok", "spi_out_ok")
+_PIPE_RX_COUNTERS = ("received", "rx", "rx_ok", "rf_rx_ok", "ingress_ok")
+
+_SNAPSHOT_GAUGE_KEYS = {
+    "mesh": {"q"},
+    "spi": {"poll_min", "poll_avg", "poll_max"},
+    "adaptive": {"budget"},
+    "latency": {"lat_avg_ms", "lat_max_ms"},
+    "encode": {"enc_avg_us", "enc_max_us"},
+    "decode": {"dec_avg_us", "dec_max_us"},
+    "tx_pipeline": {"tx_pipe_avg_us", "tx_pipe_max_us"},
+    "rx_pipeline": {"rx_pipe_avg_us", "rx_pipe_max_us"},
+    "vox": {"vox_active"},
+    "rx_depth": {"rx_q_min", "rx_q_avg", "rx_q_max"},
+    "atune": {"q", "under_d", "skip_pct", "ws_corr", "ws_drift"},
 }
 
 # =============================================================================
@@ -185,31 +216,60 @@ def parse_pipeline_logfmt(line: str) -> dict[str, int | str] | None:
     return record
 
 
+def _reset_aware_delta(
+    samples: list[dict], excluded: set[str] | frozenset[str] = frozenset()
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Sum cumulative-counter increments without spanning counter resets."""
+    if len(samples) < 2:
+        return {}, {}
+    out: dict[str, int] = {}
+    resets: dict[str, int] = {}
+    keys = set.union(*(set(sample) for sample in samples)) - excluded
+    for key in sorted(keys):
+        try:
+            values = [int(sample[key]) for sample in samples if key in sample]
+        except (TypeError, ValueError):
+            continue
+        if len(values) < 2:
+            continue
+        total = 0
+        reset_count = 0
+        for previous, current in zip(values, values[1:]):
+            if current >= previous:
+                total += current - previous
+            else:
+                # The new epoch starts at zero; count only its observed value.
+                total += current
+                reset_count += 1
+        out[key] = total
+        if reset_count:
+            resets[key] = reset_count
+    return out, resets
+
+
 def _dict_delta(first: dict, last: dict) -> dict:
-    """Compute per-key integer delta between two snapshots."""
+    """Compute a reset-aware delta between two cumulative snapshots."""
     if not first or not last:
         return {}
-    out: dict[str, int] = {}
-    for k in sorted(set(first) & set(last)):
-        try:
-            out[k] = int(last[k]) - int(first[k])
-        except (TypeError, ValueError):
-            pass
-    return out
+    return _reset_aware_delta([first, last], _IDENTITY_KEYS)[0]
 
 
 def _pipeline_delta(first: dict, last: dict) -> dict:
-    return {
-        key: value
-        for key, value in _dict_delta(first, last).items()
-        if key not in _PIPE_GAUGE_KEYS
-    }
+    return _reset_aware_delta(
+        [first, last], _PIPE_GAUGE_KEYS | _IDENTITY_KEYS
+    )[0]
 
 
 def _scalar_delta(first: int | None, last: int | None) -> int | None:
     if first is None or last is None:
         return None
-    return last - first
+    return last - first if last >= first else last
+
+
+def _scalar_series_delta(values: list[int]) -> int | None:
+    if len(values) < 2:
+        return None
+    return _reset_aware_delta([{"value": value} for value in values])[0]["value"]
 
 
 def _rate_per_min(value: int | None, duration_s: int) -> float | None:
@@ -231,6 +291,41 @@ def _discover_ports() -> list[str]:
     return sorted(set(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")))
 
 
+def _serial_identity(port: str) -> tuple[str | None, int | None, int | None]:
+    """Return stable USB identity fields for a serial device when available."""
+    for info in list_ports.comports():
+        if info.device == port:
+            return info.serial_number, info.vid, info.pid
+    return None, None, None
+
+
+def _reconnect_candidates(
+    original_port: str, identity: tuple[str | None, int | None, int | None]
+) -> list[str]:
+    """Find the original path or a re-enumerated path for the same USB device."""
+    serial_number, vid, pid = identity
+    if not serial_number:
+        return [original_port]
+    infos = list(list_ports.comports())
+    original_info = next((info for info in infos if info.device == original_port), None)
+    candidates = []
+    if original_info is None or (
+        original_info.serial_number == serial_number
+        and original_info.vid == vid
+        and original_info.pid == pid
+    ):
+        candidates.append(original_port)
+    for info in infos:
+        if (
+            info.device != original_port
+            and info.serial_number == serial_number
+            and info.vid == vid
+            and info.pid == pid
+        ):
+            candidates.append(info.device)
+    return candidates
+
+
 # =============================================================================
 # Data model
 # =============================================================================
@@ -245,6 +340,7 @@ class PortStats:
     # Connection
     open_ok: bool = False
     open_error: str | None = None
+    reconnects: int = 0
     lines: int = 0
     bytes_rx: int = 0
 
@@ -307,6 +403,9 @@ class PortStats:
     first_pipe: dict[str, dict] = field(default_factory=dict)
     last_pipe: dict[str, dict] = field(default_factory=dict)
     pipe_samples: dict[str, int] = field(default_factory=dict)
+    pipe_history: dict[str, list[dict]] = field(default_factory=dict)
+    pipe_identity: dict[str, dict[str, int | str]] = field(default_factory=dict)
+    sample_history: dict[str, list[dict]] = field(default_factory=dict)
 
     # Scalars
     latency_max_peak_ms: int = 0
@@ -315,6 +414,8 @@ class PortStats:
     last_uflow_under: int | None = None
     first_nrf_audio_rx_pkts: int | None = None
     last_nrf_audio_rx_pkts: int | None = None
+    uflow_under_history: list[int] = field(default_factory=list)
+    nrf_audio_rx_history: list[int] = field(default_factory=list)
     last_crc_warn: int | None = None
 
     # ------------------------------------------------------------------
@@ -330,13 +431,27 @@ class PortStats:
             setattr(self, first_attr, values)
         setattr(self, last_attr, values)
         setattr(self, count_attr, getattr(self, count_attr) + 1)
+        self.sample_history.setdefault(name, []).append(values.copy())
 
     def delta(self, name: str) -> dict:
         """Return the integer delta between first and last for *name*."""
-        return _dict_delta(
-            getattr(self, f"first_{name}"),
-            getattr(self, f"last_{name}"),
-        )
+        history = self.sample_history.get(name)
+        excluded = _IDENTITY_KEYS | _SNAPSHOT_GAUGE_KEYS.get(name, set())
+        if history:
+            return _reset_aware_delta(history, excluded)[0]
+        return _reset_aware_delta(
+            [getattr(self, f"first_{name}"), getattr(self, f"last_{name}")],
+            excluded,
+        )[0]
+
+    def resets(self, name: str) -> dict[str, int]:
+        history = self.sample_history.get(name)
+        excluded = _IDENTITY_KEYS | _SNAPSHOT_GAUGE_KEYS.get(name, set())
+        if history:
+            return _reset_aware_delta(history, excluded)[1]
+        first = getattr(self, f"first_{name}")
+        last = getattr(self, f"last_{name}")
+        return _reset_aware_delta([first, last], excluded)[1]
 
 
 # =============================================================================
@@ -345,37 +460,132 @@ class PortStats:
 
 
 def compute_hop_pct(s: PortStats) -> dict[str, float | None]:
-    """Derive per-hop delivery / gap percentages from E2E deltas."""
+    """Derive stage-local loss percentages; TX/RX delivery needs two endpoints."""
     out: dict[str, float | None] = {}
 
     e2e_esp_d = s.delta("e2e_esp")
     e2e_nrf_d = s.delta("e2e_nrf")
-    audio_d = s.delta("audio_pipe")
-
-    # ESP end-to-end
+    # These gap counters are local to the same receive stage and denominator.
     if e2e_esp_d:
-        tx = e2e_esp_d.get("tx", 0)
-        out["esp_e2e_delivery_pct"] = _pct(e2e_esp_d.get("rx", 0), tx)
-        out["esp_e2e_gap_pct"] = _pct(e2e_esp_d.get("gap_fr", 0), tx)
+        gaps = e2e_esp_d.get("gap_fr", 0)
+        out["esp_e2e_gap_pct"] = _pct(gaps, e2e_esp_d.get("rx", 0) + gaps)
 
     # nRF per-hop
     if e2e_nrf_d:
         spi_in = e2e_nrf_d.get("spi_in", 0)
-        rf_tx = e2e_nrf_d.get("rf_tx", 0)
-        rf_rx = e2e_nrf_d.get("rf_rx", 0)
-        out["nrf_spi_in_to_rf_tx_pct"] = _pct(rf_tx, spi_in)
-        out["nrf_rf_tx_to_rf_rx_pct"] = _pct(rf_rx, rf_tx)
-        out["nrf_rf_rx_to_spi_out_pct"] = _pct(e2e_nrf_d.get("spi_out", 0), rf_rx)
-        out["nrf_spi_gap_pct"] = _pct(e2e_nrf_d.get("spi_gap_fr", 0), spi_in)
-        out["nrf_rf_gap_pct"] = _pct(e2e_nrf_d.get("rf_gap_fr", 0), rf_tx)
-
-    # ESP bridge throughput
-    if audio_d:
-        out["esp_txq_to_rx_from_nrf_pct"] = _pct(
-            audio_d.get("rx_from_nrf", 0), audio_d.get("tx_queued", 0)
+        spi_gaps = e2e_nrf_d.get("spi_gap_fr", 0)
+        rf_gaps = e2e_nrf_d.get("rf_gap_fr", 0)
+        out["nrf_spi_gap_pct"] = _pct(spi_gaps, spi_in + spi_gaps)
+        out["nrf_rf_gap_pct"] = _pct(
+            rf_gaps, e2e_nrf_d.get("rf_rx", 0) + rf_gaps
         )
 
     return out
+
+
+def _pipe_key(record: dict[str, int | str]) -> str:
+    key = f"{record['dev']}:{record['stage']}:{record.get('node', 'na')}"
+    for field_name in ("session", "src_node", "dst_node", "peer", "peer_node"):
+        if field_name in record:
+            key += f":{field_name}={record[field_name]}"
+    return key
+
+
+def _endpoint(record: dict, direction: str) -> tuple[Any, Any] | None:
+    node = record.get("node")
+    peer = record.get("peer_node", record.get("peer"))
+    source = record.get("src_node", record.get("src"))
+    destination = record.get("dst_node", record.get("dst"))
+    if direction == "tx":
+        source = source if source is not None else node
+        destination = destination if destination is not None else peer
+    else:
+        source = source if source is not None else peer
+        destination = destination if destination is not None else node
+    if source is None or destination is None:
+        return None
+    if source == destination:
+        return None
+    return source, destination
+
+
+def _counter_value(delta: dict[str, int], aliases: tuple[str, ...]) -> tuple[str, int] | None:
+    for name in aliases:
+        if name in delta:
+            return name, delta[name]
+    return None
+
+
+def compute_correlated_delivery(all_stats: list[PortStats]) -> dict[str, Any]:
+    """Correlate PIPE TX/RX counters only with explicit session and endpoints."""
+    transmitters: dict[tuple[Any, Any, Any, str], list[dict]] = {}
+    receivers: dict[tuple[Any, Any, Any, str], list[dict]] = {}
+
+    for stats in all_stats:
+        for key, identity in stats.pipe_identity.items():
+            if "session" not in identity:
+                continue
+            stage = str(identity.get("stage", ""))
+            semantic = re.sub(r"(?:[_-](?:tx|rx))$", "", stage)
+            history = stats.pipe_history.get(key, [])
+            delta, resets = _reset_aware_delta(
+                history, _PIPE_GAUGE_KEYS | _IDENTITY_KEYS
+            )
+            tx = _counter_value(delta, _PIPE_TX_COUNTERS)
+            rx = _counter_value(delta, _PIPE_RX_COUNTERS)
+            if tx is not None:
+                endpoints = _endpoint(identity, "tx")
+                if endpoints:
+                    link = (identity["session"], endpoints[0], endpoints[1], semantic)
+                    transmitters.setdefault(link, []).append(
+                        {"port": stats.port, "counter": tx[0], "value": tx[1], "resets": resets}
+                    )
+            if rx is not None:
+                endpoints = _endpoint(identity, "rx")
+                if endpoints:
+                    link = (identity["session"], endpoints[0], endpoints[1], semantic)
+                    receivers.setdefault(link, []).append(
+                        {"port": stats.port, "counter": rx[0], "value": rx[1], "resets": resets}
+                    )
+
+    links: list[dict[str, Any]] = []
+    for link in sorted(set(transmitters) & set(receivers), key=str):
+        tx_entries = transmitters[link]
+        rx_entries = receivers[link]
+        if len(tx_entries) != 1 or len(rx_entries) != 1:
+            continue
+        tx, rx = tx_entries[0], rx_entries[0]
+        status = "ok"
+        percentage = _pct(rx["value"], tx["value"])
+        reset_in_window = (
+            tx["counter"] in tx["resets"] or rx["counter"] in rx["resets"]
+        )
+        if reset_in_window or (percentage is not None and percentage > 100.0):
+            status = "inconsistent correlated data"
+            percentage = None
+        links.append(
+            {
+                "session": link[0],
+                "sender_node": link[1],
+                "receiver_node": link[2],
+                "stage": link[3],
+                "sender_port": tx["port"],
+                "receiver_port": rx["port"],
+                "sent": tx["value"],
+                "received": rx["value"],
+                "delivery_pct": percentage,
+                "status": status,
+            }
+        )
+
+    if not links:
+        return {
+            "status": "insufficient correlated data",
+            "reason": "PIPE records require matching session, sender, receiver, and stage semantics",
+            "links": [],
+        }
+    overall_status = "ok" if all(link["status"] == "ok" for link in links) else "inconsistent correlated data"
+    return {"status": overall_status, "links": links}
 
 
 # =============================================================================
@@ -402,20 +612,39 @@ class PortReader(threading.Thread):
         self.stats = stats
 
     def run(self) -> None:
-        try:
-            ser = serial.Serial(self.port, self.baud, timeout=0.2)
-            self.stats.open_ok = True
-        except Exception as exc:
-            self.stats.open_error = str(exc)
-            return
-
-        with ser, open(self.out_path, "w", encoding="utf-8", errors="replace") as fh:
+        identity = _serial_identity(self.port)
+        ser = None
+        connected_once = False
+        with open(self.out_path, "w", encoding="utf-8", errors="replace") as fh:
             while not self.stop_event.is_set():
+                if ser is None:
+                    last_error = None
+                    for candidate in _reconnect_candidates(self.port, identity):
+                        try:
+                            ser = serial.Serial(candidate, self.baud, timeout=0.2)
+                            self.stats.open_ok = True
+                            self.stats.open_error = None
+                            if connected_once:
+                                self.stats.reconnects += 1
+                            connected_once = True
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                    if ser is None:
+                        self.stats.open_error = f"Open error: {last_error}"
+                        self.stop_event.wait(0.25)
+                        continue
                 try:
                     raw = ser.readline()
                 except Exception as exc:
                     self.stats.open_error = f"Read error: {exc}"
-                    break
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+                    ser = None
+                    self.stop_event.wait(0.1)
+                    continue
                 if not raw:
                     continue
 
@@ -424,6 +653,8 @@ class PortReader(threading.Thread):
                 self.stats.lines += 1
                 fh.write(f"{_now_iso()} {line}\n")
                 self._parse_line(line)
+        if ser is not None:
+            ser.close()
 
     # ------------------------------------------------------------------
     # Line parsing
@@ -434,13 +665,18 @@ class PortReader(threading.Thread):
 
         pipe = parse_pipeline_logfmt(line)
         if pipe is not None:
-            node = pipe.get("node", "na")
-            name = f"{pipe['dev']}:{pipe['stage']}:{node}"
+            name = _pipe_key(pipe)
             values = {k: v for k, v in pipe.items() if isinstance(v, int)}
             if name not in s.first_pipe:
                 s.first_pipe[name] = values.copy()
             s.last_pipe[name] = values
             s.pipe_samples[name] = s.pipe_samples.get(name, 0) + 1
+            s.pipe_history.setdefault(name, []).append(values.copy())
+            s.pipe_identity[name] = {
+                key: value
+                for key, value in pipe.items()
+                if key in _IDENTITY_KEYS or key in {"dev", "stage"}
+            }
 
         # Simple first/last int-dict parsers
         for regex, name in _SIMPLE_PARSERS:
@@ -472,6 +708,7 @@ class PortReader(threading.Thread):
                     s.first_frame_counts = vals.copy()
                 s.last_frame_counts = vals
                 s.frame_counts_samples += 1
+                s.sample_history.setdefault("frame_counts", []).append(vals.copy())
 
         # Latency peak tracking
         if s.last_latency:
@@ -487,6 +724,7 @@ class PortReader(threading.Thread):
             if s.first_uflow_under is None:
                 s.first_uflow_under = under
             s.last_uflow_under = under
+            s.uflow_under_history.append(under)
             s.uflow_events += 1
             s.uflow_reason_counts[reason] = s.uflow_reason_counts.get(reason, 0) + 1
 
@@ -497,6 +735,7 @@ class PortReader(threading.Thread):
             if s.first_nrf_audio_rx_pkts is None:
                 s.first_nrf_audio_rx_pkts = rx_pkts
             s.last_nrf_audio_rx_pkts = rx_pkts
+            s.nrf_audio_rx_history.append(rx_pkts)
             s.nrf_audio_samples += 1
 
         # nRF auto-tune (adds computed skip_pct)
@@ -545,10 +784,14 @@ def _snapshot_json(s: PortStats, name: str) -> dict[str, Any]:
     """Return first / last / delta dict entries for one snapshot group."""
     first = getattr(s, f"first_{name}")
     last = getattr(s, f"last_{name}")
+    history = s.sample_history.get(name, [first, last] if first and last else [])
+    excluded = _IDENTITY_KEYS | _SNAPSHOT_GAUGE_KEYS.get(name, set())
+    delta, resets = _reset_aware_delta(history, excluded)
     return {
         f"first_{name}": first,
         f"last_{name}": last,
-        f"{name}_delta": _dict_delta(first, last),
+        f"{name}_delta": delta,
+        f"{name}_reset_epochs": resets,
     }
 
 
@@ -558,6 +801,7 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
         "port": s.port,
         "open_ok": s.open_ok,
         "open_error": s.open_error,
+        "reconnects": s.reconnects,
         "lines": s.lines,
         "bytes": s.bytes_rx,
         "mesh_samples": s.mesh_samples,
@@ -585,7 +829,16 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
             name: {
                 "first": s.first_pipe[name],
                 "last": s.last_pipe.get(name, {}),
-                "delta": _pipeline_delta(s.first_pipe[name], s.last_pipe.get(name, {})),
+                "delta": _reset_aware_delta(
+                    s.pipe_history.get(name)
+                    or [s.first_pipe[name], s.last_pipe.get(name, {})],
+                    _PIPE_GAUGE_KEYS | _IDENTITY_KEYS,
+                )[0],
+                "reset_epochs": _reset_aware_delta(
+                    s.pipe_history.get(name)
+                    or [s.first_pipe[name], s.last_pipe.get(name, {})],
+                    _PIPE_GAUGE_KEYS | _IDENTITY_KEYS,
+                )[1],
             }
             for name in sorted(s.first_pipe)
         },
@@ -597,11 +850,19 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
             "latency_max_peak_ms": s.latency_max_peak_ms,
             "first_uflow_under": s.first_uflow_under,
             "last_uflow_under": s.last_uflow_under,
-            "uflow_under_delta": _scalar_delta(s.first_uflow_under, s.last_uflow_under),
+            "uflow_under_delta": _scalar_series_delta(
+                s.uflow_under_history
+                or [value for value in (s.first_uflow_under, s.last_uflow_under) if value is not None]
+            ),
             "first_nrf_audio_rx_pkts": s.first_nrf_audio_rx_pkts,
             "last_nrf_audio_rx_pkts": s.last_nrf_audio_rx_pkts,
-            "nrf_audio_rx_delta": _scalar_delta(
-                s.first_nrf_audio_rx_pkts, s.last_nrf_audio_rx_pkts
+            "nrf_audio_rx_delta": _scalar_series_delta(
+                s.nrf_audio_rx_history
+                or [
+                    value
+                    for value in (s.first_nrf_audio_rx_pkts, s.last_nrf_audio_rx_pkts)
+                    if value is not None
+                ]
             ),
             "hop_pct": compute_hop_pct(s),
             "last_crc_warn": s.last_crc_warn,
@@ -628,6 +889,7 @@ def write_summary_json(
         "requested_duration_s": duration,
         "actual_duration_s": round(ended_at - started_at, 3),
         "ports": [_build_port_json(s) for s in all_stats],
+        "correlated_delivery": compute_correlated_delivery(all_stats),
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
@@ -660,8 +922,16 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         f"e2e_nrf={s.e2e_nrf_samples}"
     )
     for name in sorted(s.first_pipe):
-        delta = _pipeline_delta(s.first_pipe[name], s.last_pipe.get(name, {}))
+        delta, resets = _reset_aware_delta(
+            s.pipe_history.get(name)
+            or [s.first_pipe[name], s.last_pipe.get(name, {})],
+            _PIPE_GAUGE_KEYS | _IDENTITY_KEYS,
+        )
         fields = " ".join(f"{key}={value}" for key, value in delta.items() if value != 0)
+        if resets:
+            fields += " resets=" + ",".join(
+                f"{key}:{count}" for key, count in sorted(resets.items())
+            )
         out.append(f"  PIPE {name} samples={s.pipe_samples.get(name, 0)} {fields}".rstrip())
 
     # Mesh
@@ -830,7 +1100,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
 
     # nRF underflow
     if s.uflow_events > 0:
-        ud = _scalar_delta(s.first_uflow_under, s.last_uflow_under)
+        ud = _scalar_series_delta(s.uflow_under_history)
         reasons = ", ".join(
             f"{k}={v}"
             for k, v in sorted(s.uflow_reason_counts.items(), key=lambda kv: -kv[1])
@@ -845,7 +1115,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
 
     # nRF bridge audio RX
     if s.last_nrf_audio_rx_pkts is not None:
-        rx_d = _scalar_delta(s.first_nrf_audio_rx_pkts, s.last_nrf_audio_rx_pkts)
+        rx_d = _scalar_series_delta(s.nrf_audio_rx_history)
         out.append(
             f"  nRF Bridge Audio RX: last_pkts={s.last_nrf_audio_rx_pkts} "
             f"delta={rx_d if rx_d is not None else 'n/a'} "
@@ -880,10 +1150,9 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
                 f"  Delta E2E ESP: tx={d.get('tx', 0)} rx={d.get('rx', 0)} "
                 f"gap_evt={d.get('gap_evt', 0)} gap_fr={d.get('gap_fr', 0)}"
             )
-            deliv = _pct(d.get("rx", 0), d.get("tx", 0))
-            gap = _pct(d.get("gap_fr", 0), d.get("tx", 0))
-            if deliv is not None and gap is not None:
-                out.append(f"  Hop % ESP e2e: delivery={deliv}% gap={gap}%")
+            gap = compute_hop_pct(s).get("esp_e2e_gap_pct")
+            if gap is not None:
+                out.append(f"  Stage-local ESP RX gap={gap}%")
 
     # E2E nRF
     if s.last_e2e_nrf:
@@ -903,19 +1172,14 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
                 f"rf_gap_evt={d.get('rf_gap_evt', 0)} "
                 f"rf_gap_fr={d.get('rf_gap_fr', 0)} spi_out={d.get('spi_out', 0)}"
             )
-            hop_vals = [
-                _pct(d.get("rf_tx", 0), d.get("spi_in", 0)),
-                _pct(d.get("rf_rx", 0), d.get("rf_tx", 0)),
-                _pct(d.get("spi_out", 0), d.get("rf_rx", 0)),
-                _pct(d.get("spi_gap_fr", 0), d.get("spi_in", 0)),
-                _pct(d.get("rf_gap_fr", 0), d.get("rf_tx", 0)),
-            ]
-            if None not in hop_vals:
-                out.append(
-                    f"  Hop % nRF: spi->rf={hop_vals[0]}% rf->rf={hop_vals[1]}% "
-                    f"rf->spi={hop_vals[2]}% spi_gap={hop_vals[3]}% "
-                    f"rf_gap={hop_vals[4]}%"
-                )
+            hop = compute_hop_pct(s)
+            gap_parts = []
+            if hop.get("nrf_spi_gap_pct") is not None:
+                gap_parts.append(f"spi_rx_gap={hop['nrf_spi_gap_pct']}%")
+            if hop.get("nrf_rf_gap_pct") is not None:
+                gap_parts.append(f"rf_rx_gap={hop['nrf_rf_gap_pct']}%")
+            if gap_parts:
+                out.append(f"  Stage-local nRF: {' '.join(gap_parts)}")
 
     if s.last_crc_warn is not None:
         out.append(f"  Last ESP bridge CRC warn counter: {s.last_crc_warn}")
@@ -961,7 +1225,7 @@ def _health_line(s: PortStats) -> str:
     if decoded > 0 and rx_und > 0 and (rx_und / decoded) > 0.1:
         issues.append(f"esp_und_per_decoded={rx_und / decoded:.2f}")
 
-    uflow_d = _scalar_delta(s.first_uflow_under, s.last_uflow_under)
+    uflow_d = _scalar_series_delta(s.uflow_under_history)
     if uflow_d is not None and uflow_d > 0:
         issues.append(f"nrf_under+{uflow_d}")
 
@@ -993,6 +1257,20 @@ def write_human_report(
     for s in all_stats:
         lines.extend(_report_lines_for_port(s, duration))
 
+    correlation = compute_correlated_delivery(all_stats)
+    lines.append(f"Correlated delivery: {correlation['status']}")
+    if correlation.get("reason"):
+        lines.append(f"  {correlation['reason']}")
+    for link in correlation["links"]:
+        delivery = (
+            f"{link['delivery_pct']}%" if link["delivery_pct"] is not None else "not reported"
+        )
+        lines.append(
+            f"  session={link['session']} {link['sender_node']}->{link['receiver_node']} "
+            f"stage={link['stage']} sent={link['sent']} received={link['received']} "
+            f"delivery={delivery} status={link['status']}"
+        )
+
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines).rstrip() + "\n")
 
@@ -1011,18 +1289,16 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
         glitch_d = s.delta("glitch")
         hop = compute_hop_pct(s)
 
-        # ESP port: glitches + e2e delivery + latency
-        is_esp = glitch_d or (hop and "esp_e2e_delivery_pct" in hop)
+        # ESP port: glitches + stage-local gaps + latency
+        is_esp = glitch_d or (hop and "esp_e2e_gap_pct" in hop)
         if is_esp:
             parts: list[str] = []
             if glitch_d:
                 gl = glitch_d.get("glitches", 0)
                 gpm = _rate_per_min(gl, duration)
                 parts.append(f"glitches={gl} ({gpm}/min)")
-            if hop.get("esp_e2e_delivery_pct") is not None:
-                parts.append(f"e2e_delivery={hop['esp_e2e_delivery_pct']}%")
             if hop.get("esp_e2e_gap_pct") is not None:
-                parts.append(f"e2e_gap={hop['esp_e2e_gap_pct']}%")
+                parts.append(f"rx_gap={hop['esp_e2e_gap_pct']}%")
             if parts:
                 print(f"  {s.port} (ESP): {' | '.join(parts)}")
                 printed = True
@@ -1056,13 +1332,12 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
                 print(f"    Latency: {' | '.join(lat_parts)}")
                 printed = True
 
-        # nRF port: hop ratios
-        if hop and "nrf_rf_tx_to_rf_rx_pct" in hop:
+        # nRF port: stage-local receive gap ratios
+        if hop and ("nrf_spi_gap_pct" in hop or "nrf_rf_gap_pct" in hop):
             parts = []
             for label, key in [
                 ("spi_gap", "nrf_spi_gap_pct"),
                 ("rf_gap", "nrf_rf_gap_pct"),
-                ("rf_delivery", "nrf_rf_tx_to_rf_rx_pct"),
             ]:
                 if hop.get(key) is not None:
                     parts.append(f"{label}={hop[key]}%")
@@ -1072,6 +1347,8 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
 
     if not printed:
         print("  (no metrics captured)")
+    correlation = compute_correlated_delivery(all_stats)
+    print(f"  Correlated delivery: {correlation['status']}")
     print()
 
 

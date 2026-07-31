@@ -12,7 +12,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -262,6 +261,15 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
     }
 }
 
+static void audio_activity_callback(bool active)
+{
+    if (active) {
+        power_notify_voice_start();
+    } else {
+        power_notify_voice_end();
+    }
+}
+
 /**
  * @brief Callback from mesh subsystem when audio frame is received (ESP-NOW)
  */
@@ -389,39 +397,10 @@ static void mesh_peer_callback(const mesh_peer_info_t *peer, bool joined)
     if (joined) {
         ESP_LOGI(TAG, "Peer JOINED: node_id=%u, slot=%d, MAC=" MACSTR, peer->node_id,
                  peer->slot_index, MAC2STR(peer->mac_addr));
+        (void)audio_play_notification(AUDIO_NOTIFY_PEER_JOIN);
     } else {
         ESP_LOGI(TAG, "Peer LEFT: node_id=%u", peer->node_id);
-    }
-}
-
-/* ============================================================================
- * Asynchronous notification tone playback
- *
- * Bridge event callbacks run inside the SPI RX parse context; calling
- * audio_play_notification() there blocks I2S for up to 500 ms and can
- * stall the SPI bridge.  We post the desired tone type to a small
- * FreeRTOS queue and a lightweight task drains it.
- * ============================================================================ */
-
-#define NOTIFY_QUEUE_LEN 4
-static QueueHandle_t s_notify_queue = NULL;
-
-static void notify_task(void *arg)
-{
-    (void)arg;
-    audio_notify_t type;
-    for (;;) {
-        if (xQueueReceive(s_notify_queue, &type, portMAX_DELAY) == pdTRUE) {
-            audio_play_notification(type);
-        }
-    }
-}
-
-static void post_notification(audio_notify_t type)
-{
-    if (s_notify_queue != NULL) {
-        /* Best-effort: if queue full the tone is silently dropped. */
-        xQueueSend(s_notify_queue, &type, 0);
+        (void)audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
     }
 }
 
@@ -453,7 +432,7 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
 
         if (!s_mesh_active) {
             s_mesh_active = true;
-            post_notification(AUDIO_NOTIFY_MESH_ENABLED);
+            (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
         }
         s_sync_lost_window_start_ms = now_ms;
         s_sync_lost_count = 0;
@@ -461,18 +440,21 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
         break;
     case BRIDGE_EVENT_PEER_JOINED:
         ESP_LOGI(TAG, "Peer joined mesh");
-        post_notification(AUDIO_NOTIFY_PEER_JOIN);
+        (void)audio_play_notification(AUDIO_NOTIFY_PEER_JOIN);
         s_sync_lost_window_start_ms = now_ms;
         s_sync_lost_count = 0;
         s_peer_left_latched = false;
         break;
     case BRIDGE_EVENT_PEER_LEFT:
         ESP_LOGI(TAG, "Peer left mesh");
-        post_notification(AUDIO_NOTIFY_PEER_LEAVE);
-        s_mesh_active = false;
+        (void)audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
         s_sync_lost_window_start_ms = now_ms;
         s_sync_lost_count = 0;
         s_peer_left_latched = true;
+        break;
+    case BRIDGE_EVENT_MESH_STOPPED:
+        ESP_LOGI(TAG, "nRF52840 mesh stopped");
+        s_mesh_active = false;
         break;
     case BRIDGE_EVENT_SYNC_LOST:
         /* Transient nRF coordinator timeout/rescan event.
@@ -487,10 +469,12 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
         if (!s_peer_left_latched && s_sync_lost_count >= SYNC_LOST_ESCALATE_COUNT) {
             ESP_LOGW(TAG, "SYNC_LOST storm (%u in %u ms) -> treating as peer left",
                      s_sync_lost_count, SYNC_LOST_ESCALATE_WINDOW_MS);
-            post_notification(AUDIO_NOTIFY_PEER_LEAVE);
-            s_mesh_active = false;
+            (void)audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
             s_peer_left_latched = true;
         }
+        break;
+    case BRIDGE_EVENT_COMMAND_ACK:
+    case BRIDGE_EVENT_BECAME_COORDINATOR:
         break;
     default:
         break;
@@ -509,6 +493,9 @@ static void button_long_press_callback(int gpio)
         ESP_LOGI(TAG, "Disabling mesh networking...");
         esp_err_t ret = ESP_OK;
 
+        bool was_enabled = s_mesh_user_enabled;
+        s_mesh_user_enabled = false;
+
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_stop();
         } else if (s_active_transport == TRANSPORT_NRF52840) {
@@ -522,17 +509,20 @@ static void button_long_press_callback(int gpio)
         }
 
         if (ret == ESP_OK) {
-            s_mesh_user_enabled = false;
             s_mesh_active = false;
-            post_notification(AUDIO_NOTIFY_MESH_DISABLED);
+            (void)audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
             ESP_LOGI(TAG, "Mesh disabled");
         } else {
+            s_mesh_user_enabled = was_enabled;
             ESP_LOGE(TAG, "Failed to stop mesh: %s", esp_err_to_name(ret));
         }
     } else {
         /* Enable mesh */
         ESP_LOGI(TAG, "Enabling mesh networking...");
         esp_err_t ret = ESP_OK;
+
+        s_mesh_user_enabled = true;
+        s_mesh_active = false;
 
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             ret = mesh_start();
@@ -547,14 +537,14 @@ static void button_long_press_callback(int gpio)
         }
 
         if (ret == ESP_OK) {
-            s_mesh_user_enabled = true;
-            /* Mark active immediately after successful enable command.
-             * nRF may already be in ACTIVE state and not emit another
-             * MESH_READY event, so waiting for callback can mute TX. */
-            s_mesh_active = true;
-            post_notification(AUDIO_NOTIFY_MESH_ENABLED);
-            ESP_LOGI(TAG, "Mesh enabled");
+            if (s_active_transport == TRANSPORT_ESP_NOW) {
+                s_mesh_active = true;
+                (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+            }
+            ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
         } else {
+            s_mesh_user_enabled = false;
+            s_mesh_active = false;
             ESP_LOGE(TAG, "Failed to start mesh: %s", esp_err_to_name(ret));
         }
     }
@@ -585,11 +575,6 @@ void app_main(void)
     /* Initialize NVS */
     ESP_ERROR_CHECK(init_nvs());
     ESP_LOGI(TAG, "[%" PRId64 " ms] NVS initialized", get_time_ms());
-
-    /* Create asynchronous notification tone queue + task */
-    s_notify_queue = xQueueCreate(NOTIFY_QUEUE_LEN, sizeof(audio_notify_t));
-    configASSERT(s_notify_queue != NULL);
-    xTaskCreate(notify_task, "notify", 4096, NULL, 5, NULL);
 
     /* Initialize power management (Phase 3) */
     esp_err_t ret = power_init();
@@ -634,6 +619,7 @@ void app_main(void)
         disable_esp_radios_for_nrf_transport();
     } else {
         /* No nRF52840 - fallback to ESP-NOW */
+        uart_bridge_deinit();
         s_active_transport = TRANSPORT_ESP_NOW;
         ESP_LOGI(TAG, "nRF52840 not detected - using ESP-NOW transport");
     }
@@ -657,6 +643,7 @@ void app_main(void)
 
     /* Register audio TX callback */
     audio_register_tx_callback(audio_tx_callback);
+    audio_register_activity_callback(audio_activity_callback);
 
     /* Now initialize ESP-NOW mesh if needed (after audio) */
     if (s_active_transport == TRANSPORT_ESP_NOW) {
@@ -695,7 +682,7 @@ void app_main(void)
 #endif
     ESP_LOGI(TAG, "");
 
-    /* Play before the audio task starts writing silence to the same I2S channel. */
+    /* Queue startup notification; the audio task owns generation and I2S playback. */
     ret = audio_play_notification(AUDIO_NOTIFY_STARTUP);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to play startup notification: %s", esp_err_to_name(ret));

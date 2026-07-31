@@ -36,6 +36,9 @@ extern "C" {
 #define AUDIO_I2S_DIN_GPIO  6 /**< I2S data in (from mic) GPIO */
 #define AUDIO_I2S_DOUT_GPIO 7 /**< I2S data out (to speaker) GPIO */
 
+/** Matches the mesh grant limit while keeping audio independent of mesh headers. */
+#define AUDIO_MAX_RX_SOURCES 2
+
 /**
  * @brief I2S GPIO pin configuration
  */
@@ -116,6 +119,8 @@ typedef enum {
  * @param active true when VOX marks the frame as active speech
  * @param timestamp_us Capture timestamp in microseconds
  */
+typedef void (*audio_activity_cb_t)(bool active);
+
 typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active,
                               int64_t timestamp_us);
 
@@ -203,9 +208,12 @@ typedef struct {
     uint32_t capture_timeouts;   /**< ADC notification/read timeouts */
     uint32_t encode_errors;      /**< Opus encode failures */
     uint32_t decode_errors;      /**< Opus decode and PLC failures */
-    uint32_t rx_queue_overflows; /**< Frames rejected by the playback queue */
+    uint32_t rx_queue_overflows; /**< Frames rejected by a playback queue */
+    uint32_t rx_source_rejections; /**< Frames rejected because all source slots are occupied */
     uint32_t jitter_trim_frames; /**< Frames discarded to reduce playback backlog */
+    uint32_t notification_queue_overflows; /**< Notification requests dropped while queue is full */
     uint32_t playback_frames;    /**< Complete I2S playback writes */
+    uint8_t active_rx_sources;   /**< Remote source slots currently assigned */
     bool vox_active;             /**< Current VOX state */
 } audio_stats_t;
 
@@ -278,6 +286,8 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id);
  */
 esp_err_t audio_register_tx_callback(audio_tx_cb_t cb);
 
+esp_err_t audio_register_activity_callback(audio_activity_cb_t cb);
+
 /**
  * @brief Set audio operating mode
  * @param mode AUDIO_MODE_LOOPBACK or AUDIO_MODE_MESH
@@ -327,7 +337,7 @@ typedef enum {
 /**
  * @brief Play a notification sound
  *
- * Generates a notification tone through the speaker.
+ * Queues a notification tone for the audio playback task.
  * Non-blocking - queues the sound for playback.
  *
  * @param type Type of notification sound

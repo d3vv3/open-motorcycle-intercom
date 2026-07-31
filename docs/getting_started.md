@@ -21,7 +21,7 @@ See [Hardware BOM](../README.md#hardware-bom-development) for full component lis
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| ESP-IDF | v5.1+ (v5.2.2 recommended) | [Installation Guide](https://docs.espressif.com/projects/esp-idf/en/v5.2.2/esp32s3/get-started/) |
+| ESP-IDF | v5.5 | [Installation Guide](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/get-started/) |
 | Git | Any recent | Source control |
 
 ---
@@ -81,9 +81,10 @@ I (185) omi: [62 ms] Mesh initialized
 I (190) omi: [62 ms] System ready
 ```
 
-Timestamps and heap are illustrative. When an nRF52840 is wired up over the SPI
-bridge you'll instead see `nRF52840 detected on UART - using ESB transport`, and
-the ESP-NOW mesh init is skipped in favor of the nRF/ESB transport.
+Timestamps and heap are illustrative. When an nRF52840 is wired over the SPI
+bridge, the current firmware log says `nRF52840 detected on UART - using ESB
+transport` (the `UART` label is stale); ESP-NOW initialization is then skipped in
+favor of nRF/ESB.
 
 ---
 
@@ -108,9 +109,19 @@ omi/
 |   └-- hwtest/             # Hardware bring-up / test utilities
 |
 ├-- nrf_mesh/               # nRF52840 (Zephyr) radio firmware: ESB, TDMA, mesh
+├-- shared/                 # Wire definitions and transport-neutral mesh core
+├-- tests/c/                # Host compile and mesh_core tests
+├-- tests/python/           # Benchmark/parser tests
 |
 └-- docs/                   # Documentation
 ```
+
+## Continuous Integration
+
+GitHub Actions builds the ESP32-S3 firmware with ESP-IDF v5.5 and the XIAO
+nRF52840 firmware with nRF Connect SDK v2.7.0. A host job runs `pytest`, compiles
+the shared wire headers with strict C11 warnings, and builds/runs the shared
+`mesh_core` tests.
 
 ---
 

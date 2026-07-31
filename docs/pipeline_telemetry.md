@@ -15,8 +15,10 @@ cumulative integers. Counter names ending in `_drop`, `_fail`, `_err`, or
 do not calculate deltas for those fields.
 
 `benchmark.py` accepts records with ESP-IDF prefixes, Zephyr prefixes, or no
-prefix. It groups records by `dev:stage:node` and writes first, last, and delta
-values to the benchmark JSON report.
+prefix. It groups records by device, stage, node, and any explicit session/link
+identity. Reports include first/last values, reset-aware deltas, and per-counter
+`reset_epochs`; a counter decrease starts a new epoch instead of producing a
+negative delta.
 
 ## Stages
 
@@ -49,13 +51,20 @@ drops.
 8. `esp:transport play_q_ok` counts frames admitted to ESP playback.
 9. `esp:audio play_ok` counts complete I2S writes.
 
-Use `spi_gap` and the nRF E2E gap fields to estimate missing frame counts. A
-counter reset or backward sequence jump indicates a reboot/session boundary;
-split statistics at that point.
+Use `spi_gap` and the nRF E2E gap fields to estimate missing frame counts. These
+are stage-local loss estimates, not end-to-end delivery percentages.
+
+Delivery is reported only when separate TX and RX records have matching explicit
+`session`, sender, receiver, and stage semantics. A single port's unrelated TX
+and RX counters are never treated as correlated delivery. Missing identity yields
+`insufficient correlated data`; reset epochs or RX greater than TX yield
+`inconsistent correlated data` and suppress the percentage. This avoids a false
+delivery claim but cannot infer correlation for legacy logs that lack link
+identity.
 
 ## Commands
 
 ```bash
 python benchmark.py --duration 120
-python -m unittest discover -s tests/python -v
+python -m pytest tests/python
 ```

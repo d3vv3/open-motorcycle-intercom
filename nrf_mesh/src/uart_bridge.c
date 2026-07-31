@@ -138,12 +138,13 @@ static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
     case UART_PKT_COMMAND:
         if (len > 0) {
             uint8_t cmd_id = payload[0];
+            uint8_t generation = len >= sizeof(bridge_command_payload_t) ? payload[1] : 0;
             LOG_INF("Received command: 0x%02X", cmd_id);
-            if (cmd_id == 0x01) { /* Enable Mesh */
-                mesh_protocol_request_start();
-            } else if (cmd_id == 0x02) { /* Disable Mesh */
-                mesh_protocol_request_stop();
-            } else if (cmd_id == 0x03) { /* Ping / Get Status */
+            if (cmd_id == BRIDGE_COMMAND_MESH_START) {
+                mesh_protocol_request_start(generation);
+            } else if (cmd_id == BRIDGE_COMMAND_MESH_STOP) {
+                mesh_protocol_request_stop(generation);
+            } else if (cmd_id == BRIDGE_COMMAND_STATUS) {
                 printk("[uart_bridge] PING received, sending status\n");
                 mesh_protocol_request_status();
             }
@@ -329,7 +330,7 @@ int uart_bridge_init(void)
     LOG_INF("SPI bridge initialized");
 
     /* Send a test STATUS so ESP32 can detect us during probe */
-    uart_bridge_send_status(MESH_ROLE_NONE, 0, 0);
+    uart_bridge_send_status(MESH_STATE_IDLE, MESH_ROLE_NONE, 0, 0, -1, 0);
 
     return 0;
 }
@@ -375,6 +376,9 @@ int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
     if (!s_initialized) {
         return -EINVAL;
     }
+    if (len > SPI_MAX_PAYLOAD - 1 || (len > 0 && data == NULL)) {
+        return -EMSGSIZE;
+    }
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
     uint8_t payload[SPI_MAX_PAYLOAD] = {0};
@@ -390,19 +394,39 @@ int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
     return 0;
 }
 
-int uart_bridge_send_status(uint8_t role, uint8_t peer_count, uint8_t node_id)
+int uart_bridge_send_status(uint8_t state, uint8_t role, uint8_t peer_count, uint8_t node_id,
+                            int8_t slot_index, uint8_t coordinator_id)
 {
     if (!s_initialized) {
         return -EINVAL;
     }
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
-    uint8_t payload[3] = {role, peer_count, node_id};
-    uint16_t pkt_len = build_packet(pkt, UART_PKT_STATUS, payload, sizeof(payload));
+    bridge_status_payload_t payload = {
+        .version = BRIDGE_PROTOCOL_VERSION,
+        .mesh_state = state,
+        .role = role,
+        .node_id = node_id,
+        .slot_index = slot_index,
+        .coordinator_id = coordinator_id,
+        .peer_count = peer_count,
+    };
+    uint16_t pkt_len =
+        build_packet(pkt, UART_PKT_STATUS, (const uint8_t *)&payload, sizeof(payload));
     queue_control_packet(pkt, pkt_len);
 
-    LOG_DBG("Queued status: role=%d, peers=%d, id=%d", role, peer_count, node_id);
+    LOG_DBG("Queued status: state=%d role=%d peers=%d id=%d", state, role, peer_count, node_id);
     return 0;
+}
+
+int uart_bridge_send_command_ack(uint8_t command, uint8_t generation, int result)
+{
+    bridge_command_ack_payload_t ack = {
+        .command = command,
+        .generation = generation,
+        .result = result == 0 ? 0 : -1,
+    };
+    return uart_bridge_send_event(BRIDGE_EVENT_COMMAND_ACK, (const uint8_t *)&ack, sizeof(ack));
 }
 
 void uart_bridge_process(void)
@@ -441,19 +465,20 @@ void uart_bridge_process(void)
 
     memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
     uint8_t tx_kind = 0;
+    uint8_t tx_index = 0;
 
-    /* Copy one queued packet while locked, then release before the SPI transfer. */
+    /* Peek one packet. Advance its queue only after a successful transfer. */
     k_mutex_lock(&s_tx_lock, K_FOREVER);
-    if (s_audio_head != s_audio_tail) {
-        struct tx_entry *e = &s_audio_q[s_audio_tail];
-        memcpy(s_tx_buf, e->buf, e->len);
-        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
-        tx_kind = 1;
-    } else if (s_ctrl_head != s_ctrl_tail) {
+    if (s_ctrl_head != s_ctrl_tail) {
+        tx_index = s_ctrl_tail;
         struct tx_entry *e = &s_ctrl_q[s_ctrl_tail];
         memcpy(s_tx_buf, e->buf, e->len);
-        s_ctrl_tail = (s_ctrl_tail + 1) % TX_CTRL_QUEUE_SIZE;
         tx_kind = 2;
+    } else if (s_audio_head != s_audio_tail) {
+        tx_index = s_audio_tail;
+        struct tx_entry *e = &s_audio_q[s_audio_tail];
+        memcpy(s_tx_buf, e->buf, e->len);
+        tx_kind = 1;
     }
     k_mutex_unlock(&s_tx_lock);
 
@@ -488,14 +513,6 @@ void uart_bridge_process(void)
     k_busy_wait(50);                    /* Hold CS a bit after transfer */
     gpio_pin_set(s_cs_port, CS_PIN, 1); /* Deassert CS */
     txn_count++;
-    if (tx_kind == 1) {
-        s_spi_tx_audio++;
-    } else if (tx_kind == 2) {
-        s_spi_tx_control++;
-    } else {
-        s_spi_tx_idle++;
-    }
-
     if (ret) {
         s_spi_tx_fail++;
         if (txn_count <= 10) {
@@ -503,6 +520,18 @@ void uart_bridge_process(void)
         }
         return;
     }
+
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    if (tx_kind == 1 && s_audio_tail == tx_index) {
+        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
+        s_spi_tx_audio++;
+    } else if (tx_kind == 2 && s_ctrl_tail == tx_index) {
+        s_ctrl_tail = (s_ctrl_tail + 1) % TX_CTRL_QUEUE_SIZE;
+        s_spi_tx_control++;
+    } else if (tx_kind == 0) {
+        s_spi_tx_idle++;
+    }
+    k_mutex_unlock(&s_tx_lock);
 
     /* Debug: log first 3 transactions for boot verification */
     if (txn_count <= 3) {

@@ -106,8 +106,11 @@ The master polls the slave every 5 ms with a full-duplex 256-byte transaction.
 
 ### I2S WS Sync Wire (Clock Discipline)
 
-The ESP32's I2S Word Select (WS) output is tapped and fed to the nRF52840 to discipline
-the TDMA frame timer.  This eliminates clock drift between boards.
+The ESP32's I2S Word Select (WS) output is tapped and fed to the nRF52840. The
+nRF counts rising edges in hardware and uses valid frame samples to discipline
+its coordinator TDMA period in 100 us timer increments. Corrections are bounded;
+the wire reduces relative drift but does not eliminate oscillator error or prove
+over-the-air synchronization accuracy.
 
 | ESP32-S3 | XIAO nRF52840 | Function |
 |----------|---------------|----------|
