@@ -45,7 +45,7 @@ static const char *TAG = "spi_bridge";
 #define TX_AUDIO_MAX_AGE_US 120000
 #define COMMAND_ACK_TIMEOUT_MS 300
 #define COMMAND_MAX_ATTEMPTS   3
-#define STATUS_STALE_TIMEOUT_US 3000000
+#define STATUS_STALE_TIMEOUT_US 5000000
 
 typedef struct {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
@@ -62,6 +62,7 @@ static TaskHandle_t s_rx_task = NULL;
 
 static uart_bridge_audio_cb_t s_audio_cb = NULL;
 static uart_bridge_event_cb_t s_event_cb = NULL;
+static uart_bridge_status_cb_t s_status_cb = NULL;
 
 static uart_bridge_status_t s_status = {0};
 static bool s_connected = false;
@@ -116,6 +117,17 @@ static uint32_t s_bridge_rx_crc_fail = 0;
 static uint32_t s_bridge_rx_bad_sync = 0;
 static uint32_t s_bridge_rx_bad_len = 0;
 static uint32_t s_bridge_rx_trunc = 0;
+static uint32_t s_status_rx_valid = 0;
+static uint32_t s_status_expiration_count = 0;
+static uint32_t s_status_age_current_ms = 0;
+static uint32_t s_status_age_max_ms = 0;
+static uint32_t s_status_expired_generation = 0;
+static uint8_t s_status_expired_state = BRIDGE_MESH_STATE_IDLE;
+static bool s_status_expired = false;
+static uint32_t s_audio_gate_stale = 0;
+static uint32_t s_audio_gate_inactive = 0;
+static uint32_t s_audio_gate_disconnected = 0;
+static uint32_t s_audio_gate_invalid_node = 0;
 static uint8_t s_audio_tx_waiting_ack_seq = 0;
 static volatile bool s_audio_tx_waiting_ack = false;
 static tx_entry_t s_audio_tx_inflight;
@@ -232,6 +244,64 @@ static bool status_is_fresh_locked(int64_t now_us)
            now_us - s_status.received_at_us <= STATUS_STALE_TIMEOUT_US;
 }
 
+static void update_status_age_locked(int64_t now_us)
+{
+    if (s_status.received_at_us <= 0 || now_us < s_status.received_at_us) {
+        s_status_age_current_ms = 0;
+        return;
+    }
+
+    int64_t age_ms = (now_us - s_status.received_at_us) / 1000;
+    s_status_age_current_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
+    if (s_status_age_current_ms > s_status_age_max_ms) {
+        s_status_age_max_ms = s_status_age_current_ms;
+    }
+}
+
+static void log_status_telemetry(int64_t now_us)
+{
+    static int64_t last_log_us = 0;
+    if (now_us - last_log_us <= 5000000) {
+        return;
+    }
+
+    uint32_t valid_rx;
+    uint32_t expiration_count;
+    uint32_t age_ms;
+    uint32_t max_age_ms;
+    uint32_t generation;
+    uint8_t state;
+    uint32_t expired_generation;
+    uint8_t expired_state;
+    uint32_t gate_stale;
+    uint32_t gate_inactive;
+    uint32_t gate_disconnected;
+    uint32_t gate_invalid_node;
+
+    portENTER_CRITICAL(&s_status_lock);
+    update_status_age_locked(now_us);
+    valid_rx = s_status_rx_valid;
+    expiration_count = s_status_expiration_count;
+    age_ms = s_status_age_current_ms;
+    max_age_ms = s_status_age_max_ms;
+    generation = s_status.generation;
+    state = s_status.mesh_state;
+    expired_generation = s_status_expired_generation;
+    expired_state = s_status_expired_state;
+    gate_stale = s_audio_gate_stale;
+    gate_inactive = s_audio_gate_inactive;
+    gate_disconnected = s_audio_gate_disconnected;
+    gate_invalid_node = s_audio_gate_invalid_node;
+    portEXIT_CRITICAL(&s_status_lock);
+
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=bridge_status valid_rx=%lu expire=%lu age_ms=%lu max_age_ms=%lu gen=%lu state=%u exp_gen=%lu exp_state=%u gate_stale=%lu gate_inactive=%lu gate_disconnected=%lu gate_invalid_node=%lu",
+             valid_rx, expiration_count, age_ms, max_age_ms, generation, state,
+             expired_generation, expired_state, gate_stale, gate_inactive, gate_disconnected,
+             gate_invalid_node);
+    last_log_us = now_us;
+}
+
 /* ============================================================================
  * Private Functions
  * ============================================================================ */
@@ -261,6 +331,15 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
 
             int64_t received_at_us = esp_timer_get_time();
             portENTER_CRITICAL(&s_status_lock);
+            bool continuity_lost =
+                s_status.received_at_us > 0 && received_at_us >= s_status.received_at_us &&
+                received_at_us - s_status.received_at_us > STATUS_STALE_TIMEOUT_US;
+            if (continuity_lost && !s_status_expired) {
+                update_status_age_locked(received_at_us);
+                s_status_expiration_count++;
+                s_status_expired_generation = s_status.generation;
+                s_status_expired_state = s_status.mesh_state;
+            }
             /* Check for changes before updating */
             bool changed = (!s_connected) || (s_status.mesh_state != status.mesh_state) ||
                            (s_status.role != status.role) ||
@@ -280,8 +359,17 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
             s_status.protocol_version = status.version;
             s_status.generation = generation;
             s_status.received_at_us = received_at_us;
+            s_status.continuity_lost = continuity_lost;
             s_connected = true;
+            s_status_expired = false;
+            s_status_rx_valid++;
+            s_status_age_current_ms = 0;
+            uart_bridge_status_t published_status = s_status;
             portEXIT_CRITICAL(&s_status_lock);
+
+            if (s_status_cb) {
+                s_status_cb(&published_status);
+            }
 
             if (changed) {
                 ESP_LOGI(TAG, "Status: state=%u role=%u node=%u slot=%d coord=%u peers=%u",
@@ -294,6 +382,15 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
         } else if (len == 3) {
             int64_t received_at_us = esp_timer_get_time();
             portENTER_CRITICAL(&s_status_lock);
+            bool continuity_lost =
+                s_status.received_at_us > 0 && received_at_us >= s_status.received_at_us &&
+                received_at_us - s_status.received_at_us > STATUS_STALE_TIMEOUT_US;
+            if (continuity_lost && !s_status_expired) {
+                update_status_age_locked(received_at_us);
+                s_status_expiration_count++;
+                s_status_expired_generation = s_status.generation;
+                s_status_expired_state = s_status.mesh_state;
+            }
             uint32_t generation = s_status.generation + 1;
             memset(&s_status, 0, sizeof(s_status));
             s_status.role = payload[0];
@@ -308,8 +405,17 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
             s_status.has_mesh_state = false;
             s_status.generation = generation;
             s_status.received_at_us = received_at_us;
+            s_status.continuity_lost = continuity_lost;
             s_connected = true;
+            s_status_expired = false;
+            s_status_rx_valid++;
+            s_status_age_current_ms = 0;
+            uart_bridge_status_t published_status = s_status;
             portEXIT_CRITICAL(&s_status_lock);
+
+            if (s_status_cb) {
+                s_status_cb(&published_status);
+            }
 
             if (payload[0] == 0 || payload[2] == 0) {
                 discard_pending_audio();
@@ -762,6 +868,8 @@ void uart_bridge_deinit(void)
     portENTER_CRITICAL(&s_status_lock);
     s_connected = false;
     memset(&s_status, 0, sizeof(s_status));
+    s_status_expired = false;
+    s_status_age_current_ms = 0;
     portEXIT_CRITICAL(&s_status_lock);
     s_audio_tx_waiting_ack = false;
     s_audio_tx_inflight_valid = false;
@@ -897,6 +1005,11 @@ void uart_bridge_set_event_callback(uart_bridge_event_cb_t cb)
     s_event_cb = cb;
 }
 
+void uart_bridge_set_status_callback(uart_bridge_status_cb_t cb)
+{
+    s_status_cb = cb;
+}
+
 esp_err_t uart_bridge_get_status(uart_bridge_status_t *status)
 {
     if (status == NULL) {
@@ -905,21 +1018,36 @@ esp_err_t uart_bridge_get_status(uart_bridge_status_t *status)
 
     bool expired = false;
     uint32_t expired_generation = 0;
+    uint8_t expired_state = BRIDGE_MESH_STATE_IDLE;
+    uint32_t expired_age_ms = 0;
     int64_t now_us = esp_timer_get_time();
     portENTER_CRITICAL(&s_status_lock);
+    update_status_age_locked(now_us);
     if (!status_is_fresh_locked(now_us)) {
         expired = s_connected;
         expired_generation = s_status.generation;
+        expired_state = s_status.mesh_state;
+        expired_age_ms = s_status_age_current_ms;
+        if (expired) {
+            s_status_expiration_count++;
+            s_status_expired_generation = expired_generation;
+            s_status_expired_state = expired_state;
+            s_status_expired = true;
+        }
         s_connected = false;
         portEXIT_CRITICAL(&s_status_lock);
         if (expired) {
+            ESP_LOGW(TAG, "Status expired: age_ms=%lu generation=%lu state=%u", expired_age_ms,
+                     expired_generation, expired_state);
             discard_audio_for_expired_status(expired_generation);
         }
+        log_status_telemetry(now_us);
         return ESP_ERR_NOT_FOUND;
     }
 
     memcpy(status, &s_status, sizeof(uart_bridge_status_t));
     portEXIT_CRITICAL(&s_status_lock);
+    log_status_telemetry(now_us);
     return ESP_OK;
 }
 
@@ -932,8 +1060,23 @@ bool uart_bridge_is_connected(void)
 bool uart_bridge_is_mesh_ready(void)
 {
     uart_bridge_status_t status;
-    return uart_bridge_get_status(&status) == ESP_OK &&
-           status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
+    esp_err_t err = uart_bridge_get_status(&status);
+
+    portENTER_CRITICAL(&s_status_lock);
+    if (err != ESP_OK) {
+        if (s_status_expired) {
+            s_audio_gate_stale++;
+        } else {
+            s_audio_gate_disconnected++;
+        }
+    } else if (status.mesh_state != BRIDGE_MESH_STATE_ACTIVE) {
+        s_audio_gate_inactive++;
+    } else if (status.node_id == 0) {
+        s_audio_gate_invalid_node++;
+    }
+    portEXIT_CRITICAL(&s_status_lock);
+
+    return err == ESP_OK && status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
 }
 
 bool uart_bridge_probe(uint32_t timeout_ms)

@@ -2058,24 +2058,37 @@ static void handle_packet(const mesh_rx_item_t *rx)
     case MESH_PKT_LEAVE:
         /* Handle peer leaving */
         ESP_LOGI(TAG, "Node %d leaving mesh", rx->header.src_id);
+        if (rx->header.src_id == s_node_id ||
+            memcmp(rx->src_mac, s_local_mac, sizeof(s_local_mac)) == 0) {
+            ESP_LOGW(TAG, "Ignoring LEAVE with local identity: node_id=%u, MAC=" MACSTR,
+                     rx->header.src_id, MAC2STR(rx->src_mac));
+            break;
+        }
         xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
         bool peer_removed = false;
         mesh_peer_info_t removed_peer = {0};
         for (int i = 0; i < MESH_MAX_NODES; i++) {
-            if (s_peers[i].info.node_id == rx->header.src_id) {
+            if (s_peers[i].info.active && s_peers[i].info.node_id == rx->header.src_id &&
+                memcmp(s_peers[i].info.mac_addr, rx->src_mac,
+                       sizeof(s_peers[i].info.mac_addr)) == 0) {
                 removed_peer = s_peers[i].info;
                 s_peers[i].info.active = false;
-                s_peer_count--;
+                if (s_peer_count > 0) {
+                    s_peer_count--;
+                }
                 peer_removed = true;
                 break;
             }
         }
         xSemaphoreGive(s_peer_mutex);
-        mesh_core_dedupe_purge_node(&s_dedupe, rx->header.src_id);
         if (peer_removed) {
+            mesh_core_dedupe_purge_node(&s_dedupe, rx->header.src_id);
             if (s_peer_cb) {
                 s_peer_cb(&removed_peer, false);
             }
+        } else {
+            ESP_LOGW(TAG, "Ignoring stale/unknown LEAVE: node_id=%u, MAC=" MACSTR,
+                     rx->header.src_id, MAC2STR(rx->src_mac));
         }
         if (s_role == MESH_ROLE_COORDINATOR) {
             send_slot_map();

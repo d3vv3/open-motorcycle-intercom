@@ -11,6 +11,7 @@
 #include "vox.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -131,7 +132,10 @@ static adc_continuous_handle_t s_adc_handle = NULL;
 
 /* Audio task handle */
 static TaskHandle_t s_audio_task = NULL;
+static portMUX_TYPE s_audio_task_lock = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t s_audio_task_done = NULL;
+static SemaphoreHandle_t s_rx_reset_done = NULL;
+static SemaphoreHandle_t s_rx_reset_mutex = NULL;
 
 /* ADC notification handle */
 static TaskHandle_t s_adc_notify_task = NULL;
@@ -161,6 +165,7 @@ static voice_cleanup_state_t s_voice_cleanup = {0};
 /* RX source slots and notification playback are owned by the audio task. */
 static audio_rx_source_t s_rx_sources[AUDIO_MAX_RX_SOURCES] = {0};
 static SemaphoreHandle_t s_rx_sources_mutex = NULL;
+static atomic_bool s_rx_reset_requested = false;
 static QueueHandle_t s_notification_queue = NULL;
 static audio_notification_state_t s_notification = {0};
 
@@ -679,9 +684,16 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
 
 static void audio_task_await_delete(void)
 {
+    portENTER_CRITICAL(&s_audio_task_lock);
+    bool reset_requested = atomic_exchange(&s_rx_reset_requested, false);
+    s_audio_task = NULL;
+    portEXIT_CRITICAL(&s_audio_task_lock);
+    if (reset_requested) {
+        reset_rx_sources();
+        xSemaphoreGive(s_rx_reset_done);
+    }
     s_adc_notify_task = NULL;
     s_running = false;
-    s_audio_task = NULL;
     xSemaphoreGive(s_audio_task_done);
     vTaskDelete(NULL);
 }
@@ -732,6 +744,11 @@ static void audio_task(void *arg)
         /* Wait for ADC data ready notification (with timeout) */
         bool capture_notified =
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ADC_READ_TIMEOUT_MS)) != 0;
+
+        if (atomic_exchange(&s_rx_reset_requested, false)) {
+            reset_rx_sources();
+            xSemaphoreGive(s_rx_reset_done);
+        }
         if (!capture_notified) {
             s_stats.capture_timeouts++;
         }
@@ -1150,10 +1167,13 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
     memset(&s_stats, 0, sizeof(s_stats));
 
     s_audio_task_done = xSemaphoreCreateBinary();
+    s_rx_reset_done = xSemaphoreCreateBinary();
+    s_rx_reset_mutex = xSemaphoreCreateMutex();
     s_rx_sources_mutex = xSemaphoreCreateMutex();
     s_notification_queue =
         xQueueCreate(NOTIFICATION_QUEUE_SIZE, sizeof(audio_notification_request_t));
-    if (!s_audio_task_done || !s_rx_sources_mutex || !s_notification_queue) {
+    if (!s_audio_task_done || !s_rx_reset_done || !s_rx_reset_mutex || !s_rx_sources_mutex ||
+        !s_notification_queue) {
         ESP_LOGE(TAG, "Failed to create audio synchronization resources");
         if (s_audio_task_done) {
             vSemaphoreDelete(s_audio_task_done);
@@ -1162,6 +1182,14 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
         if (s_rx_sources_mutex) {
             vSemaphoreDelete(s_rx_sources_mutex);
             s_rx_sources_mutex = NULL;
+        }
+        if (s_rx_reset_done) {
+            vSemaphoreDelete(s_rx_reset_done);
+            s_rx_reset_done = NULL;
+        }
+        if (s_rx_reset_mutex) {
+            vSemaphoreDelete(s_rx_reset_mutex);
+            s_rx_reset_mutex = NULL;
         }
         if (s_notification_queue) {
             vQueueDelete(s_notification_queue);
@@ -1185,6 +1213,10 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
             s_notification_queue = NULL;
             vSemaphoreDelete(s_rx_sources_mutex);
             s_rx_sources_mutex = NULL;
+            vSemaphoreDelete(s_rx_reset_mutex);
+            s_rx_reset_mutex = NULL;
+            vSemaphoreDelete(s_rx_reset_done);
+            s_rx_reset_done = NULL;
             vSemaphoreDelete(s_audio_task_done);
             s_audio_task_done = NULL;
             opus_deinit();
@@ -1248,6 +1280,14 @@ esp_err_t audio_deinit(void)
     if (s_audio_task_done) {
         vSemaphoreDelete(s_audio_task_done);
         s_audio_task_done = NULL;
+    }
+    if (s_rx_reset_done) {
+        vSemaphoreDelete(s_rx_reset_done);
+        s_rx_reset_done = NULL;
+    }
+    if (s_rx_reset_mutex) {
+        vSemaphoreDelete(s_rx_reset_mutex);
+        s_rx_reset_mutex = NULL;
     }
 
     s_initialized = false;
@@ -1400,6 +1440,27 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     xSemaphoreGive(s_rx_sources_mutex);
 
     return ESP_OK;
+}
+
+void audio_clear_rx_frames(void)
+{
+    if (!s_initialized || s_rx_reset_mutex == NULL || s_rx_reset_done == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_rx_reset_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_rx_reset_done, 0);
+    portENTER_CRITICAL(&s_audio_task_lock);
+    TaskHandle_t task = s_audio_task;
+    if (task != NULL) {
+        atomic_store(&s_rx_reset_requested, true);
+    }
+    portEXIT_CRITICAL(&s_audio_task_lock);
+    if (task != NULL) {
+        xSemaphoreTake(s_rx_reset_done, portMAX_DELAY);
+    } else {
+        reset_rx_sources();
+    }
+    xSemaphoreGive(s_rx_reset_mutex);
 }
 
 esp_err_t audio_register_tx_callback(audio_tx_cb_t cb)

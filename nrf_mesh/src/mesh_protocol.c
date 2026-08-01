@@ -73,6 +73,7 @@ static mesh_role_t s_role = MESH_ROLE_NONE;
 static uint8_t s_node_id = 0;
 static int8_t s_slot_index = -1;
 static uint8_t s_coordinator_id = 0;
+static bool s_participant_membership_known = false;
 
 static uint8_t s_local_addr[5];
 static mesh_peer_info_t s_peers[MESH_MAX_NODES];
@@ -233,8 +234,18 @@ static void esb_rx_callback(const uint8_t *data, uint8_t len, const uint8_t *src
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter);
 static int send_packet_ex(mesh_pkt_type_t type, const void *payload, uint16_t len, uint8_t ttl,
                           uint8_t flags, uint8_t src_id, uint8_t seq);
+static int send_slot_map(void);
 static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, uint8_t flags);
 static bool relay_queue_empty(void);
+
+static uint8_t bridge_peer_count(void)
+{
+    if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_PARTICIPANT &&
+        !s_participant_membership_known) {
+        return BRIDGE_PEER_COUNT_UNKNOWN;
+    }
+    return s_peer_count;
+}
 
 static void set_audio_ingress_enabled(bool enabled, bool purge)
 {
@@ -273,6 +284,16 @@ static void update_peer_last_seen(uint8_t node_id, int8_t rssi)
         if (s_peers[i].active && s_peers[i].node_id == node_id) {
             s_peers[i].last_seen_ms = k_uptime_get();
             s_peers[i].rssi_dbm = rssi;
+            if (!s_peers[i].announced && s_role == MESH_ROLE_COORDINATOR) {
+                s_peers[i].announced = true;
+                s_peer_count++;
+                uint8_t joined_id = node_id;
+                uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id,
+                                        s_slot_index, s_coordinator_id);
+                uart_bridge_send_event(BRIDGE_EVENT_PEER_JOINED, &joined_id,
+                                       sizeof(joined_id));
+                send_slot_map();
+            }
             break;
         }
     }
@@ -545,7 +566,8 @@ static int send_slot_map(void)
     payload.slot_count = MESH_MAX_NODES;
 
     for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (s_peers[i].active && s_peers[i].slot_index >= 0 && s_peers[i].slot_index < MESH_MAX_NODES) {
+        if (s_peers[i].active && s_peers[i].announced && s_peers[i].slot_index >= 0 &&
+            s_peers[i].slot_index < MESH_MAX_NODES) {
             payload.slot_ids[s_peers[i].slot_index] = s_peers[i].node_id;
         }
     }
@@ -830,7 +852,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
                 set_audio_ingress_enabled(false, true);
 
                 k_work_cancel_delayable(&s_status_work);
-                uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+                uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                                         s_coordinator_id);
                 k_work_schedule(&s_join_work, K_NO_WAIT);
             } else if (cmp > 0) {
@@ -876,10 +898,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
                                sizeof(s_peers[i].esb_addr));
                         s_peers[i].last_seen_ms = k_uptime_get();
                         s_peers[i].active = true;
-                        s_peer_count++;
-                        uint8_t joined_id = assigned_id;
-                        uart_bridge_send_event(BRIDGE_EVENT_PEER_JOINED, &joined_id,
-                                               sizeof(joined_id));
+                        s_peers[i].announced = false;
                         break;
                     }
                 }
@@ -919,13 +938,14 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
             s_state = MESH_STATE_ACTIVE;
             s_role = MESH_ROLE_PARTICIPANT;
             s_peer_count = 1;
+            s_participant_membership_known = false;
             set_audio_ingress_enabled(true, false);
             k_work_cancel_delayable(&s_join_work);
             tdma_start(s_slot_index, false);
             s_last_sync_time = k_uptime_get_32();
             k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
-            uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
-                                    s_coordinator_id);
+            uart_bridge_send_status(s_state, s_role, BRIDGE_PEER_COUNT_UNKNOWN, s_node_id,
+                                    s_slot_index, s_coordinator_id);
             uart_bridge_send_event(BRIDGE_EVENT_MESH_READY, NULL, 0);
         }
         break;
@@ -943,6 +963,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
     case MESH_PKT_STATUS:
         if (hdr->payload_len >= sizeof(mesh_status_payload_t)) {
             const mesh_status_payload_t *status = (const mesh_status_payload_t *)payload;
+            update_peer_last_seen(hdr->src_id, rssi);
             for (int i = 0; i < MESH_MAX_NODES; i++) {
                 if (s_peers[i].active && s_peers[i].node_id == hdr->src_id) {
                     s_peers[i].battery_pct = status->battery_pct;
@@ -984,7 +1005,10 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
             }
             s_slot_index = parsed.local_slot;
             s_peer_count = (uint8_t)(parsed.member_count - 1U);
+            s_participant_membership_known = true;
             tdma_set_slot_index(parsed.local_slot);
+            uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
+                                    s_coordinator_id);
 
             clear_speaker_grants();
             for (uint8_t i = 0; i < slot_map->active_speaker_count && i < MESH_MAX_ACTIVE_SPEAKERS;
@@ -1034,17 +1058,21 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
                                           sizeof(leave->sender_addr)) == 0;
             }
             if (s_peers[i].active && s_peers[i].node_id == hdr->src_id && identity_matches) {
+                bool announced = s_peers[i].announced;
                 s_peers[i].active = false;
                 mesh_core_dedupe_purge_node(&s_dedupe, hdr->src_id);
-                if (s_peer_count > 0) {
+                if (announced && s_peer_count > 0) {
                     s_peer_count--;
                 }
                 LOG_INF("Peer %u left, remaining peers: %u", hdr->src_id, s_peer_count);
 
-                /* Notify ESP32 so it can play a disconnect tone */
-                uint8_t departed_id = hdr->src_id;
-                uart_bridge_send_event(BRIDGE_EVENT_PEER_LEFT, &departed_id,
-                                       sizeof(departed_id));
+                if (announced) {
+                    uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id,
+                                            s_slot_index, s_coordinator_id);
+                    uint8_t departed_id = hdr->src_id;
+                    uart_bridge_send_event(BRIDGE_EVENT_PEER_LEFT, &departed_id,
+                                           sizeof(departed_id));
+                }
 
                 break;
             }
@@ -1086,6 +1114,7 @@ static void scan_work_handler(struct k_work *work)
     esb_radio_get_address(s_peers[0].esb_addr);
     s_peers[0].slot_index = 0;
     s_peers[0].active = true;
+    s_peers[0].announced = true;
     s_peers[0].last_seen_ms = k_uptime_get();
     s_peer_count = 0;
 
@@ -1098,7 +1127,7 @@ static void scan_work_handler(struct k_work *work)
     k_work_schedule(&s_status_work, K_MSEC(STATUS_INTERVAL_MS));
 
     LOG_INF("ACTIVE as coordinator, node_id=%d, slot=%d", s_node_id, s_slot_index);
-    uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+    uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                             s_coordinator_id);
     uart_bridge_send_event(BRIDGE_EVENT_BECAME_COORDINATOR, NULL, 0);
     uart_bridge_send_event(BRIDGE_EVENT_MESH_READY, NULL, 0);
@@ -1127,7 +1156,7 @@ static void join_work_handler(struct k_work *work)
         s_node_id = 0;
         s_slot_index = -1;
         s_coordinator_id = 0;
-        uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+        uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                                 s_coordinator_id);
         k_work_schedule(&s_scan_work, K_MSEC(delay_ms));
     }
@@ -1160,9 +1189,10 @@ static void check_peer_timeouts(void)
 
         if ((now - s_peers[i].last_seen_ms) > MESH_NODE_TIMEOUT_MS) {
             uint8_t timed_out_id = s_peers[i].node_id;
+            bool announced = s_peers[i].announced;
             s_peers[i].active = false;
             mesh_core_dedupe_purge_node(&s_dedupe, timed_out_id);
-            if (s_peer_count > 0) {
+            if (announced && s_peer_count > 0) {
                 s_peer_count--;
             }
             topology_changed = true;
@@ -1171,8 +1201,10 @@ static void check_peer_timeouts(void)
                     s_peer_count);
 
             /* Notify ESP32 so it can play a disconnect tone. */
-            uart_bridge_send_event(BRIDGE_EVENT_PEER_LEFT, &timed_out_id,
-                                   sizeof(timed_out_id));
+            if (announced) {
+                uart_bridge_send_event(BRIDGE_EVENT_PEER_LEFT, &timed_out_id,
+                                       sizeof(timed_out_id));
+            }
         }
     }
 
@@ -1194,7 +1226,7 @@ static void status_work_handler(struct k_work *work)
     check_peer_timeouts();
 
     /* Send status to ESP32 */
-    uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+    uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                             s_coordinator_id);
 
     /* Send mesh status and keepalive over RF */
@@ -1325,7 +1357,7 @@ static void status_work_handler(struct k_work *work)
             s_coordinator_id = 0;
 
             uint32_t delay_ms = scan_timeout_ms();
-            uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+            uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                                     s_coordinator_id);
             k_work_schedule(&s_scan_work, K_MSEC(delay_ms));
             return; /* Don't reschedule status work */
@@ -1577,11 +1609,11 @@ static void command_work_handler(struct k_work *work)
                 mesh_protocol_stop();
             }
             uart_bridge_send_command_ack(command, generation, result);
-            uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+            uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                                     s_coordinator_id);
         }
         if (atomic_set(&s_status_pending, 0) != 0) {
-            uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+            uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                                     s_coordinator_id);
         }
     } while (atomic_get(&s_control_pending) != 0 || atomic_get(&s_status_pending) != 0);
@@ -1708,7 +1740,7 @@ void mesh_protocol_stop(void)
     s_node_id = 0;
     s_slot_index = -1;
     s_coordinator_id = 0;
-    uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+    uart_bridge_send_status(s_state, s_role, bridge_peer_count(), s_node_id, s_slot_index,
                             s_coordinator_id);
     uart_bridge_send_event(BRIDGE_EVENT_MESH_STOPPED, NULL, 0);
 }

@@ -35,6 +35,12 @@ _PIPE_GAUGE_KEYS = {
     "callback_jitter_max_us",
     "sync_frame_diff",
     "sync_phase_us",
+    "age_ms",
+    "max_age_ms",
+    "gen",
+    "state",
+    "exp_gen",
+    "exp_state",
 }
 
 _PIPE_SIGNED_KEYS = {

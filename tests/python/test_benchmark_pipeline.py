@@ -142,6 +142,26 @@ class PipelineLogTest(unittest.TestCase):
         self.assertNotIn("q_depth", pipeline["delta"])
         self.assertNotIn("tx_wait_avg_us", pipeline["delta"])
 
+    def test_bridge_status_counters_exclude_snapshot_fields(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "PIPE v=1 dev=esp stage=bridge_status valid_rx=100 expire=1 age_ms=20 "
+            "max_age_ms=3100 gen=100 state=3 exp_gen=90 exp_state=3 gate_stale=4"
+        )
+        reader._parse_line(
+            "PIPE v=1 dev=esp stage=bridge_status valid_rx=110 expire=2 age_ms=40 "
+            "max_age_ms=5200 gen=110 state=3 exp_gen=105 exp_state=3 gate_stale=7"
+        )
+
+        pipeline = _build_port_json(stats)["pipeline"]["esp:bridge_status:na"]
+        self.assertEqual(pipeline["delta"]["valid_rx"], 10)
+        self.assertEqual(pipeline["delta"]["expire"], 1)
+        self.assertEqual(pipeline["delta"]["gate_stale"], 3)
+        for gauge in ("age_ms", "max_age_ms", "gen", "state", "exp_gen", "exp_state"):
+            self.assertNotIn(gauge, pipeline["delta"])
+            self.assertNotIn(gauge, pipeline["reset_epochs"])
+
     def test_reset_epochs_are_accumulated_without_negative_delta(self):
         stats = PortStats(port="test")
         reader = PortReader("test", 115200, None, "unused", stats)

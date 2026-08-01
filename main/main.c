@@ -7,10 +7,12 @@
  */
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "esp_log.h"
@@ -52,7 +54,7 @@ static const char *TAG = "omi";
  * State
  * ============================================================================ */
 
-static bool s_mesh_active = false;
+static _Atomic bool s_mesh_active = false;
 
 /* End-to-end audio sequence diagnostics (nRF transport path) */
 static uint16_t s_e2e_tx_seq = 0;
@@ -171,7 +173,7 @@ typedef enum {
 } transport_type_t;
 
 static transport_type_t s_active_transport = TRANSPORT_NONE;
-static bool s_mesh_user_enabled = false;
+static _Atomic bool s_mesh_user_enabled = false;
 
 #define MESH_NVS_NAMESPACE "omi"
 #define MESH_NVS_ENABLED_KEY "mesh_enabled"
@@ -181,16 +183,19 @@ static bool s_mesh_user_enabled = false;
 static uint8_t s_nrf_reconcile_attempts = 0;
 static bool s_nrf_status_observed = false;
 static uint8_t s_nrf_last_mesh_state = BRIDGE_MESH_STATE_IDLE;
-
-/* SYNC_LOST escalation: treat sustained loss as effective peer leave.
- * The nRF SYNC_TIMEOUT is 5 s and after each SYNC_LOST the nRF rescans,
- * so consecutive events are spaced ~7-10 s apart.  Use a 30 s window
- * with a threshold of 2 so the escalation is actually reachable. */
-#define SYNC_LOST_ESCALATE_WINDOW_MS 30000
-#define SYNC_LOST_ESCALATE_COUNT     2
-static uint32_t s_sync_lost_window_start_ms = 0;
-static uint8_t s_sync_lost_count = 0;
-static bool s_peer_left_latched = false;
+static bool s_nrf_membership_observed = false;
+static uint8_t s_nrf_last_peer_count = 0;
+static SemaphoreHandle_t s_nrf_membership_mutex = NULL;
+static _Atomic bool s_mesh_enable_notification_pending = false;
+#define NRF_NOTIFICATION_QUEUE_SIZE 8
+typedef struct {
+    audio_notify_t type;
+    uint32_t generation;
+} nrf_notification_t;
+static nrf_notification_t s_nrf_notification_queue[NRF_NOTIFICATION_QUEUE_SIZE];
+static uint8_t s_nrf_notification_head = 0;
+static uint8_t s_nrf_notification_tail = 0;
+static uint32_t s_nrf_membership_generation = 0;
 static int64_t s_mesh_restart_attempt_ms = 0;
 
 static esp_err_t load_mesh_user_intent(void)
@@ -272,12 +277,14 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         s_pipe_source_frames++;
         uint16_t seq = s_e2e_tx_seq++;
         s_e2e_tx_frames++;
-        if (s_mesh_active && uart_bridge_is_mesh_ready()) {
+        xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+        if (s_mesh_user_enabled && uart_bridge_is_mesh_ready()) {
             uint8_t tx_buf[130];
             uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
             if (len > MESH_MAX_OPUS_BYTES) {
                 s_pipe_spi_oversize++;
                 ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
+                xSemaphoreGive(s_nrf_membership_mutex);
                 break;
             }
 
@@ -316,6 +323,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
                 last_log = now;
             }
         }
+        xSemaphoreGive(s_nrf_membership_mutex);
         break;
 
     default:
@@ -425,7 +433,14 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
      * bit distinguishes speech from intentional silence/comfort frames. */
     frame.active = (data[0] & MESH_AUDIO_FLAG_ACTIVE) != 0;
 
+    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+    if (!s_mesh_user_enabled || !uart_bridge_is_mesh_ready()) {
+        xSemaphoreGive(s_nrf_membership_mutex);
+        s_pipe_spi_rx_invalid++;
+        return;
+    }
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
+    xSemaphoreGive(s_nrf_membership_mutex);
     if (ret != ESP_OK) {
         s_pipe_play_queue_drop++;
         ESP_LOGD(TAG, "Failed to queue RX audio: %s", esp_err_to_name(ret));
@@ -473,6 +488,104 @@ static void mesh_peer_callback(const mesh_peer_info_t *peer, bool joined)
     }
 }
 
+static void reset_nrf_membership_tracking(void)
+{
+    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+    s_nrf_membership_observed = false;
+    s_nrf_last_peer_count = 0;
+    s_nrf_notification_head = 0;
+    s_nrf_notification_tail = 0;
+    s_nrf_membership_generation++;
+    xSemaphoreGive(s_nrf_membership_mutex);
+}
+
+static void queue_nrf_notification_locked(audio_notify_t type)
+{
+    uint8_t next = (uint8_t)((s_nrf_notification_head + 1) % NRF_NOTIFICATION_QUEUE_SIZE);
+    if (next == s_nrf_notification_tail) {
+        s_nrf_notification_tail =
+            (uint8_t)((s_nrf_notification_tail + 1) % NRF_NOTIFICATION_QUEUE_SIZE);
+    }
+    s_nrf_notification_queue[s_nrf_notification_head] = (nrf_notification_t){
+        .type = type,
+        .generation = s_nrf_membership_generation,
+    };
+    s_nrf_notification_head = next;
+}
+
+static void drain_nrf_notifications(void)
+{
+    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+    while (s_nrf_notification_tail != s_nrf_notification_head) {
+        nrf_notification_t item = s_nrf_notification_queue[s_nrf_notification_tail];
+        s_nrf_notification_tail =
+            (uint8_t)((s_nrf_notification_tail + 1) % NRF_NOTIFICATION_QUEUE_SIZE);
+        if (item.generation == s_nrf_membership_generation &&
+            atomic_load(&s_mesh_user_enabled)) {
+            (void)audio_play_notification(item.type);
+        }
+    }
+    xSemaphoreGive(s_nrf_membership_mutex);
+}
+
+static void set_mesh_user_runtime_state(bool enabled)
+{
+    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+    atomic_store(&s_mesh_user_enabled, enabled);
+    atomic_store(&s_mesh_enable_notification_pending, enabled);
+    s_nrf_membership_generation++;
+    s_nrf_notification_head = 0;
+    s_nrf_notification_tail = 0;
+    if (!enabled) {
+        s_nrf_membership_observed = false;
+        s_nrf_last_peer_count = 0;
+        atomic_store(&s_mesh_active, false);
+    }
+    xSemaphoreGive(s_nrf_membership_mutex);
+}
+
+static void bridge_status_callback(const uart_bridge_status_t *status)
+{
+    bool ready = status->mesh_state == BRIDGE_MESH_STATE_ACTIVE && status->node_id != 0;
+    bool user_enabled;
+    bool logged_join = false;
+    bool logged_leave = false;
+
+    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+    user_enabled = atomic_load(&s_mesh_user_enabled);
+    if (!user_enabled) {
+        s_nrf_membership_observed = false;
+        s_nrf_last_peer_count = 0;
+    } else if (!ready || status->continuity_lost ||
+               status->peer_count == BRIDGE_PEER_COUNT_UNKNOWN) {
+        s_nrf_membership_observed = false;
+        s_nrf_last_peer_count = 0;
+    } else if (!s_nrf_membership_observed) {
+        s_nrf_membership_observed = true;
+        s_nrf_last_peer_count = status->peer_count;
+    } else {
+        if (status->peer_count > s_nrf_last_peer_count) {
+            queue_nrf_notification_locked(AUDIO_NOTIFY_PEER_JOIN);
+            logged_join = true;
+        } else if (status->peer_count < s_nrf_last_peer_count) {
+            queue_nrf_notification_locked(AUDIO_NOTIFY_PEER_LEAVE);
+            logged_leave = true;
+        }
+        s_nrf_last_peer_count = status->peer_count;
+    }
+    atomic_store(&s_mesh_active, user_enabled && ready);
+    if (user_enabled && ready && atomic_exchange(&s_mesh_enable_notification_pending, false)) {
+        queue_nrf_notification_locked(AUDIO_NOTIFY_MESH_ENABLED);
+    }
+    xSemaphoreGive(s_nrf_membership_mutex);
+
+    if (logged_join) {
+        ESP_LOGI(TAG, "nRF peer count increased to %u", status->peer_count);
+    } else if (logged_leave) {
+        ESP_LOGI(TAG, "nRF peer count decreased to %u", status->peer_count);
+    }
+}
+
 /**
  * @brief Callback for mesh events from nRF52840
  */
@@ -480,13 +593,6 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
 {
     (void)data;
     (void)len;
-
-    uint32_t now_ms = (uint32_t)get_time_ms();
-
-    if (now_ms - s_sync_lost_window_start_ms > SYNC_LOST_ESCALATE_WINDOW_MS) {
-        s_sync_lost_window_start_ms = now_ms;
-        s_sync_lost_count = 0;
-    }
 
     switch (event) {
     case BRIDGE_EVENT_MESH_READY:
@@ -497,49 +603,21 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
             s_mesh_active = false;
             break;
         }
-
-        if (!s_mesh_active) {
-            s_mesh_active = true;
-            (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
-        }
-        s_sync_lost_window_start_ms = now_ms;
-        s_sync_lost_count = 0;
-        s_peer_left_latched = false;
         break;
     case BRIDGE_EVENT_PEER_JOINED:
-        ESP_LOGI(TAG, "Peer joined mesh");
-        (void)audio_play_notification(AUDIO_NOTIFY_PEER_JOIN);
-        s_sync_lost_window_start_ms = now_ms;
-        s_sync_lost_count = 0;
-        s_peer_left_latched = false;
+        ESP_LOGI(TAG, "Peer join event received; waiting for status confirmation");
         break;
     case BRIDGE_EVENT_PEER_LEFT:
-        ESP_LOGI(TAG, "Peer left mesh");
-        (void)audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
-        s_sync_lost_window_start_ms = now_ms;
-        s_sync_lost_count = 0;
-        s_peer_left_latched = true;
+        ESP_LOGI(TAG, "Peer leave event received; waiting for status confirmation");
         break;
     case BRIDGE_EVENT_MESH_STOPPED:
         ESP_LOGI(TAG, "nRF52840 mesh stopped");
         s_mesh_active = false;
+        atomic_store(&s_mesh_enable_notification_pending, false);
+        reset_nrf_membership_tracking();
         break;
     case BRIDGE_EVENT_SYNC_LOST:
-        /* Transient nRF coordinator timeout/rescan event.
-         * Keep this informational only (no disconnect tone), because mesh can
-         * recover immediately and audio may continue during role transition. */
-        ESP_LOGW(TAG, "nRF sync lost/rescanning (suppressing peer-leave tone)");
-
-        if (s_sync_lost_count < 255) {
-            s_sync_lost_count++;
-        }
-
-        if (!s_peer_left_latched && s_sync_lost_count >= SYNC_LOST_ESCALATE_COUNT) {
-            ESP_LOGW(TAG, "SYNC_LOST storm (%u in %u ms) -> treating as peer left",
-                     s_sync_lost_count, SYNC_LOST_ESCALATE_WINDOW_MS);
-            (void)audio_play_notification(AUDIO_NOTIFY_PEER_LEAVE);
-            s_peer_left_latched = true;
-        }
+        ESP_LOGW(TAG, "nRF sync lost/rescanning; waiting for status confirmation");
         break;
     case BRIDGE_EVENT_COMMAND_ACK:
     case BRIDGE_EVENT_BECAME_COORDINATOR:
@@ -553,7 +631,10 @@ static void reconcile_nrf_mesh_state(int64_t now_ms)
 {
     uart_bridge_status_t status;
     if (uart_bridge_get_status(&status) != ESP_OK) {
-        s_mesh_active = false;
+        atomic_store(&s_mesh_active, false);
+        if (s_nrf_status_observed) {
+            reset_nrf_membership_tracking();
+        }
         s_nrf_status_observed = false;
         return;
     }
@@ -566,10 +647,7 @@ static void reconcile_nrf_mesh_state(int64_t now_ms)
     }
 
     if (s_mesh_user_enabled && ready) {
-        if (!s_mesh_active) {
-            s_mesh_active = true;
-            (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
-        }
+        atomic_store(&s_mesh_active, true);
         return;
     }
 
@@ -609,7 +687,7 @@ static void button_long_press_callback(int gpio)
         ESP_LOGE(TAG, "Failed to persist mesh intent: %s", esp_err_to_name(ret));
         return;
     }
-    s_mesh_user_enabled = requested_enabled;
+    set_mesh_user_runtime_state(requested_enabled);
     reset_nrf_reconciliation();
 
     if (!requested_enabled) {
@@ -625,10 +703,14 @@ static void button_long_press_callback(int gpio)
 
         if (ret == ESP_OK) {
             s_mesh_active = false;
+            atomic_store(&s_mesh_enable_notification_pending, false);
+            reset_nrf_membership_tracking();
+            audio_clear_rx_frames();
             (void)audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
             ESP_LOGI(TAG, "Mesh disabled");
         } else {
-            s_mesh_user_enabled = true;
+            set_mesh_user_runtime_state(true);
+            atomic_store(&s_mesh_enable_notification_pending, false);
             esp_err_t persist_ret = persist_mesh_user_intent(true);
             if (persist_ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to restore enabled mesh intent: %s",
@@ -650,11 +732,12 @@ static void button_long_press_callback(int gpio)
         if (ret == ESP_OK) {
             if (s_active_transport == TRANSPORT_ESP_NOW) {
                 s_mesh_active = true;
+                atomic_store(&s_mesh_enable_notification_pending, false);
                 (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
             }
             ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
         } else {
-            s_mesh_user_enabled = false;
+            set_mesh_user_runtime_state(false);
             esp_err_t persist_ret = persist_mesh_user_intent(false);
             if (persist_ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to restore disabled mesh intent: %s",
@@ -693,6 +776,8 @@ void app_main(void)
     ESP_LOGI(TAG, "[%" PRId64 " ms] NVS initialized", get_time_ms());
     ESP_ERROR_CHECK(load_mesh_user_intent());
     ESP_LOGI(TAG, "Persisted mesh intent: %s", s_mesh_user_enabled ? "enabled" : "disabled");
+    s_nrf_membership_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_nrf_membership_mutex ? ESP_OK : ESP_ERR_NO_MEM);
 
     /* Initialize power management (Phase 3) */
     esp_err_t ret = power_init();
@@ -728,6 +813,7 @@ void app_main(void)
 
         uart_bridge_set_audio_callback(bridge_audio_callback);
         uart_bridge_set_event_callback(bridge_event_callback);
+        uart_bridge_set_status_callback(bridge_status_callback);
 
         s_mesh_active = false;
         reset_nrf_reconciliation();
@@ -906,6 +992,7 @@ void app_main(void)
             static int64_t last_rtt_log_ms = 0;
 
             reconcile_nrf_mesh_state(now_ms);
+            drain_nrf_notifications();
             rtt_probe_tick(now_ms, s_mesh_active, uart_bridge_is_connected());
 
             if ((now_ms - last_rtt_log_ms) >= RTT_LOG_INTERVAL_MS) {

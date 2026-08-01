@@ -54,6 +54,7 @@ typedef struct {
     uint8_t protocol_version;
     uint32_t generation;
     int64_t received_at_us;
+    bool continuity_lost;
     int8_t rssi;
 } uart_bridge_status_t;
 
@@ -64,6 +65,9 @@ typedef void (*uart_bridge_audio_cb_t)(uint8_t src_id, const uint8_t *data, uint
 /* Callback for mesh events */
 typedef void (*uart_bridge_event_cb_t)(uart_bridge_event_t event, const uint8_t *data,
                                        uint16_t len);
+
+/* Callback for each validated status packet. */
+typedef void (*uart_bridge_status_cb_t)(const uart_bridge_status_t *status);
 
 /* ============================================================================
  * Public API
@@ -99,6 +103,12 @@ void uart_bridge_set_audio_callback(uart_bridge_audio_cb_t cb);
  * @param cb Callback function
  */
 void uart_bridge_set_event_callback(uart_bridge_event_cb_t cb);
+
+/**
+ * @brief Register callback for validated status updates
+ * @param cb Callback function
+ */
+void uart_bridge_set_status_callback(uart_bridge_status_cb_t cb);
 
 /**
  * @brief Get current mesh status

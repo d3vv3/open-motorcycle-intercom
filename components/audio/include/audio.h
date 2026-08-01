@@ -275,6 +275,9 @@ esp_err_t audio_get_tx_frame(audio_frame_t *frame, uint32_t timeout_ms);
  */
 esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id);
 
+/** Clear queued remote audio and reset receive decoder state. */
+void audio_clear_rx_frames(void);
+
 /**
  * @brief Register callback for encoded TX frames (mesh mode)
  *

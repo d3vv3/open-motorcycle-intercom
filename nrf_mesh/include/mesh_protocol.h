@@ -72,6 +72,7 @@ typedef struct {
     uint8_t heard_bitmap;
     uint8_t relay_bitmap;
     bool active;
+    bool announced;
 } mesh_peer_info_t;
 
 /**

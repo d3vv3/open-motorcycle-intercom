@@ -60,6 +60,7 @@ static bool s_initialized = false;
 struct tx_entry {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
     uint16_t len;
+    uint8_t type;
 };
 
 static struct tx_entry s_audio_q[TX_AUDIO_QUEUE_SIZE];
@@ -82,6 +83,9 @@ static uint32_t s_spi_tx_audio = 0;
 static uint32_t s_spi_tx_control = 0;
 static uint32_t s_spi_tx_idle = 0;
 static uint32_t s_spi_tx_fail = 0;
+static uint32_t s_status_enqueue = 0;
+static uint32_t s_status_tx = 0;
+static uint32_t s_status_drop = 0;
 
 /* SPI poll interval jitter diagnostics */
 static int64_t s_last_poll_us = 0;
@@ -261,19 +265,26 @@ static uint16_t build_packet(uint8_t *dst, uint8_t type, const uint8_t *payload,
     return (uint16_t)(3 + wire_len);
 }
 
-static void queue_control_packet(const uint8_t *buf, uint16_t len)
+static void queue_control_packet(const uint8_t *buf, uint16_t len, uint8_t type)
 {
     k_mutex_lock(&s_tx_lock, K_FOREVER);
     uint8_t next_head = (s_ctrl_head + 1) % TX_CTRL_QUEUE_SIZE;
     if (next_head == s_ctrl_tail) {
         /* Full: drop oldest to make room for the new event */
+        if (s_ctrl_q[s_ctrl_tail].type == UART_PKT_STATUS) {
+            s_status_drop++;
+        }
         s_control_q_overwrite++;
         s_ctrl_tail = (s_ctrl_tail + 1) % TX_CTRL_QUEUE_SIZE;
     }
     struct tx_entry *e = &s_ctrl_q[s_ctrl_head];
     memcpy(e->buf, buf, len);
     e->len = len;
+    e->type = type;
     s_ctrl_head = next_head;
+    if (type == UART_PKT_STATUS) {
+        s_status_enqueue++;
+    }
     k_mutex_unlock(&s_tx_lock);
 }
 
@@ -388,7 +399,7 @@ int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
     }
 
     uint16_t pkt_len = build_packet(pkt, UART_PKT_EVENT, payload, (uint8_t)(len + 1));
-    queue_control_packet(pkt, pkt_len);
+    queue_control_packet(pkt, pkt_len, UART_PKT_EVENT);
 
     LOG_DBG("Queued event: type=%d, len=%d", event_type, len);
     return 0;
@@ -414,7 +425,7 @@ int uart_bridge_send_status(uint8_t state, uint8_t role, uint8_t peer_count, uin
     };
     uint16_t pkt_len =
         build_packet(pkt, UART_PKT_STATUS, (const uint8_t *)&payload, sizeof(payload));
-    queue_control_packet(pkt, pkt_len);
+    queue_control_packet(pkt, pkt_len, UART_PKT_STATUS);
 
     LOG_DBG("Queued status: state=%d role=%d peers=%d id=%d", state, role, peer_count, node_id);
     return 0;
@@ -467,6 +478,7 @@ void uart_bridge_process(void)
     memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
     uint8_t tx_kind = 0;
     uint8_t tx_index = 0;
+    uint8_t tx_type = 0;
 
     /* Peek one packet. Advance its queue only after a successful transfer. */
     k_mutex_lock(&s_tx_lock, K_FOREVER);
@@ -475,6 +487,7 @@ void uart_bridge_process(void)
         struct tx_entry *e = &s_ctrl_q[s_ctrl_tail];
         memcpy(s_tx_buf, e->buf, e->len);
         tx_kind = 2;
+        tx_type = e->type;
     } else if (s_audio_head != s_audio_tail) {
         tx_index = s_audio_tail;
         struct tx_entry *e = &s_audio_q[s_audio_tail];
@@ -529,6 +542,9 @@ void uart_bridge_process(void)
     } else if (tx_kind == 2 && s_ctrl_tail == tx_index) {
         s_ctrl_tail = (s_ctrl_tail + 1) % TX_CTRL_QUEUE_SIZE;
         s_spi_tx_control++;
+        if (tx_type == UART_PKT_STATUS) {
+            s_status_tx++;
+        }
     } else if (tx_kind == 0) {
         s_spi_tx_idle++;
     }
@@ -548,11 +564,12 @@ void uart_bridge_process(void)
         printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u seq_gap=%u crc_fail=%u ack_pulse=%u\n",
                s_poll_dt_min_us, avg, s_poll_dt_max_us, s_audio_q_overwrite, s_bridge_rx_seq_gap,
                 s_bridge_rx_crc_fail, s_ack_pulse_count);
-        printk("PIPE v=1 dev=nrf stage=spi ingress_ok=%u ingress_reject=%u ingress_dup=%u rx_seq_gap=%u rx_crc_drop=%u ack=%u audio_q_drop=%u control_q_drop=%u tx_audio=%u tx_control=%u tx_idle=%u tx_fail=%u poll_max_us=%u\n",
+        printk("PIPE v=1 dev=nrf stage=spi ingress_ok=%u ingress_reject=%u ingress_dup=%u rx_seq_gap=%u rx_crc_drop=%u ack=%u audio_q_drop=%u control_q_drop=%u tx_audio=%u tx_control=%u tx_idle=%u tx_fail=%u poll_max_us=%u status_enqueue=%u status_tx=%u status_drop=%u\n",
                s_audio_ingress_ok, s_audio_ingress_reject, s_audio_ingress_duplicate,
                s_bridge_rx_seq_gap, s_bridge_rx_crc_fail, s_ack_pulse_count,
                s_audio_q_overwrite, s_control_q_overwrite, s_spi_tx_audio,
-               s_spi_tx_control, s_spi_tx_idle, s_spi_tx_fail, s_poll_dt_max_us);
+               s_spi_tx_control, s_spi_tx_idle, s_spi_tx_fail, s_poll_dt_max_us,
+               s_status_enqueue, s_status_tx, s_status_drop);
     }
 
 }
@@ -574,7 +591,7 @@ int uart_bridge_send_log(const char *msg, uint8_t len)
 
     uint8_t pkt[BRIDGE_SPI_MAX_XFER] = {0};
     uint16_t pkt_len = build_packet(pkt, UART_PKT_LOG, (const uint8_t *)msg, len);
-    queue_control_packet(pkt, pkt_len);
+    queue_control_packet(pkt, pkt_len, UART_PKT_LOG);
 
     return 0;
 }
