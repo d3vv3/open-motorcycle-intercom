@@ -1,11 +1,10 @@
 /**
  * @file ws_sync.c
- * @brief I2S WS Sync Capture — disciplines TDMA from ESP32 playout clock
+ * @brief I2S WS Sync Capture diagnostics
  *
  * Uses GPIOTE + PPI + TIMER1 in counter mode to count WS rising edges
  * from the ESP32's I2S output (16 kHz).  Each TDMA frame (~20 ms) we
- * snapshot the count and compare to the expected 320 edges.  The delta
- * drives a correction fed into tdma_tune_timing().
+ * snapshot the count and compare to the expected 320 edges.
  *
  * Hardware wiring: ESP32 GPIO5 (I2S WS / LCK) → nRF XIAO D0 (P0.02)
  */

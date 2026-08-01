@@ -106,7 +106,7 @@ int main(void)
     }
     printk("[DIAG] TDMA OK\n");
 
-    /* Initialize WS sync capture (I2S clock discipline) */
+    /* Initialize WS sync capture diagnostics */
     printk("[DIAG] Initializing WS sync capture...\n");
     ret = ws_sync_init();
     if (ret) {

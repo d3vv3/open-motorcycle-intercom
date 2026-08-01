@@ -3,9 +3,8 @@
  * @brief I2S Word-Select (WS) Sync Capture
  *
  * Captures the ESP32's I2S WS signal (16 kHz) on nRF GPIO P0.02 (XIAO D0)
- * using GPIOTE + PPI + TIMER1 to measure the ESP32 playout clock rate
- * relative to the nRF local clock.  The measured drift is used to discipline
- * the TDMA frame timer so both boards stay in lock-step.
+ * using GPIOTE + PPI + TIMER1 for playout-clock diagnostics. RF TDMA timing
+ * remains on its fixed 20 ms packet cadence.
  */
 
 #ifndef OMI_WS_SYNC_H
@@ -39,12 +38,10 @@ void ws_sync_stop(void);
 bool ws_sync_capture(uint32_t *edge_count);
 
 /**
- * @brief Process a captured WS edge count and compute phase correction.
+ * @brief Process a captured WS edge count for diagnostics.
  *
  * Process each frame-boundary capture from deferred context. Returns the
- * measured timing correction in microseconds that should be fed to
- * tdma_tune_timing() to keep the TDMA frame aligned with the ESP32
- * I2S playout clock.
+ * measured timing difference in microseconds.
  *
  * @param frame_counter Frame sequence paired with edge_count at capture time.
  * @param edge_count Absolute WS edge count captured at the frame boundary.

@@ -30,6 +30,7 @@ LOG_MODULE_REGISTER(tdma, LOG_LEVEL_INF);
 #define MAX_PENDING_CORRECTION_US 2000
 #define MAX_SYNC_DRIFT_PPM 5000
 #define SYNC_REACQUIRE_FRAME_THRESHOLD 4
+#define SYNC_REACQUIRE_PHASE_THRESHOLD_US MESH_GUARD_US
 #define FRAME_HISTORY_SIZE 16
 
 /* ============================================================================
@@ -478,7 +479,7 @@ int tdma_start(int8_t slot_index, bool synchronized)
     s_generation++;
     s_running = true;
     s_synchronized = synchronized;
-    s_local_clock_source = synchronized;
+    s_local_clock_source = false;
     s_timer_quiesced = false;
     int64_t arm_now_us = k_ticks_to_us_floor64(k_uptime_ticks());
     k_timer_start(&s_frame_timer,
@@ -626,11 +627,17 @@ void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us
     }
 
     int32_t phase_error_us = (int32_t)CLAMP(frame_start_us - local_frame_start_us,
-                                            -MAX_PENDING_CORRECTION_US,
-                                            MAX_PENDING_CORRECTION_US);
+                                             -MAX_PENDING_CORRECTION_US,
+                                             MAX_PENDING_CORRECTION_US);
     s_stats.sync_phase_correction_us = phase_error_us;
-    s_pending_correction_us = clamp_pending_correction(
-        (int64_t)s_pending_correction_us + phase_error_us);
+    if (phase_error_us > SYNC_REACQUIRE_PHASE_THRESHOLD_US ||
+        phase_error_us < -SYNC_REACQUIRE_PHASE_THRESHOLD_US) {
+        k_spin_unlock(&s_tdma_lock, key);
+        acquire_sync(frame_counter, drift_ppm, frame_start_us, true);
+        return;
+    }
+
+    s_pending_correction_us = phase_error_us;
     s_stats.correction_pending_us = s_pending_correction_us;
     set_rate_correction_locked(drift_ppm);
     k_spin_unlock(&s_tdma_lock, key);
