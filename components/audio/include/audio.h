@@ -7,7 +7,7 @@
  * - Speaker output (I2S)
  * - Opus encode/decode
  * - VOX detection
- * - Jitter buffer
+ * - Packet-store and adaptive PCM playout
  */
 
 #ifndef OMI_AUDIO_H
@@ -179,7 +179,7 @@ typedef struct {
 typedef struct {
     uint32_t frames_encoded;     /**< Total frames encoded */
     uint32_t frames_decoded;     /**< Total frames decoded */
-    uint32_t frames_dropped;     /**< Frames dropped due to overflow */
+    uint32_t frames_dropped;     /**< Frames rejected by bounded audio buffers */
     uint32_t vox_activations;    /**< Number of VOX activations */
     uint32_t encode_time_us_avg; /**< Average encode time in microseconds */
     uint32_t encode_time_us_max; /**< Maximum encode time in microseconds */
@@ -192,13 +192,12 @@ typedef struct {
     uint32_t rx_pipe_us_avg;     /**< RX packet enqueue -> speaker write latency avg (us) */
     uint32_t rx_pipe_us_max;     /**< RX packet enqueue -> speaker write latency max (us) */
     uint32_t glitches_detected;  /**< Number of audio glitches detected */
-    uint32_t rx_queue_underruns; /**< Mesh RX queue empty events */
+    uint32_t rx_queue_underruns; /**< Legacy alias count for PCM source underruns */
     uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
-    uint32_t plc_frames;         /**< PLC frames for empty polls and adaptive holds
-                                      (total concealment is plc_frames + conceal_loss_frames) */
-    uint32_t grace_empty_polls;  /**< Empty RX polls inside grace window */
-    uint32_t hold_frames;        /**< Adaptive playout hold frames (queue refill) */
-    uint32_t catchup_frames;     /**< State-preserving decoded catch-up discards */
+    uint32_t plc_frames;         /**< PLC generated during intentional DTX idle */
+    uint32_t grace_empty_polls;  /**< Legacy compatibility counter; remains zero */
+    uint32_t hold_frames;        /**< Legacy compatibility counter; remains zero */
+    uint32_t catchup_frames;     /**< Legacy compatibility counter; remains zero */
     uint32_t conceal_loss_frames; /**< PLC frames generated for a detected sequence hole */
     uint32_t seq_gap_frames;     /**< Missing frames detected by playout sequence tracking */
     uint32_t seq_resets;         /**< Sequence discontinuities too large to conceal */
@@ -218,7 +217,16 @@ typedef struct {
     uint32_t rx_queue_overflows; /**< Frames rejected because the playback queue was full */
     uint32_t rx_lock_drops;      /**< Frames rejected because the source lock was unavailable */
     uint32_t rx_source_rejections; /**< Frames rejected because all source slots are occupied */
-    uint32_t jitter_trim_frames; /**< Frames discarded to reduce playback backlog */
+    uint32_t jitter_trim_frames; /**< Legacy compatibility counter; remains zero */
+    uint32_t packet_duplicate_drops; /**< Sequenced packets rejected as duplicates */
+    uint32_t packet_late_drops;  /**< Sequenced packets rejected after their deadline */
+    uint32_t packet_future_drops; /**< Sequenced packets beyond the bounded window */
+    uint32_t pcm_fifo_overflows; /**< Decoded PCM blocks rejected by a source ASRC */
+    uint32_t pcm_underruns;      /**< Source ASRC underruns */
+    int32_t asrc_correction_ppm; /**< Current signed correction for the most-adjusted source */
+    uint32_t asrc_correction_abs_max_ppm; /**< Maximum absolute ASRC correction */
+    bool asrc_recovery_active;   /**< ASRC is draining compressed packet backlog */
+    uint32_t playout_task_loops; /**< I2S-paced playout loop count */
     uint32_t notification_queue_overflows; /**< Notification requests dropped while queue is full */
     uint32_t playback_frames;    /**< Complete I2S playback writes */
     uint8_t active_rx_sources;   /**< Remote source slots currently assigned */

@@ -41,6 +41,10 @@ _PIPE_GAUGE_KEYS = {
     "state",
     "exp_gen",
     "exp_state",
+    "rx_sources",
+    "asrc_ppm",
+    "asrc_abs_max_ppm",
+    "asrc_recovery",
 }
 
 _PIPE_SIGNED_KEYS = {
@@ -50,6 +54,7 @@ _PIPE_SIGNED_KEYS = {
     "callback_jitter_us",
     "sync_frame_diff",
     "sync_phase_us",
+    "asrc_ppm",
 }
 
 _IDENTITY_KEYS = {

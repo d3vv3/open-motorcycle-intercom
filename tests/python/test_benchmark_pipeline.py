@@ -173,6 +173,26 @@ class PipelineLogTest(unittest.TestCase):
         self.assertEqual(pipeline["delta"]["rx_lock_drop"], 2)
         self.assertEqual(pipeline["delta"]["glitch"], 0)
 
+    def test_audio_pipe_accepts_signed_asrc_gauge(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        base = (
+            "PIPE v=1 dev=esp stage=audio capture_ok={ok} conceal={conceal} "
+            "rx_sources=1 asrc_ppm={ppm} asrc_abs_max_ppm={maximum} asrc_recovery={recovery}"
+        )
+        reader._parse_line(base.format(ok=100, conceal=2, ppm=-375, maximum=375, recovery=0))
+        reader._parse_line(base.format(ok=200, conceal=7, ppm=250, maximum=500, recovery=1))
+
+        pipeline = _build_port_json(stats)["pipeline"]["esp:audio:na"]
+        self.assertEqual(pipeline["delta"]["capture_ok"], 100)
+        self.assertEqual(pipeline["delta"]["conceal"], 5)
+        self.assertNotIn("asrc_ppm", pipeline["delta"])
+        self.assertNotIn("asrc_abs_max_ppm", pipeline["delta"])
+        self.assertNotIn("rx_sources", pipeline["delta"])
+        self.assertNotIn("asrc_recovery", pipeline["delta"])
+        self.assertEqual(pipeline["last"]["asrc_ppm"], 250)
+        self.assertEqual(pipeline["last"]["asrc_recovery"], 1)
+
     def test_records_first_last_and_cumulative_delta(self):
         stats = PortStats(port="test")
         reader = PortReader("test", 115200, None, "unused", stats)

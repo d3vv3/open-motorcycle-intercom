@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "audio.c" "vox.c" "voice_cleanup.c" "audio_jitter_buffer.c"
+    SRCS "audio.c" "vox.c" "voice_cleanup.c" "audio_packet_store.c" "audio_pcm_resampler.c"
     INCLUDE_DIRS "include"
     REQUIRES 
         esp_timer
