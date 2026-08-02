@@ -25,6 +25,7 @@
 
 #include "audio.h"
 #include "audio_bundle.h"
+#include "audio_tx_cache.h"
 #include "button.h"
 #include "mesh.h"
 #include "nvs.h"
@@ -107,15 +108,7 @@ static void reset_all_e2e_rx_sources(void)
     memset(s_e2e_rx_seq_state, 0, sizeof(s_e2e_rx_seq_state));
 }
 
-typedef struct {
-    uint8_t data[MESH_AUDIO_V2_MAX_FRAME_BYTES];
-    uint16_t len;
-    uint16_t seq;
-    bool active;
-} nrf_previous_audio_t;
-
-static nrf_previous_audio_t s_nrf_previous_audio = {0};
-static _Atomic bool s_nrf_previous_valid = false;
+static audio_tx_cache_t s_nrf_previous_audio;
 
 
 /* RTT log cadence while using nRF transport */
@@ -291,25 +284,6 @@ static esp_err_t init_audio_with_test_flags(void)
     return audio_init_with_config(&audio_cfg);
 }
 
-static void reset_nrf_previous_audio(void)
-{
-    atomic_store_explicit(&s_nrf_previous_valid, false, memory_order_release);
-}
-
-static void cache_nrf_previous_audio(const uint8_t *data, uint16_t len, bool active,
-                                     uint16_t seq, bool eligible)
-{
-    if (len == 0 || len > sizeof(s_nrf_previous_audio.data)) {
-        reset_nrf_previous_audio();
-        return;
-    }
-    memcpy(s_nrf_previous_audio.data, data, len);
-    s_nrf_previous_audio.len = len;
-    s_nrf_previous_audio.seq = seq;
-    s_nrf_previous_audio.active = active;
-    atomic_store_explicit(&s_nrf_previous_valid, eligible, memory_order_release);
-}
-
 /**
  * @brief Callback from audio subsystem when encoded frame is ready
  */
@@ -332,7 +306,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         s_e2e_tx_frames++;
         if (len > MESH_MAX_OPUS_BYTES) {
             s_pipe_spi_oversize++;
-            reset_nrf_previous_audio();
+            audio_tx_cache_reset(&s_nrf_previous_audio);
             ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
             break;
         }
@@ -340,17 +314,17 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         /* Single-predecessor redundancy: prev1 recovers isolated losses, and
          * Opus PLC covers the rare two-in-a-row loss. prev2 measured near-zero
          * additional recovery for ~1/3 of the airtime budget. */
-        bool attach_previous1 =
-            atomic_load_explicit(&s_nrf_previous_valid, memory_order_acquire) &&
-            s_nrf_previous_audio.active &&
-            (uint16_t)(s_nrf_previous_audio.seq + 1u) == seq;
+        uint16_t previous1_len = 0;
+        const uint8_t *previous1_data =
+            audio_tx_cache_previous(&s_nrf_previous_audio, seq, &previous1_len);
+        bool attach_previous1 = previous1_data != NULL;
         uint8_t bundle_buf[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
         size_t bundle_len = 0;
         audio_bundle_view_t bundle = {
-            .previous1_data = attach_previous1 ? s_nrf_previous_audio.data : NULL,
+            .previous1_data = previous1_data,
             .previous2_data = NULL,
             .current_data = data,
-            .previous1_len = attach_previous1 ? s_nrf_previous_audio.len : 0,
+            .previous1_len = previous1_len,
             .previous2_len = 0,
             .current_len = len,
             .current_seq = seq,
@@ -364,8 +338,8 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         bool bundle_encoded = audio_bundle_encode(&bundle, bundle_buf, sizeof(bundle_buf),
                                                   &bundle_len);
 
-        cache_nrf_previous_audio(data, len, active, seq,
-                                 atomic_load(&s_mesh_user_enabled));
+        audio_tx_cache_store(&s_nrf_previous_audio, data, len, active, seq,
+                             atomic_load(&s_mesh_user_enabled));
 
         xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
         if (s_mesh_user_enabled && uart_bridge_is_mesh_ready()) {
@@ -695,7 +669,7 @@ static void set_mesh_user_runtime_state(bool enabled)
     s_nrf_notification_head = 0;
     s_nrf_notification_tail = 0;
     if (!enabled) {
-        reset_nrf_previous_audio();
+        audio_tx_cache_reset(&s_nrf_previous_audio);
         s_nrf_membership_observed = false;
         s_nrf_last_peer_count = 0;
         atomic_store(&s_mesh_active, false);
@@ -779,7 +753,7 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
     case BRIDGE_EVENT_MESH_STOPPED:
         ESP_LOGI(TAG, "nRF52840 mesh stopped");
         reset_all_e2e_rx_sources();
-        reset_nrf_previous_audio();
+        audio_tx_cache_reset(&s_nrf_previous_audio);
         s_mesh_active = false;
         atomic_store(&s_mesh_enable_notification_pending, false);
         reset_nrf_membership_tracking();
@@ -990,7 +964,7 @@ void app_main(void)
     } else {
         /* No nRF52840 - fallback to ESP-NOW */
         uart_bridge_deinit();
-        reset_nrf_previous_audio();
+        audio_tx_cache_reset(&s_nrf_previous_audio);
         s_active_transport = TRANSPORT_ESP_NOW;
         ESP_LOGI(TAG, "nRF52840 not detected - using ESP-NOW transport");
     }
