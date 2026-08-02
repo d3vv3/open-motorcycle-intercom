@@ -126,6 +126,53 @@ class PipelineLogTest(unittest.TestCase):
             {"rx_q_min": 1, "rx_q_avg": 4, "rx_q_max": 7, "rx_q_total": 12},
         )
 
+    def test_parses_current_concealment_line_with_loss_fields(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "I (123456) audio:   Concealment: plc=111 grace_empty=98 conceal=30 "
+            "seq_gap=34 seq_reset=2 seq_stale=1"
+        )
+
+        self.assertEqual(
+            stats.last_conceal,
+            {
+                "plc": 111,
+                "grace_empty": 98,
+                "conceal": 30,
+                "seq_gap_frames": 34,
+                "seq_reset": 2,
+                "seq_stale": 1,
+            },
+        )
+
+    def test_parses_legacy_concealment_line_without_loss_fields(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line("I (123456) audio:   Concealment: plc=5 grace_empty=4")
+
+        self.assertEqual(stats.last_conceal, {"plc": 5, "grace_empty": 4})
+
+    def test_audio_pipe_record_tracks_conceal_and_lock_drop_counters(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        base = (
+            "PIPE v=1 dev=esp stage=audio capture_ok={ok} capture_short=0 "
+            "capture_timeout=0 capture_err=0 encode_ok={ok} encode_err=0 dtx_drop=0 "
+            "rx_q_drop=0 rx_lock_drop={lock} rx_src_drop=0 jitter_drop=0 "
+            "decode_ok={ok} decode_err=0 plc=0 hold=0 catchup=0 conceal={conceal} "
+            "seq_gap={gap} seq_reset=0 seq_stale=0 glitch=0 play_ok={ok} i2s_err=0 "
+            "notify_drop=0 rx_sources=1"
+        )
+        reader._parse_line(base.format(ok=100, lock=1, conceal=2, gap=2))
+        reader._parse_line(base.format(ok=200, lock=3, conceal=7, gap=9))
+
+        pipeline = _build_port_json(stats)["pipeline"]["esp:audio:na"]
+        self.assertEqual(pipeline["delta"]["conceal"], 5)
+        self.assertEqual(pipeline["delta"]["seq_gap"], 7)
+        self.assertEqual(pipeline["delta"]["rx_lock_drop"], 2)
+        self.assertEqual(pipeline["delta"]["glitch"], 0)
+
     def test_records_first_last_and_cumulative_delta(self):
         stats = PortStats(port="test")
         reader = PortReader("test", 115200, None, "unused", stats)

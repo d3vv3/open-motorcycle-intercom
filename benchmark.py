@@ -129,6 +129,8 @@ ESP_AUDIO_GLITCH_RE = re.compile(
 
 ESP_AUDIO_CONCEAL_RE = re.compile(
     r"Concealment:\s*plc=(?P<plc>\d+)\s*grace_empty=(?P<grace_empty>\d+)"
+    r"(?:\s*conceal=(?P<conceal>\d+)\s*seq_gap=(?P<seq_gap_frames>\d+)\s*"
+    r"seq_reset=(?P<seq_reset>\d+)\s*seq_stale=(?P<seq_stale>\d+))?"
 )
 
 ESP_AUDIO_ADAPTIVE_RE = re.compile(
@@ -1041,11 +1043,17 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     # Concealment
     if s.last_conceal:
         m, d = s.last_conceal, s.delta("conceal")
-        out.append(f"  Last Concealment: plc={m['plc']} grace_empty={m['grace_empty']}")
+        out.append(
+            f"  Last Concealment: plc={m['plc']} grace_empty={m['grace_empty']} "
+            f"conceal={m.get('conceal', 0)} seq_gap={m.get('seq_gap_frames', 0)} "
+            f"seq_reset={m.get('seq_reset', 0)} seq_stale={m.get('seq_stale', 0)}"
+        )
         if d:
             out.append(
                 f"  Delta Concealment: plc={d.get('plc', 0)} "
-                f"grace_empty={d.get('grace_empty', 0)}"
+                f"grace_empty={d.get('grace_empty', 0)} "
+                f"conceal={d.get('conceal', 0)} seq_gap={d.get('seq_gap_frames', 0)} "
+                f"seq_reset={d.get('seq_reset', 0)} seq_stale={d.get('seq_stale', 0)}"
             )
 
     # Adaptive playout

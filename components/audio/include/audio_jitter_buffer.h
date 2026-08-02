@@ -16,7 +16,9 @@ typedef struct {
     uint16_t len;
     uint8_t source_id;
     int64_t timestamp_us;
-    bool active; /* false => sender is in intentional silence (DTX), not packet loss */
+    bool active;   /* false => sender is in intentional silence (DTX), not packet loss */
+    uint16_t seq;  /* End-to-end sequence, valid only when has_seq */
+    bool has_seq;  /* Transport supplied a per-frame sequence number */
 } audio_rx_item_t;
 
 typedef struct {
@@ -28,6 +30,8 @@ typedef struct {
     bool hold_next;             /* Skip next consume to let queue refill */
     uint8_t hold_budget;        /* Accumulated hold-frames to burn off */
     bool stream_silent;         /* Last decoded frame marked intentional silence (DTX) */
+    uint16_t next_seq;          /* Sequence expected for the next decoded frame */
+    bool next_seq_valid;        /* next_seq holds a usable value */
 } audio_jitter_state_t;
 
 void audio_jitter_reset(audio_jitter_state_t *state);

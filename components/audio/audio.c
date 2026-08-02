@@ -75,6 +75,22 @@ static const char *TAG = "audio";
 #define HOLD_BUDGET_MAX           1
 #define GRACE_EMPTY_MAX           5
 
+/* Longest run of lost frames rebuilt one-by-one before the decoder is resynchronised.
+ * Beyond this the dropout is long enough that concealment no longer sounds better
+ * than restarting cleanly. */
+#define MAX_CONCEAL_FRAMES 8
+
+/* Expected network loss declared to the encoder. See opus_init() for what
+ * this does and does not enable at the configured bitrate. */
+#define OPUS_EXPECTED_LOSS_PERC 5
+
+/* Bounded waits: the source lock is only ever held for short queue operations, so a
+ * short wait removes contention drops without risking the caller's deadline. The
+ * enqueue wait stays below the 2 ms nRF SPI poll period because the bridge receive
+ * task must re-arm its next transaction. */
+#define RX_ENQUEUE_LOCK_WAIT_MS 1
+#define RX_DECODE_LOCK_WAIT_MS  2
+
 #define NOTIFICATION_QUEUE_SIZE   4
 #define NOTIFICATION_BEEP_SAMPLES 1600
 #define NOTIFICATION_GAP_SAMPLES  400
@@ -94,6 +110,12 @@ typedef struct {
     float a1, a2;     /* Denominator coefficients (a0 = 1) */
 } hpf_state_t;
 
+typedef enum {
+    PLAYOUT_DECODE,  /* Decode this packet now */
+    PLAYOUT_CONCEAL, /* Fill one missing frame; packet is held in pending */
+    PLAYOUT_DROP,    /* Stale duplicate or late reorder; discard the packet */
+} playout_action_t;
+
 typedef struct {
     bool assigned;
     uint8_t source_id;
@@ -101,6 +123,9 @@ typedef struct {
     OpusDecoder *decoder;
     QueueHandle_t queue;
     audio_jitter_state_t jitter;
+    /* Packet held back while the frames missing before it are concealed. */
+    audio_rx_item_t pending;
+    bool pending_valid;
 } audio_rx_source_t;
 
 typedef struct {
@@ -382,6 +407,13 @@ static esp_err_t opus_init(const audio_config_t *config)
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_BITRATE(config->opus_bitrate));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_INBAND_FEC(1));
+    /* Declaring the expected loss rate weakens long-term prediction (silk LTP
+     * scaling), so the decoder recovers faster after a concealed frame.
+     * It does NOT buy in-band FEC here: decide_fec() needs an equivalent rate
+     * above the 16 kbit/s wideband threshold scaled by (125 - loss)/100, which at
+     * 12 kbit/s is unreachable at any loss percentage. Playout therefore conceals
+     * with PLC, not LBRR. Raising the bitrate past ~25 kbit/s would change that. */
+    opus_encoder_ctl(s_opus_encoder, OPUS_SET_PACKET_LOSS_PERC(OPUS_EXPECTED_LOSS_PERC));
     opus_encoder_ctl(s_opus_encoder, OPUS_SET_COMPLEXITY(5));
     /* Discontinuous transmission: during silence the encoder emits a periodic
      * comfort-noise (SID) frame and otherwise returns a 1-2 byte DTX frame that
@@ -514,6 +546,7 @@ static void reset_rx_sources(void)
         source->assigned = false;
         source->source_id = 0;
         source->last_enqueue_us = 0;
+        source->pending_valid = false;
         audio_jitter_reset(&source->jitter);
         if (source->queue) {
             xQueueReset(source->queue);
@@ -542,14 +575,81 @@ static void record_decode_result(int samples, int64_t decode_time, int64_t *deco
     }
 }
 
+/* Pop the next packet for this source: a held-back packet first, then the queue.
+ * Caller must hold s_rx_sources_mutex. */
+static bool take_next_item(audio_rx_source_t *source, audio_rx_item_t *item)
+{
+    if (source->pending_valid) {
+        *item = source->pending;
+        source->pending_valid = false;
+        return true;
+    }
+    return xQueueReceive(source->queue, item, 0) == pdTRUE;
+}
+
+/* Decide how to play a packet whose sequence may not follow the previous one.
+ * Caller must hold s_rx_sources_mutex. */
+static playout_action_t resolve_playout_sequence(audio_rx_source_t *source,
+                                                 const audio_rx_item_t *item)
+{
+    audio_jitter_state_t *jitter = &source->jitter;
+
+    if (!item->has_seq) {
+        jitter->next_seq_valid = false;
+        return PLAYOUT_DECODE;
+    }
+
+    if (!jitter->next_seq_valid) {
+        jitter->next_seq = (uint16_t)(item->seq + 1);
+        jitter->next_seq_valid = true;
+        return PLAYOUT_DECODE;
+    }
+
+    int16_t delta = (int16_t)(item->seq - jitter->next_seq);
+
+    if (delta == 0) {
+        jitter->next_seq = (uint16_t)(item->seq + 1);
+        return PLAYOUT_DECODE;
+    }
+
+    if (delta > 0 && delta <= MAX_CONCEAL_FRAMES) {
+        /* Conceal exactly one missing frame now and replay this packet next tick,
+         * so the playout timeline keeps one output frame per sender frame. */
+        source->pending = *item;
+        source->pending_valid = true;
+        jitter->next_seq++;
+        s_stats.seq_gap_frames++;
+        s_stats.conceal_loss_frames++;
+        return PLAYOUT_CONCEAL;
+    }
+
+    if (delta < 0 && delta >= -MAX_CONCEAL_FRAMES) {
+        /* Duplicate or late reordered packet. Playout already moved past it, so
+         * decoding it would corrupt predictor state. Discard it and keep going. */
+        s_stats.seq_stale_drops++;
+        return PLAYOUT_DROP;
+    }
+
+    /* Dropout too long to conceal, or the sender restarted: resynchronise cleanly. */
+    if (delta > 0) {
+        s_stats.seq_gap_frames += (uint32_t)delta;
+        s_stats.glitches_detected++;
+    }
+    s_stats.seq_resets++;
+    opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+    jitter->next_seq = (uint16_t)(item->seq + 1);
+    return PLAYOUT_DECODE;
+}
+
 static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
                              int64_t *decode_time_sum)
 {
     audio_rx_item_t item;
     bool decode_plc = false;
     bool have_item = false;
+    bool conceal_loss = false;
 
-    if (xSemaphoreTake(s_rx_sources_mutex, 0) != pdTRUE) {
+    if (xSemaphoreTake(s_rx_sources_mutex, pdMS_TO_TICKS(RX_DECODE_LOCK_WAIT_MS)) != pdTRUE) {
         return false;
     }
     if (!source->assigned) {
@@ -563,6 +663,13 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
     uint32_t trim_count = s_stats.jitter_trim_frames;
     audio_jitter_trim_backlog(source->queue, &source->jitter, &s_stats, &item);
     if (s_stats.jitter_trim_frames != trim_count) {
+        /* Trim is an explicit resynchronisation point. A held-back packet is older
+         * than everything trim kept, so it would otherwise consume the re-baseline
+         * and make the discarded frames reappear as a gap. */
+        if (source->pending_valid) {
+            source->pending_valid = false;
+            s_stats.frames_dropped++;
+        }
         opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
     }
     items = uxQueueMessagesWaiting(source->queue);
@@ -573,32 +680,69 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
         s_stats.hold_frames++;
         s_stats.plc_frames++;
         decode_plc = true;
-    } else if (source->jitter.playout_started &&
-               xQueueReceive(source->queue, &item, 0) == pdTRUE) {
-        source->jitter.last_rx_packet_us = now_us;
-        source->jitter.consecutive_empty = 0;
-        source->jitter.stream_silent = !item.active;
-        have_item = true;
-
-        UBaseType_t remaining = uxQueueMessagesWaiting(source->queue);
-        if (remaining == 0 && source->jitter.hold_budget < HOLD_BUDGET_MAX) {
-            source->jitter.hold_next = true;
-            source->jitter.hold_budget++;
-        }
     } else if (source->jitter.playout_started) {
-        source->jitter.consecutive_empty++;
-        s_stats.grace_empty_polls++;
-        if (source->jitter.consecutive_empty <= GRACE_EMPTY_MAX) {
-            decode_plc = true;
-            s_stats.plc_frames++;
-        } else if (source->jitter.stream_silent) {
-            source->jitter.playout_started = false;
-        } else if (audio_jitter_should_count_underrun(&source->jitter, now_us)) {
-            s_stats.rx_queue_underruns++;
-            s_stats.glitches_detected++;
-            source->jitter.playout_started = false;
+        playout_action_t action = PLAYOUT_DROP;
+        unsigned stale_dropped = 0;
+        /* Bounded by queue capacity plus the held packet. */
+        for (unsigned attempt = 0; attempt <= AUDIO_RX_QUEUE_SIZE; attempt++) {
+            if (!take_next_item(source, &item)) {
+                action = PLAYOUT_DROP;
+                break;
+            }
+            action = resolve_playout_sequence(source, &item);
+            if (action != PLAYOUT_DROP) {
+                break;
+            }
+            s_stats.frames_dropped++;
+            stale_dropped++;
+        }
+
+        if (action == PLAYOUT_DECODE) {
+            source->jitter.last_rx_packet_us = now_us;
+            source->jitter.consecutive_empty = 0;
+            source->jitter.stream_silent = !item.active;
+            have_item = true;
+
+            UBaseType_t remaining = uxQueueMessagesWaiting(source->queue);
+            if (remaining == 0 && !source->pending_valid &&
+                source->jitter.hold_budget < HOLD_BUDGET_MAX) {
+                source->jitter.hold_next = true;
+                source->jitter.hold_budget++;
+            }
+        } else if (action == PLAYOUT_CONCEAL) {
+            source->jitter.last_rx_packet_us = now_us;
+            source->jitter.consecutive_empty = 0;
+            conceal_loss = true;
         } else {
-            source->jitter.playout_started = false;
+            source->jitter.consecutive_empty++;
+            s_stats.grace_empty_polls++;
+            if (source->jitter.consecutive_empty <= GRACE_EMPTY_MAX) {
+                decode_plc = true;
+                s_stats.plc_frames++;
+                if (stale_dropped > 0) {
+                    /* Everything queued was already behind playout, so the frames
+                     * assumed lost were only late. Stop guessing and let the next
+                     * packet re-anchor the timeline. */
+                    source->jitter.next_seq_valid = false;
+                } else if (source->jitter.next_seq_valid && !source->jitter.stream_silent) {
+                    /* The sender is transmitting, so this slot really was a lost
+                     * packet: consume its sequence number, otherwise a later burst
+                     * is concealed a second time. During intentional DTX silence
+                     * the sender consumes no sequence number, so leave it alone or
+                     * the first frame of the resumed utterance looks stale. */
+                    source->jitter.next_seq++;
+                }
+            } else {
+                if (!source->jitter.stream_silent &&
+                    audio_jitter_should_count_underrun(&source->jitter, now_us)) {
+                    s_stats.rx_queue_underruns++;
+                    s_stats.glitches_detected++;
+                }
+                source->jitter.playout_started = false;
+                /* Playout stopped: the break is already accounted for, so re-baseline
+                 * instead of reporting the resulting sequence jump a second time. */
+                source->jitter.next_seq_valid = false;
+            }
         }
     }
 
@@ -606,12 +750,13 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
         now_us - source->last_enqueue_us >= RX_SOURCE_IDLE_TIMEOUT_US) {
         source->assigned = false;
         source->source_id = 0;
+        source->pending_valid = false;
         audio_jitter_reset(&source->jitter);
         opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
     }
     xSemaphoreGive(s_rx_sources_mutex);
 
-    if (!have_item && !decode_plc) {
+    if (!have_item && !decode_plc && !conceal_loss) {
         return false;
     }
 
@@ -621,7 +766,14 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
                             : opus_decode(source->decoder, NULL, 0, s_decode_frame,
                                           AUDIO_FRAME_SAMPLES, 0);
     int64_t decode_time = esp_timer_get_time() - decode_start;
-    record_decode_result(samples, decode_time, decode_time_sum);
+    if (have_item) {
+        record_decode_result(samples, decode_time, decode_time_sum);
+    } else if (samples != AUDIO_FRAME_SAMPLES) {
+        /* Keep decode_ok comparable with the sender's encode_ok: only real packets
+         * count as decodes, but concealment failures are still errors. */
+        s_stats.decode_errors++;
+        ESP_LOGW(TAG, "Opus concealment failed: %d", samples);
+    }
     if (samples != AUDIO_FRAME_SAMPLES) {
         return false;
     }
@@ -652,8 +804,39 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
                 source->jitter.hold_budget > 0 && uxQueueMessagesWaiting(source->queue) >= 3 &&
                 xQueueReceive(source->queue, &catchup_item, 0) == pdTRUE) {
                 source->jitter.hold_budget--;
-                s_stats.catchup_frames++;
                 have_catchup_item = true;
+
+                /* The catch-up frame is decoded here, so it consumes its sequence
+                 * slot too. Resolve the delta first: a stale packet must not reach
+                 * the decoder, and a real hole must stay visible in telemetry. */
+                bool seq_known = catchup_item.has_seq && source->jitter.next_seq_valid;
+                int16_t cdelta =
+                    seq_known ? (int16_t)(catchup_item.seq - source->jitter.next_seq) : 0;
+
+                if (seq_known && cdelta < 0) {
+                    have_catchup_item = false;
+                    s_stats.seq_stale_drops++;
+                    s_stats.frames_dropped++;
+                } else {
+                    if (cdelta > MAX_CONCEAL_FRAMES) {
+                        /* Same hard resynchronisation the main path performs. */
+                        s_stats.seq_resets++;
+                        s_stats.glitches_detected++;
+                        opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+                    }
+                    if (cdelta > 0) {
+                        s_stats.seq_gap_frames += (uint32_t)cdelta;
+                    }
+                    if (catchup_item.has_seq) {
+                        source->jitter.next_seq = (uint16_t)(catchup_item.seq + 1);
+                        source->jitter.next_seq_valid = true;
+                    } else {
+                        source->jitter.next_seq_valid = false;
+                    }
+                    /* Keep the DTX view local to the last frame actually consumed. */
+                    source->jitter.stream_silent = !catchup_item.active;
+                    s_stats.catchup_frames++;
+                }
             }
             xSemaphoreGive(s_rx_sources_mutex);
         }
@@ -1049,21 +1232,27 @@ static void audio_task(void *arg)
             ESP_LOGI(TAG, "  Glitches: %lu (rx_und=%lu i2s_inc=%lu), ADC overruns: %lu",
                      s_stats.glitches_detected, s_stats.rx_queue_underruns,
                      s_stats.i2s_write_incomplete, s_stats.adc_overruns);
-            ESP_LOGI(TAG, "  Concealment: plc=%lu grace_empty=%lu",
-                     s_stats.plc_frames, s_stats.grace_empty_polls);
+            ESP_LOGI(TAG,
+                     "  Concealment: plc=%lu grace_empty=%lu conceal=%lu seq_gap=%lu "
+                     "seq_reset=%lu seq_stale=%lu",
+                     s_stats.plc_frames, s_stats.grace_empty_polls, s_stats.conceal_loss_frames,
+                     s_stats.seq_gap_frames, s_stats.seq_resets, s_stats.seq_stale_drops);
             ESP_LOGI(TAG, "  Adaptive playout: hold=%lu catchup=%lu sources=%u",
                      s_stats.hold_frames, s_stats.catchup_frames, s_stats.active_rx_sources);
             ESP_LOGI(TAG, "  RX queue depth/source: min=%u avg=%u max=%u (total now=%u)",
                      s_stats.rx_q_depth_min, s_stats.rx_q_depth_avg, s_stats.rx_q_depth_max,
                      s_stats.jitter_buffer_depth);
             ESP_LOGI(TAG,
-                     "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu rx_q_drop=%lu rx_src_drop=%lu jitter_drop=%lu decode_ok=%lu decode_err=%lu plc=%lu hold=%lu catchup=%lu play_ok=%lu i2s_err=%lu notify_drop=%lu rx_sources=%u",
+                     "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu rx_q_drop=%lu rx_lock_drop=%lu rx_src_drop=%lu jitter_drop=%lu decode_ok=%lu decode_err=%lu plc=%lu hold=%lu catchup=%lu conceal=%lu seq_gap=%lu seq_reset=%lu seq_stale=%lu glitch=%lu play_ok=%lu i2s_err=%lu notify_drop=%lu rx_sources=%u",
                      s_stats.capture_frames_ok, s_stats.capture_short_reads,
                      s_stats.capture_timeouts, s_stats.adc_overruns, s_stats.frames_encoded,
                      s_stats.encode_errors, s_stats.tx_dtx_suppressed,
-                     s_stats.rx_queue_overflows, s_stats.rx_source_rejections,
+                     s_stats.rx_queue_overflows, s_stats.rx_lock_drops,
+                     s_stats.rx_source_rejections,
                      s_stats.jitter_trim_frames, s_stats.frames_decoded, s_stats.decode_errors,
                      s_stats.plc_frames, s_stats.hold_frames, s_stats.catchup_frames,
+                     s_stats.conceal_loss_frames, s_stats.seq_gap_frames, s_stats.seq_resets,
+                     s_stats.seq_stale_drops, s_stats.glitches_detected,
                      s_stats.playback_frames, s_stats.i2s_write_incomplete,
                      s_stats.notification_queue_overflows, s_stats.active_rx_sources);
             last_heartbeat = now_ms;
@@ -1396,11 +1585,13 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     rx_item.source_id = source_id;
     rx_item.timestamp_us = frame->timestamp_ms * 1000;
     rx_item.active = frame->active;
+    rx_item.seq = frame->seq;
+    rx_item.has_seq = frame->has_seq;
 
-    if (xSemaphoreTake(s_rx_sources_mutex, 0) != pdTRUE) {
+    if (xSemaphoreTake(s_rx_sources_mutex, pdMS_TO_TICKS(RX_ENQUEUE_LOCK_WAIT_MS)) != pdTRUE) {
         s_stats.frames_dropped++;
-        s_stats.rx_queue_overflows++;
-        return ESP_ERR_NO_MEM;
+        s_stats.rx_lock_drops++;
+        return ESP_ERR_TIMEOUT;
     }
 
     audio_rx_source_t *source = NULL;
@@ -1425,6 +1616,7 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         }
         source->assigned = true;
         source->source_id = source_id;
+        source->pending_valid = false;
         audio_jitter_reset(&source->jitter);
         xQueueReset(source->queue);
         opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);

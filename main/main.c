@@ -358,6 +358,9 @@ static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_i
     frame.len = len;
     frame.timestamp_ms = timestamp_us / 1000;
     frame.active = (audio_flags & MESH_AUDIO_FLAG_ACTIVE) != 0;
+    /* ESP-NOW carries no end-to-end audio sequence, so playout cannot detect holes. */
+    frame.seq = 0;
+    frame.has_seq = false;
 
     esp_err_t ret = audio_put_rx_frame(&frame, src_id);
     if (ret != ESP_OK) {
@@ -432,6 +435,9 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     /* data[0] carries the audio_flags byte set by audio_tx_callback; the ACTIVE
      * bit distinguishes speech from intentional silence/comfort frames. */
     frame.active = (data[0] & MESH_AUDIO_FLAG_ACTIVE) != 0;
+    /* Hand the end-to-end sequence to playout so it can conceal missing frames. */
+    frame.seq = e2e_seq;
+    frame.has_seq = true;
 
     xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
     if (!s_mesh_user_enabled || !uart_bridge_is_mesh_ready()) {

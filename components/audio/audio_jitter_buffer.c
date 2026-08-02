@@ -16,6 +16,8 @@ void audio_jitter_reset(audio_jitter_state_t *state)
     state->hold_next = false;
     state->hold_budget = 0;
     state->stream_silent = false;
+    state->next_seq = 0;
+    state->next_seq_valid = false;
 }
 
 void audio_jitter_record_depth(audio_jitter_state_t *state, audio_stats_t *stats, UBaseType_t items)
@@ -65,6 +67,8 @@ void audio_jitter_trim_backlog(QueueHandle_t queue, audio_jitter_state_t *state,
         if (xQueueReceive(queue, scratch_item, 0) == pdTRUE) {
             stats->frames_dropped++;
             stats->jitter_trim_frames++;
+            /* Deliberate discard: re-baseline so playout does not conceal it as loss. */
+            state->next_seq_valid = false;
             items = uxQueueMessagesWaiting(queue);
         } else {
             break;

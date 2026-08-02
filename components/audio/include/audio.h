@@ -169,6 +169,8 @@ typedef struct {
     uint16_t len;         /**< Actual length of encoded data */
     int64_t timestamp_ms; /**< Capture timestamp */
     bool active;          /**< Sender VOX active (speech) vs intentional silence/comfort frame */
+    uint16_t seq;         /**< End-to-end frame sequence (valid only when has_seq) */
+    bool has_seq;         /**< Transport supplied a per-frame sequence number */
 } audio_frame_t;
 
 /**
@@ -192,10 +194,15 @@ typedef struct {
     uint32_t glitches_detected;  /**< Number of audio glitches detected */
     uint32_t rx_queue_underruns; /**< Mesh RX queue empty events */
     uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
-    uint32_t plc_frames;         /**< Opus PLC frames generated for gaps and adaptive holds */
+    uint32_t plc_frames;         /**< PLC frames for empty polls and adaptive holds
+                                      (total concealment is plc_frames + conceal_loss_frames) */
     uint32_t grace_empty_polls;  /**< Empty RX polls inside grace window */
     uint32_t hold_frames;        /**< Adaptive playout hold frames (queue refill) */
     uint32_t catchup_frames;     /**< State-preserving decoded catch-up discards */
+    uint32_t conceal_loss_frames; /**< PLC frames generated for a detected sequence hole */
+    uint32_t seq_gap_frames;     /**< Missing frames detected by playout sequence tracking */
+    uint32_t seq_resets;         /**< Sequence discontinuities too large to conceal */
+    uint32_t seq_stale_drops;    /**< Duplicate or late reordered packets discarded */
     uint8_t jitter_buffer_depth; /**< Current jitter buffer depth */
     uint8_t rx_q_depth_min;      /**< Minimum observed RX queue depth */
     uint8_t rx_q_depth_avg;      /**< Average observed RX queue depth */
@@ -208,7 +215,8 @@ typedef struct {
     uint32_t capture_timeouts;   /**< ADC notification/read timeouts */
     uint32_t encode_errors;      /**< Opus encode failures */
     uint32_t decode_errors;      /**< Opus decode and PLC failures */
-    uint32_t rx_queue_overflows; /**< Frames rejected by a playback queue */
+    uint32_t rx_queue_overflows; /**< Frames rejected because the playback queue was full */
+    uint32_t rx_lock_drops;      /**< Frames rejected because the source lock was unavailable */
     uint32_t rx_source_rejections; /**< Frames rejected because all source slots are occupied */
     uint32_t jitter_trim_frames; /**< Frames discarded to reduce playback backlog */
     uint32_t notification_queue_overflows; /**< Notification requests dropped while queue is full */
