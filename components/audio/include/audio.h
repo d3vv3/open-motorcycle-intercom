@@ -37,7 +37,7 @@ extern "C" {
 #define AUDIO_I2S_DOUT_GPIO 7 /**< I2S data out (to speaker) GPIO */
 
 /** Matches the mesh grant limit while keeping audio independent of mesh headers. */
-#define AUDIO_MAX_RX_SOURCES 2
+#define AUDIO_MAX_RX_SOURCES 3
 
 /**
  * @brief I2S GPIO pin configuration
@@ -217,6 +217,7 @@ typedef struct {
     uint32_t rx_queue_overflows; /**< Frames rejected because the playback queue was full */
     uint32_t rx_lock_drops;      /**< Frames rejected because the source lock was unavailable */
     uint32_t rx_source_rejections; /**< Frames rejected because all source slots are occupied */
+    uint32_t rx_source_evictions;  /**< Silent sources displaced by a newly active talker */
     uint32_t jitter_trim_frames; /**< Legacy compatibility counter; remains zero */
     uint32_t packet_duplicate_drops; /**< Sequenced packets rejected as duplicates */
     uint32_t packet_late_drops;  /**< Sequenced packets rejected after their deadline */

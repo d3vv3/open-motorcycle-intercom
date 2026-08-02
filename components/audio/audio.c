@@ -51,6 +51,8 @@ static const char *TAG = "audio";
 #define OPUS_DTX_FRAME_MAX_BYTES 2
 #define OPUS_EXPECTED_LOSS_PERC  5
 #define RX_SOURCE_IDLE_TIMEOUT_MS 1000
+/* A source must be VOX-silent this long before a new talker may displace it. */
+#define RX_SOURCE_EVICT_SILENCE_MS 400
 #define RX_ENQUEUE_LOCK_WAIT_MS   1
 
 #define LOOPBACK_QUEUE_SIZE      8
@@ -70,6 +72,7 @@ typedef struct {
     bool assigned;
     uint8_t source_id;
     uint64_t last_enqueue_ms;
+    uint64_t last_active_ms;
     bool decoder_reset_pending;
     bool decoded_active;
     OpusDecoder *decoder;
@@ -427,6 +430,7 @@ static void reset_rx_source_metadata_locked(void)
         source->assigned = false;
         source->source_id = 0;
         source->last_enqueue_ms = 0;
+        source->last_active_ms = 0;
         source->decoder_reset_pending = true;
         audio_packet_store_reset(&source->packet_store);
     }
@@ -514,6 +518,7 @@ static bool decode_and_buffer_source(audio_rx_source_t *source, uint64_t now_ms,
         now_ms - source->last_enqueue_ms >= RX_SOURCE_IDLE_TIMEOUT_MS) {
         source->assigned = false;
         source->source_id = 0;
+        source->last_active_ms = 0;
         source->decoder_reset_pending = false;
         audio_packet_store_reset(&source->packet_store);
         assigned = false;
@@ -767,7 +772,8 @@ static void log_audio_stats(void)
     ESP_LOGI(TAG,
              "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu "
              "capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu "
-             "rx_q_drop=%lu rx_lock_drop=%lu rx_src_drop=%lu jitter_drop=%lu decode_ok=%lu "
+             "rx_q_drop=%lu rx_lock_drop=%lu rx_src_drop=%lu rx_src_evict=%lu "
+             "jitter_drop=%lu decode_ok=%lu "
              "decode_err=%lu plc=%lu hold=%lu catchup=%lu conceal=%lu seq_gap=%lu "
              "seq_reset=%lu seq_stale=%lu glitch=%lu play_ok=%lu i2s_err=%lu notify_drop=%lu "
              "rx_sources=%u packet_dup=%lu packet_late=%lu packet_future=%lu pcm_overflow=%lu "
@@ -776,7 +782,8 @@ static void log_audio_stats(void)
              stats.capture_frames_ok, stats.capture_short_reads, stats.capture_timeouts,
              stats.adc_overruns, stats.frames_encoded, stats.encode_errors,
              stats.tx_dtx_suppressed, stats.rx_queue_overflows, stats.rx_lock_drops,
-             stats.rx_source_rejections, stats.jitter_trim_frames, stats.frames_decoded,
+             stats.rx_source_rejections, stats.rx_source_evictions,
+             stats.jitter_trim_frames, stats.frames_decoded,
              stats.decode_errors, stats.plc_frames, stats.hold_frames,
              stats.catchup_frames, stats.conceal_loss_frames, stats.seq_gap_frames,
              stats.seq_resets, stats.seq_stale_drops, stats.glitches_detected,
@@ -1427,6 +1434,8 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         return ESP_ERR_INVALID_STATE;
     }
 
+    int64_t now_us = esp_timer_get_time();
+    uint64_t alloc_now_ms = (uint64_t)(now_us / 1000);
     audio_rx_source_t *source = NULL;
     audio_rx_source_t *free_source = NULL;
     for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
@@ -1440,6 +1449,27 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     }
     if (source == NULL) {
         source = free_source;
+        if (source == NULL && frame->active) {
+            /* Top-N selection: a new active talker displaces the source
+             * that has been VOX-silent the longest. Recently active
+             * sources keep their slot (first speaker wins). */
+            audio_rx_source_t *victim = NULL;
+            for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
+                if (victim == NULL ||
+                    s_rx_sources[i].last_active_ms < victim->last_active_ms) {
+                    victim = &s_rx_sources[i];
+                }
+            }
+            if (victim != NULL &&
+                alloc_now_ms - victim->last_active_ms >= RX_SOURCE_EVICT_SILENCE_MS) {
+                source = victim;
+                source->assigned = false;
+                source->last_active_ms = 0;
+                STATS_LOCK();
+                s_stats.rx_source_evictions++;
+                STATS_UNLOCK();
+            }
+        }
         if (source == NULL) {
             xSemaphoreGive(s_rx_sources_mutex);
             STATS_LOCK();
@@ -1454,7 +1484,9 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         source->decoder_reset_pending = true;
         audio_packet_store_reset(&source->packet_store);
     }
-    int64_t now_us = esp_timer_get_time();
+    if (frame->active) {
+        source->last_active_ms = alloc_now_ms;
+    }
     if (packet.received_us == 0u) {
         packet.received_us = (uint64_t)now_us;
     }
