@@ -105,7 +105,7 @@ jobs:
     name: nRF52840 Zephyr firmware
     runs-on: ubuntu-latest
     # NCS supplies the Nordic ESB module used by this app; the matching toolchain
-    # image and sdk-nrf v2.7.0 commit keep the hosted build reproducible.
+    # image and annotated sdk-nrf v2.7.0 tag keep the hosted build reproducible.
     container:
       image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.7.0@sha256:b481467f39ed524a2cb23fed8b9dcdc1e4f60972988b913c386538953c929247
 
@@ -117,7 +117,7 @@ jobs:
         shell: bash
         run: |
           west init -m https://github.com/nrfconnect/sdk-nrf.git \
-            --mr 5cb85570ca43bc344d3145c2338128eacf4b48ec \
+            --mr v2.7.0 \
             "$GITHUB_WORKSPACE/.ncs"
           cd "$GITHUB_WORKSPACE/.ncs"
           west update --narrow -o=--depth=1
