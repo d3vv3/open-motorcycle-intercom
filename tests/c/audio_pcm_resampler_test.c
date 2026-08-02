@@ -5,6 +5,12 @@
 #include <stdio.h>
 #include <string.h>
 
+_Static_assert(AUDIO_PCM_RESAMPLER_TARGET_SAMPLES ==
+                   4u * AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES,
+               "PCM target must hold four 20 ms frames");
+_Static_assert(AUDIO_PCM_RESAMPLER_START_SAMPLES == AUDIO_PCM_RESAMPLER_TARGET_SAMPLES,
+               "PCM start threshold must match its target");
+
 static void fill_constant(int16_t *samples, size_t count, int16_t value)
 {
     size_t i;
@@ -159,10 +165,16 @@ static void simulate_producer(int32_t producer_ppm)
         }
     }
 
-    assert(minimum_depth > 400u);
-    assert(maximum_depth < 1600u);
-    assert(state.depth > 500u && state.depth < 900u);
-    assert(status.depth_before > 800u && status.depth_before < 1100u);
+    assert(minimum_depth > AUDIO_PCM_RESAMPLER_TARGET_SAMPLES -
+                               AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES - 240u);
+    assert(maximum_depth < AUDIO_PCM_RESAMPLER_TARGET_SAMPLES -
+                               AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES + 400u);
+    assert(state.depth > AUDIO_PCM_RESAMPLER_TARGET_SAMPLES -
+                             AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES - 140u);
+    assert(state.depth < AUDIO_PCM_RESAMPLER_TARGET_SAMPLES -
+                             AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES + 260u);
+    assert(status.depth_before > AUDIO_PCM_RESAMPLER_TARGET_SAMPLES - 160u);
+    assert(status.depth_before < AUDIO_PCM_RESAMPLER_TARGET_SAMPLES + 140u);
     assert(produced_total + AUDIO_PCM_RESAMPLER_START_SAMPLES ==
            consumed_total + state.depth);
     if (producer_ppm > 0) {
@@ -219,9 +231,12 @@ static void test_ring_wrap_and_overflow(void)
         assert(status.correction_ppm == 0);
         for (i = 0; i < AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES; ++i) {
             assert(output[i] == (int16_t)(expected++));
-            block[i] = (int16_t)((int)(iteration + 3u) *
-                                     (int)AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES +
-                                 (int)i);
+            block[i] =
+                (int16_t)(((int)iteration +
+                           (int)(AUDIO_PCM_RESAMPLER_TARGET_SAMPLES /
+                                 AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES)) *
+                              (int)AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES +
+                          (int)i);
         }
         assert(!audio_pcm_resampler_push(&state, block, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES, true)
                     .rejected_push);
@@ -285,7 +300,8 @@ static void test_underrun_and_restart(void)
     status = audio_pcm_resampler_render(&state, output, 0u);
     assert(!status.started && !status.underrun);
     assert(!status.audible_active);
-    assert(status.depth_before == 959u && status.depth_after == 959u);
+    assert(status.depth_before == AUDIO_PCM_RESAMPLER_START_SAMPLES - 1u);
+    assert(status.depth_after == AUDIO_PCM_RESAMPLER_START_SAMPLES - 1u);
     for (i = 0; i < AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES; ++i) {
         assert(output[i] == 0);
     }
@@ -320,9 +336,10 @@ static void test_activity_follows_pcm_timeline(void)
                                      false)
                 .rejected_push);
     status = audio_pcm_resampler_render(&state, output, 0u);
-    assert(status.audible_active);
+    assert(status.started && !status.underrun && status.audible_active);
+    assert(status.depth_before == AUDIO_PCM_RESAMPLER_TARGET_SAMPLES);
     status = audio_pcm_resampler_render(&state, output, 0u);
-    assert(!status.audible_active);
+    assert(status.started && !status.underrun && !status.audible_active);
 
     audio_pcm_resampler_reset(&state);
     assert(!audio_pcm_resampler_push(&state, first, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES, false)
@@ -333,9 +350,40 @@ static void test_activity_follows_pcm_timeline(void)
                                      true)
                 .rejected_push);
     status = audio_pcm_resampler_render(&state, output, 0u);
-    assert(!status.audible_active);
+    assert(status.started && !status.underrun && !status.audible_active);
+    assert(status.depth_before == AUDIO_PCM_RESAMPLER_TARGET_SAMPLES);
     status = audio_pcm_resampler_render(&state, output, 0u);
-    assert(status.audible_active);
+    assert(status.started && !status.underrun && status.audible_active);
+}
+
+static void test_two_producer_gaps_are_bridged(void)
+{
+    audio_pcm_resampler_t state;
+    audio_pcm_resampler_telemetry_t status;
+    int16_t initial[AUDIO_PCM_RESAMPLER_TARGET_SAMPLES];
+    int16_t replacement[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES];
+    int16_t output[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES];
+
+    fill_constant(initial, AUDIO_PCM_RESAMPLER_TARGET_SAMPLES, 1234);
+    fill_constant(replacement, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES, 1234);
+    audio_pcm_resampler_reset(&state);
+    assert(!audio_pcm_resampler_push(&state, initial,
+                                     AUDIO_PCM_RESAMPLER_TARGET_SAMPLES, true)
+                .rejected_push);
+
+    status = audio_pcm_resampler_render(&state, output, 0u);
+    assert(status.started && !status.underrun);
+    status = audio_pcm_resampler_render(&state, output, 0u);
+    assert(status.started && !status.underrun);
+
+    assert(!audio_pcm_resampler_push(&state, replacement,
+                                     AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES, true)
+                .rejected_push);
+    assert(!audio_pcm_resampler_push(&state, replacement,
+                                     AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES, true)
+                .rejected_push);
+    status = audio_pcm_resampler_render(&state, output, 0u);
+    assert(status.started && !status.underrun);
 }
 
 static void test_upstream_burst_recovery(void)
@@ -454,6 +502,7 @@ int main(void)
     test_int16_limits();
     test_underrun_and_restart();
     test_activity_follows_pcm_timeline();
+    test_two_producer_gaps_are_bridged();
     test_upstream_burst_recovery();
     test_reset_and_instance_independence();
     puts("audio_pcm_resampler tests passed");

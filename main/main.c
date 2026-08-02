@@ -24,6 +24,7 @@
 #include "esp_wifi.h"
 
 #include "audio.h"
+#include "audio_bundle.h"
 #include "button.h"
 #include "mesh.h"
 #include "nvs.h"
@@ -62,6 +63,7 @@ static uint32_t s_e2e_tx_frames = 0;
 static uint32_t s_e2e_rx_frames = 0;
 static uint32_t s_e2e_rx_gap_events = 0;
 static uint32_t s_e2e_rx_gap_frames = 0;
+static uint32_t s_e2e_rx_recovered_frames = 0;
 static uint32_t s_e2e_rx_reset_events = 0;
 static uint32_t s_pipe_source_frames = 0;
 static uint32_t s_pipe_gate_drops = 0;
@@ -75,13 +77,45 @@ static uint32_t s_pipe_spi_rx_self = 0;
 static uint32_t s_pipe_probe_rx = 0;
 static uint32_t s_pipe_play_queue_ok = 0;
 static uint32_t s_pipe_play_queue_drop = 0;
+static uint32_t s_pipe_bundle_tx = 0;
+static uint32_t s_pipe_prev1_attached = 0;
+static uint32_t s_pipe_prev2_attached = 0;
+static uint32_t s_pipe_bundle_rx = 0;
+static uint32_t s_pipe_bundle_bad = 0;
+static uint32_t s_pipe_prev1_offer = 0;
+static uint32_t s_pipe_prev1_accept = 0;
+static uint32_t s_pipe_prev1_reject = 0;
+static uint32_t s_pipe_prev2_offer = 0;
+static uint32_t s_pipe_prev2_accept = 0;
+static uint32_t s_pipe_prev2_reject = 0;
 
 typedef struct {
     bool initialized;
     uint16_t last_seq;
+    uint32_t outstanding_gap_frames;
 } e2e_rx_seq_state_t;
 
 static e2e_rx_seq_state_t s_e2e_rx_seq_state[256] = {0};
+
+static void reset_e2e_rx_source(uint8_t source_id)
+{
+    memset(&s_e2e_rx_seq_state[source_id], 0, sizeof(s_e2e_rx_seq_state[source_id]));
+}
+
+static void reset_all_e2e_rx_sources(void)
+{
+    memset(s_e2e_rx_seq_state, 0, sizeof(s_e2e_rx_seq_state));
+}
+
+typedef struct {
+    uint8_t data[MESH_AUDIO_V2_MAX_FRAME_BYTES];
+    uint16_t len;
+    uint16_t seq;
+    bool active;
+} nrf_previous_audio_t;
+
+static nrf_previous_audio_t s_nrf_previous_audio[2] = {0};
+static _Atomic uint8_t s_nrf_previous_depth = 0;
 
 
 /* RTT log cadence while using nRF transport */
@@ -257,6 +291,31 @@ static esp_err_t init_audio_with_test_flags(void)
     return audio_init_with_config(&audio_cfg);
 }
 
+static void reset_nrf_previous_audio(void)
+{
+    atomic_store_explicit(&s_nrf_previous_depth, 0, memory_order_release);
+}
+
+static void cache_nrf_previous_audio(const uint8_t *data, uint16_t len, bool active,
+                                     uint16_t seq, bool eligible)
+{
+    if (len == 0 || len > sizeof(s_nrf_previous_audio[0].data)) {
+        reset_nrf_previous_audio();
+        return;
+    }
+    uint8_t depth = atomic_load_explicit(&s_nrf_previous_depth, memory_order_acquire);
+    if (depth > 0) {
+        s_nrf_previous_audio[1] = s_nrf_previous_audio[0];
+    }
+    memcpy(s_nrf_previous_audio[0].data, data, len);
+    s_nrf_previous_audio[0].len = len;
+    s_nrf_previous_audio[0].seq = seq;
+    s_nrf_previous_audio[0].active = active;
+    atomic_store_explicit(&s_nrf_previous_depth,
+                          eligible ? (depth < 2 ? (uint8_t)(depth + 1u) : 2u) : 0u,
+                          memory_order_release);
+}
+
 /**
  * @brief Callback from audio subsystem when encoded frame is ready
  */
@@ -277,25 +336,65 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         s_pipe_source_frames++;
         uint16_t seq = s_e2e_tx_seq++;
         s_e2e_tx_frames++;
+        if (len > MESH_MAX_OPUS_BYTES) {
+            s_pipe_spi_oversize++;
+            reset_nrf_previous_audio();
+            ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
+            break;
+        }
+
+        uint8_t previous_depth =
+            atomic_load_explicit(&s_nrf_previous_depth, memory_order_acquire);
+        bool attach_previous1 =
+            previous_depth >= 1u &&
+            s_nrf_previous_audio[0].active &&
+            (uint16_t)(s_nrf_previous_audio[0].seq + 1u) == seq;
+        bool attach_previous2 =
+            attach_previous1 && previous_depth >= 2u && s_nrf_previous_audio[1].active &&
+            (uint16_t)(s_nrf_previous_audio[1].seq + 1u) ==
+                s_nrf_previous_audio[0].seq;
+        uint8_t bundle_buf[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
+        size_t bundle_len = 0;
+        audio_bundle_view_t bundle = {
+            .previous1_data = attach_previous1 ? s_nrf_previous_audio[0].data : NULL,
+            .previous2_data = attach_previous2 ? s_nrf_previous_audio[1].data : NULL,
+            .current_data = data,
+            .previous1_len = attach_previous1 ? s_nrf_previous_audio[0].len : 0,
+            .previous2_len = attach_previous2 ? s_nrf_previous_audio[1].len : 0,
+            .current_len = len,
+            .current_seq = seq,
+            .stream_id = get_bridge_node_id(),
+            .flags = active ? AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE : 0,
+        };
+        if (attach_previous1) {
+            bundle.flags |= AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
+                            AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
+        }
+        if (attach_previous2) {
+            bundle.flags |= AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT |
+                            AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE;
+        }
+        bool bundle_encoded = audio_bundle_encode(&bundle, bundle_buf, sizeof(bundle_buf),
+                                                  &bundle_len);
+
+        cache_nrf_previous_audio(data, len, active, seq,
+                                 atomic_load(&s_mesh_user_enabled));
+
         xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
         if (s_mesh_user_enabled && uart_bridge_is_mesh_ready()) {
-            uint8_t tx_buf[130];
-            uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
-            if (len > MESH_MAX_OPUS_BYTES) {
-                s_pipe_spi_oversize++;
-                ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
-                xSemaphoreGive(s_nrf_membership_mutex);
-                break;
-            }
-
-            /* Bridge payload format: [audio_flags][e2e_seq_hi][e2e_seq_lo][opus...] */
-            tx_buf[0] = audio_flags;
-            tx_buf[1] = (uint8_t)(seq >> 8);
-            tx_buf[2] = (uint8_t)(seq & 0xFF);
-            memcpy(&tx_buf[3], data, len);
-
             s_pipe_spi_attempts++;
-            esp_err_t ret = uart_bridge_send_audio(tx_buf, (uint16_t)(len + 3));
+            esp_err_t ret = bundle_encoded
+                                ? uart_bridge_send_audio_v2(bundle_buf, (uint16_t)bundle_len)
+                                : ESP_ERR_INVALID_SIZE;
+            if (ret == ESP_OK) {
+                s_pipe_bundle_tx++;
+                if (attach_previous1) {
+                    s_pipe_prev1_attached++;
+                }
+                if (attach_previous2) {
+                    s_pipe_prev2_attached++;
+                }
+            }
             if (ret != ESP_OK) {
                 s_pipe_spi_enqueue_fail++;
                 ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
@@ -368,15 +467,57 @@ static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_i
     }
 }
 
+static esp_err_t submit_nrf_audio_frame(const audio_frame_t *frame, uint8_t src_id,
+                                        bool *admitted)
+{
+    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
+    bool ready = s_mesh_user_enabled && uart_bridge_is_mesh_ready();
+    if (admitted != NULL) {
+        *admitted = ready;
+    }
+    esp_err_t ret = ready ? audio_put_rx_frame(frame, src_id) : ESP_ERR_INVALID_STATE;
+    xSemaphoreGive(s_nrf_membership_mutex);
+    return ret;
+}
+
+static void offer_nrf_predecessor(uint8_t src_id, const uint8_t *data, size_t len,
+                                  uint16_t seq, bool active, int64_t timestamp_us,
+                                  e2e_rx_seq_state_t *seq_state, uint32_t *offer_count,
+                                  uint32_t *accept_count, uint32_t *reject_count)
+{
+    audio_frame_t frame;
+
+    (*offer_count)++;
+    memcpy(frame.data, data, len);
+    frame.len = (uint16_t)len;
+    frame.timestamp_ms = timestamp_us / 1000;
+    frame.active = active;
+    frame.seq = seq;
+    frame.has_seq = true;
+
+    if (submit_nrf_audio_frame(&frame, src_id, NULL) == ESP_OK) {
+        (*accept_count)++;
+        if (seq_state->outstanding_gap_frames > 0) {
+            seq_state->outstanding_gap_frames--;
+            s_e2e_rx_recovered_frames++;
+        }
+    } else {
+        (*reject_count)++;
+    }
+}
+
 /**
  * @brief Callback from UART bridge when audio is received (nRF52840)
  */
 static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t len,
-                                  int64_t timestamp_us)
+                                   int64_t timestamp_us, bool redundant_bundle)
 {
-    audio_frame_t frame;
-
     if (!s_mesh_user_enabled || !uart_bridge_is_mesh_ready()) {
+        s_pipe_spi_rx_invalid++;
+        return;
+    }
+
+    if (src_id == 0 || src_id > MESH_MAX_NODES) {
         s_pipe_spi_rx_invalid++;
         return;
     }
@@ -384,69 +525,96 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     uint8_t local_node_id = get_bridge_node_id();
 
     s_pipe_spi_rx++;
-    if (len < 4) {
-        s_pipe_spi_rx_invalid++;
-        return;
-    }
-
     if (local_node_id != 0 && src_id == local_node_id) {
         s_pipe_spi_rx_self++;
         return;
     }
 
-    const uint8_t *payload = data + 1;
-    uint16_t payload_len = (uint16_t)(len - 1);
-
-    if (rtt_probe_handle_packet(src_id, payload, payload_len)) {
-        s_pipe_probe_rx++;
+    if (!redundant_bundle) {
+        if (len < 2 || !rtt_probe_handle_packet(src_id, data + 1, (uint16_t)(len - 1))) {
+            s_pipe_spi_rx_invalid++;
+        } else {
+            s_pipe_probe_rx++;
+        }
         return;
     }
 
-    uint16_t e2e_seq = ((uint16_t)payload[0] << 8) | payload[1];
+    audio_bundle_view_t bundle = {0};
+    s_pipe_bundle_rx++;
+    if (!audio_bundle_parse(data, len, &bundle) ||
+        (bundle.stream_id != 0 && bundle.stream_id != src_id)) {
+        s_pipe_bundle_bad++;
+        s_pipe_spi_rx_invalid++;
+        return;
+    }
+    uint16_t e2e_seq = bundle.current_seq;
+
     e2e_rx_seq_state_t *seq_state = &s_e2e_rx_seq_state[src_id];
     if (!seq_state->initialized) {
         seq_state->initialized = true;
+        seq_state->last_seq = e2e_seq;
     } else {
         uint16_t expected = (uint16_t)(seq_state->last_seq + 1);
-        if (e2e_seq != expected) {
+        if (e2e_seq == expected) {
+            seq_state->last_seq = e2e_seq;
+        } else {
             int16_t signed_delta = (int16_t)(e2e_seq - expected);
             if (signed_delta > 0) {
+                uint32_t gap = (uint16_t)signed_delta;
                 s_e2e_rx_gap_events++;
-                s_e2e_rx_gap_frames += (uint16_t)signed_delta;
+                s_e2e_rx_gap_frames += gap;
+                if (UINT32_MAX - seq_state->outstanding_gap_frames < gap) {
+                    seq_state->outstanding_gap_frames = UINT32_MAX;
+                } else {
+                    seq_state->outstanding_gap_frames += gap;
+                }
+                seq_state->last_seq = e2e_seq;
             } else {
-                /* Backward jump or implausibly large forward jump -> reset/restart. */
+                /* Late/reordered current: retain the forward tracker and outstanding loss. */
                 s_e2e_rx_reset_events++;
             }
         }
     }
-    seq_state->last_seq = e2e_seq;
     s_e2e_rx_frames++;
 
-    uint16_t opus_len = (uint16_t)(payload_len - 2);
-    if (opus_len > sizeof(frame.data)) {
+    audio_frame_t frame;
+    if (bundle.current_len > sizeof(frame.data)) {
         s_pipe_spi_rx_invalid++;
-        ESP_LOGW(TAG, "Audio frame too large: %u bytes", opus_len);
+        ESP_LOGW(TAG, "Audio frame too large: %u bytes", (unsigned)bundle.current_len);
         return;
     }
 
-    memcpy(frame.data, payload + 2, opus_len);
-    frame.len = opus_len;
+    if (bundle.previous2_len != 0) {
+        offer_nrf_predecessor(
+            src_id, bundle.previous2_data, bundle.previous2_len,
+            (uint16_t)(e2e_seq - 2u),
+            (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0,
+            timestamp_us - 40000, seq_state, &s_pipe_prev2_offer,
+            &s_pipe_prev2_accept, &s_pipe_prev2_reject);
+    }
+    if (bundle.previous1_len != 0) {
+        offer_nrf_predecessor(
+            src_id, bundle.previous1_data, bundle.previous1_len,
+            (uint16_t)(e2e_seq - 1u),
+            (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0,
+            timestamp_us - 20000, seq_state, &s_pipe_prev1_offer,
+            &s_pipe_prev1_accept, &s_pipe_prev1_reject);
+    }
+
+    memcpy(frame.data, bundle.current_data, bundle.current_len);
+    frame.len = (uint16_t)bundle.current_len;
     frame.timestamp_ms = timestamp_us / 1000;
-    /* data[0] carries the audio_flags byte set by audio_tx_callback; the ACTIVE
-     * bit distinguishes speech from intentional silence/comfort frames. */
-    frame.active = (data[0] & MESH_AUDIO_FLAG_ACTIVE) != 0;
+    frame.active = (bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE) != 0;
     /* Hand the end-to-end sequence to playout so it can conceal missing frames. */
     frame.seq = e2e_seq;
     frame.has_seq = true;
 
-    xSemaphoreTake(s_nrf_membership_mutex, portMAX_DELAY);
-    if (!s_mesh_user_enabled || !uart_bridge_is_mesh_ready()) {
-        xSemaphoreGive(s_nrf_membership_mutex);
+    bool admitted = false;
+    esp_err_t ret = submit_nrf_audio_frame(&frame, src_id, &admitted);
+    if (!admitted) {
         s_pipe_spi_rx_invalid++;
         return;
     }
-    esp_err_t ret = audio_put_rx_frame(&frame, src_id);
-    xSemaphoreGive(s_nrf_membership_mutex);
     if (ret != ESP_OK) {
         s_pipe_play_queue_drop++;
         ESP_LOGD(TAG, "Failed to queue RX audio: %s", esp_err_to_name(ret));
@@ -543,6 +711,7 @@ static void set_mesh_user_runtime_state(bool enabled)
     s_nrf_notification_head = 0;
     s_nrf_notification_tail = 0;
     if (!enabled) {
+        reset_nrf_previous_audio();
         s_nrf_membership_observed = false;
         s_nrf_last_peer_count = 0;
         atomic_store(&s_mesh_active, false);
@@ -597,9 +766,6 @@ static void bridge_status_callback(const uart_bridge_status_t *status)
  */
 static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data, uint16_t len)
 {
-    (void)data;
-    (void)len;
-
     switch (event) {
     case BRIDGE_EVENT_MESH_READY:
         ESP_LOGI(TAG, "nRF52840 mesh ready");
@@ -611,19 +777,32 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
         }
         break;
     case BRIDGE_EVENT_PEER_JOINED:
-        ESP_LOGI(TAG, "Peer join event received; waiting for status confirmation");
+        if (data != NULL && len >= 1 && data[0] >= 1 && data[0] <= MESH_MAX_NODES) {
+            reset_e2e_rx_source(data[0]);
+            ESP_LOGI(TAG, "Peer %u join event received; waiting for status confirmation", data[0]);
+        } else {
+            ESP_LOGW(TAG, "Ignoring peer join event with invalid node ID");
+        }
         break;
     case BRIDGE_EVENT_PEER_LEFT:
-        ESP_LOGI(TAG, "Peer leave event received; waiting for status confirmation");
+        if (data != NULL && len >= 1 && data[0] >= 1 && data[0] <= MESH_MAX_NODES) {
+            reset_e2e_rx_source(data[0]);
+            ESP_LOGI(TAG, "Peer %u leave event received; waiting for status confirmation", data[0]);
+        } else {
+            ESP_LOGW(TAG, "Ignoring peer leave event with invalid node ID");
+        }
         break;
     case BRIDGE_EVENT_MESH_STOPPED:
         ESP_LOGI(TAG, "nRF52840 mesh stopped");
+        reset_all_e2e_rx_sources();
+        reset_nrf_previous_audio();
         s_mesh_active = false;
         atomic_store(&s_mesh_enable_notification_pending, false);
         reset_nrf_membership_tracking();
         break;
     case BRIDGE_EVENT_SYNC_LOST:
         ESP_LOGW(TAG, "nRF sync lost/rescanning; waiting for status confirmation");
+        reset_all_e2e_rx_sources();
         break;
     case BRIDGE_EVENT_COMMAND_ACK:
     case BRIDGE_EVENT_BECAME_COORDINATOR:
@@ -827,6 +1006,7 @@ void app_main(void)
     } else {
         /* No nRF52840 - fallback to ESP-NOW */
         uart_bridge_deinit();
+        reset_nrf_previous_audio();
         s_active_transport = TRANSPORT_ESP_NOW;
         ESP_LOGI(TAG, "nRF52840 not detected - using ESP-NOW transport");
     }
@@ -1009,16 +1189,30 @@ void app_main(void)
                          rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
                          rtt.jitter_ms_avg, rtt.jitter_ms_max);
                 ESP_LOGI(TAG,
-                         "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu",
+                         "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu recovered=%lu effective_gap=%lu",
                          s_e2e_tx_frames, s_e2e_rx_frames, s_e2e_rx_gap_events,
-                         s_e2e_rx_gap_frames, s_e2e_rx_reset_events);
+                         s_e2e_rx_gap_frames, s_e2e_rx_reset_events,
+                         s_e2e_rx_recovered_frames,
+                         s_e2e_rx_gap_frames > s_e2e_rx_recovered_frames
+                             ? s_e2e_rx_gap_frames - s_e2e_rx_recovered_frames
+                             : 0);
                 ESP_LOGI(TAG,
-                         "PIPE v=1 dev=esp stage=transport node=%u source=%lu gate_drop=%lu spi_try=%lu spi_ok=%lu spi_fail=%lu spi_oversize=%lu spi_rx=%lu spi_gap=%lu spi_invalid=%lu spi_self=%lu probe_rx=%lu play_q_ok=%lu play_q_drop=%lu",
+                         "PIPE v=1 dev=esp stage=transport node=%u source=%lu gate_drop=%lu spi_try=%lu spi_ok=%lu spi_fail=%lu spi_oversize=%lu spi_rx=%lu spi_gap=%lu spi_invalid=%lu spi_self=%lu probe_rx=%lu play_q_ok=%lu play_q_drop=%lu bundle_tx=%lu bundle_rx=%lu bundle_bad=%lu prev1_attached=%lu prev2_attached=%lu prev1_offer=%lu prev1_accept=%lu prev1_reject=%lu prev2_offer=%lu prev2_accept=%lu prev2_reject=%lu recovered=%lu",
                          get_bridge_node_id(), s_pipe_source_frames, s_pipe_gate_drops,
                          s_pipe_spi_attempts, s_pipe_spi_enqueue_ok, s_pipe_spi_enqueue_fail,
                          s_pipe_spi_oversize, s_pipe_spi_rx, s_e2e_rx_gap_frames,
                          s_pipe_spi_rx_invalid, s_pipe_spi_rx_self, s_pipe_probe_rx,
-                         s_pipe_play_queue_ok, s_pipe_play_queue_drop);
+                         s_pipe_play_queue_ok, s_pipe_play_queue_drop, s_pipe_bundle_tx,
+                         s_pipe_bundle_rx, s_pipe_bundle_bad, s_pipe_prev1_attached,
+                         s_pipe_prev2_attached, s_pipe_prev1_offer, s_pipe_prev1_accept,
+                         s_pipe_prev1_reject, s_pipe_prev2_offer, s_pipe_prev2_accept,
+                         s_pipe_prev2_reject, s_e2e_rx_recovered_frames);
+                ESP_LOGI(TAG,
+                         "Redundancy: tx=%lu rx=%lu attached=%lu/%lu prev1=%lu/%lu/%lu prev2=%lu/%lu/%lu recovered=%lu",
+                         s_pipe_bundle_tx, s_pipe_bundle_rx, s_pipe_prev1_attached,
+                         s_pipe_prev2_attached, s_pipe_prev1_offer, s_pipe_prev1_accept,
+                         s_pipe_prev1_reject, s_pipe_prev2_offer, s_pipe_prev2_accept,
+                         s_pipe_prev2_reject, s_e2e_rx_recovered_frames);
                 last_rtt_log_ms = now_ms;
             }
         }

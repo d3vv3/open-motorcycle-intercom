@@ -45,6 +45,8 @@ _PIPE_GAUGE_KEYS = {
     "asrc_ppm",
     "asrc_abs_max_ppm",
     "asrc_recovery",
+    "bundle_max_bytes",
+    "tx_duration_max_us",
 }
 
 _PIPE_SIGNED_KEYS = {
@@ -84,6 +86,7 @@ _SNAPSHOT_GAUGE_KEYS = {
     "rx_pipeline": {"rx_pipe_avg_us", "rx_pipe_max_us"},
     "vox": {"vox_active"},
     "rx_depth": {"rx_q_min", "rx_q_avg", "rx_q_max", "rx_q_total"},
+    "e2e_esp": {"effective_gap"},
     "atune": {
         "r",
         "q",
@@ -199,6 +202,7 @@ NRF_ATUNE_RE = re.compile(
 ESP_E2E_RE = re.compile(
     r"\[E2E_ESP\]\s*tx=(?P<tx>\d+)\s*rx=(?P<rx>\d+)\s*gap_evt=(?P<gap_evt>\d+)\s*"
     r"gap_fr=(?P<gap_fr>\d+)\s*reset_evt=(?P<reset_evt>\d+)"
+    r"(?:\s*recovered=(?P<recovered>\d+)\s*effective_gap=(?P<effective_gap>\d+))?"
 )
 
 NRF_E2E_RE = re.compile(
@@ -520,8 +524,14 @@ def compute_hop_pct(s: PortStats) -> dict[str, float | None]:
     e2e_nrf_d = s.delta("e2e_nrf")
     # These gap counters are local to the same receive stage and denominator.
     if e2e_esp_d:
-        gaps = e2e_esp_d.get("gap_fr", 0)
-        out["esp_e2e_gap_pct"] = _pct(gaps, e2e_esp_d.get("rx", 0) + gaps)
+        raw_gaps = e2e_esp_d.get("gap_fr", 0)
+        effective_gaps = max(raw_gaps - e2e_esp_d.get("recovered", 0), 0)
+        received = e2e_esp_d.get("rx", 0)
+        out["esp_e2e_raw_gap_pct"] = _pct(raw_gaps, received + raw_gaps)
+        out["esp_e2e_effective_gap_pct"] = _pct(
+            effective_gaps, received + effective_gaps
+        )
+        out["esp_e2e_gap_pct"] = out["esp_e2e_effective_gap_pct"]
 
     # nRF per-hop
     if e2e_nrf_d:
@@ -840,6 +850,10 @@ def _snapshot_json(s: PortStats, name: str) -> dict[str, Any]:
     history = s.sample_history.get(name, [first, last] if first and last else [])
     excluded = _IDENTITY_KEYS | _SNAPSHOT_GAUGE_KEYS.get(name, set())
     delta, resets = _reset_aware_delta(history, excluded)
+    if name == "e2e_esp" and delta:
+        delta["effective_gap"] = max(
+            delta.get("gap_fr", 0) - delta.get("recovered", 0), 0
+        )
     return {
         f"first_{name}": first,
         f"last_{name}": last,
@@ -1200,18 +1214,29 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     # E2E ESP
     if s.last_e2e_esp:
         m, d = s.last_e2e_esp, s.delta("e2e_esp")
+        recovered = m.get("recovered", 0)
+        effective_gap = max(m["gap_fr"] - recovered, 0)
         out.append(
             f"  E2E ESP: tx={m['tx']} rx={m['rx']} "
-            f"gap_evt={m['gap_evt']} gap_fr={m['gap_fr']}"
+            f"gap_evt={m['gap_evt']} raw_gap={m['gap_fr']} "
+            f"recovered={recovered} effective_gap={effective_gap}"
         )
         if d:
+            raw_gap = d.get("gap_fr", 0)
+            recovered = d.get("recovered", 0)
+            effective_gap = max(raw_gap - recovered, 0)
             out.append(
                 f"  Delta E2E ESP: tx={d.get('tx', 0)} rx={d.get('rx', 0)} "
-                f"gap_evt={d.get('gap_evt', 0)} gap_fr={d.get('gap_fr', 0)}"
+                f"gap_evt={d.get('gap_evt', 0)} raw_gap={raw_gap} "
+                f"recovered={recovered} effective_gap={effective_gap}"
             )
-            gap = compute_hop_pct(s).get("esp_e2e_gap_pct")
-            if gap is not None:
-                out.append(f"  Stage-local ESP RX gap={gap}%")
+            hop = compute_hop_pct(s)
+            raw_pct = hop.get("esp_e2e_raw_gap_pct")
+            effective_pct = hop.get("esp_e2e_effective_gap_pct")
+            if raw_pct is not None and effective_pct is not None:
+                out.append(
+                    f"  Stage-local ESP RX gap: raw={raw_pct}% effective={effective_pct}%"
+                )
 
     # E2E nRF
     if s.last_e2e_nrf:
@@ -1289,8 +1314,11 @@ def _health_line(s: PortStats) -> str:
         issues.append(f"nrf_under+{uflow_d}")
 
     e2e_esp_d = s.delta("e2e_esp")
-    if e2e_esp_d.get("gap_fr", 0) > 0:
-        issues.append(f"e2e_esp_gap_fr+{e2e_esp_d['gap_fr']}")
+    effective_gap = max(
+        e2e_esp_d.get("gap_fr", 0) - e2e_esp_d.get("recovered", 0), 0
+    )
+    if effective_gap > 0:
+        issues.append(f"e2e_esp_effective_gap+{effective_gap}")
 
     e2e_nrf_d = s.delta("e2e_nrf")
     if e2e_nrf_d.get("spi_gap_fr", 0) > 0:
@@ -1349,15 +1377,17 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
         hop = compute_hop_pct(s)
 
         # ESP port: glitches + stage-local gaps + latency
-        is_esp = glitch_d or (hop and "esp_e2e_gap_pct" in hop)
+        is_esp = glitch_d or (hop and "esp_e2e_effective_gap_pct" in hop)
         if is_esp:
             parts: list[str] = []
             if glitch_d:
                 gl = glitch_d.get("glitches", 0)
                 gpm = _rate_per_min(gl, duration)
                 parts.append(f"glitches={gl} ({gpm}/min)")
-            if hop.get("esp_e2e_gap_pct") is not None:
-                parts.append(f"rx_gap={hop['esp_e2e_gap_pct']}%")
+            raw_gap = hop.get("esp_e2e_raw_gap_pct")
+            effective_gap = hop.get("esp_e2e_effective_gap_pct")
+            if raw_gap is not None and effective_gap is not None:
+                parts.append(f"rx_gap_raw={raw_gap}% rx_gap_effective={effective_gap}%")
             if parts:
                 print(f"  {s.port} (ESP): {' | '.join(parts)}")
                 printed = True

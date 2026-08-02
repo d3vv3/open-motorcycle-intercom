@@ -79,6 +79,12 @@ uint32_t tdma_get_frame_counter(void);
 int32_t tdma_get_time_to_slot_us(void);
 
 /**
+ * @brief Get usable microseconds remaining before the guarded TX deadline
+ * @return Remaining usable time, or 0 when outside an active local slot
+ */
+uint32_t tdma_get_current_slot_remaining_us(void);
+
+/**
  * @brief Synchronize to coordinator timing
  * @param frame_counter Coordinator's frame counter
  * @param drift_ppm Coordinator period correction in ppm; positive is longer.

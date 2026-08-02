@@ -245,7 +245,8 @@ audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *sto
         packet_ready = store->occupied[slot] &&
                        store->packets[slot].sequence == store->expected_sequence;
     }
-    if (!packet_ready && now_ms < store->next_deadline_ms) {
+    if (!packet_ready &&
+        now_ms < store->next_deadline_ms + AUDIO_PACKET_STORE_LATE_GRACE_MS) {
         return AUDIO_PACKET_STORE_POP_NOT_DUE;
     }
 

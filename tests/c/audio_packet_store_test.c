@@ -47,7 +47,10 @@ static void test_sequential_and_prefill(void)
     assert(audio_packet_store_depth(&store) == 0u);
     assert(audio_packet_store_pop(&store, 0u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
     assert(audio_packet_store_pop(&store, 59u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
-    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 79u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 99u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
 }
 
 static void test_prefill_timeout(void)
@@ -63,6 +66,7 @@ static void test_prefill_timeout(void)
 static void test_reorder_and_missing_deadline(void)
 {
     audio_packet_store_t store;
+    audio_packet_t value;
     audio_packet_t output = {0};
     audio_packet_store_reset(&store);
     push_ok(&store, 100u, 0u);
@@ -74,12 +78,46 @@ static void test_reorder_and_missing_deadline(void)
 
     audio_packet_store_reset(&store);
     push_ok(&store, 100u, 0u);
+    push_ok(&store, 103u, 0u);
+    push_ok(&store, 104u, 0u);
+    expect_packet(&store, 0u, 100u);
+    assert(audio_packet_store_pop(&store, 20u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    value = packet(101u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    assert(audio_packet_store_push(&store, &value, 40u) == AUDIO_PACKET_STORE_PUSH_OK);
+    expect_packet(&store, 40u, 101u);
+    assert(audio_packet_store_pop(&store, 79u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    value = packet(102u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    assert(audio_packet_store_push(&store, &value, 79u) == AUDIO_PACKET_STORE_PUSH_OK);
+    expect_packet(&store, 79u, 102u);
+
+    audio_packet_store_reset(&store);
+    push_ok(&store, 100u, 0u);
     push_ok(&store, 102u, 0u);
     push_ok(&store, 103u, 0u);
     expect_packet(&store, 0u, 100u);
-    assert(audio_packet_store_pop(&store, 19u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
-    assert(audio_packet_store_pop(&store, 20u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
-    expect_packet(&store, 20u, 102u);
+    assert(audio_packet_store_pop(&store, 20u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 59u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    expect_packet(&store, 60u, 102u);
+}
+
+static void test_two_frame_loss_recovery(void)
+{
+    audio_packet_store_t store;
+    audio_packet_t output = {0};
+
+    audio_packet_store_reset(&store);
+    push_ok(&store, 100u, 0u);
+    push_ok(&store, 103u, 0u);
+    push_ok(&store, 104u, 0u);
+    expect_packet(&store, 0u, 100u);
+    assert(audio_packet_store_pop(&store, 59u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(store.expected_sequence == 102u);
+    assert(audio_packet_store_pop(&store, 79u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 80u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(store.expected_sequence == 103u);
+    expect_packet(&store, 80u, 103u);
 }
 
 static void test_duplicate_and_late(void)
@@ -193,15 +231,20 @@ static void test_overdue_events(void)
     audio_packet_t output = {0};
     audio_packet_store_reset(&store);
     push_ok(&store, 30u, 0u);
-    push_ok(&store, 32u, 0u);
-    push_ok(&store, 34u, 0u);
+    push_ok(&store, 33u, 0u);
+    push_ok(&store, 36u, 0u);
     expect_packet(&store, 0u, 30u);
-    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
-    expect_packet(&store, 100u, 32u);
-    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
-    expect_packet(&store, 100u, 34u);
-    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
-    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(store.expected_sequence == 32u);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(store.expected_sequence == 33u);
+    expect_packet(&store, 140u, 33u);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(store.expected_sequence == 35u);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(store.expected_sequence == 36u);
+    expect_packet(&store, 140u, 36u);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
 }
 
 static void test_dtx_inactive_payload_and_active_restart_loss(void)
@@ -221,10 +264,12 @@ static void test_dtx_inactive_payload_and_active_restart_loss(void)
     assert(output.data[0] == 50u);
     assert(store.expected_sequence == 51u);
     assert(store.dtx_idle);
-    assert(audio_packet_store_pop(&store, 80u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(audio_packet_store_pop(&store, 80u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 119u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 120u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
     assert(store.expected_sequence == 52u);
     assert(store.dtx_idle);
-    assert(audio_packet_store_pop(&store, 80u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(audio_packet_store_pop(&store, 120u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
     assert(output.sequence == 52u);
     assert(output.active);
     assert(store.expected_sequence == 53u);
@@ -243,14 +288,16 @@ static void test_dtx_lost_comfort_update(void)
     assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
     assert(output.sequence == 60u && !output.active);
     assert(store.expected_sequence == 61u);
-    assert(audio_packet_store_pop(&store, 80u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
+    assert(audio_packet_store_pop(&store, 80u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 120u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
     assert(store.expected_sequence == 61u);
 
     value = packet(62u, AUDIO_PACKET_MODE_SEQUENCED, false);
-    assert(audio_packet_store_push(&store, &value, 81u) == AUDIO_PACKET_STORE_PUSH_OK);
-    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(audio_packet_store_push(&store, &value, 121u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(audio_packet_store_pop(&store, 120u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_MISSING);
     assert(store.expected_sequence == 62u);
-    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(audio_packet_store_pop(&store, 140u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
     assert(output.sequence == 62u && !output.active);
     assert(store.expected_sequence == 63u);
     assert(store.dtx_idle);
@@ -276,7 +323,9 @@ static void test_dtx_buffered_early_and_empty_deadline(void)
     assert(output.sequence == 72u && !output.active);
     assert(audio_packet_store_pop(&store, 0u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
     assert(audio_packet_store_pop(&store, 59u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
-    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
+    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 99u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
     assert(store.expected_sequence == 73u);
 }
 
@@ -290,22 +339,22 @@ static void test_lost_dtx_transition_active_resume(void)
     audio_packet_store_reset(&store);
     push_ok(&store, 50u, 0u);
     expect_packet(&store, 60u, 50u);
-    for (deadline = 80u; deadline <= 160u; deadline += AUDIO_PACKET_STORE_FRAME_MS) {
+    for (deadline = 120u; deadline <= 200u; deadline += AUDIO_PACKET_STORE_FRAME_MS) {
         assert(audio_packet_store_pop(&store, deadline, &output) ==
                AUDIO_PACKET_STORE_POP_MISSING);
     }
     assert(store.expected_sequence == 56u);
     assert(store.sequence_uncertain);
-    assert(audio_packet_store_pop(&store, 180u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
+    assert(audio_packet_store_pop(&store, 220u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
     assert(store.expected_sequence == 56u);
 
     value = packet(49u, AUDIO_PACKET_MODE_SEQUENCED, true);
-    assert(audio_packet_store_push(&store, &value, 181u) == AUDIO_PACKET_STORE_PUSH_LATE);
+    assert(audio_packet_store_push(&store, &value, 221u) == AUDIO_PACKET_STORE_PUSH_LATE);
     assert(store.expected_sequence == 56u);
     assert(store.sequence_uncertain);
-    push_ok(&store, 51u, 181u);
+    push_ok(&store, 51u, 221u);
     assert(store.expected_sequence == 51u);
-    expect_packet(&store, 181u, 51u);
+    expect_packet(&store, 221u, 51u);
     assert(store.expected_sequence == 52u);
     assert(!store.dtx_idle);
     assert(!store.sequence_uncertain);
@@ -322,13 +371,13 @@ static void test_lost_dtx_transition_comfort_resume(void)
     audio_packet_store_reset(&store);
     push_ok(&store, 50u, 0u);
     expect_packet(&store, 60u, 50u);
-    for (deadline = 80u; deadline <= 160u; deadline += AUDIO_PACKET_STORE_FRAME_MS) {
+    for (deadline = 120u; deadline <= 200u; deadline += AUDIO_PACKET_STORE_FRAME_MS) {
         assert(audio_packet_store_pop(&store, deadline, &output) ==
                AUDIO_PACKET_STORE_POP_MISSING);
     }
     value = packet(51u, AUDIO_PACKET_MODE_SEQUENCED, false);
-    assert(audio_packet_store_push(&store, &value, 161u) == AUDIO_PACKET_STORE_PUSH_OK);
-    assert(audio_packet_store_pop(&store, 161u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(audio_packet_store_push(&store, &value, 201u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(audio_packet_store_pop(&store, 201u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
     assert(output.sequence == 51u && !output.active);
     assert(store.expected_sequence == 52u);
     assert(store.dtx_idle);
@@ -340,7 +389,7 @@ static void test_buffered_six_frame_burst_loss(void)
     audio_packet_store_t store;
     audio_packet_t output = {0};
     uint16_t missing_sequence;
-    uint64_t deadline = 80u;
+    uint64_t deadline = 120u;
 
     audio_packet_store_reset(&store);
     push_ok(&store, 50u, 0u);
@@ -354,7 +403,7 @@ static void test_buffered_six_frame_burst_loss(void)
         assert(!store.sequence_uncertain);
         deadline += AUDIO_PACKET_STORE_FRAME_MS;
     }
-    expect_packet(&store, 160u, 56u);
+    expect_packet(&store, 200u, 56u);
     assert(store.expected_sequence == 57u);
 }
 
@@ -367,13 +416,13 @@ static void test_lost_dtx_transition_wrap(void)
     audio_packet_store_reset(&store);
     push_ok(&store, UINT16_C(65534), 0u);
     expect_packet(&store, 60u, UINT16_C(65534));
-    for (deadline = 80u; deadline <= 160u; deadline += AUDIO_PACKET_STORE_FRAME_MS) {
+    for (deadline = 120u; deadline <= 200u; deadline += AUDIO_PACKET_STORE_FRAME_MS) {
         assert(audio_packet_store_pop(&store, deadline, &output) ==
                AUDIO_PACKET_STORE_POP_MISSING);
     }
     assert(store.expected_sequence == 4u);
-    push_ok(&store, UINT16_C(65535), 161u);
-    expect_packet(&store, 161u, UINT16_C(65535));
+    push_ok(&store, UINT16_C(65535), 201u);
+    expect_packet(&store, 201u, UINT16_C(65535));
     assert(store.expected_sequence == 0u);
     assert(!store.sequence_uncertain);
 }
@@ -395,7 +444,8 @@ static void test_arrival_order(void)
     assert(audio_packet_store_pop(&store, 0u, &output) == AUDIO_PACKET_STORE_POP_PACKET);
     assert(output.sequence == 8u && !output.active);
     assert(audio_packet_store_pop(&store, 59u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
-    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
+    assert(audio_packet_store_pop(&store, 60u, &output) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 100u, &output) == AUDIO_PACKET_STORE_POP_DTX_IDLE);
 }
 
 static void test_mode_mismatch_reset_and_lengths(void)
@@ -436,6 +486,7 @@ int main(void)
     test_sequential_and_prefill();
     test_prefill_timeout();
     test_reorder_and_missing_deadline();
+    test_two_frame_loss_recovery();
     test_duplicate_and_late();
     test_stale_slot_collision();
     test_future_and_full();

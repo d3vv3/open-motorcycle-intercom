@@ -6,7 +6,9 @@ from benchmark import (
     PortReader,
     PortStats,
     _build_port_json,
+    _health_line,
     _reconnect_candidates,
+    _report_lines_for_port,
     compute_correlated_delivery,
     compute_hop_pct,
     parse_pipeline_logfmt,
@@ -228,6 +230,166 @@ class PipelineLogTest(unittest.TestCase):
         for gauge in ("age_ms", "max_age_ms", "gen", "state", "exp_gen", "exp_state"):
             self.assertNotIn(gauge, pipeline["delta"])
             self.assertNotIn(gauge, pipeline["reset_epochs"])
+
+    def test_two_predecessor_redundancy_counters_delta(self):
+        stats = PortStats(port="test")
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "PIPE v=1 dev=esp stage=transport bundle_tx=10 bundle_rx=20 bundle_bad=2 "
+            "prev1_attached=7 prev2_attached=4 prev1_offer=12 prev1_accept=9 "
+            "prev1_reject=3 prev2_offer=8 prev2_accept=5 prev2_reject=3 recovered=11"
+        )
+        reader._parse_line(
+            "PIPE v=1 dev=esp stage=transport bundle_tx=18 bundle_rx=31 bundle_bad=4 "
+            "prev1_attached=13 prev2_attached=9 prev1_offer=19 prev1_accept=14 "
+            "prev1_reject=5 prev2_offer=14 prev2_accept=9 prev2_reject=5 recovered=20"
+        )
+
+        pipeline = _build_port_json(stats)["pipeline"]["esp:transport:na"]
+        self.assertEqual(
+            pipeline["delta"],
+            {
+                "bundle_bad": 2,
+                "bundle_rx": 11,
+                "bundle_tx": 8,
+                "prev1_accept": 5,
+                "prev1_attached": 6,
+                "prev1_offer": 7,
+                "prev1_reject": 2,
+                "prev2_accept": 4,
+                "prev2_attached": 5,
+                "prev2_offer": 6,
+                "prev2_reject": 2,
+                "recovered": 9,
+            },
+        )
+
+    def test_e2e_recovery_parses_and_reports_effective_gap(self):
+        stats = PortStats(port="test", open_ok=True, lines=2)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "[E2E_ESP] tx=100 rx=80 gap_evt=8 gap_fr=10 reset_evt=0 "
+            "recovered=4 effective_gap=6"
+        )
+        reader._parse_line(
+            "[E2E_ESP] tx=120 rx=98 gap_evt=12 gap_fr=15 reset_evt=0 "
+            "recovered=7 effective_gap=8"
+        )
+
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["last_e2e_esp"]["recovered"], 7)
+        self.assertEqual(summary["last_e2e_esp"]["effective_gap"], 8)
+        self.assertEqual(summary["e2e_esp_delta"]["gap_fr"], 5)
+        self.assertEqual(summary["e2e_esp_delta"]["recovered"], 3)
+        self.assertEqual(summary["e2e_esp_delta"]["effective_gap"], 2)
+        self.assertEqual(summary["hop_pct"]["esp_e2e_raw_gap_pct"], 21.74)
+        self.assertEqual(summary["hop_pct"]["esp_e2e_effective_gap_pct"], 10.0)
+        report = "\n".join(_report_lines_for_port(stats, 60))
+        self.assertIn("raw_gap=5 recovered=3 effective_gap=2", report)
+        self.assertIn("e2e_esp_effective_gap+2", _health_line(stats))
+
+    def test_e2e_recovery_keeps_legacy_logs_and_clears_health_when_repaired(self):
+        legacy = PortStats(port="legacy")
+        legacy_reader = PortReader("legacy", 115200, None, "unused", legacy)
+        legacy_reader._parse_line(
+            "[E2E_ESP] tx=10 rx=8 gap_evt=1 gap_fr=2 reset_evt=0"
+        )
+        self.assertNotIn("recovered", legacy.last_e2e_esp)
+
+        repaired = PortStats(port="test", open_ok=True, lines=2)
+        repaired_reader = PortReader("test", 115200, None, "unused", repaired)
+        repaired_reader._parse_line(
+            "[E2E_ESP] tx=100 rx=80 gap_evt=8 gap_fr=10 reset_evt=0 "
+            "recovered=4 effective_gap=6"
+        )
+        repaired_reader._parse_line(
+            "[E2E_ESP] tx=120 rx=98 gap_evt=12 gap_fr=15 reset_evt=0 "
+            "recovered=9 effective_gap=6"
+        )
+        self.assertEqual(_health_line(repaired), "OK (no error/drops/CRC growth observed)")
+
+    def test_e2e_recovery_credits_only_outstanding_raw_gaps(self):
+        scenarios = (
+            # Join-midstream predecessor accepted as prefill utility, not recovery.
+            ((0, 0), (0, 0), 0),
+            # One newly observed gap is recovered by its predecessor.
+            ((0, 0), (1, 1), 0),
+            # Earlier recovery cannot hide a later independent gap.
+            ((1, 1), (2, 1), 1),
+            # One redundant predecessor repairs only one frame of a larger gap.
+            ((2, 1), (5, 2), 2),
+            # Recovery accumulated before the window cannot offset a new gap.
+            ((10, 10), (11, 10), 1),
+        )
+
+        for index, (first, last, expected_effective) in enumerate(scenarios):
+            with self.subTest(index=index):
+                stats = PortStats(port="test", open_ok=True, lines=2)
+                reader = PortReader("test", 115200, None, "unused", stats)
+                reader._parse_line(
+                    f"[E2E_ESP] tx=100 rx=80 gap_evt=0 gap_fr={first[0]} "
+                    f"reset_evt=0 recovered={first[1]} "
+                    f"effective_gap={max(first[0] - first[1], 0)}"
+                )
+                reader._parse_line(
+                    f"[E2E_ESP] tx=120 rx=98 gap_evt=1 gap_fr={last[0]} "
+                    f"reset_evt=0 recovered={last[1]} "
+                    f"effective_gap={max(last[0] - last[1], 0)}"
+                )
+
+                summary = _build_port_json(stats)
+                self.assertEqual(
+                    summary["e2e_esp_delta"]["effective_gap"], expected_effective
+                )
+                health = _health_line(stats)
+                if expected_effective == 0:
+                    self.assertEqual(health, "OK (no error/drops/CRC growth observed)")
+                else:
+                    self.assertIn(
+                        f"e2e_esp_effective_gap+{expected_effective}", health
+                    )
+
+    def test_late_current_does_not_create_a_later_effective_gap(self):
+        stats = PortStats(port="test", open_ok=True, lines=3)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "[E2E_ESP] tx=100 rx=80 gap_evt=0 gap_fr=0 reset_evt=0 "
+            "recovered=0 effective_gap=0"
+        )
+        # A late standalone current increments only the reorder/reset diagnostic.
+        reader._parse_line(
+            "[E2E_ESP] tx=101 rx=81 gap_evt=0 gap_fr=0 reset_evt=1 "
+            "recovered=0 effective_gap=0"
+        )
+        # The next expected current remains in order because last_seq did not regress.
+        reader._parse_line(
+            "[E2E_ESP] tx=102 rx=82 gap_evt=0 gap_fr=0 reset_evt=1 "
+            "recovered=0 effective_gap=0"
+        )
+
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["e2e_esp_delta"]["gap_fr"], 0)
+        self.assertEqual(summary["e2e_esp_delta"]["effective_gap"], 0)
+        self.assertEqual(summary["e2e_esp_delta"]["reset_evt"], 1)
+        self.assertEqual(_health_line(stats), "OK (no error/drops/CRC growth observed)")
+
+    def test_true_forward_gap_can_still_be_recovered(self):
+        stats = PortStats(port="test", open_ok=True, lines=2)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "[E2E_ESP] tx=100 rx=80 gap_evt=0 gap_fr=0 reset_evt=0 "
+            "recovered=0 effective_gap=0"
+        )
+        reader._parse_line(
+            "[E2E_ESP] tx=102 rx=81 gap_evt=1 gap_fr=1 reset_evt=0 "
+            "recovered=1 effective_gap=0"
+        )
+
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["e2e_esp_delta"]["gap_fr"], 1)
+        self.assertEqual(summary["e2e_esp_delta"]["recovered"], 1)
+        self.assertEqual(summary["e2e_esp_delta"]["effective_gap"], 0)
+        self.assertEqual(_health_line(stats), "OK (no error/drops/CRC growth observed)")
 
     def test_reset_epochs_are_accumulated_without_negative_delta(self):
         stats = PortStats(port="test")

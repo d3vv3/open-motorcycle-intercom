@@ -12,6 +12,7 @@ target_sources(app PRIVATE
     src/uart_bridge.c
     src/mesh_protocol.c
     src/ws_sync.c
+    ../shared/audio_bundle.c
     ../shared/mesh_core.c
 )
 

@@ -70,6 +70,18 @@ jobs:
       - name: Run shared mesh core tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/mesh_core_test && /tmp/mesh_core_test
 
+      - name: Run audio bundle tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/audio_bundle_test && /tmp/audio_bundle_test
+
+      - name: Run audio packet store tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/audio_packet_store_test && /tmp/audio_packet_store_test
+
+      - name: Run audio PCM resampler tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/audio_pcm_resampler_test && /tmp/audio_pcm_resampler_test
+
+      - name: Run integrated audio playout recovery tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/audio_playout_recovery_test && /tmp/audio_playout_recovery_test
+
   nrf-zephyr:
     name: nRF52840 Zephyr firmware
     runs-on: ubuntu-latest

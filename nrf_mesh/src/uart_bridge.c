@@ -2,7 +2,7 @@
  * @file uart_bridge.c
  * @brief SPI Bridge to ESP32-S3 (nRF52840 = SPI Master)
  *
- * Protocol: [SYNC:0xAA][LEN:1B][SEQ:1B][TYPE:1B][PAYLOAD:0-128B][CRC8:1B]
+ * Protocol: [SYNC:0xAA][LEN:1B][SEQ:1B][TYPE:1B][PAYLOAD:0-208B][CRC8:1B]
  * LEN covers: [SEQ][TYPE][PAYLOAD]
  * CRC8 covers: [LEN][SEQ][TYPE][PAYLOAD]
  * Each call to uart_bridge_process() performs one full-duplex SPI
@@ -23,6 +23,7 @@
 #include <zephyr/logging/log.h>
 
 #include "mesh_protocol.h"
+#include "audio_bundle.h"
 
 LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
 
@@ -30,8 +31,13 @@ LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
  * Constants
  * ============================================================================ */
 
-#define SPI_MAX_PAYLOAD 128
+#define SPI_MAX_PAYLOAD 208
 #define TX_AUDIO_QUEUE_SIZE 16
+
+_Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 1 <= SPI_MAX_PAYLOAD,
+               "V2 bridge payload exceeds SPI capacity");
+_Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 1 + 5 <= BRIDGE_SPI_MAX_XFER,
+               "maximum V2 bridge frame exceeds fixed SPI transfer");
 
 /* ============================================================================
  * Static Variables
@@ -139,6 +145,9 @@ static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
         return -EINVAL;
     }
 
+    case UART_PKT_AUDIO_V2:
+        return mesh_protocol_send_audio_v2(payload, len);
+
     case UART_PKT_COMMAND:
         if (len > 0) {
             uint8_t cmd_id = payload[0];
@@ -232,7 +241,7 @@ static void parse_rx(const uint8_t *buf, size_t len)
     const uint8_t *payload = &buf[4];
     uint8_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
 
-    if (pkt_type == UART_PKT_AUDIO) {
+    if (pkt_type == UART_PKT_AUDIO || pkt_type == UART_PKT_AUDIO_V2) {
         bool duplicate = s_last_audio_seq_valid && (seq == s_last_audio_seq);
         if (duplicate) {
             s_audio_ingress_duplicate++;
@@ -374,11 +383,43 @@ int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
     payload[0] = src_id;
     memcpy(&payload[1], data, len);
     e->len = build_packet(e->buf, UART_PKT_AUDIO, payload, (uint8_t)(len + 1));
+    e->type = UART_PKT_AUDIO;
 
     s_audio_head = next_head;
     k_mutex_unlock(&s_tx_lock);
 
     LOG_DBG("Queued audio packet: src=%d, len=%d", src_id, len);
+    return 0;
+}
+
+int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len)
+{
+    audio_bundle_view_t bundle;
+
+    if (!s_initialized || !audio_bundle_parse(data, len, &bundle)) {
+        return -EINVAL;
+    }
+    if ((uint16_t)len + 1U > SPI_MAX_PAYLOAD) {
+        return -EMSGSIZE;
+    }
+
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    uint8_t cur_head = s_audio_head;
+    uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
+    if (next_head == s_audio_tail) {
+        s_audio_tail = (uint8_t)((s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE);
+        s_audio_q_overwrite++;
+    }
+
+    struct tx_entry *e = &s_audio_q[cur_head];
+    memset(e->buf, 0, sizeof(e->buf));
+    uint8_t payload[MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 1];
+    payload[0] = src_id;
+    memcpy(payload + 1, data, len);
+    e->len = build_packet(e->buf, UART_PKT_AUDIO_V2, payload, (uint8_t)(len + 1));
+    e->type = UART_PKT_AUDIO_V2;
+    s_audio_head = next_head;
+    k_mutex_unlock(&s_tx_lock);
     return 0;
 }
 
@@ -470,8 +511,9 @@ void uart_bridge_process(void)
 
     static uint32_t status_keepalive = 0;
 
-    /* Periodic keepalive status when no control packet is pending */
-    if ((status_keepalive++ % 50) == 0) {
+    /* Publish bridge status at roughly 1 Hz. */
+    if (++status_keepalive >= 200) {
+        status_keepalive = 0;
         mesh_protocol_request_status();
     }
 

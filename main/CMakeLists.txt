@@ -3,8 +3,8 @@
 # Runtime detection determines which transport to use
 
 idf_component_register(
-    SRCS "main.c" "rtt_probe.c"
-    INCLUDE_DIRS "."
+    SRCS "main.c" "rtt_probe.c" "../shared/audio_bundle.c"
+    INCLUDE_DIRS "." "../shared"
     REQUIRES 
         audio
         mesh

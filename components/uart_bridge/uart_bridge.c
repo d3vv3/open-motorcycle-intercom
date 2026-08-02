@@ -20,6 +20,8 @@
 
 #include <string.h>
 
+#include "audio_bundle.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -46,6 +48,9 @@ static const char *TAG = "spi_bridge";
 #define COMMAND_ACK_TIMEOUT_MS 300
 #define COMMAND_MAX_ATTEMPTS   3
 #define STATUS_STALE_TIMEOUT_US 5000000
+
+_Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 6 <= BRIDGE_SPI_MAX_XFER,
+               "source-prefixed audio v2 bundle must fit one SPI transfer");
 
 typedef struct {
     uint8_t buf[BRIDGE_SPI_MAX_XFER];
@@ -310,10 +315,13 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
 {
     switch (type) {
     case BRIDGE_PKT_AUDIO:
+    case BRIDGE_PKT_AUDIO_V2:
         if (s_audio_cb && len > 1) {
+            /* nRF prefixes both audio versions with src_id; preserve the bundle itself. */
             uint8_t src_id = payload[0];
             s_audio_rx_count++;
-            s_audio_cb(src_id, payload + 1, len - 1, esp_timer_get_time());
+            s_audio_cb(src_id, payload + 1, len - 1, esp_timer_get_time(),
+                       type == BRIDGE_PKT_AUDIO_V2);
         }
         break;
 
@@ -916,7 +924,7 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
     return ESP_OK;
 }
 
-esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
+static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t len)
 {
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
@@ -950,7 +958,7 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     entry->buf[0] = SYNC_BYTE;
     entry->buf[1] = (uint8_t)wire_len;
     entry->buf[2] = s_bridge_tx_seq++;
-    entry->buf[3] = BRIDGE_PKT_AUDIO;
+    entry->buf[3] = type;
     if (len > 0 && data != NULL) {
         memcpy(&entry->buf[4], data, len);
     }
@@ -993,6 +1001,22 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
     }
 
     return ESP_OK;
+}
+
+esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
+{
+    return send_audio_packet(BRIDGE_PKT_AUDIO, data, len);
+}
+
+esp_err_t uart_bridge_send_audio_v2(const uint8_t *data, uint16_t len)
+{
+    audio_bundle_view_t bundle;
+
+    if (len > MESH_AUDIO_V2_MAX_BUNDLE_SIZE ||
+        !audio_bundle_parse(data, len, &bundle)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return send_audio_packet(BRIDGE_PKT_AUDIO_V2, data, len);
 }
 
 void uart_bridge_set_audio_callback(uart_bridge_audio_cb_t cb)

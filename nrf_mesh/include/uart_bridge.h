@@ -15,6 +15,7 @@
 #include "bridge_protocol_defs.h"
 
 #define UART_PKT_AUDIO   BRIDGE_PKT_AUDIO
+#define UART_PKT_AUDIO_V2 BRIDGE_PKT_AUDIO_V2
 #define UART_PKT_STATUS  BRIDGE_PKT_STATUS
 #define UART_PKT_EVENT   BRIDGE_PKT_MESH_EVENT
 #define UART_PKT_COMMAND BRIDGE_PKT_CONTROL
@@ -40,13 +41,18 @@
 int uart_bridge_init(void);
 
 /**
- * @brief Send audio packet to ESP32
+ * @brief Send a legacy RTT probe to ESP32
  * @param src_id Source node ID
- * @param data Opus audio data
+ * @param data RTT probe data
  * @param len Data length
  * @return 0 on success
  */
 int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len);
+
+/**
+ * @brief Send an intact V2 audio bundle to ESP32 with its source ID prefix
+ */
+int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len);
 
 /**
  * @brief Send mesh event to ESP32

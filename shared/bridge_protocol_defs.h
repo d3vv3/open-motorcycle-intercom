@@ -13,6 +13,7 @@
 #define BRIDGE_PKT_MESH_EVENT 0x03
 #define BRIDGE_PKT_CONTROL    0x04
 #define BRIDGE_PKT_LOG        0x05
+#define BRIDGE_PKT_AUDIO_V2   0x06
 
 typedef enum {
     BRIDGE_COMMAND_MESH_START = 0x01,
@@ -28,6 +29,7 @@ typedef enum {
     BRIDGE_EVENT_SYNC_LOST = 0x05,
     BRIDGE_EVENT_MESH_STOPPED = 0x06,
     BRIDGE_EVENT_COMMAND_ACK = 0x07,
+    BRIDGE_EVENT_AUDIO_V2_READY = 0x08,
 } bridge_event_t;
 
 typedef enum {
@@ -67,5 +69,7 @@ _Static_assert(offsetof(bridge_status_payload_t, peer_count) == 1,
                "legacy status peer prefix changed");
 _Static_assert(offsetof(bridge_status_payload_t, node_id) == 2,
                "legacy status node prefix changed");
+_Static_assert(BRIDGE_PKT_AUDIO_V2 == 0x06, "bridge audio v2 packet ID changed");
+_Static_assert(BRIDGE_EVENT_AUDIO_V2_READY == 0x08, "bridge audio v2 event ID changed");
 
 #endif

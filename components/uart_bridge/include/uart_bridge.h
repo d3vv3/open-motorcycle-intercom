@@ -58,9 +58,10 @@ typedef struct {
     int8_t rssi;
 } uart_bridge_status_t;
 
-/* Callback for received audio packets */
+/* Both audio packet versions carry a bridge source prefix. The callback receives
+ * that source separately and data points to the intact legacy payload or v2 bundle. */
 typedef void (*uart_bridge_audio_cb_t)(uint8_t src_id, const uint8_t *data, uint16_t len,
-                                       int64_t timestamp_us);
+                                        int64_t timestamp_us, bool redundant_bundle);
 
 /* Callback for mesh events */
 typedef void (*uart_bridge_event_cb_t)(uart_bridge_event_t event, const uint8_t *data,
@@ -91,6 +92,11 @@ void uart_bridge_deinit(void);
  * @return ESP_OK on success
  */
 esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len);
+
+/**
+ * @brief Send a redundant audio bundle to the mesh via nRF52840
+ */
+esp_err_t uart_bridge_send_audio_v2(const uint8_t *data, uint16_t len);
 
 /**
  * @brief Register callback for received audio

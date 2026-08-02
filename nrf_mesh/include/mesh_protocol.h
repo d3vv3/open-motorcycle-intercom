@@ -76,12 +76,17 @@ typedef struct {
 } mesh_peer_info_t;
 
 /**
- * @brief Queue audio packet for transmission in next slot
- * @param data Audio payload
+ * @brief Queue a legacy RTT probe for transmission in the next slot
+ * @param data RTT probe payload
  * @param len Payload length
  * @return 0 on success
  */
 int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags);
+
+/**
+ * @brief Queue a mandatory V2 microphone bundle for transmission
+ */
+int mesh_protocol_send_audio_v2(const uint8_t *data, uint8_t len);
 
 void mesh_protocol_request_start(uint8_t generation);
 void mesh_protocol_request_stop(uint8_t generation);

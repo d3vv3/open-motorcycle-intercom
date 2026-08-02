@@ -575,6 +575,21 @@ int32_t tdma_get_time_to_slot_us(void)
     return (int32_t)(MAX(next_frame_deadline_us - now_us, 0) + slot_start);
 }
 
+uint32_t tdma_get_current_slot_remaining_us(void)
+{
+    int64_t now_us = k_ticks_to_us_floor64(k_uptime_ticks());
+    k_spinlock_key_t key = k_spin_lock(&s_tdma_lock);
+    if (!s_running || s_slot_index < 0 || now_us < s_slot_start_us) {
+        k_spin_unlock(&s_tdma_lock, key);
+        return 0;
+    }
+
+    uint32_t remaining_us =
+        (uint32_t)CLAMP(s_slot_deadline_us - now_us, 0, UINT32_MAX);
+    k_spin_unlock(&s_tdma_lock, key);
+    return remaining_us;
+}
+
 void tdma_tune_timing(int32_t offset_us)
 {
     k_spinlock_key_t key = k_spin_lock(&s_tdma_lock);
