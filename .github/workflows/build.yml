@@ -82,6 +82,25 @@ jobs:
       - name: Run integrated audio playout recovery tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/audio_playout_recovery_test && /tmp/audio_playout_recovery_test
 
+      - name: Run RX source selection tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/audio_rx_source_select_test && /tmp/audio_rx_source_select_test
+
+      - name: Run audio TX cache tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/audio_tx_cache_test && /tmp/audio_tx_cache_test
+
+      - name: Run C suites under ASan and UBSan
+        run: |
+          set -e
+          SAN="-fsanitize=address,undefined -fno-sanitize-recover=all -g -O1"
+          FLAGS="-std=c11 -Wall -Wextra -Werror -pedantic"
+          cc $FLAGS $SAN -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/san_mesh_core && /tmp/san_mesh_core
+          cc $FLAGS $SAN -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/san_audio_bundle && /tmp/san_audio_bundle
+          cc $FLAGS $SAN -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/san_audio_tx_cache && /tmp/san_audio_tx_cache
+          cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/san_packet_store && /tmp/san_packet_store
+          cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
+          cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
+          cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
+
   nrf-zephyr:
     name: nRF52840 Zephyr firmware
     runs-on: ubuntu-latest
