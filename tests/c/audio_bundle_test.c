@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void fill(uint8_t *data, size_t len, uint8_t first)
@@ -315,6 +316,264 @@ static void test_strip_two_to_one_to_zero(void)
     assert(!audio_bundle_strip_oldest(wire, NULL));
 }
 
+/*
+ * Deterministic mini-fuzz coverage below. No libc rand(): a fixed-seed
+ * xorshift64 PRNG makes every run bit-identical.
+ */
+
+#define FUZZ_RANDOM_ITERATIONS   50000u
+#define FUZZ_MUTATION_ITERATIONS 50000u
+#define FUZZ_MAX_EXTRA_LEN       16u
+
+static uint64_t fuzz_state = UINT64_C(0x9e3779b97f4a7c15);
+
+static uint64_t fuzz_next(void)
+{
+    fuzz_state ^= fuzz_state << 13;
+    fuzz_state ^= fuzz_state >> 7;
+    fuzz_state ^= fuzz_state << 17;
+    return fuzz_state;
+}
+
+/* Uniform-ish value in [0, bound); bound must be > 0. */
+static size_t fuzz_below(size_t bound)
+{
+    return (size_t)(fuzz_next() % (uint64_t)bound);
+}
+
+/*
+ * Invariants every successful parse must satisfy:
+ *  - current frame is non-empty and every frame length <= MESH_AUDIO_V2_MAX_FRAME_BYTES
+ *  - fixed header + sum of frame lengths <= input length
+ *  - flags contain no bits outside AUDIO_BUNDLE_FLAG_MASK
+ *  - PRESENT flags match non-zero frame lengths; previous2 implies previous1;
+ *    ACTIVE flags only alongside the matching PRESENT flag
+ *  - every returned data pointer lies inside [buf, buf + len); pointer + its
+ *    length stays within buf + len; absent frames have NULL pointers
+ */
+static void assert_parsed_invariants(const uint8_t *buf, size_t len,
+                                     const audio_bundle_view_t *parsed)
+{
+    const uint8_t *frame_start = buf + MESH_AUDIO_V2_FIXED_HEADER_SIZE;
+    size_t total_frames =
+        parsed->previous2_len + parsed->previous1_len + parsed->current_len;
+    bool previous1_present =
+        (parsed->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT) != 0u;
+    bool previous2_present =
+        (parsed->flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT) != 0u;
+
+    assert(len >= MESH_AUDIO_V2_FIXED_HEADER_SIZE);
+    assert(parsed->current_len >= 1u);
+    assert(parsed->current_len <= MESH_AUDIO_V2_MAX_FRAME_BYTES);
+    assert(parsed->previous1_len <= MESH_AUDIO_V2_MAX_FRAME_BYTES);
+    assert(parsed->previous2_len <= MESH_AUDIO_V2_MAX_FRAME_BYTES);
+    assert(MESH_AUDIO_V2_FIXED_HEADER_SIZE + total_frames <= len);
+
+    assert((parsed->flags & (uint8_t)~AUDIO_BUNDLE_FLAG_MASK) == 0u);
+    assert(previous1_present == (parsed->previous1_len != 0u));
+    assert(previous2_present == (parsed->previous2_len != 0u));
+    assert(!previous2_present || previous1_present);
+    assert((parsed->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) == 0u ||
+           previous1_present);
+    assert((parsed->flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) == 0u ||
+           previous2_present);
+
+    if (previous2_present) {
+        assert(parsed->previous2_data == frame_start);
+        assert(parsed->previous2_data + parsed->previous2_len <= buf + len);
+    } else {
+        assert(parsed->previous2_data == NULL);
+    }
+    if (previous1_present) {
+        assert(parsed->previous1_data == frame_start + parsed->previous2_len);
+        assert(parsed->previous1_data + parsed->previous1_len <= buf + len);
+    } else {
+        assert(parsed->previous1_data == NULL);
+    }
+    assert(parsed->current_data ==
+           frame_start + parsed->previous2_len + parsed->previous1_len);
+    assert(parsed->current_data + parsed->current_len <= buf + len);
+}
+
+/*
+ * Corpus 1: pure random bytes at random lengths. Each buffer is heap
+ * allocated at its exact length so address-sanitized runs catch any
+ * out-of-bounds read inside audio_bundle_parse. A fraction of inputs get
+ * plausible header bytes so the deeper validation paths are exercised too.
+ */
+static void test_fuzz_random_bytes(void)
+{
+    size_t iteration;
+
+    for (iteration = 0u; iteration < FUZZ_RANDOM_ITERATIONS; ++iteration) {
+        size_t len =
+            fuzz_below(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + FUZZ_MAX_EXTRA_LEN + 1u);
+        uint8_t *buf = malloc(len != 0u ? len : 1u);
+        audio_bundle_view_t parsed;
+        size_t index;
+
+        assert(buf != NULL);
+        for (index = 0u; index < len; ++index) {
+            buf[index] = (uint8_t)fuzz_next();
+        }
+        /* Bias some inputs past the cheap magic-byte checks. */
+        if (len >= 2u && fuzz_below(4u) != 0u) {
+            buf[0] = MESH_AUDIO_V2_CODEC_OPUS;
+            buf[1] = MESH_AUDIO_V2_FRAME_MS;
+        }
+        if (len >= 4u && fuzz_below(2u) != 0u) {
+            buf[3] &= AUDIO_BUNDLE_FLAG_MASK;
+        }
+        if (len >= MESH_AUDIO_V2_FIXED_HEADER_SIZE && fuzz_below(2u) != 0u) {
+            buf[6] = (uint8_t)fuzz_below(MESH_AUDIO_V2_MAX_FRAME_BYTES + 2u);
+            buf[7] = (uint8_t)fuzz_below(MESH_AUDIO_V2_MAX_FRAME_BYTES + 2u);
+        }
+
+        if (audio_bundle_parse(buf, len, &parsed)) {
+            assert_parsed_invariants(buf, len, &parsed);
+        }
+        free(buf);
+    }
+}
+
+/*
+ * Corpus 2: encode a valid randomized bundle (random frame sizes including
+ * absent previous frames and max-size frames, random flags/seq/stream id),
+ * then apply 0-4 mutations (bit flip, byte set, truncated parse length,
+ * extended parse length over trailing garbage) before parsing an
+ * exact-length heap slice. Zero mutations must round-trip exactly.
+ */
+static void test_fuzz_mutated_bundles(void)
+{
+    uint8_t previous2[MESH_AUDIO_V2_MAX_FRAME_BYTES];
+    uint8_t previous1[MESH_AUDIO_V2_MAX_FRAME_BYTES];
+    uint8_t current[MESH_AUDIO_V2_MAX_FRAME_BYTES];
+    size_t iteration;
+
+    for (iteration = 0u; iteration < FUZZ_MUTATION_ITERATIONS; ++iteration) {
+        bool previous1_present = fuzz_below(4u) != 0u;
+        bool previous2_present = previous1_present && fuzz_below(2u) != 0u;
+        size_t current_len = 1u + fuzz_below(MESH_AUDIO_V2_MAX_FRAME_BYTES);
+        size_t previous1_len =
+            previous1_present ? 1u + fuzz_below(MESH_AUDIO_V2_MAX_FRAME_BYTES) : 0u;
+        size_t previous2_len =
+            previous2_present ? 1u + fuzz_below(MESH_AUDIO_V2_MAX_FRAME_BYTES) : 0u;
+        uint16_t sequence = (uint16_t)fuzz_next();
+        uint8_t flags = 0u;
+        size_t encoded_len;
+        size_t capacity;
+        size_t parse_len;
+        size_t mutation_count;
+        size_t mutation;
+        size_t index;
+        size_t wire_len = 0u;
+        uint8_t *buf;
+        uint8_t *slice;
+        audio_bundle_view_t input;
+        audio_bundle_view_t parsed;
+        bool ok;
+
+        /* Occasionally force the boundary: every frame at maximum size. */
+        if (fuzz_below(16u) == 0u) {
+            current_len = MESH_AUDIO_V2_MAX_FRAME_BYTES;
+            if (previous1_present) {
+                previous1_len = MESH_AUDIO_V2_MAX_FRAME_BYTES;
+            }
+            if (previous2_present) {
+                previous2_len = MESH_AUDIO_V2_MAX_FRAME_BYTES;
+            }
+        }
+
+        if (fuzz_below(2u) != 0u) {
+            flags |= AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE;
+        }
+        if (previous1_present) {
+            flags |= AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT;
+            if (fuzz_below(2u) != 0u) {
+                flags |= AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
+            }
+        }
+        if (previous2_present) {
+            flags |= AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT;
+            if (fuzz_below(2u) != 0u) {
+                flags |= AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE;
+            }
+        }
+
+        for (index = 0u; index < previous2_len; ++index) {
+            previous2[index] = (uint8_t)fuzz_next();
+        }
+        for (index = 0u; index < previous1_len; ++index) {
+            previous1[index] = (uint8_t)fuzz_next();
+        }
+        for (index = 0u; index < current_len; ++index) {
+            current[index] = (uint8_t)fuzz_next();
+        }
+
+        input = make_bundle(previous2_present ? previous2 : NULL, previous2_len,
+                            previous1_present ? previous1 : NULL, previous1_len,
+                            current, current_len, sequence, flags);
+        input.stream_id = (uint8_t)fuzz_next();
+
+        encoded_len = MESH_AUDIO_V2_FIXED_HEADER_SIZE + previous2_len +
+                      previous1_len + current_len;
+        capacity = encoded_len + fuzz_below(FUZZ_MAX_EXTRA_LEN + 1u);
+        buf = malloc(capacity);
+        assert(buf != NULL);
+        for (index = encoded_len; index < capacity; ++index) {
+            buf[index] = (uint8_t)fuzz_next(); /* trailing garbage */
+        }
+        assert(audio_bundle_encode(&input, buf, capacity, &wire_len));
+        assert(wire_len == encoded_len);
+
+        parse_len = encoded_len;
+        mutation_count = fuzz_below(5u); /* 0 = pristine round-trip check */
+        for (mutation = 0u; mutation < mutation_count; ++mutation) {
+            switch (fuzz_below(4u)) {
+            case 0u: /* bit flip */
+                buf[fuzz_below(encoded_len)] ^=
+                    (uint8_t)(1u << fuzz_below(8u));
+                break;
+            case 1u: /* byte set */
+                buf[fuzz_below(encoded_len)] = (uint8_t)fuzz_next();
+                break;
+            case 2u: /* truncate claimed length */
+                parse_len = fuzz_below(encoded_len + 1u);
+                break;
+            default: /* extend claimed length into trailing garbage */
+                parse_len = encoded_len + fuzz_below(capacity - encoded_len + 1u);
+                break;
+            }
+        }
+
+        /* Exact-length slice so sanitizers see the true input boundary. */
+        slice = malloc(parse_len != 0u ? parse_len : 1u);
+        assert(slice != NULL);
+        memcpy(slice, buf, parse_len);
+        ok = audio_bundle_parse(slice, parse_len, &parsed);
+
+        if (mutation_count == 0u) {
+            assert(ok);
+            assert(parsed.current_seq == sequence);
+            assert(parsed.flags == flags);
+            assert(parsed.stream_id == input.stream_id);
+            assert(parsed.previous2_len == previous2_len);
+            assert(parsed.previous1_len == previous1_len);
+            assert(parsed.current_len == current_len);
+            assert(previous2_len == 0u ||
+                   memcmp(parsed.previous2_data, previous2, previous2_len) == 0);
+            assert(previous1_len == 0u ||
+                   memcmp(parsed.previous1_data, previous1, previous1_len) == 0);
+            assert(memcmp(parsed.current_data, current, current_len) == 0);
+        }
+        if (ok) {
+            assert_parsed_invariants(slice, parse_len, &parsed);
+        }
+        free(slice);
+        free(buf);
+    }
+}
+
 int main(void)
 {
     test_zero_predecessors();
@@ -325,6 +584,8 @@ int main(void)
     test_malformed_wire();
     test_encode_rejections_and_bounds();
     test_strip_two_to_one_to_zero();
+    test_fuzz_random_bytes();
+    test_fuzz_mutated_bundles();
     puts("audio_bundle tests passed");
     return 0;
 }
