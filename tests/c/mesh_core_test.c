@@ -225,6 +225,135 @@ static void test_speaker_selection(void)
     assert(mesh_core_select_speakers(previous, 2, NULL, selected) == 0);
 }
 
+/* Firmware airtime model constants (mesh_protocol.c): 129 us ramp,
+ * 4 us/byte at 2 Mbps, 11 bytes on-air overhead, 100 us TX margin. */
+#define TEST_RAMP_US 129u
+#define TEST_US_PER_BYTE 4u
+#define TEST_OVERHEAD_BYTES 11u
+#define TEST_MARGIN_US 100u
+
+static int fit(uint32_t remaining_us, const uint32_t *candidates, size_t count)
+{
+    return mesh_core_fit_airtime(remaining_us, TEST_MARGIN_US, TEST_RAMP_US,
+                                 TEST_US_PER_BYTE, TEST_OVERHEAD_BYTES, candidates, count);
+}
+
+static void test_fit_airtime(void)
+{
+    /* Full bundle, after stripping prev2, after stripping prev1. */
+    const uint32_t candidates[3] = {208, 150, 90};
+    /* required = 129 + 4 * (len + 11) + 100 */
+    const uint32_t required_full = 1105;  /* len 208 */
+    const uint32_t required_one = 873;    /* len 150 */
+    const uint32_t required_two = 633;    /* len 90 */
+
+    assert(mesh_core_esb_tx_us(TEST_RAMP_US, TEST_US_PER_BYTE, TEST_OVERHEAD_BYTES, 208) ==
+           required_full - TEST_MARGIN_US);
+
+    /* Generous slot: no strip. */
+    assert(fit(5000, candidates, 3) == 0);
+    /* Boundary: required == remaining still transmits (the firmware only
+     * strips/drops on the strict `required > remaining`). */
+    assert(fit(required_full, candidates, 3) == 0);
+    /* One microsecond short of the full bundle: exactly one strip. */
+    assert(fit(required_full - 1, candidates, 3) == 1);
+    assert(fit(required_one, candidates, 3) == 1);
+    /* Tighter still: strip both predecessors. */
+    assert(fit(required_one - 1, candidates, 3) == 2);
+    assert(fit(required_two, candidates, 3) == 2);
+    /* Impossible: even the bare bundle misses the slot -> late drop. */
+    assert(fit(required_two - 1, candidates, 3) == -1);
+    assert(fit(0, candidates, 3) == -1);
+
+    /* Bundle without predecessors: fit or drop, never strip. */
+    assert(fit(required_full, candidates, 1) == 0);
+    assert(fit(required_full - 1, candidates, 1) == -1);
+
+    /* Degenerate arguments drop. */
+    assert(fit(5000, NULL, 3) == -1);
+    assert(fit(5000, candidates, 0) == -1);
+}
+
+static void test_defer_local_tail(void)
+{
+    assert(mesh_core_defer_local_tail(true, true, true, true));
+    assert(!mesh_core_defer_local_tail(false, true, true, true));
+    assert(!mesh_core_defer_local_tail(true, false, true, true));
+    assert(!mesh_core_defer_local_tail(true, true, false, true));
+    assert(!mesh_core_defer_local_tail(true, true, true, false));
+}
+
+static void test_successor_carries_prev1(void)
+{
+    static const uint8_t frame[4] = {0x11, 0x22, 0x33, 0x44};
+    static const uint8_t other[4] = {0x11, 0x22, 0x33, 0x45};
+    audio_bundle_view_t tail = {
+        .current_data = frame,
+        .current_len = sizeof(frame),
+        .current_seq = 0xFFFF,
+        .flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE,
+    };
+    audio_bundle_view_t successor = {
+        .previous1_data = frame,
+        .previous1_len = sizeof(frame),
+        .current_data = other,
+        .current_len = sizeof(other),
+        .current_seq = 0x0000,
+        .flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE |
+                 AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
+                 AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE,
+    };
+
+    /* Proven successor across the uint16 sequence wraparound. */
+    assert(mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+
+    /* Tail no longer holds the deferred sequence. */
+    assert(!mesh_core_successor_carries_prev1(0xFFFE, &tail, &successor));
+
+    /* Successor is not the immediate next sequence. */
+    successor.current_seq = 1;
+    assert(!mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+    successor.current_seq = 0;
+
+    /* prev1 not present. */
+    successor.flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE;
+    assert(!mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+    successor.flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE |
+                      AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
+                      AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
+
+    /* prev1 length mismatch. */
+    successor.previous1_len = sizeof(frame) - 1;
+    assert(!mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+    successor.previous1_len = sizeof(frame);
+
+    /* Active state must match: tail active but successor prev1 inactive. */
+    successor.flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE |
+                      AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT;
+    assert(!mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+    /* ...and inactive/inactive is an equally valid proof. */
+    tail.flags = 0;
+    assert(mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+    tail.flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE;
+    successor.flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE |
+                      AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
+                      AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
+
+    /* Payload bytes must be identical. */
+    successor.previous1_data = other;
+    assert(!mesh_core_successor_carries_prev1(0xFFFF, &tail, &successor));
+    successor.previous1_data = frame;
+
+    /* Non-wraparound sequence also works. */
+    tail.current_seq = 41;
+    successor.current_seq = 42;
+    assert(mesh_core_successor_carries_prev1(41, &tail, &successor));
+
+    /* Degenerate arguments never prove a successor. */
+    assert(!mesh_core_successor_carries_prev1(41, NULL, &successor));
+    assert(!mesh_core_successor_carries_prev1(41, &tail, NULL));
+}
+
 int main(void)
 {
     test_ids_and_bitmaps();
@@ -236,6 +365,9 @@ int main(void)
     test_join_assignments();
     test_slot_maps();
     test_speaker_selection();
+    test_fit_airtime();
+    test_defer_local_tail();
+    test_successor_carries_prev1();
     puts("mesh_core tests passed");
     return 0;
 }

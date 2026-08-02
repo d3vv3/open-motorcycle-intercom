@@ -266,6 +266,54 @@ size_t mesh_core_select_speakers(const uint8_t *previous, size_t slot_count,
     return count;
 }
 
+uint32_t mesh_core_esb_tx_us(uint32_t ramp_us, uint32_t us_per_byte,
+                             uint32_t overhead_bytes, uint32_t outer_packet_bytes)
+{
+    return ramp_us + us_per_byte * (outer_packet_bytes + overhead_bytes);
+}
+
+int mesh_core_fit_airtime(uint32_t remaining_us, uint32_t margin_us, uint32_t ramp_us,
+                          uint32_t us_per_byte, uint32_t overhead_bytes,
+                          const uint32_t *candidate_outer_lens, size_t candidate_count)
+{
+    if (candidate_outer_lens == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < candidate_count; i++) {
+        uint32_t required_us = mesh_core_esb_tx_us(ramp_us, us_per_byte, overhead_bytes,
+                                                   candidate_outer_lens[i]) +
+                               margin_us;
+        /* required_us <= remaining_us sends; the TX paths strip/drop only on
+         * the strict `required_us > remaining_us`, so the exact-margin
+         * boundary still transmits. */
+        if (required_us <= remaining_us) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending,
+                                bool relay_contention_turn, bool tail_is_active_bundle)
+{
+    return local_pending && relay_pending && relay_contention_turn && tail_is_active_bundle;
+}
+
+bool mesh_core_successor_carries_prev1(uint16_t deferred_seq,
+                                       const audio_bundle_view_t *tail,
+                                       const audio_bundle_view_t *successor)
+{
+    if (tail == NULL || successor == NULL || tail->current_seq != deferred_seq ||
+        successor->current_seq != (uint16_t)(tail->current_seq + 1u) ||
+        (successor->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT) == 0u ||
+        successor->previous1_len != tail->current_len ||
+        ((successor->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u) !=
+            ((tail->flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE) != 0u)) {
+        return false;
+    }
+    return memcmp(successor->previous1_data, tail->current_data, tail->current_len) == 0;
+}
+
 bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
                                      uint8_t sender_id, uint8_t expected_coordinator_id,
                                      uint8_t slot_count)

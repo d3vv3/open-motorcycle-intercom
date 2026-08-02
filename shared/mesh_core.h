@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "audio_bundle.h"
 #include "mesh_protocol_defs.h"
 
 #define MESH_CORE_DEDUPE_CAPACITY 32
@@ -94,6 +95,57 @@ uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
  */
 size_t mesh_core_select_speakers(const uint8_t *previous, size_t slot_count,
                                  const int64_t *active_since_ms, uint8_t *selected);
+
+/**
+ * Estimated ESB on-air TX time for one outer packet.
+ *
+ * Mirrors the nRF radio model used by mesh_protocol.c:
+ * ramp_us + us_per_byte * (outer_packet_bytes + overhead_bytes).
+ */
+uint32_t mesh_core_esb_tx_us(uint32_t ramp_us, uint32_t us_per_byte,
+                             uint32_t overhead_bytes, uint32_t outer_packet_bytes);
+
+/**
+ * Decide how many predecessor frames must be stripped from an audio bundle
+ * so its outer packet fits the remaining TDMA slot airtime.
+ *
+ * candidate_outer_lens[0] is the full outer packet length in bytes; each
+ * following entry is the outer length after stripping one more predecessor
+ * frame (oldest first: prev2, then prev1). Returns the index of the first
+ * candidate whose estimated TX time plus margin_us fits remaining_us -
+ * i.e. the number of strips required - or -1 when even the last candidate
+ * does not fit (late drop).
+ *
+ * Fit uses required_us <= remaining_us: a packet landing exactly on the
+ * margin boundary is still sent, mirroring the strict
+ * `required_us > remaining_us` strip/drop condition in mesh_protocol.c.
+ */
+int mesh_core_fit_airtime(uint32_t remaining_us, uint32_t margin_us, uint32_t ramp_us,
+                          uint32_t us_per_byte, uint32_t overhead_bytes,
+                          const uint32_t *candidate_outer_lens, size_t candidate_count);
+
+/**
+ * Decide whether the local audio tail is deferred for one slot while relay
+ * traffic contends for airtime. The tail is only ever deferred when it is
+ * an active AUDIO_V2 bundle: an inactive or non-bundle tail transmits
+ * immediately because no successor bundle will re-carry it as prev1.
+ */
+bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending,
+                                bool relay_contention_turn, bool tail_is_active_bundle);
+
+/**
+ * Proof that a deferred local tail is safe to skip: its immediate successor
+ * bundle must provably carry the deferred current frame as prev1. Checks
+ * that the tail still holds the deferred sequence, the successor is the
+ * next sequence (uint16_t wraparound-safe), prev1 is present with matching
+ * length and active state, and the payload bytes are identical.
+ *
+ * Both views must come from successful audio_bundle_parse() calls (parse
+ * guarantees previous1_data is non-NULL whenever PREVIOUS1_PRESENT is set).
+ */
+bool mesh_core_successor_carries_prev1(uint16_t deferred_seq,
+                                       const audio_bundle_view_t *tail,
+                                       const audio_bundle_view_t *successor);
 
 bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
                                      uint8_t sender_id, uint8_t expected_coordinator_id,

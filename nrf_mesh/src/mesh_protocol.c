@@ -1530,13 +1530,6 @@ static uint8_t tx_queue_depth(void)
     return TX_AUDIO_RING_SIZE - s_tx_tail + s_tx_head;
 }
 
-static uint32_t estimate_esb_tx_us(uint8_t outer_packet_bytes)
-{
-    return ESB_NORMAL_RAMP_US +
-           ESB_2MBPS_US_PER_BYTE *
-               ((uint32_t)outer_packet_bytes + ESB_2MBPS_OVERHEAD_BYTES);
-}
-
 static void consume_local_audio_entries(uint8_t count, const char *underflow_reason)
 {
     s_tx_tail = (uint8_t)((s_tx_tail + count) % TX_AUDIO_RING_SIZE);
@@ -1579,18 +1572,12 @@ static bool deferred_tail_has_proven_successor(void)
     if (tail->packet_type != MESH_PKT_AUDIO_V2 ||
         successor->packet_type != MESH_PKT_AUDIO_V2 ||
         !audio_bundle_parse(tail->data, tail->len, &tail_bundle) ||
-        !audio_bundle_parse(successor->data, successor->len, &successor_bundle) ||
-        tail_bundle.current_seq != s_local_deferred_seq ||
-        successor_bundle.current_seq != (uint16_t)(tail_bundle.current_seq + 1u) ||
-        (successor_bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT) == 0u ||
-        successor_bundle.previous1_len != tail_bundle.current_len ||
-        ((successor_bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u) !=
-            ((tail_bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE) != 0u)) {
+        !audio_bundle_parse(successor->data, successor->len, &successor_bundle)) {
         return false;
     }
 
-    return memcmp(successor_bundle.previous1_data, tail_bundle.current_data,
-                  tail_bundle.current_len) == 0;
+    return mesh_core_successor_carries_prev1(s_local_deferred_seq, &tail_bundle,
+                                             &successor_bundle);
 }
 
 static void transmit_relay_entry(void)
@@ -1623,11 +1610,37 @@ static void transmit_relay_entry(void)
                 prev1_forwarded = bundle.previous1_len != 0u;
                 prev2_forwarded = bundle.previous2_len != 0u;
                 uint32_t remaining_us = tdma_get_current_slot_remaining_us();
-                uint32_t required_us = estimate_esb_tx_us(packet_len) + AUDIO_TX_MARGIN_US;
                 bool bundle_valid = true;
 
-                while (required_us > remaining_us &&
-                       (prev2_forwarded || prev1_forwarded)) {
+                /* Candidate outer lengths: as-is, after stripping prev2,
+                 * then prev1.  audio_bundle_strip_oldest() removes exactly
+                 * the stripped frame's payload bytes, so the lengths are
+                 * known without mutating the packet. */
+                uint32_t candidates[3];
+                size_t candidate_count = 0;
+                uint32_t candidate_len = packet_len;
+                candidates[candidate_count++] = candidate_len;
+                if (prev2_forwarded) {
+                    candidate_len -= (uint32_t)bundle.previous2_len;
+                    candidates[candidate_count++] = candidate_len;
+                }
+                if (prev1_forwarded) {
+                    candidate_len -= (uint32_t)bundle.previous1_len;
+                    candidates[candidate_count++] = candidate_len;
+                }
+
+                int strips = mesh_core_fit_airtime(remaining_us, AUDIO_TX_MARGIN_US,
+                                                   ESB_NORMAL_RAMP_US,
+                                                   ESB_2MBPS_US_PER_BYTE,
+                                                   ESB_2MBPS_OVERHEAD_BYTES, candidates,
+                                                   candidate_count);
+                /* -1 means even the bare bundle misses the slot: the
+                 * original loop still strips every predecessor before
+                 * late-dropping, so replay all strips in that case too. */
+                size_t strips_needed =
+                    strips >= 0 ? (size_t)strips : candidate_count - 1u;
+
+                for (size_t i = 0; i < strips_needed; i++) {
                     bool stripping_prev2 = prev2_forwarded;
                     if (audio_bundle_strip_oldest(payload, &bundle_len)) {
                         hdr->payload_len = (uint16_t)bundle_len;
@@ -1639,7 +1652,6 @@ static void transmit_relay_entry(void)
                             s_stat_prev1_stripped++;
                             prev1_forwarded = false;
                         }
-                        required_us = estimate_esb_tx_us(packet_len) + AUDIO_TX_MARGIN_US;
                     } else {
                         s_stat_bundle_bad++;
                         bundle_valid = false;
@@ -1647,7 +1659,7 @@ static void transmit_relay_entry(void)
                     }
                 }
 
-                if (bundle_valid && required_us > remaining_us) {
+                if (bundle_valid && strips < 0) {
                     s_stat_bundle_late_drop++;
                     ret = -ETIME;
                 } else if (bundle_valid) {
@@ -1708,15 +1720,38 @@ static enum local_tx_outcome transmit_local_entry(const struct tx_audio_entry *e
             prev1_forwarded = bundle.previous1_len != 0u;
             prev2_forwarded = bundle.previous2_len != 0u;
             uint32_t remaining_us = tdma_get_current_slot_remaining_us();
-            uint32_t required_us =
-                estimate_esb_tx_us((uint8_t)(sizeof(mesh_header_t) + bundle_len)) +
-                AUDIO_TX_MARGIN_US;
             bool bundle_valid = true;
 
-            while (required_us > remaining_us &&
-                   (prev2_forwarded || prev1_forwarded)) {
+            /* Candidate outer lengths: as-is, after stripping prev2, then
+             * prev1 (see transmit_relay_entry for the length model). */
+            uint32_t candidates[3];
+            size_t candidate_count = 0;
+            uint32_t candidate_len = (uint32_t)(sizeof(mesh_header_t) + bundle_len);
+            candidates[candidate_count++] = candidate_len;
+            if (prev2_forwarded) {
+                candidate_len -= (uint32_t)bundle.previous2_len;
+                candidates[candidate_count++] = candidate_len;
+            }
+            if (prev1_forwarded) {
+                candidate_len -= (uint32_t)bundle.previous1_len;
+                candidates[candidate_count++] = candidate_len;
+            }
+
+            int strips = mesh_core_fit_airtime(remaining_us, AUDIO_TX_MARGIN_US,
+                                               ESB_NORMAL_RAMP_US, ESB_2MBPS_US_PER_BYTE,
+                                               ESB_2MBPS_OVERHEAD_BYTES, candidates,
+                                               candidate_count);
+            /* -1 (late drop) still walks every strip step first, matching
+             * the original loop; with retain_prev1 that walk hits the
+             * prev1 step and falls back before any counter is recorded. */
+            size_t strips_needed = strips >= 0 ? (size_t)strips : candidate_count - 1u;
+
+            for (size_t i = 0; i < strips_needed; i++) {
                 bool stripping_prev2 = prev2_forwarded;
                 if (!stripping_prev2 && retain_prev1) {
+                    /* Fall back before touching strip counters or calling
+                     * note_audio_activity(), exactly like the original
+                     * early return inside the strip loop. */
                     return LOCAL_TX_FALLBACK_ORIGINAL;
                 }
                 if (!audio_bundle_strip_oldest(bundle_data, &bundle_len)) {
@@ -1731,9 +1766,6 @@ static enum local_tx_outcome transmit_local_entry(const struct tx_audio_entry *e
                     prev1_forwarded = false;
                     prev1_stripped = true;
                 }
-                required_us =
-                    estimate_esb_tx_us((uint8_t)(sizeof(mesh_header_t) + bundle_len)) +
-                    AUDIO_TX_MARGIN_US;
             }
 
             if (prev2_stripped) {
@@ -1744,7 +1776,7 @@ static enum local_tx_outcome transmit_local_entry(const struct tx_audio_entry *e
             }
             note_audio_activity(s_node_id,
                                 bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE);
-            if (bundle_valid && required_us > remaining_us) {
+            if (bundle_valid && strips < 0) {
                 s_stat_bundle_late_drop++;
                 ret = -ETIME;
             } else if (bundle_valid) {
@@ -1816,8 +1848,14 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     bool local_pending = s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail;
     bool relay_pending = !relay_queue_empty();
     uint16_t deferred_seq = 0;
-    bool defer_local = local_pending && relay_pending && s_relay_contention_turn &&
-                       local_tail_is_active_v2(&deferred_seq);
+    /* local_tail_is_active_v2() parses the tail entry, so keep the original
+     * short-circuit: only inspect the tail once contention actually holds. */
+    bool defer_local = false;
+    if (local_pending && relay_pending && s_relay_contention_turn) {
+        defer_local = mesh_core_defer_local_tail(local_pending, relay_pending,
+                                                 s_relay_contention_turn,
+                                                 local_tail_is_active_v2(&deferred_seq));
+    }
 
     if (defer_local) {
         /* Leave the local tail intact until the next local turn can prove that
