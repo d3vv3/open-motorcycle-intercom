@@ -11,6 +11,19 @@
 
 #define AUDIO_RX_QUEUE_SIZE 8
 
+/* Playout buffer window, in 20 ms frames.
+ *
+ * The window must be wider than the arrival jitter it absorbs, otherwise the
+ * queue alternately starves and overflows and every correction deletes or
+ * duplicates audio. Measured dwell is roughly two frames with excursions to
+ * both extremes, so the window is three frames wide.
+ *
+ * Catch-up only runs near the top of the window. Reclaiming hold debt at
+ * normal depth would delete audio the buffer was sized to hold. */
+#define MESH_RX_PREFILL_FRAMES     3
+#define MESH_RX_MAX_TARGET_FRAMES  6
+#define MESH_RX_CATCHUP_MIN_FRAMES 5
+
 typedef struct {
     uint8_t data[64];
     uint16_t len;

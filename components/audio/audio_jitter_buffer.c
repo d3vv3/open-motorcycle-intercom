@@ -1,8 +1,5 @@
 #include "audio_jitter_buffer.h"
 
-#define MESH_RX_PREFILL_FRAMES    2
-#define MESH_RX_MAX_TARGET_FRAMES 4
-
 void audio_jitter_reset(audio_jitter_state_t *state)
 {
     if (!state) {
@@ -67,7 +64,6 @@ void audio_jitter_trim_backlog(QueueHandle_t queue, audio_jitter_state_t *state,
         if (xQueueReceive(queue, scratch_item, 0) == pdTRUE) {
             stats->frames_dropped++;
             stats->jitter_trim_frames++;
-            /* Deliberate discard: re-baseline so playout does not conceal it as loss. */
             state->next_seq_valid = false;
             items = uxQueueMessagesWaiting(queue);
         } else {

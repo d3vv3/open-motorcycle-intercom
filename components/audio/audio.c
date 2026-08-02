@@ -663,9 +663,6 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
     uint32_t trim_count = s_stats.jitter_trim_frames;
     audio_jitter_trim_backlog(source->queue, &source->jitter, &s_stats, &item);
     if (s_stats.jitter_trim_frames != trim_count) {
-        /* Trim is an explicit resynchronisation point. A held-back packet is older
-         * than everything trim kept, so it would otherwise consume the re-baseline
-         * and make the discarded frames reappear as a gap. */
         if (source->pending_valid) {
             source->pending_valid = false;
             s_stats.frames_dropped++;
@@ -801,7 +798,8 @@ static bool decode_rx_source(audio_rx_source_t *source, int64_t now_us,
 
         if (xSemaphoreTake(s_rx_sources_mutex, 0) == pdTRUE) {
             if (source->assigned && source->jitter.playout_started &&
-                source->jitter.hold_budget > 0 && uxQueueMessagesWaiting(source->queue) >= 3 &&
+                source->jitter.hold_budget > 0 &&
+                uxQueueMessagesWaiting(source->queue) >= MESH_RX_CATCHUP_MIN_FRAMES &&
                 xQueueReceive(source->queue, &catchup_item, 0) == pdTRUE) {
                 source->jitter.hold_budget--;
                 have_catchup_item = true;
