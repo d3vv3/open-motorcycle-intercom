@@ -66,7 +66,9 @@ static void mesh_log(const char *fmt, ...)
 #define MESH_PACKET_PAYLOAD_MAX MESH_AUDIO_V2_MAX_BUNDLE_SIZE
 #define MESH_PACKET_OUTER_MAX MESH_AUDIO_V2_MAX_PACKET_SIZE
 #define ESB_NORMAL_RAMP_US 129U
-#define ESB_1MBPS_OVERHEAD_BYTES 10U
+/* 2 Mbps on-air overhead: 2-byte preamble + 5-byte address + ~2-byte PCF + 2-byte CRC. */
+#define ESB_2MBPS_OVERHEAD_BYTES 11U
+#define ESB_2MBPS_US_PER_BYTE 4U
 #define AUDIO_TX_MARGIN_US 100U
 
 /* Protocol v2 is a deliberate fail-closed RF migration: v1 peers are rejected. */
@@ -1516,7 +1518,8 @@ static uint8_t tx_queue_depth(void)
 static uint32_t estimate_esb_tx_us(uint8_t outer_packet_bytes)
 {
     return ESB_NORMAL_RAMP_US +
-           8U * ((uint32_t)outer_packet_bytes + ESB_1MBPS_OVERHEAD_BYTES);
+           ESB_2MBPS_US_PER_BYTE *
+               ((uint32_t)outer_packet_bytes + ESB_2MBPS_OVERHEAD_BYTES);
 }
 
 static void consume_local_audio_entries(uint8_t count, const char *underflow_reason)

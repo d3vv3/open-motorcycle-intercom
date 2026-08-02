@@ -29,7 +29,7 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 #endif
 #endif
 
-#define OMI_ESB_BITRATE      ESB_BITRATE_1MBPS
+#define OMI_ESB_BITRATE      ESB_BITRATE_2MBPS
 #define OMI_ESB_TX_POWER_DBM 8
 
 /* Broadcast address for mesh discovery */
@@ -180,7 +180,7 @@ int esb_radio_init(uint8_t channel)
     }
 
     s_initialized = true;
-    LOG_INF("ESB radio initialized (bitrate=1Mbps)");
+    LOG_INF("ESB radio initialized (bitrate=2Mbps)");
 
     return 0;
 }
