@@ -6,6 +6,7 @@
 #include "audio.h"
 #include "audio_packet_store.h"
 #include "audio_pcm_resampler.h"
+#include "audio_rx_source_select.h"
 #include "voice_cleanup.h"
 #include "vox.h"
 
@@ -51,8 +52,7 @@ static const char *TAG = "audio";
 #define OPUS_DTX_FRAME_MAX_BYTES 2
 #define OPUS_EXPECTED_LOSS_PERC  5
 #define RX_SOURCE_IDLE_TIMEOUT_MS 1000
-/* A source must be VOX-silent this long before a new talker may displace it. */
-#define RX_SOURCE_EVICT_SILENCE_MS 400
+/* RX_SOURCE_EVICT_SILENCE_MS lives in audio_rx_source_select.h. */
 #define RX_ENQUEUE_LOCK_WAIT_MS   1
 
 #define LOOPBACK_QUEUE_SIZE      8
@@ -1436,48 +1436,32 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
 
     int64_t now_us = esp_timer_get_time();
     uint64_t alloc_now_ms = (uint64_t)(now_us / 1000);
-    audio_rx_source_t *source = NULL;
-    audio_rx_source_t *free_source = NULL;
+    audio_rx_slot_snapshot_t slot_snapshot[AUDIO_MAX_RX_SOURCES];
     for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
-        if (s_rx_sources[i].assigned && s_rx_sources[i].source_id == source_id) {
-            source = &s_rx_sources[i];
-            break;
-        }
-        if (!s_rx_sources[i].assigned && free_source == NULL) {
-            free_source = &s_rx_sources[i];
-        }
+        slot_snapshot[i].assigned = s_rx_sources[i].assigned;
+        slot_snapshot[i].source_id = s_rx_sources[i].source_id;
+        slot_snapshot[i].last_active_ms = s_rx_sources[i].last_active_ms;
     }
-    if (source == NULL) {
-        source = free_source;
-        if (source == NULL && frame->active) {
-            /* Top-N selection: a new active talker displaces the source
-             * that has been VOX-silent the longest. Recently active
-             * sources keep their slot (first speaker wins). */
-            audio_rx_source_t *victim = NULL;
-            for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
-                if (victim == NULL ||
-                    s_rx_sources[i].last_active_ms < victim->last_active_ms) {
-                    victim = &s_rx_sources[i];
-                }
-            }
-            if (victim != NULL &&
-                alloc_now_ms - victim->last_active_ms >= RX_SOURCE_EVICT_SILENCE_MS) {
-                source = victim;
-                source->assigned = false;
-                source->last_active_ms = 0;
-                STATS_LOCK();
-                s_stats.rx_source_evictions++;
-                STATS_UNLOCK();
-            }
-        }
-        if (source == NULL) {
-            xSemaphoreGive(s_rx_sources_mutex);
+    audio_rx_select_decision_t decision = audio_rx_source_select(
+        slot_snapshot, AUDIO_MAX_RX_SOURCES, source_id, frame->active,
+        alloc_now_ms);
+    if (decision.action == AUDIO_RX_SELECT_REJECT) {
+        xSemaphoreGive(s_rx_sources_mutex);
+        STATS_LOCK();
+        s_stats.frames_dropped++;
+        s_stats.rx_source_rejections++;
+        STATS_UNLOCK();
+        xSemaphoreGive(s_lifecycle_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    audio_rx_source_t *source = &s_rx_sources[decision.slot_index];
+    if (decision.action != AUDIO_RX_SELECT_MATCH) {
+        if (decision.action == AUDIO_RX_SELECT_EVICT) {
+            source->assigned = false;
+            source->last_active_ms = 0;
             STATS_LOCK();
-            s_stats.frames_dropped++;
-            s_stats.rx_source_rejections++;
+            s_stats.rx_source_evictions++;
             STATS_UNLOCK();
-            xSemaphoreGive(s_lifecycle_mutex);
-            return ESP_ERR_NO_MEM;
         }
         source->assigned = true;
         source->source_id = source_id;
