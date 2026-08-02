@@ -63,6 +63,30 @@ static void timer_dummy_handler(nrf_timer_event_t event, void *ctx)
     ARG_UNUSED(ctx);
 }
 
+#if NRFX_API_VER_AT_LEAST(3, 2, 0)
+static const nrfx_gpiote_t s_gpiote = NRFX_GPIOTE_INSTANCE(0);
+
+static nrfx_err_t gpiote_channel_alloc(uint8_t *channel)
+{
+    return nrfx_gpiote_channel_alloc(&s_gpiote, channel);
+}
+
+static nrfx_err_t gpiote_channel_free(uint8_t channel)
+{
+    return nrfx_gpiote_channel_free(&s_gpiote, channel);
+}
+#else
+static nrfx_err_t gpiote_channel_alloc(uint8_t *channel)
+{
+    return nrfx_gpiote_channel_alloc(channel);
+}
+
+static nrfx_err_t gpiote_channel_free(uint8_t channel)
+{
+    return nrfx_gpiote_channel_free(channel);
+}
+#endif
+
 /* ============================================================================
  * Public API
  * ============================================================================ */
@@ -88,7 +112,7 @@ int ws_sync_init(void)
         return err == NRFX_ERROR_INVALID_STATE ? -EBUSY : -EIO;
     }
 
-    err = nrfx_gpiote_channel_alloc(&s_gpiote_channel);
+    err = gpiote_channel_alloc(&s_gpiote_channel);
     if (err != NRFX_SUCCESS) {
         LOG_ERR("GPIOTE channel alloc failed: 0x%x", err);
         nrfx_timer_uninit(&s_timer);
@@ -107,7 +131,7 @@ int ws_sync_init(void)
     if (err != NRFX_SUCCESS) {
         LOG_ERR("PPI alloc failed: 0x%x", err);
         nrf_gpiote_event_disable(NRF_GPIOTE, s_gpiote_channel);
-        (void)nrfx_gpiote_channel_free(s_gpiote_channel);
+        (void)gpiote_channel_free(s_gpiote_channel);
         nrfx_timer_uninit(&s_timer);
         return -EIO;
     }
@@ -123,7 +147,7 @@ int ws_sync_init(void)
         LOG_ERR("PPI assign failed: 0x%x", err);
         (void)nrfx_ppi_channel_free(s_ppi_channel);
         nrf_gpiote_event_disable(NRF_GPIOTE, s_gpiote_channel);
-        (void)nrfx_gpiote_channel_free(s_gpiote_channel);
+        (void)gpiote_channel_free(s_gpiote_channel);
         nrfx_timer_uninit(&s_timer);
         return -EIO;
     }
