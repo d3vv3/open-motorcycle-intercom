@@ -215,6 +215,57 @@ uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
     return heard != 0 ? heard : members;
 }
 
+static bool speaker_selected(const uint8_t *selected, size_t slot_count, uint8_t node_id)
+{
+    for (size_t i = 0; i < slot_count; i++) {
+        if (selected[i] == node_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t mesh_core_select_speakers(const uint8_t *previous, size_t slot_count,
+                                 const int64_t *active_since_ms, uint8_t *selected)
+{
+    if (selected == NULL || slot_count == 0) {
+        return 0;
+    }
+    memset(selected, 0, slot_count);
+    if (previous == NULL || active_since_ms == NULL) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (size_t i = 0; i < slot_count && count < slot_count; i++) {
+        uint8_t node_id = previous[i];
+        if (mesh_core_node_id_valid(node_id) && active_since_ms[node_id] > 0 &&
+            !speaker_selected(selected, slot_count, node_id)) {
+            selected[count++] = node_id;
+        }
+    }
+
+    while (count < slot_count) {
+        uint8_t best = 0;
+        int64_t best_since = 0;
+        for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES; node_id++) {
+            int64_t since = active_since_ms[node_id];
+            if (since <= 0 || speaker_selected(selected, slot_count, node_id)) {
+                continue;
+            }
+            if (best == 0 || since < best_since) {
+                best = node_id;
+                best_since = since;
+            }
+        }
+        if (best == 0) {
+            break;
+        }
+        selected[count++] = best;
+    }
+    return count;
+}
+
 bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
                                      uint8_t sender_id, uint8_t expected_coordinator_id,
                                      uint8_t slot_count)

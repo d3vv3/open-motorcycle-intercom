@@ -99,6 +99,7 @@ static uint8_t s_tx_seq = 0;
 static uint8_t s_active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static uint8_t s_relay_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
 static int64_t s_active_speaker_deadline_ms[MESH_MAX_NODES + 1] = {0};
+static int64_t s_speaker_active_since_ms[MESH_MAX_NODES + 1] = {0};
 static uint8_t s_heard_bitmap = 0;
 static uint8_t s_relay_bitmap = 0;
 
@@ -435,8 +436,13 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
         return;
     }
 
+    int64_t now = k_uptime_get();
+
     s_heard_bitmap |= mesh_core_node_bit(src_id);
-    s_active_speaker_deadline_ms[src_id] = k_uptime_get() + ACTIVE_SPEAKER_TIMEOUT_MS;
+    if (s_active_speaker_deadline_ms[src_id] <= now) {
+        s_speaker_active_since_ms[src_id] = now;
+    }
+    s_active_speaker_deadline_ms[src_id] = now + ACTIVE_SPEAKER_TIMEOUT_MS;
 }
 
 static uint8_t compute_relay_mask(uint8_t speaker_id)
@@ -484,12 +490,18 @@ static void update_speaker_grants(void)
 
     memcpy(previous, s_active_speaker_ids, sizeof(previous));
 
-    for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES && idx < MESH_MAX_ACTIVE_SPEAKERS; node_id++) {
+    int64_t active_since[MESH_MAX_NODES + 1] = {0};
+    for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES; node_id++) {
         if (s_active_speaker_deadline_ms[node_id] > now) {
-            selected[idx] = node_id;
-            relay_masks[idx] = compute_relay_mask(node_id);
-            idx++;
+            active_since[node_id] = s_speaker_active_since_ms[node_id] > 0
+                                        ? s_speaker_active_since_ms[node_id]
+                                        : 1;
         }
+    }
+    idx = (int)mesh_core_select_speakers(previous, MESH_MAX_ACTIVE_SPEAKERS,
+                                         active_since, selected);
+    for (int i = 0; i < idx; i++) {
+        relay_masks[i] = compute_relay_mask(selected[i]);
     }
 
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
@@ -974,6 +986,8 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
                 memset(s_control_ring, 0, sizeof(s_control_ring));
                 memset(s_active_speaker_deadline_ms, 0,
                        sizeof(s_active_speaker_deadline_ms));
+                memset(s_speaker_active_since_ms, 0,
+                       sizeof(s_speaker_active_since_ms));
                 clear_speaker_grants();
                 s_relay_head = 0;
                 s_relay_tail = 0;
@@ -1477,6 +1491,7 @@ static void status_work_handler(struct k_work *work)
             memset(s_relay_ring, 0, sizeof(s_relay_ring));
             memset(s_control_ring, 0, sizeof(s_control_ring));
             memset(s_active_speaker_deadline_ms, 0, sizeof(s_active_speaker_deadline_ms));
+            memset(s_speaker_active_since_ms, 0, sizeof(s_speaker_active_since_ms));
             clear_speaker_grants();
             s_heard_bitmap = 0;
             s_relay_bitmap = 0;
@@ -2161,6 +2176,7 @@ void mesh_protocol_stop(void)
     memset(s_relay_ring, 0, sizeof(s_relay_ring));
     memset(s_control_ring, 0, sizeof(s_control_ring));
     memset(s_active_speaker_deadline_ms, 0, sizeof(s_active_speaker_deadline_ms));
+    memset(s_speaker_active_since_ms, 0, sizeof(s_speaker_active_since_ms));
     clear_speaker_grants();
     s_heard_bitmap = 0;
     s_relay_bitmap = 0;

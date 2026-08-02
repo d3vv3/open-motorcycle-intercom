@@ -175,6 +175,56 @@ static void test_slot_maps(void)
     assert(!mesh_core_slot_map_valid(&map, 3, 1, NULL));
 }
 
+static void test_speaker_selection(void)
+{
+    uint8_t previous[2] = {0, 0};
+    uint8_t selected[2] = {0, 0};
+    int64_t since[MESH_MAX_NODES + 1] = {0};
+
+    /* No activity selects nobody. */
+    assert(mesh_core_select_speakers(previous, 2, since, selected) == 0);
+    assert(selected[0] == 0 && selected[1] == 0);
+
+    /* Earliest talk spurt wins the free slots, not the lowest node id. */
+    since[7] = 100;
+    since[2] = 200;
+    since[5] = 300;
+    assert(mesh_core_select_speakers(previous, 2, since, selected) == 2);
+    assert(selected[0] == 7 && selected[1] == 2);
+
+    /* Granted speakers keep their slot while active, newcomers wait. */
+    previous[0] = 7;
+    previous[1] = 2;
+    since[1] = 50;
+    assert(mesh_core_select_speakers(previous, 2, since, selected) == 2);
+    assert(selected[0] == 7 && selected[1] == 2);
+
+    /* A grant frees only when its holder goes silent. */
+    since[2] = 0;
+    assert(mesh_core_select_speakers(previous, 2, since, selected) == 2);
+    assert(selected[0] == 7 && selected[1] == 1);
+
+    /* Tie on start time falls back to the lower node id. */
+    memset(since, 0, sizeof(since));
+    previous[0] = 0;
+    previous[1] = 0;
+    since[6] = 400;
+    since[3] = 400;
+    assert(mesh_core_select_speakers(previous, 2, since, selected) == 2);
+    assert(selected[0] == 3 && selected[1] == 6);
+
+    /* Invalid previous ids and duplicate entries are ignored. */
+    previous[0] = 9;
+    previous[1] = 6;
+    assert(mesh_core_select_speakers(previous, 2, since, selected) == 2);
+    assert(selected[0] == 6 && selected[1] == 3);
+
+    /* Degenerate arguments select nobody. */
+    assert(mesh_core_select_speakers(NULL, 2, since, selected) == 0);
+    assert(mesh_core_select_speakers(previous, 0, since, selected) == 0);
+    assert(mesh_core_select_speakers(previous, 2, NULL, selected) == 0);
+}
+
 int main(void)
 {
     test_ids_and_bitmaps();
@@ -185,6 +235,7 @@ int main(void)
     test_relay_masks();
     test_join_assignments();
     test_slot_maps();
+    test_speaker_selection();
     puts("mesh_core tests passed");
     return 0;
 }

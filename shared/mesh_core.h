@@ -80,6 +80,21 @@ uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
                              uint8_t local_heard_bitmap,
                              const mesh_core_peer_snapshot_t *peers, size_t peer_count);
 
+/**
+ * Select up to slot_count speaker grants with first-speaker precedence.
+ *
+ * active_since_ms is indexed by node id (index 0 unused, valid indices
+ * 1..MESH_MAX_NODES); a value greater than zero marks the node as an
+ * active speaker and records when its current talk spurt started.
+ *
+ * Nodes granted in previous[] keep their grant while they stay active.
+ * Free slots go to the remaining active nodes, earliest talk-spurt start
+ * first; ties fall back to the lower node id. Returns the number of
+ * selected speakers; selected[] is zero-filled beyond that count.
+ */
+size_t mesh_core_select_speakers(const uint8_t *previous, size_t slot_count,
+                                 const int64_t *active_since_ms, uint8_t *selected);
+
 bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
                                      uint8_t sender_id, uint8_t expected_coordinator_id,
                                      uint8_t slot_count);
