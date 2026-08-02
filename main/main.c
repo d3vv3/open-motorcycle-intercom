@@ -114,8 +114,8 @@ typedef struct {
     bool active;
 } nrf_previous_audio_t;
 
-static nrf_previous_audio_t s_nrf_previous_audio[2] = {0};
-static _Atomic uint8_t s_nrf_previous_depth = 0;
+static nrf_previous_audio_t s_nrf_previous_audio = {0};
+static _Atomic bool s_nrf_previous_valid = false;
 
 
 /* RTT log cadence while using nRF transport */
@@ -293,27 +293,21 @@ static esp_err_t init_audio_with_test_flags(void)
 
 static void reset_nrf_previous_audio(void)
 {
-    atomic_store_explicit(&s_nrf_previous_depth, 0, memory_order_release);
+    atomic_store_explicit(&s_nrf_previous_valid, false, memory_order_release);
 }
 
 static void cache_nrf_previous_audio(const uint8_t *data, uint16_t len, bool active,
                                      uint16_t seq, bool eligible)
 {
-    if (len == 0 || len > sizeof(s_nrf_previous_audio[0].data)) {
+    if (len == 0 || len > sizeof(s_nrf_previous_audio.data)) {
         reset_nrf_previous_audio();
         return;
     }
-    uint8_t depth = atomic_load_explicit(&s_nrf_previous_depth, memory_order_acquire);
-    if (depth > 0) {
-        s_nrf_previous_audio[1] = s_nrf_previous_audio[0];
-    }
-    memcpy(s_nrf_previous_audio[0].data, data, len);
-    s_nrf_previous_audio[0].len = len;
-    s_nrf_previous_audio[0].seq = seq;
-    s_nrf_previous_audio[0].active = active;
-    atomic_store_explicit(&s_nrf_previous_depth,
-                          eligible ? (depth < 2 ? (uint8_t)(depth + 1u) : 2u) : 0u,
-                          memory_order_release);
+    memcpy(s_nrf_previous_audio.data, data, len);
+    s_nrf_previous_audio.len = len;
+    s_nrf_previous_audio.seq = seq;
+    s_nrf_previous_audio.active = active;
+    atomic_store_explicit(&s_nrf_previous_valid, eligible, memory_order_release);
 }
 
 /**
@@ -343,24 +337,21 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
             break;
         }
 
-        uint8_t previous_depth =
-            atomic_load_explicit(&s_nrf_previous_depth, memory_order_acquire);
+        /* Single-predecessor redundancy: prev1 recovers isolated losses, and
+         * Opus PLC covers the rare two-in-a-row loss. prev2 measured near-zero
+         * additional recovery for ~1/3 of the airtime budget. */
         bool attach_previous1 =
-            previous_depth >= 1u &&
-            s_nrf_previous_audio[0].active &&
-            (uint16_t)(s_nrf_previous_audio[0].seq + 1u) == seq;
-        bool attach_previous2 =
-            attach_previous1 && previous_depth >= 2u && s_nrf_previous_audio[1].active &&
-            (uint16_t)(s_nrf_previous_audio[1].seq + 1u) ==
-                s_nrf_previous_audio[0].seq;
+            atomic_load_explicit(&s_nrf_previous_valid, memory_order_acquire) &&
+            s_nrf_previous_audio.active &&
+            (uint16_t)(s_nrf_previous_audio.seq + 1u) == seq;
         uint8_t bundle_buf[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
         size_t bundle_len = 0;
         audio_bundle_view_t bundle = {
-            .previous1_data = attach_previous1 ? s_nrf_previous_audio[0].data : NULL,
-            .previous2_data = attach_previous2 ? s_nrf_previous_audio[1].data : NULL,
+            .previous1_data = attach_previous1 ? s_nrf_previous_audio.data : NULL,
+            .previous2_data = NULL,
             .current_data = data,
-            .previous1_len = attach_previous1 ? s_nrf_previous_audio[0].len : 0,
-            .previous2_len = attach_previous2 ? s_nrf_previous_audio[1].len : 0,
+            .previous1_len = attach_previous1 ? s_nrf_previous_audio.len : 0,
+            .previous2_len = 0,
             .current_len = len,
             .current_seq = seq,
             .stream_id = get_bridge_node_id(),
@@ -369,10 +360,6 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
         if (attach_previous1) {
             bundle.flags |= AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
                             AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
-        }
-        if (attach_previous2) {
-            bundle.flags |= AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT |
-                            AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE;
         }
         bool bundle_encoded = audio_bundle_encode(&bundle, bundle_buf, sizeof(bundle_buf),
                                                   &bundle_len);
@@ -390,9 +377,6 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
                 s_pipe_bundle_tx++;
                 if (attach_previous1) {
                     s_pipe_prev1_attached++;
-                }
-                if (attach_previous2) {
-                    s_pipe_prev2_attached++;
                 }
             }
             if (ret != ESP_OK) {
