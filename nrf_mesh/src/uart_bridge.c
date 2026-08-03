@@ -24,6 +24,7 @@
 
 #include "mesh_protocol.h"
 #include "audio_bundle.h"
+#include "bridge_frame.h"
 
 LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
 
@@ -38,6 +39,8 @@ _Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 1 <= SPI_MAX_PAYLOAD,
                "V2 bridge payload exceeds SPI capacity");
 _Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 1 + 5 <= BRIDGE_SPI_MAX_XFER,
                "maximum V2 bridge frame exceeds fixed SPI transfer");
+_Static_assert(SPI_MAX_PAYLOAD <= BRIDGE_FRAME_MAX_PAYLOAD,
+               "SPI bridge payload exceeds frame codec capacity");
 
 /* ============================================================================
  * Static Variables
@@ -171,50 +174,32 @@ static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
     return -ENOTSUP;
 }
 
-static uint8_t crc8_compute(const uint8_t *data, size_t len)
-{
-    uint8_t crc = 0x00;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++) {
-            if (crc & 0x80) {
-                crc = (uint8_t)((crc << 1) ^ 0x07);
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    return crc;
-}
-
 /**
  * @brief Parse the RX buffer after an SPI transaction.
  */
 static void parse_rx(const uint8_t *buf, size_t len)
 {
-    if (len < 5) {
+    bridge_frame_view_t frame;
+    bridge_frame_decode_result_t result =
+        bridge_frame_decode(buf, len, SPI_MAX_PAYLOAD, &frame);
+
+    if (result == BRIDGE_FRAME_IDLE || result == BRIDGE_FRAME_BAD_SYNC ||
+        (result == BRIDGE_FRAME_TRUNCATED && len < BRIDGE_FRAME_OVERHEAD)) {
         return;
     }
-
-    /* Idle frame (no sync byte) - master sent nothing meaningful */
-    if (buf[0] != UART_SYNC_BYTE) {
+    if (result == BRIDGE_FRAME_BAD_LENGTH) {
+        LOG_WRN("Bad packet length: %u", len >= 2u ? buf[1] : 0u);
         return;
     }
-
-    uint8_t pkt_len = buf[1];
-    if (pkt_len < 2 || pkt_len > SPI_MAX_PAYLOAD + 2) {
-        LOG_WRN("Bad packet length: %u", pkt_len);
+    if (result == BRIDGE_FRAME_TRUNCATED) {
+        LOG_WRN("Truncated packet: need %u, got %u", buf[1] + 3u, (unsigned int)len);
         return;
     }
+    if (result == BRIDGE_FRAME_BAD_CRC) {
+        uint8_t pkt_len = buf[1];
+        uint8_t rx_crc = buf[2u + pkt_len];
+        uint8_t calc_crc = bridge_frame_crc8(buf + 1u, (size_t)pkt_len + 1u);
 
-    if ((size_t)(pkt_len + 3) > len) {
-        LOG_WRN("Truncated packet: need %u, got %u", pkt_len + 3, (unsigned int)len);
-        return;
-    }
-
-    uint8_t rx_crc = buf[2 + pkt_len];
-    uint8_t calc_crc = crc8_compute(&buf[1], (size_t)(pkt_len + 1));
-    if (rx_crc != calc_crc) {
         s_bridge_rx_crc_fail++;
         if ((s_bridge_rx_crc_fail % 50) == 1) {
             LOG_WRN("CRC mismatch rx=0x%02X calc=0x%02X fail=%u", rx_crc, calc_crc,
@@ -223,7 +208,7 @@ static void parse_rx(const uint8_t *buf, size_t len)
         return;
     }
 
-    uint8_t seq = buf[2];
+    uint8_t seq = frame.seq;
     if (!s_bridge_rx_seq_init) {
         s_bridge_rx_expected = seq;
         s_bridge_rx_seq_init = true;
@@ -237,16 +222,12 @@ static void parse_rx(const uint8_t *buf, size_t len)
         }
     }
 
-    uint8_t pkt_type = buf[3];
-    const uint8_t *payload = &buf[4];
-    uint8_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
-
-    if (pkt_type == UART_PKT_AUDIO || pkt_type == UART_PKT_AUDIO_V2) {
+    if (frame.type == UART_PKT_AUDIO || frame.type == UART_PKT_AUDIO_V2) {
         bool duplicate = s_last_audio_seq_valid && (seq == s_last_audio_seq);
         if (duplicate) {
             s_audio_ingress_duplicate++;
             pulse_ack_line();
-        } else if (handle_rx_packet(pkt_type, payload, payload_len) == 0) {
+        } else if (handle_rx_packet(frame.type, frame.payload, (uint8_t)frame.payload_len) == 0) {
             s_audio_ingress_ok++;
             s_last_audio_seq = seq;
             s_last_audio_seq_valid = true;
@@ -257,21 +238,18 @@ static void parse_rx(const uint8_t *buf, size_t len)
         return;
     }
 
-    (void)handle_rx_packet(pkt_type, payload, payload_len);
+    (void)handle_rx_packet(frame.type, frame.payload, (uint8_t)frame.payload_len);
 }
 
 static uint16_t build_packet(uint8_t *dst, uint8_t type, const uint8_t *payload, uint8_t len)
 {
-    uint8_t wire_len = (uint8_t)(2 + len);
-    dst[0] = UART_SYNC_BYTE;
-    dst[1] = wire_len;
-    dst[2] = s_bridge_tx_seq++;
-    dst[3] = type;
-    if (len > 0 && payload != NULL) {
-        memcpy(&dst[4], payload, len);
+    size_t encoded_len = bridge_frame_encode(dst, BRIDGE_SPI_MAX_XFER, SPI_MAX_PAYLOAD,
+                                             s_bridge_tx_seq, type, payload, len);
+
+    if (encoded_len != 0u) {
+        s_bridge_tx_seq++;
     }
-    dst[2 + wire_len] = crc8_compute(&dst[1], (size_t)(wire_len + 1));
-    return (uint16_t)(3 + wire_len);
+    return (uint16_t)encoded_len;
 }
 
 static void queue_control_packet(const uint8_t *buf, uint16_t len, uint8_t type)

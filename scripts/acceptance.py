@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -69,6 +70,20 @@ def flash_all_esp(esp_ports: list[str], build_dir: str) -> None:
     time.sleep(FLASH_SETTLE_S)
 
 
+def restore_all_esp(esp_ports: list[str], build_dir: str) -> None:
+    errors: list[tuple[str, Exception]] = []
+    for port in esp_ports:
+        try:
+            flash_esp(port, build_dir)
+        except Exception as exc:
+            errors.append((port, exc))
+    if errors:
+        detail = ", ".join(f"{port}: {exc}" for port, exc in errors)
+        raise RuntimeError(f"restore flash failed ({detail})")
+    print(f"WAIT  {FLASH_SETTLE_S} s for boards to settle")
+    time.sleep(FLASH_SETTLE_S)
+
+
 # ---------------------------------------------------------------------------
 # Benchmark run
 # ---------------------------------------------------------------------------
@@ -115,15 +130,71 @@ def _fmt(value: object) -> str:
     return "n/a" if value is None else str(value)
 
 
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _is_finite_integer(value: object) -> bool:
+    return _is_finite_number(value) and (
+        isinstance(value, int) or value.is_integer()
+    )
+
+
+def _nested_value(value: object, *keys: str) -> object:
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
 def assert_run(run_dir: str, esp_ports: list[str], args: argparse.Namespace) -> bool:
     """Check ESP-port metrics in summary.json. Return True when all pass."""
     summary_path = os.path.join(run_dir, "summary.json")
-    with open(summary_path, "r", encoding="utf-8") as fh:
-        summary = json.load(fh)
-
-    by_port = {entry.get("port"): entry for entry in summary.get("ports", [])}
     rows: list[tuple[str, str, str, str, str]] = []
     ok = True
+
+    try:
+        with open(summary_path, "r", encoding="utf-8") as fh:
+            summary = json.load(fh)
+    except (OSError, ValueError) as exc:
+        rows.append(("summary", "summary_json", "valid JSON", str(exc), "FAIL"))
+        summary = {}
+        ok = False
+
+    if not isinstance(summary, dict):
+        rows.append(
+            ("summary", "summary_shape", "object", type(summary).__name__, "FAIL")
+        )
+        ports = []
+        ok = False
+    else:
+        ports = summary.get("ports")
+        if not isinstance(ports, list):
+            rows.append(
+                ("summary", "ports_shape", "array", type(ports).__name__, "FAIL")
+            )
+            ports = []
+            ok = False
+
+    by_port: dict[str, dict[str, object]] = {}
+    for index, entry in enumerate(ports):
+        if not isinstance(entry, dict) or not isinstance(entry.get("port"), str):
+            rows.append(
+                ("summary", f"ports[{index}]", "port object", type(entry).__name__, "FAIL")
+            )
+            ok = False
+            continue
+        port_name = entry["port"]
+        if port_name in by_port:
+            rows.append((port_name, "port_in_summary", "unique", "duplicate", "FAIL"))
+            ok = False
+            continue
+        by_port[port_name] = entry
 
     for port in esp_ports:
         entry = by_port.get(port)
@@ -132,53 +203,71 @@ def assert_run(run_dir: str, esp_ports: list[str], args: argparse.Namespace) -> 
             ok = False
             continue
 
-        if not entry.get("open_ok", False):
-            rows.append((port, "open_ok", "true", "false", "FAIL"))
+        open_ok = entry.get("open_ok")
+        if open_ok is not True:
+            rows.append((port, "open_ok", "true", _fmt(open_ok), "FAIL"))
             ok = False
 
         # Glitches
-        glitches = entry.get("glitch_delta", {}).get("glitches")
-        if glitches is None:
-            rows.append((port, "glitches", f"<= {args.max_glitches}", "n/a", "SKIP"))
-        else:
+        glitches = _nested_value(entry, "glitch_delta", "glitches")
+        if _is_finite_integer(glitches) and glitches >= 0:
             passed = glitches <= args.max_glitches
             rows.append(
                 (port, "glitches", f"<= {args.max_glitches}", str(glitches),
                  "PASS" if passed else "FAIL")
             )
             ok = ok and passed
+        else:
+            rows.append(
+                (port, "glitches", f"<= {args.max_glitches}", _fmt(glitches), "FAIL")
+            )
+            ok = False
 
         # Effective RX gap percentage
-        gap = entry.get("hop_pct", {}).get("esp_e2e_effective_gap_pct")
-        if gap is None:
-            rows.append(
-                (port, "effective_gap_pct", f"<= {args.max_effective_gap_pct}",
-                 "n/a", "SKIP")
-            )
-        else:
+        gap = _nested_value(entry, "hop_pct", "esp_e2e_effective_gap_pct")
+        if _is_finite_number(gap) and 0 <= gap <= 100:
             passed = gap <= args.max_effective_gap_pct
             rows.append(
                 (port, "effective_gap_pct", f"<= {args.max_effective_gap_pct}",
                  str(gap), "PASS" if passed else "FAIL")
             )
             ok = ok and passed
-
-        # PCM underrun delta (from PIPE pipeline records, when present)
-        underruns = [
-            (name, rec["delta"]["pcm_underrun"])
-            for name, rec in entry.get("pipeline", {}).items()
-            if "pcm_underrun" in rec.get("delta", {})
-        ]
-        if not underruns:
-            rows.append((port, "pcm_underrun_delta", "== 0", "n/a", "SKIP"))
         else:
-            total = sum(v for _, v in underruns)
+            rows.append(
+                (port, "effective_gap_pct", f"<= {args.max_effective_gap_pct}",
+                 _fmt(gap), "FAIL")
+            )
+            ok = False
+
+        # PCM underrun delta (from PIPE pipeline records)
+        pipeline = entry.get("pipeline")
+        underruns: list[object] = []
+        pipeline_valid = isinstance(pipeline, dict)
+        if pipeline_valid:
+            for rec in pipeline.values():
+                if not isinstance(rec, dict) or not isinstance(rec.get("delta"), dict):
+                    pipeline_valid = False
+                    continue
+                if "pcm_underrun" in rec["delta"]:
+                    underruns.append(rec["delta"]["pcm_underrun"])
+
+        values_valid = bool(underruns) and all(
+            _is_finite_integer(value) and value >= 0 for value in underruns
+        )
+        if pipeline_valid and values_valid:
+            total = sum(underruns)
             passed = total == 0
             rows.append(
                 (port, "pcm_underrun_delta", "== 0", str(total),
                  "PASS" if passed else "FAIL")
             )
             ok = ok and passed
+        else:
+            rows.append(
+                (port, "pcm_underrun_delta", "== 0",
+                 _fmt(underruns if underruns else None), "FAIL")
+            )
+            ok = False
 
     print(f"\nRun dir: {run_dir}")
     _print_table(rows)
@@ -246,6 +335,7 @@ def main() -> int:
     if args.force_tx == "on" and args.skip_flash:
         print("NOTE  --skip-flash given: --force-tx on has no effect")
 
+    restore_error: Exception | None = None
     try:
         if force_tx:
             set_force_tx_define(1)
@@ -254,14 +344,18 @@ def main() -> int:
         run_dir = run_benchmark(args.duration, args.ports, args.out_dir)
         return 0 if assert_run(run_dir, args.esp_ports, args) else 1
     finally:
+        operation_failed = sys.exc_info()[0] is not None
         if force_tx:
             print("RESTORE FORCE_TX_ALWAYS_FOR_TEST=0 and reflash")
             try:
                 set_force_tx_define(0)
-                flash_all_esp(args.esp_ports, args.esp_build_dir)
+                restore_all_esp(args.esp_ports, args.esp_build_dir)
             except Exception as exc:
+                restore_error = exc
                 print(f"ERROR during restore: {exc}")
                 print(f"MANUAL ACTION: verify define in {MAIN_C} and reflash ESPs")
+        if restore_error is not None and not operation_failed:
+            raise RuntimeError("failed to restore normal ESP firmware") from restore_error
 
 
 if __name__ == "__main__":

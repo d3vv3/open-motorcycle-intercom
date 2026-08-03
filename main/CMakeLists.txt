@@ -4,6 +4,7 @@
 
 idf_component_register(
     SRCS "main.c" "rtt_probe.c" "../shared/audio_bundle.c" "../shared/audio_tx_cache.c"
+         "../shared/audio_rx_tracker.c"
     INCLUDE_DIRS "." "../shared"
     REQUIRES 
         audio

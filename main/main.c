@@ -25,6 +25,7 @@
 
 #include "audio.h"
 #include "audio_bundle.h"
+#include "audio_rx_tracker.h"
 #include "audio_tx_cache.h"
 #include "button.h"
 #include "mesh.h"
@@ -61,11 +62,8 @@ static _Atomic bool s_mesh_active = false;
 /* End-to-end audio sequence diagnostics (nRF transport path) */
 static uint16_t s_e2e_tx_seq = 0;
 static uint32_t s_e2e_tx_frames = 0;
-static uint32_t s_e2e_rx_frames = 0;
-static uint32_t s_e2e_rx_gap_events = 0;
-static uint32_t s_e2e_rx_gap_frames = 0;
-static uint32_t s_e2e_rx_recovered_frames = 0;
-static uint32_t s_e2e_rx_reset_events = 0;
+static audio_rx_tracker_t s_e2e_rx_tracker = {0};
+static portMUX_TYPE s_e2e_rx_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_pipe_source_frames = 0;
 static uint32_t s_pipe_gate_drops = 0;
 static uint32_t s_pipe_spi_attempts = 0;
@@ -90,22 +88,18 @@ static uint32_t s_pipe_prev2_offer = 0;
 static uint32_t s_pipe_prev2_accept = 0;
 static uint32_t s_pipe_prev2_reject = 0;
 
-typedef struct {
-    bool initialized;
-    uint16_t last_seq;
-    uint32_t outstanding_gap_frames;
-} e2e_rx_seq_state_t;
-
-static e2e_rx_seq_state_t s_e2e_rx_seq_state[256] = {0};
-
 static void reset_e2e_rx_source(uint8_t source_id)
 {
-    memset(&s_e2e_rx_seq_state[source_id], 0, sizeof(s_e2e_rx_seq_state[source_id]));
+    portENTER_CRITICAL(&s_e2e_rx_lock);
+    audio_rx_tracker_reset_source(&s_e2e_rx_tracker, source_id);
+    portEXIT_CRITICAL(&s_e2e_rx_lock);
 }
 
 static void reset_all_e2e_rx_sources(void)
 {
-    memset(s_e2e_rx_seq_state, 0, sizeof(s_e2e_rx_seq_state));
+    portENTER_CRITICAL(&s_e2e_rx_lock);
+    audio_rx_tracker_reset_sources(&s_e2e_rx_tracker);
+    portEXIT_CRITICAL(&s_e2e_rx_lock);
 }
 
 static audio_tx_cache_t s_nrf_previous_audio;
@@ -440,8 +434,8 @@ static esp_err_t submit_nrf_audio_frame(const audio_frame_t *frame, uint8_t src_
 
 static void offer_nrf_predecessor(uint8_t src_id, const uint8_t *data, size_t len,
                                   uint16_t seq, bool active, int64_t timestamp_us,
-                                  e2e_rx_seq_state_t *seq_state, uint32_t *offer_count,
-                                  uint32_t *accept_count, uint32_t *reject_count)
+                                  uint32_t *offer_count, uint32_t *accept_count,
+                                  uint32_t *reject_count)
 {
     audio_frame_t frame;
 
@@ -453,15 +447,16 @@ static void offer_nrf_predecessor(uint8_t src_id, const uint8_t *data, size_t le
     frame.seq = seq;
     frame.has_seq = true;
 
-    if (submit_nrf_audio_frame(&frame, src_id, NULL) == ESP_OK) {
+    bool queue_succeeded = submit_nrf_audio_frame(&frame, src_id, NULL) == ESP_OK;
+    if (queue_succeeded) {
         (*accept_count)++;
-        if (seq_state->outstanding_gap_frames > 0) {
-            seq_state->outstanding_gap_frames--;
-            s_e2e_rx_recovered_frames++;
-        }
     } else {
         (*reject_count)++;
     }
+    portENTER_CRITICAL(&s_e2e_rx_lock);
+    (void)audio_rx_tracker_credit_predecessor(&s_e2e_rx_tracker, src_id,
+                                              queue_succeeded);
+    portEXIT_CRITICAL(&s_e2e_rx_lock);
 }
 
 /**
@@ -507,33 +502,9 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     }
     uint16_t e2e_seq = bundle.current_seq;
 
-    e2e_rx_seq_state_t *seq_state = &s_e2e_rx_seq_state[src_id];
-    if (!seq_state->initialized) {
-        seq_state->initialized = true;
-        seq_state->last_seq = e2e_seq;
-    } else {
-        uint16_t expected = (uint16_t)(seq_state->last_seq + 1);
-        if (e2e_seq == expected) {
-            seq_state->last_seq = e2e_seq;
-        } else {
-            int16_t signed_delta = (int16_t)(e2e_seq - expected);
-            if (signed_delta > 0) {
-                uint32_t gap = (uint16_t)signed_delta;
-                s_e2e_rx_gap_events++;
-                s_e2e_rx_gap_frames += gap;
-                if (UINT32_MAX - seq_state->outstanding_gap_frames < gap) {
-                    seq_state->outstanding_gap_frames = UINT32_MAX;
-                } else {
-                    seq_state->outstanding_gap_frames += gap;
-                }
-                seq_state->last_seq = e2e_seq;
-            } else {
-                /* Late/reordered current: retain the forward tracker and outstanding loss. */
-                s_e2e_rx_reset_events++;
-            }
-        }
-    }
-    s_e2e_rx_frames++;
+    portENTER_CRITICAL(&s_e2e_rx_lock);
+    (void)audio_rx_tracker_accept(&s_e2e_rx_tracker, src_id, e2e_seq);
+    portEXIT_CRITICAL(&s_e2e_rx_lock);
 
     audio_frame_t frame;
     if (bundle.current_len > sizeof(frame.data)) {
@@ -547,7 +518,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
             src_id, bundle.previous2_data, bundle.previous2_len,
             (uint16_t)(e2e_seq - 2u),
             (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0,
-            timestamp_us - 40000, seq_state, &s_pipe_prev2_offer,
+            timestamp_us - 40000, &s_pipe_prev2_offer,
             &s_pipe_prev2_accept, &s_pipe_prev2_reject);
     }
     if (bundle.previous1_len != 0) {
@@ -555,7 +526,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
             src_id, bundle.previous1_data, bundle.previous1_len,
             (uint16_t)(e2e_seq - 1u),
             (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0,
-            timestamp_us - 20000, seq_state, &s_pipe_prev1_offer,
+            timestamp_us - 20000, &s_pipe_prev1_offer,
             &s_pipe_prev1_accept, &s_pipe_prev1_reject);
     }
 
@@ -1141,36 +1112,47 @@ void app_main(void)
 
             if ((now_ms - last_rtt_log_ms) >= RTT_LOG_INTERVAL_MS) {
                 rtt_probe_stats_t rtt = {0};
+                uint32_t rx_frames;
+                uint32_t rx_gap_events;
+                uint32_t rx_gap_frames;
+                uint32_t rx_reordered;
+                uint32_t rx_recovered;
                 rtt_probe_get_stats(&rtt);
+                portENTER_CRITICAL(&s_e2e_rx_lock);
+                rx_frames = s_e2e_rx_tracker.frames;
+                rx_gap_events = s_e2e_rx_tracker.gap_events;
+                rx_gap_frames = s_e2e_rx_tracker.gap_frames;
+                rx_reordered = s_e2e_rx_tracker.reordered_or_old;
+                rx_recovered = s_e2e_rx_tracker.recovered_frames;
+                portEXIT_CRITICAL(&s_e2e_rx_lock);
 
                 ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
                          rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
                          rtt.jitter_ms_avg, rtt.jitter_ms_max);
                 ESP_LOGI(TAG,
                          "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu recovered=%lu effective_gap=%lu",
-                         s_e2e_tx_frames, s_e2e_rx_frames, s_e2e_rx_gap_events,
-                         s_e2e_rx_gap_frames, s_e2e_rx_reset_events,
-                         s_e2e_rx_recovered_frames,
-                         s_e2e_rx_gap_frames > s_e2e_rx_recovered_frames
-                             ? s_e2e_rx_gap_frames - s_e2e_rx_recovered_frames
+                          s_e2e_tx_frames, rx_frames, rx_gap_events, rx_gap_frames,
+                          rx_reordered, rx_recovered,
+                          rx_gap_frames > rx_recovered
+                             ? rx_gap_frames - rx_recovered
                              : 0);
                 ESP_LOGI(TAG,
                          "PIPE v=1 dev=esp stage=transport node=%u source=%lu gate_drop=%lu spi_try=%lu spi_ok=%lu spi_fail=%lu spi_oversize=%lu spi_rx=%lu spi_gap=%lu spi_invalid=%lu spi_self=%lu probe_rx=%lu play_q_ok=%lu play_q_drop=%lu bundle_tx=%lu bundle_rx=%lu bundle_bad=%lu prev1_attached=%lu prev2_attached=%lu prev1_offer=%lu prev1_accept=%lu prev1_reject=%lu prev2_offer=%lu prev2_accept=%lu prev2_reject=%lu recovered=%lu",
                          get_bridge_node_id(), s_pipe_source_frames, s_pipe_gate_drops,
                          s_pipe_spi_attempts, s_pipe_spi_enqueue_ok, s_pipe_spi_enqueue_fail,
-                         s_pipe_spi_oversize, s_pipe_spi_rx, s_e2e_rx_gap_frames,
+                          s_pipe_spi_oversize, s_pipe_spi_rx, rx_gap_frames,
                          s_pipe_spi_rx_invalid, s_pipe_spi_rx_self, s_pipe_probe_rx,
                          s_pipe_play_queue_ok, s_pipe_play_queue_drop, s_pipe_bundle_tx,
                          s_pipe_bundle_rx, s_pipe_bundle_bad, s_pipe_prev1_attached,
                          s_pipe_prev2_attached, s_pipe_prev1_offer, s_pipe_prev1_accept,
                          s_pipe_prev1_reject, s_pipe_prev2_offer, s_pipe_prev2_accept,
-                         s_pipe_prev2_reject, s_e2e_rx_recovered_frames);
+                          s_pipe_prev2_reject, rx_recovered);
                 ESP_LOGI(TAG,
                          "Redundancy: tx=%lu rx=%lu attached=%lu/%lu prev1=%lu/%lu/%lu prev2=%lu/%lu/%lu recovered=%lu",
                          s_pipe_bundle_tx, s_pipe_bundle_rx, s_pipe_prev1_attached,
                          s_pipe_prev2_attached, s_pipe_prev1_offer, s_pipe_prev1_accept,
                          s_pipe_prev1_reject, s_pipe_prev2_offer, s_pipe_prev2_accept,
-                         s_pipe_prev2_reject, s_e2e_rx_recovered_frames);
+                          s_pipe_prev2_reject, rx_recovered);
                 last_rtt_log_ms = now_ms;
             }
         }

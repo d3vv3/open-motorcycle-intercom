@@ -13,7 +13,9 @@ target_sources(app PRIVATE
     src/mesh_protocol.c
     src/ws_sync.c
     ../shared/audio_bundle.c
+    ../shared/bridge_frame.c
     ../shared/mesh_core.c
+    ../shared/mesh_membership.c
 )
 
 target_include_directories(app PRIVATE

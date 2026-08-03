@@ -88,6 +88,15 @@ jobs:
       - name: Run audio TX cache tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/audio_tx_cache_test && /tmp/audio_tx_cache_test
 
+      - name: Run bridge frame codec tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/bridge_frame_test && /tmp/bridge_frame_test
+
+      - name: Run audio RX tracker tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/audio_rx_tracker_test && /tmp/audio_rx_tracker_test
+
+      - name: Run mesh membership reducer tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/mesh_membership.c tests/c/mesh_membership_test.c -o /tmp/mesh_membership_test && /tmp/mesh_membership_test
+
       - name: Run C suites under ASan and UBSan
         run: |
           set -e
@@ -96,6 +105,9 @@ jobs:
           cc $FLAGS $SAN -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/san_mesh_core && /tmp/san_mesh_core
           cc $FLAGS $SAN -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/san_audio_bundle && /tmp/san_audio_bundle
           cc $FLAGS $SAN -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/san_audio_tx_cache && /tmp/san_audio_tx_cache
+          cc $FLAGS $SAN -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/san_bridge_frame && /tmp/san_bridge_frame
+          cc $FLAGS $SAN -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/san_audio_rx_tracker && /tmp/san_audio_rx_tracker
+          cc $FLAGS $SAN -I. shared/mesh_membership.c tests/c/mesh_membership_test.c -o /tmp/san_mesh_membership && /tmp/san_mesh_membership
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/san_packet_store && /tmp/san_packet_store
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select

@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "audio_bundle.h"
+#include "bridge_frame.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -38,8 +39,6 @@ static const char *TAG = "spi_bridge";
  * Constants
  * ============================================================================ */
 
-#define SYNC_BYTE          0xAA
-#define MAX_PACKET_LEN     256
 #define RX_TASK_STACK_SIZE 4096
 #define RX_TASK_PRIORITY   5
 #define RX_TASK_CORE       0
@@ -48,6 +47,10 @@ static const char *TAG = "spi_bridge";
 #define COMMAND_ACK_TIMEOUT_MS 300
 #define COMMAND_MAX_ATTEMPTS   3
 #define STATUS_STALE_TIMEOUT_US 5000000
+#define SPI_MAX_PAYLOAD (BRIDGE_SPI_MAX_XFER - BRIDGE_FRAME_OVERHEAD)
+
+_Static_assert(SPI_MAX_PAYLOAD <= BRIDGE_FRAME_MAX_PAYLOAD,
+               "SPI bridge payload exceeds frame codec capacity");
 
 _Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 6 <= BRIDGE_SPI_MAX_XFER,
                "source-prefixed audio v2 bundle must fit one SPI transfer");
@@ -466,22 +469,6 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
     }
 }
 
-static uint8_t crc8_compute(const uint8_t *data, size_t len)
-{
-    uint8_t crc = 0x00;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int b = 0; b < 8; b++) {
-            if (crc & 0x80) {
-                crc = (uint8_t)((crc << 1) ^ 0x07);
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    return crc;
-}
-
 /**
  * @brief Parse a received SPI buffer for a framed packet.
  *
@@ -490,36 +477,35 @@ static uint8_t crc8_compute(const uint8_t *data, size_t len)
  */
 static void parse_rx(const uint8_t *buf, size_t len)
 {
-    if (len < 5) {
-        s_bridge_rx_trunc++;
-        return;
-    }
+    bridge_frame_view_t frame;
+    bridge_frame_decode_result_t result =
+        bridge_frame_decode(buf, len, SPI_MAX_PAYLOAD, &frame);
 
-    if (buf[0] == 0) {
+    if (result == BRIDGE_FRAME_IDLE) {
         return;
     }
-    if (buf[0] != SYNC_BYTE) {
+    if (result == BRIDGE_FRAME_TRUNCATED) {
+        s_bridge_rx_trunc++;
+        if (len >= BRIDGE_FRAME_OVERHEAD) {
+            ESP_LOGW(TAG, "Truncated packet: need %u, got %u", buf[1] + 3u,
+                     (unsigned)len);
+        }
+        return;
+    }
+    if (result == BRIDGE_FRAME_BAD_SYNC) {
         s_bridge_rx_bad_sync++;
         return;
     }
-
-    uint8_t pkt_len = buf[1];
-    if (pkt_len < 2 || pkt_len > MAX_PACKET_LEN - 3) {
+    if (result == BRIDGE_FRAME_BAD_LENGTH) {
         s_bridge_rx_bad_len++;
-        ESP_LOGW(TAG, "Bad packet length: %u", pkt_len);
+        ESP_LOGW(TAG, "Bad packet length: %u", len >= 2u ? buf[1] : 0u);
         return;
     }
+    if (result == BRIDGE_FRAME_BAD_CRC) {
+        uint8_t pkt_len = buf[1];
+        uint8_t rx_crc = buf[2u + pkt_len];
+        uint8_t calc_crc = bridge_frame_crc8(buf + 1u, (size_t)pkt_len + 1u);
 
-    /* Ensure we actually received enough bytes */
-    if ((size_t)(pkt_len + 3) > len) {
-        s_bridge_rx_trunc++;
-        ESP_LOGW(TAG, "Truncated packet: need %u, got %u", pkt_len + 3, (unsigned)len);
-        return;
-    }
-
-    uint8_t rx_crc = buf[2 + pkt_len];
-    uint8_t calc_crc = crc8_compute(&buf[1], (size_t)(pkt_len + 1));
-    if (rx_crc != calc_crc) {
         s_bridge_rx_crc_fail++;
         if ((s_bridge_rx_crc_fail % 50) == 1) {
             ESP_LOGW(TAG, "CRC mismatch: rx=0x%02X calc=0x%02X fail=%lu", rx_crc, calc_crc,
@@ -528,7 +514,7 @@ static void parse_rx(const uint8_t *buf, size_t len)
         return;
     }
 
-    uint8_t seq = buf[2];
+    uint8_t seq = frame.seq;
     if (!s_bridge_rx_seq_init) {
         s_bridge_rx_expected = seq;
         s_bridge_rx_seq_init = true;
@@ -540,11 +526,7 @@ static void parse_rx(const uint8_t *buf, size_t len)
     }
     s_bridge_rx_expected = seq;
 
-    uint8_t pkt_type = buf[3];
-    const uint8_t *payload = &buf[4];
-    uint16_t payload_len = pkt_len - 2; /* -2 for seq + type bytes */
-
-    handle_rx_packet(pkt_type, payload, payload_len);
+    handle_rx_packet(frame.type, frame.payload, (uint16_t)frame.payload_len);
 }
 
 /**
@@ -892,13 +874,13 @@ void uart_bridge_deinit(void)
  */
 static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
 {
+    size_t total;
+
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint16_t wire_len = (uint16_t)(2 + len);   /* SEQ + TYPE + PAYLOAD */
-    uint16_t total = (uint16_t)(3 + wire_len); /* SYNC + LEN + BODY + CRC */
-    if (total > BRIDGE_SPI_MAX_XFER) {
+    if ((size_t)len > SPI_MAX_PAYLOAD || (len != 0u && payload == NULL)) {
         s_audio_tx_invalid_size++;
         return ESP_ERR_INVALID_SIZE;
     }
@@ -908,16 +890,16 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
     }
 
     memset(s_tx_buf, 0, BRIDGE_SPI_MAX_XFER);
-    s_tx_buf[0] = SYNC_BYTE;
-    s_tx_buf[1] = (uint8_t)wire_len;
-    s_tx_buf[2] = s_bridge_tx_seq++;
-    s_tx_buf[3] = type;
-    if (len > 0 && payload != NULL) {
-        memcpy(&s_tx_buf[4], payload, len);
+    total = bridge_frame_encode(s_tx_buf, sizeof(s_tx_buf), SPI_MAX_PAYLOAD,
+                                s_bridge_tx_seq, type, payload, len);
+    if (total == 0u) {
+        xSemaphoreGive(s_tx_mutex);
+        s_audio_tx_invalid_size++;
+        return ESP_ERR_INVALID_SIZE;
     }
-    s_tx_buf[2 + wire_len] = crc8_compute(&s_tx_buf[1], (size_t)(wire_len + 1));
+    s_bridge_tx_seq++;
     memcpy(s_ctrl_pending.buf, s_tx_buf, BRIDGE_SPI_MAX_XFER);
-    s_ctrl_pending.len = total;
+    s_ctrl_pending.len = (uint16_t)total;
     s_ctrl_pending_valid = true;
 
     xSemaphoreGive(s_tx_mutex);
@@ -926,6 +908,8 @@ static esp_err_t queue_tx_packet(uint8_t type, const uint8_t *payload, uint16_t 
 
 static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t len)
 {
+    size_t total;
+
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -933,9 +917,7 @@ static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t l
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint16_t wire_len = (uint16_t)(2 + len);   /* SEQ + TYPE + PAYLOAD */
-    uint16_t total = (uint16_t)(3 + wire_len); /* SYNC + LEN + BODY + CRC */
-    if (total > BRIDGE_SPI_MAX_XFER) {
+    if ((size_t)len > SPI_MAX_PAYLOAD || (len != 0u && data == NULL)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -955,15 +937,15 @@ static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t l
 
     tx_entry_t *entry = &s_audio_q[cur_head];
     memset(entry->buf, 0, BRIDGE_SPI_MAX_XFER);
-    entry->buf[0] = SYNC_BYTE;
-    entry->buf[1] = (uint8_t)wire_len;
-    entry->buf[2] = s_bridge_tx_seq++;
-    entry->buf[3] = type;
-    if (len > 0 && data != NULL) {
-        memcpy(&entry->buf[4], data, len);
+    total = bridge_frame_encode(entry->buf, sizeof(entry->buf), SPI_MAX_PAYLOAD,
+                                s_bridge_tx_seq, type, data, len);
+    if (total == 0u) {
+        xSemaphoreGive(s_tx_mutex);
+        xSemaphoreGive(s_audio_slots_free);
+        return ESP_ERR_INVALID_SIZE;
     }
-    entry->buf[2 + wire_len] = crc8_compute(&entry->buf[1], (size_t)(wire_len + 1));
-    entry->len = total;
+    s_bridge_tx_seq++;
+    entry->len = (uint16_t)total;
     entry->queued_at_us = esp_timer_get_time();
 
     /* Memory barrier: ensure all writes to entry are visible before
