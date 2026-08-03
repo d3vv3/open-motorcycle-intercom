@@ -1,395 +1,295 @@
-# OMI Protocol Specification (v0.1)
+# OMI Protocol v2
 
-This document specifies the **on-air and inter-MCU protocol** for the Open Motorcycle Intercom (OMI).
+This document describes the implemented on-air mesh protocol and the
+ESP32-S3/nRF52840 bridge protocol. The current on-air version is `0x02`.
 
-The protocol is intentionally minimal, deterministic, and optimized for **real-time voice**, not general data transfer.
+## On-Air Envelope
 
-This specification covers:
-- Packet types and formats
-- Audio encapsulation
-- TDMA frame usage
-- Control messages
-
-[TOC]
-
----
-
-## Design Principles
-
-- Deterministic latency beats throughput
-- Fixed-size packets where possible
-- Small headers, explicit fields
-- Audio is first-class; everything else is secondary
-
----
-
-## Terminology
-
-- **Node**: One intercom unit (one rider)
-- **Frame**: One TDMA cycle (aligned to Opus frame)
-- **Slot**: Time window allocated to one node
-- **Hop**: One wireless relay
-- **Audio Frame**: One Opus-encoded 20 ms chunk
-
----
-
-## Network Model
-
-- Small, bounded mesh (2-10 nodes)
-- Single logical group per mesh
-- One active time master
-- Multi-hop broadcast transport with TTL-bounded relaying (see "Relaying & Multi-Hop")
-
----
-
-## Packet Overview
-
-All packets share a common header.
-
-### Common Packet Header (8 bytes)
-
+Every mesh packet starts with this packed 8-byte header:
 
 | Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | Version | Protocol version (0x01) |
-| 1 | 1 | Type | Packet type |
-| 2 | 1 | SrcID | Source node ID |
-| 3 | 1 | Seq | Sequence number |
-| 4 | 1 | TTL | Relay time-to-live (decremented per hop; 0 = no relay) |
-| 5 | 1 | Flags | Control flags (see below) |
-| 6 | 2 | PayloadLen | Bytes following header |
+|---:|---:|---|---|
+| 0 | 1 | `version` | Must be `0x02` |
+| 1 | 1 | `type` | Packet type |
+| 2 | 1 | `src_id` | Source node ID; `0` means unassigned |
+| 3 | 1 | `seq` | Per-sender 8-bit packet sequence |
+| 4 | 1 | `ttl` | Remaining relay hops |
+| 5 | 1 | `flags` | Relay and speaker flags |
+| 6 | 2 | `payload_len` | Bytes after the header, little-endian |
 
-All fields are little-endian.
+Node IDs are `1` through `8`. The coordinator normally owns ID `1` and slot
+`0`; other assignments map node ID `n` to slot `n - 1`.
 
-### Control Flags
+Header flags are:
 
-| Bit | Name | Meaning |
-|----|------|---------|
-| 0x01 | RELAY_REQUEST | Source is requesting relays to forward this packet |
-| 0x02 | RELAYED | Packet has already been relayed at least once |
-| 0x04 | SPEAKER_GRANTED | Sender holds a coordinator speaker grant |
+| Value | Name | Meaning |
+|---:|---|---|
+| `0x01` | `RELAY_REQUEST` | Packet may be considered for relay |
+| `0x02` | `RELAYED` | Packet has traversed a relay |
+| `0x04` | `SPEAKER_GRANTED` | Source has a current coordinator relay grant |
 
----
+Receivers fail closed by rejecting packets with another protocol version.
+There is no version negotiation or optional-field negotiation.
 
 ## Packet Types
 
+| Value | Name | Purpose |
+|---:|---|---|
+| `0x01` | `AUDIO` | Legacy single-frame audio envelope |
+| `0x02` | `JOIN` | ESP-NOW join request |
+| `0x03` | `JOIN_ACK` | ESP-NOW join assignment |
+| `0x04` | `LEAVE` | Graceful departure |
+| `0x05` | `SYNC` | Coordinator timing |
+| `0x06` | `SLOT_MAP` | Membership and relay map |
+| `0x07` | `STATUS` | Peer health and relay observations |
+| `0x08` | `KEEPALIVE` | Presence during audio silence |
+| `0x09` | `SPEAKER_GRANT` | Active-speaker and relay assignment |
+| `0x0A` | `SPEAKER_RELEASE` | Active-speaker release |
+| `0x0B` | `JOIN_V2` | nRF/ESB identity-bearing join request |
+| `0x0C` | `JOIN_ACK_V2` | nRF/ESB identity-targeted assignment |
+| `0x0D` | `AUDIO_V2` | Redundant Opus bundle |
 
-| Type | Name | Purpose |
-|----|------|--------|
-| 0x01 | AUDIO | Opus audio data |
-| 0x02 | JOIN | Request to join mesh |
-| 0x03 | JOIN_ACK | Join response |
-| 0x04 | LEAVE | Graceful leave |
-| 0x05 | SYNC | TDMA timing sync |
-| 0x06 | SLOT_MAP | Slot assignment |
-| 0x07 | STATUS | Battery / health |
-| 0x08 | KEEPALIVE | Presence check |
-| 0x09 | SPEAKER_GRANT | Coordinator grants a speaker a relay/transmit slot |
-| 0x0A | SPEAKER_RELEASE | Coordinator releases a previously granted speaker |
-| 0x0B | JOIN_V2 | nRF/ESB join request with requester identity |
-| 0x0C | JOIN_ACK_V2 | nRF/ESB targeted join response |
+Normal nRF/ESB microphone audio must use `AUDIO_V2`. On that transport,
+legacy `AUDIO` is accepted only for the fixed-format RTT diagnostic. ESP-NOW
+still uses legacy `AUDIO` for normal audio.
 
----
+## Audio V2 Bundle
 
-## Audio Packet
-
-### Purpose
-
-Carries exactly **one Opus frame**.
-
-### Payload Format
+The `AUDIO_V2` payload has an exact 8-byte fixed header followed by zero to two
+predecessor frames and the current Opus frame:
 
 | Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | Codec | 0x01 = Opus |
-| 1 | 1 | FrameMs | Frame duration (20) |
-| 2 | 1 | StreamID | Logical audio stream |
-| 3 | 1 | AudioFlags | Bit 0 = ACTIVE (speech); clear = intentional silence / comfort-noise frame |
-| 4 | N | OpusData | Encoded audio (Opus, may be a small DTX comfort-noise frame) |
+|---:|---:|---|---|
+| 0 | 1 | `codec` | `0x01` for Opus |
+| 1 | 1 | `frame_ms` | Must be `20` |
+| 2 | 1 | `stream_id` | Logical source; `0` is allowed on receive |
+| 3 | 1 | `flags` | Bundle flags below |
+| 4 | 2 | `current_seq` | Current frame sequence, big-endian |
+| 6 | 1 | `current_len` | Current frame bytes, `1..64` |
+| 7 | 1 | `previous1_len` | Immediate predecessor bytes, `0..64` |
+| 8 | N | frame data | `previous2`, then `previous1`, then `current` |
 
-Typical payload size:
-- 20-40 bytes @ 12 kbps active speech, up to 64 Opus bytes
-- 1-6 bytes for comfort-noise (DTX) frames during silence
+There is no `previous2_len` field. When `PREVIOUS2_PRESENT` is set, its length
+is inferred as:
 
-`AudioFlags` lets the receiver distinguish intentional silence from packet loss
-(see audio.md §5.1). Pure 1-2 byte DTX frames are dropped before transmission, so
-the radio stays quiet during silence.
-
-The nRF transport prepends a two-byte end-to-end frame sequence to Opus data.
-Its mesh audio capacity is therefore 66 bytes, while the codec limit remains 64 bytes.
-
-### Rules
-
-- AUDIO packets **must only be sent in TDMA slots**
-- Late local slot work is dropped before submission; receivers validate packet format, state, source, and deduplication rather than reconstructing sender slot time
-
----
-
-## TDMA Frame Usage
-
-### Frame Parameters
-
-- Frame duration: 20 ms
-- Slot duration: configurable (1–3 ms)
-- Guard time: implementation-defined
-
-### Slot Ownership
-
-- Each node owns exactly one slot
-- Slot ID is implicit by position
-
-### Transmission Rules
-
-- One AUDIO packet per slot
-- Silence = suppressed: only periodic comfort-noise (DTX) frames are sent, and pure
-  1-2 byte DTX frames are dropped before TX (see audio.md §5.1)
-- No retransmissions
-
----
-
-## Relaying & Multi-Hop
-
-Audio is **single-hop by default**: ordinary (ungranted) audio is **never
-relayed**, which prevents flooding. Multi-hop relaying is a conditional path used
-only for the currently-active speaker(s):
-
-- When a node is actively speaking (sending ACTIVE frames), the coordinator grants
-  it as an active speaker - up to `MESH_MAX_ACTIVE_SPEAKERS` concurrently - and
-  broadcasts **SPEAKER_GRANT**. That speaker's audio then carries the
-  `SPEAKER_GRANTED` flag. **SPEAKER_RELEASE** ends the grant when it goes idle.
-- Only `SPEAKER_GRANTED` audio is eligible for relay. A per-speaker **relay mask**
-  decides who relays: nodes that *heard* the speaker may relay it; nodes that did
-  not hear it are the intended recipients. (Comfort-noise / silence frames are not
-  ACTIVE, so they never trigger a grant or relay.)
-- Relays are **TTL-bounded** (`MESH_AUDIO_TTL_DEFAULT` = 2, decremented per hop;
-  TTL 0 is not forwarded) and **de-duplicated** by (Type, SrcID, Seq), so a frame
-  is never re-relayed or looped. The `RELAY_REQUEST` / `RELAYED` flags coordinate
-  this.
-- Relayed AUDIO is sent in the relay node's own slot.
-
-This is identical on both transports (ESP-NOW and nRF52840/ESB).
-
----
-
-## Join & Sync Sequence
-
-```mermaid
-sequenceDiagram
-    participant N as New node
-    participant C as Coordinator (time master)
-    Note over N: Listen passively
-    C-->>N: SYNC (frame counter, drift, coordinator addr)
-    Note over N: Learn frame timing
-    N->>C: JOIN / JOIN_V2
-    C->>N: JOIN_ACK / JOIN_ACK_V2
-    C-->>N: SLOT_MAP (broadcast)
-    Note over N: Begin TX in assigned slot
-    loop Every frame / interval
-        N->>C: AUDIO (in slot) / KEEPALIVE / STATUS
-    end
+```text
+payload_len - 8 - previous1_len - current_len
 ```
 
-Dashed arrows are broadcasts (SYNC, SLOT_MAP). After joining, periodic
-KEEPALIVE/STATUS keep the node's `last_seen` fresh so it is not timed out
-(see "Node Loss"), independent of whether it is transmitting audio.
+Bundle flags are:
 
----
+| Value | Name |
+|---:|---|
+| `0x01` | `CURRENT_ACTIVE` |
+| `0x02` | `PREVIOUS1_PRESENT` |
+| `0x04` | `PREVIOUS1_ACTIVE` |
+| `0x08` | `PREVIOUS2_PRESENT` |
+| `0x10` | `PREVIOUS2_ACTIVE` |
 
-## Control Plane
+Unknown flag bits, inconsistent presence/activity flags, empty current frames,
+and malformed lengths are rejected. `previous2` is valid only when
+`previous1` is also present.
 
-Control packets are transmitted outside TDMA voice slots. For joined nodes, both
-transports rotate control-window ownership by frame; every tenth frame is
-reserved for coordinator SYNC. ESP-NOW keeps non-SYNC control in a bounded
-priority queue and sends one item in an owned window. Before assignment,
-ESP-NOW JOIN requests transmit directly with a minimum interval and random
-jitter. ESP-NOW LEAVE also transmits directly during shutdown.
+Each Opus frame is at most 64 bytes. The three-frame data area is at most 192
+bytes, the complete bundle is at most 200 bytes, and the complete on-air packet
+is at most 208 bytes including the mesh header.
 
-### JOIN Packet
+The ESP sender currently attaches only `previous1`, and only when the cached
+frame was active, eligible, and immediately precedes `current_seq`. Parsers and
+playout recovery support both predecessors. Relays preserve the bundle when it
+fits the remaining slot airtime and strip the oldest predecessor first when it
+does not.
 
-Payload:
+## Legacy Audio
 
-| Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | Capabilities | Codec / feature bitmap (0x01 = basic Opus) |
-| 1 | 1 | Reserved | Future use |
-
-### JOIN_ACK Packet
-
-Payload:
-
-| Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | AssignedID | Node ID (1-8) |
-| 1 | 1 | SlotIndex | TDMA slot |
-| 2 | 1 | CoordinatorID | Current coordinator (time master) |
-
-ESP-NOW uses JOIN/JOIN_ACK because the receive callback supplies the sender MAC.
-Nordic ESB does not expose a transmitter address, so it uses identity-bearing
-JOIN_V2 and targeted JOIN_ACK_V2 packets instead:
-
-| Packet | Additional field | Description |
-|------|----|------|
-| JOIN_V2 | RequesterAddr (5 bytes) | Stable nRF device/ESB identity used to deduplicate retries |
-| JOIN_ACK_V2 | TargetAddr (5 bytes) | Only the matching requester accepts the broadcast ACK |
-| LEAVE | SenderAddr (5 bytes, nRF) | Confirms that the departing node ID belongs to this ESB identity |
-
-All nRF boards in a mesh must run firmware using the same JOIN handshake.
-
----
-
-## Time Synchronization (SYNC)
-
-### SYNC Packet
-
-Payload:
+The legacy `AUDIO` payload is:
 
 | Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 4 | FrameCounter | TDMA frame number |
-| 4 | 2 | DriftPPM | Estimated clock drift |
-| 6 | 5-6 | CoordinatorAddr | Coordinator radio address, used for master-election tiebreak (6 bytes WiFi MAC on ESP-NOW, 5 bytes ESB address on nRF52840) |
+|---:|---:|---|---|
+| 0 | 1 | `codec` | `0x01` for Opus |
+| 1 | 1 | `frame_ms` | `20` |
+| 2 | 1 | `stream_id` | Source stream |
+| 3 | 1 | `audio_flags` | Bit `0x01` means active audio |
+| 4 | N | data | Opus data, or the nRF RTT diagnostic payload |
 
-### Behavior
+## TDMA and RF Delivery
 
-- Master sends SYNC every 10 frames in the 16-18 ms control window
-- Participants derive a frame epoch from valid coordinator SYNC, maintain frame history, apply bounded phase/rate correction, and reacquire after a large frame-counter difference
-- Loss of SYNC triggers re-election
+A frame is 20 ms. It contains eight fixed 2 ms voice slots followed by a 2 ms
+control window. Each voice or control window closes 500 us before its nominal
+end, providing the fixed guard interval. SYNC is sent every ten frames; that
+control window is reserved for the coordinator. Other control-window ownership
+rotates by frame and assigned slot.
 
----
+Audio is attempted only in the sender's voice slot. Late work is dropped. RF
+audio has no delivery ACK and no protocol retry. nRF ESB transmissions set the
+no-ACK flag; ESP-NOW completion callbacks account for local send completion but
+do not trigger audio retransmission. Loss is handled by V2 predecessor recovery
+and Opus packet-loss concealment.
 
-## Slot Map (SLOT_MAP)
+## Relaying
 
-Broadcast by master when:
-- Node joins/leaves
-- Reconfiguration needed
+Ordinary audio remains one hop. The coordinator may grant at most two active
+speakers and publishes a relay mask for each. A packet is relay-eligible only
+when it has `RELAY_REQUEST`, `SPEAKER_GRANTED`, a positive TTL, and the receiving
+node is selected in that speaker's relay mask. Relays deduplicate by packet type,
+source ID, and sequence. The default audio TTL is `2`; each relay decrements it
+and sets `RELAYED`.
 
-Payload:
+Relay arbitration is transport-specific:
 
-| Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | SlotCount | Number of slots |
-| 1 | 8 | SlotIDs | Ordered node IDs, zero for an unused slot |
-| 9 | 1 | ActiveSpeakerCount | Number of relay-granted speakers |
-| 10 | 2 | ActiveSpeakerIDs | Relay-granted node IDs |
-| 12 | 2 | RelayMasks | Per-speaker relay-node bitmaps |
+- ESP-NOW always sends queued local audio first and uses an otherwise idle local
+  slot for one relay.
+- nRF alternates local and relay traffic when both are pending. It may defer an
+  active local V2 frame and send its successor on the next local turn only when
+  that successor proves recovery by carrying the deferred frame as `previous1`.
 
----
+There is no cross-transport claim of identical relay scheduling.
 
-## Status & Keepalive
+## Join Identity
 
-### STATUS Packet
+ESP-NOW obtains the sender's 6-byte MAC from receive metadata, so its payloads
+do not carry an address:
 
-Payload:
+| Packet | Size | Payload |
+|---|---:|---|
+| `JOIN` | 2 | `capabilities`, `reserved` |
+| `JOIN_ACK` | 3 | `assigned_id`, `slot_index`, `coordinator_id` |
+| `LEAVE` | 0 | Sender identity comes from receive metadata |
 
-| Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | BatteryPct | Battery percentage (0-100, 255=unknown) |
-| 1 | 1 | RssiDbm | Last measured RSSI (dBm) |
-| 2 | 1 | PeerCount | Active peer count |
-| 3 | 1 | FwVersion | Firmware protocol version |
-| 4 | 1 | TemperatureC | Temperature in C (127=unknown) |
-| 5 | 1 | HeardBitmap | Sources heard during the reporting interval |
-| 6 | 1 | RelayBitmap | Sources relayed during the reporting interval |
-| 7 | 1 | ActiveSpeakers | Number of active/granted speakers |
+The coordinator unicasts `JOIN_ACK` to the requester MAC. Repeated joins from a
+known MAC refresh that member and receive the same assignment.
 
-### KEEPALIVE Packet
+ESB receive delivery does not provide a transmitter identity. nRF therefore
+uses identity-bearing payloads:
 
-Payload:
+| Packet | Size | Payload |
+|---|---:|---|
+| `JOIN_V2` | 7 | `capabilities`, `reserved`, `requester_addr[5]` |
+| `JOIN_ACK_V2` | 8 | `assigned_id`, `slot_index`, `coordinator_id`, `target_addr[5]` |
+| `LEAVE` | 5 | `sender_addr[5]`; this is the current transmitted form |
 
-| Offset | Size | Field | Description |
-|------|----|------|------------|
-| 0 | 1 | BatteryPct | Battery percentage (0-100, 255=unknown) |
-| 1 | 1 | Reserved | Future use |
+`JOIN_V2` is sent with source ID `0`. Its stable device-derived ESB address lets
+the coordinator deduplicate retries. `JOIN_ACK_V2` is broadcast, but only the
+requester whose local address matches `target_addr` accepts it. nRF ignores the
+legacy `JOIN` and `JOIN_ACK` forms.
 
----
+The nRF receiver also accepts a zero-length legacy `LEAVE` for compatibility.
+That form identifies the departing peer only by `SrcID`. New senders use the
+five-byte identity-bearing form.
 
-## Failure Handling
+## Sync, Membership, and Status
 
-### Audio Loss
-
-- Missing frames are concealed by Opus PLC
-- No retransmission
-
-### Node Loss
-
-- Each node tracks a per-peer `last_seen` timestamp, refreshed by **any** packet
-  from that peer (AUDIO / KEEPALIVE / STATUS / JOIN).
-- A peer is dropped after `MESH_NODE_TIMEOUT_MS` (3000 ms) with no packets; its
-  slot is then freed and a new SLOT_MAP is broadcast by the coordinator.
-- Implemented on both transports (ESP-NOW and nRF52840/ESB).
-- Liveness is independent of voice activity: KEEPALIVE/STATUS continue during
-  silence (every 500 ms on ESP-NOW, ~1000 ms on nRF52840), so a silent node is
-  **not** dropped even though its audio TX is suppressed (see audio.md §5.1).
-
-### Master Loss
-
-- Coordinator loss is detected by SYNC timeout; nodes return to scanning.
-- On a coordinator conflict, the node with the lower radio address wins
-  (lexicographic `memcmp` of the address); the other demotes to participant.
-
----
-
-## ESP32 - nRF52 Inter-MCU Protocol
-
-### Transport
-- SPI preferred
-- ~UART acceptable for early prototypes~
-
-### Message Types
-
-| Type | Value | Direction | Purpose |
-|----|----|----------|--------|
-| AUDIO | 0x01 | Bidirectional | Audio data |
-| STATUS | 0x02 | nRF → ESP | Mesh status |
-| EVENT | 0x03 | nRF → ESP | Mesh events |
-| COMMAND | 0x04 | ESP → nRF | Mesh commands |
-| LOG | 0x05 | nRF → ESP | Debug logs |
-
-The packet IDs and packed control/status payloads are shared in
-`shared/bridge_protocol_defs.h`. Mesh START and STOP carry an 8-bit generation.
-The ESP permits one lifecycle command at a time and retries that same generation
-until a matching command ACK arrives or the attempt limit expires. ACK means the
-nRF command worker applied the requested transition; readiness is reported
-separately through STATUS and MESH_READY/MESH_STOPPED events.
-
-STATUS reports protocol version, explicit `IDLE`, `SCANNING`, `JOINING`, or
-`ACTIVE` state, role, node ID, slot, coordinator ID, and peer count. PEER_JOINED
-and PEER_LEFT describe topology changes only and are not lifecycle readiness
-signals.
-
-### Frame Format
-
-```
-[SYNC:0xAA] [LEN] [SEQ] [TYPE] [PAYLOAD...] [CRC8]
-```
-
-- LEN covers: `SEQ + TYPE + PAYLOAD`
-- CRC8 covers: `LEN + SEQ + TYPE + PAYLOAD`
-
-SPI is full duplex. ESP-to-nRF audio is retained as a single in-flight frame and
-re-presented until the nRF admission ACK pulse or a bounded timeout. Lifecycle
-control can pass while audio awaits ACK. The nRF prioritizes outbound control and
-only advances its control/audio queue after a successful SPI transfer, so a
-failed transaction is retryable rather than destructive.
-
-### Audio Message
+`SYNC` differs only in coordinator address width:
 
 | Offset | Size | Field |
-|------|----|------|
-| 0 | 1 | SrcID |
-| 1 | N | OpusData |
+|---:|---:|---|
+| 0 | 4 | `frame_counter`, little-endian |
+| 4 | 2 | signed `drift_ppm`, little-endian |
+| 6 | 6 or 5 | ESP-NOW MAC or nRF ESB coordinator address |
 
----
+The address is also the coordinator-election tie-breaker: the lower
+lexicographic address wins. nRF coordinators currently send `drift_ppm = 0`;
+participants currently apply phase correction or reacquire timing from received
+SYNC timestamps. The advertised rate-correction term is inactive while
+`drift_ppm` remains zero.
 
-## Versioning
+`SLOT_MAP` is always 14 bytes:
 
-- Major version increments break compatibility
-- Minor version adds optional fields
-- Version field in header enforces negotiation
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 1 | `slot_count` |
+| 1 | 8 | `slot_ids`; zero marks an unused slot |
+| 9 | 1 | `active_speaker_count` |
+| 10 | 2 | `active_speaker_ids` |
+| 12 | 2 | `relay_masks` |
 
----
+Current senders publish `slot_count = 8`. `SPEAKER_GRANT` is five bytes
+(`speaker_count`, two IDs, two masks); `SPEAKER_RELEASE` is three bytes
+(`speaker_count`, two IDs).
 
-## Status
+`STATUS` is exactly 8 bytes:
 
-The current wire version is `0x01`. Shared layouts are compile-time size checked;
-there is no implemented optional-field negotiation or encrypted/authenticated mode.
+| Offset | Size | Field | Sentinel or meaning |
+|---:|---:|---|---|
+| 0 | 1 | `battery_pct` | `0..100`; `255` unknown |
+| 1 | 1 | signed `rssi_dbm` | `127` unknown |
+| 2 | 1 | `peer_count` | Active peers |
+| 3 | 1 | `fw_version` | Currently `0x02` |
+| 4 | 1 | signed `temperature_c` | `127` unknown |
+| 5 | 1 | `heard_bitmap` | Sources heard in the reporting interval |
+| 6 | 1 | `relay_bitmap` | Sources relayed in the reporting interval |
+| 7 | 1 | `active_speakers` | Current active/granted count |
+
+`KEEPALIVE` is two bytes: `battery_pct` and `reserved`.
+
+## Liveness and Coordinator Loss
+
+The ordinary peer timeout is 3000 ms without accepted traffic. Audio, join
+retries, keepalives, and status reports refresh the relevant peer records; SYNC
+refreshes coordinator presence. Silence therefore does not depend on audio
+traffic.
+
+The transports differ in coordinator handling:
+
+- ESP-NOW sends KEEPALIVE every 500 ms and STATUS every 1000 ms. Its general
+  3000 ms peer timeout also removes a missing coordinator and returns the node
+  to scanning.
+- nRF sends STATUS and KEEPALIVE together every 1000 ms. It excludes the
+  coordinator from the 3000 ms peer reaper and instead returns to scanning after
+  5000 ms without accepted coordinator SYNC.
+
+## ESP32-S3/nRF52840 Bridge
+
+The bridge is SPI only. The nRF52840 is master and the ESP32-S3 is slave. It
+runs at 4 MHz, mode 0, with manual active-low chip select. The master starts one
+full-duplex transaction every 2 ms. Every transaction clocks exactly 256 bytes;
+unused bytes are zero and an all-zero first byte is idle.
+
+One framed message may occupy the start of a transaction:
+
+```text
+0xAA | LEN | SEQ | TYPE | PAYLOAD... | CRC8 | zero padding...
+```
+
+`LEN` is `2 + payload_length` and covers `SEQ`, `TYPE`, and payload. CRC8 covers
+`LEN` through the final payload byte, uses polynomial `0x07`, and starts at zero.
+The frame length before padding is `payload_length + 5`. The bridge constrains
+application payloads to 208 bytes even though the generic frame codec can
+represent up to 253.
+
+Bridge packet types are:
+
+| Value | Name | Direction |
+|---:|---|---|
+| `0x01` | `AUDIO` | Bidirectional legacy RTT diagnostic |
+| `0x02` | `STATUS` | nRF to ESP |
+| `0x03` | `MESH_EVENT` | nRF to ESP |
+| `0x04` | `CONTROL` | ESP to nRF |
+| `0x05` | `LOG` | nRF to ESP |
+| `0x06` | `AUDIO_V2` | Bidirectional normal audio |
+
+Audio payload direction is significant:
+
+- ESP to nRF `AUDIO_V2`: the intact V2 bundle.
+- nRF to ESP `AUDIO_V2`: `src_id` followed by the intact V2 bundle.
+- ESP to nRF legacy `AUDIO`: `audio_flags` followed by the RTT payload.
+- nRF to ESP legacy `AUDIO`: `src_id`, `audio_flags`, then the RTT payload.
+
+ESP-to-nRF audio uses GPIO-ACK stop-and-wait across SPI: the ESP retains and
+re-presents one in-flight audio frame until nRF admission produces an ACK pulse
+or the 50 ms timeout expires. Control can pass while audio is waiting. This
+bridge reliability mechanism does not apply to RF transmission.
+
+The bridge status payload is eight bytes: `role`, `peer_count`, `node_id`,
+`version`, `mesh_state`, signed `slot_index`, `coordinator_id`, and marker
+`0xA5`. Bridge protocol version is `2`. START and STOP control payloads contain
+`command` and 8-bit `generation`; command ACK events contain `command`, matching
+`generation`, and signed result.
+
+See [inter_mcu.md](inter_mcu.md) for ownership, queueing, status freshness, and
+failure behavior.
+
+## Security
+
+On-air authentication and encryption are not implemented. Key management and
+secure firmware update are outside protocol v2 and remain deferred.

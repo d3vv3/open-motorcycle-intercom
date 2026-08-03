@@ -1,13 +1,37 @@
 # Wiring Guide
 
-## Microphone Input
+This guide covers a development-board prototype built from breakout modules and
+also records how those functions appear on the current Rev2 PCB schematic. The
+Rev2 PCB integrates the PCM5102A, MAX9814, headphone amplifier, nRF52840, and CTIA
+jack; do not wire breakout modules on top of those integrated circuits. Rev2 is a
+development design, not a claim of production readiness.
 
-### Analog Microphone via TRRS (ADC)
+## CTIA Headset Jack
 
-This configuration uses an **analog electret microphone**
-(like a standard headset mic)
-connected through the ESP32-S3
-using the MAX 9814 microphone amplifier module.
+A CTIA TRRS headset uses this contact order:
+
+| Contact | Signal |
+|---------|--------|
+| Tip | Left headphone audio |
+| Ring 1 | Right headphone audio |
+| Ring 2 | Ground |
+| Sleeve | Microphone |
+
+The Rev2 `J2` jack follows this CTIA mapping. OMTP headsets swap microphone and
+ground and require an adapter.
+
+## Prototype Microphone Input
+
+### (Recommended) Analog Microphone via TRRS (ADC)
+
+Use a MAX9814 breakout to amplify an analog electret microphone before the
+ESP32-S3 ADC. Common MAX9814 breakouts include an onboard electret microphone:
+`OUT` is the amplified analog output, not a microphone input. To use a headset
+microphone, connect the CTIA sleeve to the breakout's microphone input/bias point
+only if that point is exposed and follow the breakout vendor's instructions for
+disconnecting its onboard microphone. Connect CTIA ring 2 to ground. The jack tip
+and ring 1 are left and right headphone outputs and do not connect to the
+MAX9814.
 
 | MAX9814 Pin | ESP32-S3                                |
 | ----------- | --------------------------------------- |
@@ -15,23 +39,16 @@ using the MAX 9814 microphone amplifier module.
 | GND         | GND                                     |
 | OUT         | GPIO1 (ADC)                             |
 | AR          | Leave floating (default attack/release) |
-| GAIN        |VDD (40dB), GND (50dB) or floating (60dB)|
-
-3.5mm TRS JACK CONNECTIONS:
-| TRRS   | MAX9814 |
-|--------|---------|
-| TIP    | MIC+     |
-| RING1  | (NC)    |
-| RING2  | (NC)    |
-| SLEEVE | GND     |
-
-> Ring 1, Ring 2 or Tip can be used for MIC+ depending on the TRRS implementation.
+| GAIN        | VDD (40 dB), GND (50 dB), or floating (60 dB) |
 
 **ADC Configuration:**
 - Channel: ADC1_CHANNEL_0 (GPIO1)
 - Sample rate: 16 kHz
 - Bit width: 12-bit (ESP32-S3 native)
-- Attenuation: **2.5dB**
+- Attenuation: **12 dB**
+
+On Rev2, the MAX9814 circuit and headset microphone bias/coupling are integrated;
+the amplified `MIC_ADC` signal reaches ESP32-S3 GPIO1.
 
 ### I2S Digital Microphone (INMP441)
 
@@ -49,9 +66,25 @@ The original design planned for an INMP441 I2S digital microphone. If switching 
 **Note:** Code changes required to switch from ADC to I2S RX mode.
 
 
-## Speaker
+## Prototype Audio Output
 
-### MAX98357A I2S Amplifier (Speaker Output)
+### (Recommended) PCM5102A 3.5mm Audio Jack
+
+The PCM5102A is an I2S DAC for a line/headphone signal path. It is not a power
+amplifier for a passive speaker. Use powered headphones/speakers or a suitable
+headphone or speaker amplifier after the DAC. Rev2 routes the PCM5102A outputs
+through a TPA6132A2 headphone amplifier to the CTIA jack.
+
+| PCM5102A            | ESP32-S3 |
+| ------------------- | -------- |
+| **BCK**             | GPIO4    |
+| **LCK (LRCK / WS)** | GPIO5    |
+| **DIN**             | GPIO7    |
+| **VIN**             | **3.3V** |
+| **GND**             | GND      |
+
+
+### MAX98357A I2S Amplifier (Alternative Speaker Output)
 
 The MAX98357A is a mono I2S Class-D amplifier. It connects to the ESP32-S3 via the I2S interface.
 
@@ -73,20 +106,12 @@ The MAX98357A is a mono I2S Class-D amplifier. It connects to the ESP32-S3 via t
 Connect SPK+ and SPK- to your speaker. Speaker impedance should be 4-8 Ohms,
 and the speaker should be 0.5W to 3W for best results.
 
-### PCM5102A 3.5mm Audio Jack (Alternative Speaker Output)
+The current firmware emits standard Philips-format I2S on the same BCLK, WS, and
+DOUT pins used by both modules. A standard-I2S MAX98357A therefore needs no
+firmware pin-mode change; configure only the module's gain/channel hardware as
+needed.
 
-| PCM5102A            | ESP32-S3 |
-| ------------------- | -------- |
-| **BCK**             | GPIO4    |
-| **LCK (LRCK / WS)** | GPIO5    |
-| **DIN**             | GPIO7    |
-| **VIN**             | **3.3V** |
-| **GND**             | GND      |
-
-**Note:** Code changes required to switch from MAX98357A to PCM5102A.
-
-
-## nRF52840 Mesh Radio (XIAO)
+## (Optional, Recommended) nRF52840 Mesh Radio (XIAO)
 
 The Seeed XIAO nRF52840 handles mesh networking via ESB (Enhanced ShockBurst).
 Audio packets received from the mesh are sent to ESP32-S3 via SPI for mixing.
@@ -94,7 +119,9 @@ Audio packets received from the mesh are sent to ESP32-S3 via SPI for mixing.
 ### SPI Connection
 
 The nRF52840 is the SPI **master** and the ESP32-S3 is the SPI **slave**.
-The master polls the slave every 5 ms with a full-duplex 256-byte transaction.
+The bridge uses SPI mode 0 at 4 MHz. The nRF polls every 2 ms with a full-duplex
+256-byte transaction and drives chip select manually because hardware CS is too
+short for reliable ESP32 SPI-slave detection.
 
 | XIAO nRF52840 | ESP32-S3 | Function |
 |---------------|----------|----------|
@@ -102,15 +129,18 @@ The master polls the slave every 5 ms with a full-duplex 256-byte transaction.
 | **Pin 7** (P1.12 / MISO) | **GPIO9**  | ESP MISO -> nRF MISO |
 | **Pin 8** (P1.13 / SCK)  | **GPIO11** | SPI Clock |
 | **Pin 9** (P1.14 / CS)   | **GPIO12** | Chip Select (active low) |
+| **D10** (P1.15) | **GPIO2** | Audio-admission ACK pulse, nRF -> ESP |
+| **3V3** | **3V3** | Common 3.3 V supply/reference |
 | **GND** | **GND** | Common ground |
+
+Use one regulated 3.3 V source for the shared 3V3 rail; do not tie together two
+independently powered regulator outputs.
 
 ### I2S WS Sync Wire (Clock Discipline)
 
-The ESP32's I2S Word Select (WS) output is tapped and fed to the nRF52840. The
-nRF counts rising edges in hardware and uses valid frame samples to discipline
-its coordinator TDMA period in 100 us timer increments. Corrections are bounded;
-the wire reduces relative drift but does not eliminate oscillator error or prove
-over-the-air synchronization accuracy.
+The ESP32's I2S Word Select (WS) output is also fed to the nRF52840. The nRF counts
+WS edges and uses them to discipline its local TDMA period. This reduces relative
+clock drift but does not by itself prove over-the-air synchronization accuracy.
 
 | ESP32-S3 | XIAO nRF52840 | Function |
 |----------|---------------|----------|
@@ -121,6 +151,9 @@ over-the-air synchronization accuracy.
 > The nRF input is high-impedance and will not affect the amplifier signal.
 
 ### Wiring Diagram
+
+The compact diagram shows the SPI bus and WS sync. The ACK and shared supply
+connections are listed in the complete table above.
 
 ```
 ESP32-S3                    XIAO nRF52840
@@ -138,4 +171,3 @@ ESP32-S3                    XIAO nRF52840
 ```
 
 > **Note:** Both boards run at 3.3V logic, no level shifter needed.
-

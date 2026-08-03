@@ -41,6 +41,8 @@ As a result, OpenHelmet is designed around **custom real-time audio transport**.
 
 ### Single-MCU
 
+Enough to get you started! Check [the wiring guide](docs/wiring.md) for details on a single-MCU prototype. It needs an ESP32-S3, an amplified microphone input, and an I2S DAC or amplifier for audio output.
+
 - [x] **ESP32-S3**
 - [x] TDMA mesh protocol over [ESP-NOW](https://www.espressif.com/en/solutions/low-power-solutions/esp-now) (2.4 GHz)
 - [x] Opus low-bitrate voice
@@ -48,20 +50,28 @@ As a result, OpenHelmet is designed around **custom real-time audio transport**.
 - [x] Speaker output via headphone jack
 - [x] VOX for voice activation
 - [x] Configure ESP32 tx power to 20 dBm (100 mW) for ESP-NOW
-- [x] Silence suppression (Opus DTX) - no radio TX during silence
+- [x] Silence suppression (Opus DTX) - most silent audio frames are suppressed; control traffic and occasional comfort updates remain
+- [x] Three-source receive mixer with first-speaker retention; a new active source can replace the longest-silent source after 400 ms
 
 ### Dual-MCU
 
-- [x] **ESP32-S3 + Nordic nRF52 52840**
+Development and validation only.
+Check [the wiring guide](docs/wiring.md) for details on how to build a dual-MCU intercom with an ESP32-S3, nRF52840, and speaker/mic hardware.
+
+The nRF52840 firmware uses the radio's +8 dBm output directly. An nRF21540 is optional for additional range, not required for basic operation. Rev2 includes the nRF21540 in its hardware design, but firmware control of the FEM and its range benefit have not yet been validated.
+
+- [x] **ESP32-S3 + Nordic nRF52840**
 - [x] TDMA mesh protocol over [ESB](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html) radio with custom PHY control
-  > The firmware configures ESB at 1 Mbps with 8 dBm TX power (`OMI_ESB_BITRATE` / `OMI_ESB_TX_POWER_DBM`).
+  > ESB is configured for 2 Mbps with +8 dBm TX power (`OMI_ESB_BITRATE` / `OMI_ESB_TX_POWER_DBM`).
 - [x] SPI audio & control bridge between MCUs
-  > Needed to make the SPI handling to take place only in 1 core of the ESP32
-- [x] Noise supression, echo cancellation
+  > The nRF52840 is the SPI master and polls the ESP32 bridge every 2 ms.
+- [x] Noise suppression and echo cancellation paths
 - [ ] Allow user to choose between [ESP-NOW](https://www.espressif.com/en/solutions/low-power-solutions/esp-now) and [ESB](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html)
-  > ESP-NOW is not interoperable with nRF52' ESB.
-- [ ] Add [nRF21540 RF FEM](https://www.nordicsemi.com/Products/nRF21540) to boost range
-  > [Validation](https://www.nordicsemi.com/Nordic-news/2023/01/Aptener-Mechatronics-BluArmor-C30-Helmet-Comms-Unit-employs-nRF52840-SoC-and-nRF21540-RF-FEM)
+  > ESP-NOW is not interoperable with nRF52 ESB. The firmware currently selects ESB when the bridge is detected and otherwise falls back to ESP-NOW; comparative range, power, and latency remain to be measured.
+- [x] Include an optional [nRF21540 RF FEM](https://www.nordicsemi.com/Products/nRF21540) in the Rev2 design
+  > Hardware bring-up and firmware control of `FEM_TX_EN`, `FEM_RX_EN`, `FEM_MODE`, `FEM_PDN`, and the SPI control interface are still outstanding.
+- [x] Three-source receive mixer with first-speaker retention and 400 ms silent-source eviction
+- [x] Relay grants limited to at most two active speakers
 
 ### Triple-MCU
 
@@ -71,12 +81,16 @@ As a result, OpenHelmet is designed around **custom real-time audio transport**.
 
 ### Custom PCB
 
-- [ ] PCB design with integrated audio codec and power management
-- [ ] Battery power with charging circuit
-- [ ] USB-C for firmware flashing
-- [ ] Buttons
+- [x] Rev2 PCB design files with integrated audio, dual MCUs, RF FEM, USB-C, charger, and regulator
+- [x] Close schematic ERC findings
+- [ ] Close PCB DRC, routing, and manufacturing-rule findings
+- [ ] Validate battery charging and regulated power rails on assembled hardware
+- [ ] Validate USB recovery and flashing
+- [ ] Bring up buttons, audio, RF, and FEM on Rev2 hardware
 - [ ] Open-source manufacturing files
 - [ ] Testing on real motorcycle rides
+
+Rev2 is a design in progress, not completed hardware. DRC closure, manufacturing output generation, assembly, and board bring-up are unfinished.
 
 ### Niceties
 
@@ -124,7 +138,7 @@ Frame structure (20 ms frame, 8 riders):
 
 - Voice slots: 8 × 2 ms = 16 ms
 - Control window: 2 ms (scheduled sync/topology/status traffic)
-- Frame margin: 2 ms; each voice/control deadline also reserves a 500 us guard
+- Frame margin: 2 ms; voice and control deadlines also reserve guard time
 
 Motorcycle groups are small and topology changes slowly, making TDMA practical.
 
@@ -135,7 +149,7 @@ Used for:
 - Topology updates
 - Slot maps and synchronization
 
-ESP-NOW queues joined-node control packets in a bounded, priority-aware queue and sends at most one when the node owns the control window. Unassigned JOIN requests use a minimum interval plus random jitter; JOIN during discovery and graceful LEAVE during shutdown are immediate exceptions because the sender does not yet have, or is relinquishing, a schedule.
+Joined-node control packets use a bounded queue and scheduled ownership. Unassigned ESP-NOW JOIN requests use a minimum interval plus randomized jitter. These rules reduce contention, but they do not guarantee collision-free RF operation.
 
 ---
 
@@ -144,10 +158,11 @@ ESP-NOW queues joined-node control packets in a bounded, priority-aware queue an
 ### Prerequisites
 
 - [ESP-IDF v5.5+](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/get-started/)
-- ESP32-S3-DevKitC-1-N8R8
+- ESP32-S3 development board with at least 8 MB flash (the DevKitC-1 N8R8 is supported, but this firmware does not currently enable or require PSRAM)
 - (Optional) XIAO nRF52840
 - USB-C data cables
-- [Audio Hardware Wiring Guide](docs/wiring.md)
+- [Development environment and ESP32 setup](docs/getting_started.md)
+- [Audio and dual-MCU wiring guide](docs/wiring.md)
 - (Optional) [KiCad](https://www.kicad.org/)
 
 ### Build
@@ -160,8 +175,11 @@ source ~/esp/esp-idf/export.sh
 idf.py build
 ```
 
-CI builds both the ESP32-S3 and XIAO nRF52840 firmware. It also runs the Python
-tests, compiles the shared wire headers, and runs the host `mesh_core` tests.
+For the optional XIAO nRF52840 firmware, use nRF Connect SDK v2.7.0 and the same board target as CI:
+
+```bash
+west build -b xiao_ble/nrf52840 ./nrf_mesh -d ./build-nrf
+```
 
 ### Flash
 
@@ -190,13 +208,21 @@ stty -F /dev/ttyACM0 115200 raw -echo && cat /dev/ttyACM0
 ```
 I (xxx) omi: ========================================
 I (xxx) omi: OMI - Open Motorcycle Intercom
-I (xxx) omi: Boot time: 0 ms
-I (xxx) omi: Opus version: libopus x.x.x
-I (xxx) omi: Free heap: 275432 bytes
+I (xxx) omi: Phase 2: Single-Hop RF Link
 I (xxx) omi: ========================================
-I (xxx) audio: Initializing audio subsystem
-I (xxx) audio: Audio task heartbeat: loops=0, encoded=0, decoded=0
+I (xxx) omi: Boot time: <milliseconds> ms
+I (xxx) omi: IDF version: v5.5.x
+I (xxx) omi: Free heap: <bytes> bytes
+I (xxx) omi: ========================================
+I (xxx) omi: nRF52840 not detected - using ESP-NOW transport
+I (xxx) omi: Mesh networking ready (desired state: disabled)
+I (xxx) omi: System running!
 ```
+
+With a working nRF bridge, the transport line is currently logged as `nRF52840 detected on UART - using ESB transport`; the `UART` name is legacy wording for the SPI bridge. Timestamps and heap values vary by build and are not setup pass/fail criteria.
+
+On a fresh device, mesh intent defaults to disabled. Hold the ESP Boot button for
+two seconds to enable it. The setting is stored in NVS for later boots.
 
 ### Troubleshooting
 

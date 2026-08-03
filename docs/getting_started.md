@@ -10,18 +10,28 @@ This guide covers setting up a development environment for the Open Motorcycle I
 
 ### Hardware
 
+This will get you started, together with **cables** and **soldering tools**:
+
 | Item | Notes |
 |------|-------|
-| ESP32-S3-DevKitC-1-N8R8 | Must have PSRAM (N8R8 variant) |
+| ESP32-S3-DevKitC-1-N8 or compatible | 8 MB flash; PSRAM is not required or enabled |
+| PCM5102A breakout | Recommended I2S audio output for a prototype |
+| MAX9814 breakout | Recommended analog microphone input for a prototype |
+| CTIA TRRS 3.5mm jack | For headset audio and microphone connections |
+| A TRRS/TRS microphone headset | For testing audio |
+| Powered headphones or an amplified speaker | A passive speaker needs a separate amplifier |
 | USB-C cable | For flashing and debugging |
+| A power source | 5V USB power supply or battery pack |
 
-See [Hardware BOM](../README.md#hardware-bom-development) for full component list.
+Check the [Wiring Guide](wiring.md) for prototype wiring and the differences in
+the Rev2 PCB schematic.
 
 ### Software
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| ESP-IDF | v5.5 | [Installation Guide](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/get-started/) |
+| ESP-IDF | v5.5 (v5.5.2 recommended) | [Installation Guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.2/esp32s3/get-started/) |
+| nRF Connect SDK | v2.7.0 | Required to build the optional XIAO nRF52840 firmware |
 | Git | Any recent | Source control |
 
 ---
@@ -29,12 +39,12 @@ See [Hardware BOM](../README.md#hardware-bom-development) for full component lis
 ## Build
 
 ```bash
-# Activate ESP-IDF environment
-get_idf
+# Activate ESP-IDF environment. Adjust the path for your installation.
+source ~/esp/esp-idf/export.sh
 
 # Clone the repository
-git clone https://github.com/your-org/omi.git
-cd omi
+git clone https://github.com/d3vv3/open-motorcycle-intercom.git
+cd open-motorcycle-intercom
 
 # Set target to ESP32-S3
 idf.py set-target esp32s3
@@ -45,53 +55,59 @@ idf.py build
 
 First build takes several minutes. Subsequent builds are faster.
 
+### Build the XIAO nRF52840 Firmware
+
+Use an nRF Connect SDK v2.7.0 workspace, then build from that workspace with the
+exact board target used by CI:
+
+```bash
+west build -b xiao_ble/nrf52840 /path/to/open-motorcycle-intercom/nrf_mesh \
+  -d /path/to/open-motorcycle-intercom/build-nrf
+```
+
+The output includes `build-nrf/zephyr/zephyr.hex` and
+`build-nrf/zephyr/zephyr.uf2`.
+
 ---
 
 ## Flash and Monitor
 
 ```bash
 # Flash firmware
-idf.py -p /dev/ttyUSB0 flash
+idf.py -p /dev/ttyACM0 flash
 
 # Monitor serial output
-idf.py -p /dev/ttyUSB0 monitor
+idf.py -p /dev/ttyACM0 monitor
 
 # Or combined
-idf.py -p /dev/ttyUSB0 flash monitor
+idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-Replace `/dev/ttyUSB0` with your serial port (`/dev/ttyACM0`, `/dev/cu.usbmodem*`, etc.).
+Identify the actual port on your system and replace `/dev/ttyACM0` as needed
+(`/dev/ttyUSB0`, `/dev/cu.usbmodem*`, and similar names are also common).
 
 **Exit monitor:** `Ctrl+]`
 
-### Expected Boot Log
+### Boot Checks
 
-```
-I (123) omi: ========================================
-I (123) omi: OMI - Open Motorcycle Intercom
-I (123) omi: IDF version: v5.5.2
-I (123) omi: Free heap: 275432 bytes
-I (123) omi: ========================================
-I (130) omi: [7 ms] NVS initialized
-I (132) omi: [9 ms] Power management initialized
-I (134) omi: [11 ms] Button handler initialized
-I (140) omi: nRF52840 not detected - using ESP-NOW transport
-I (160) omi: [37 ms] Audio initialized
-I (185) omi: [62 ms] Mesh initialized
-I (190) omi: [62 ms] System ready
-```
+Boot output changes as firmware evolves, so do not depend on exact timestamps or
+heap values. A healthy boot reports the OMI banner, ESP-IDF version, NVS, power,
+button, audio, and transport initialization. During `Detecting mesh transport...`,
+the ESP32 probes the nRF52840 over the SPI bridge. A successful SPI probe selects
+the nRF/ESB transport and disables ESP Wi-Fi/ESP-NOW; otherwise the current
+firmware reports `nRF52840 not detected - using ESP-NOW transport` and continues
+with the fallback transport.
 
-Timestamps and heap are illustrative. When an nRF52840 is wired over the SPI
-bridge, the current firmware log says `nRF52840 detected on UART - using ESB
-transport` (the `UART` label is stale); ESP-NOW initialization is then skipped in
-favor of nRF/ESB.
+Fresh NVS defaults mesh intent to disabled. Hold the ESP Boot button for two
+seconds to enable mesh operation. The firmware stores this setting for later
+boots.
 
 ---
 
 ## Project Structure
 
 ```
-omi/
+open-motorcycle-intercom/
 ├── CMakeLists.txt          # Root project file
 ├── sdkconfig.defaults      # Default SDK configuration
 ├── partitions.csv          # Flash partition table
@@ -109,19 +125,14 @@ omi/
 |   └-- hwtest/             # Hardware bring-up / test utilities
 |
 ├-- nrf_mesh/               # nRF52840 (Zephyr) radio firmware: ESB, TDMA, mesh
-├-- shared/                 # Wire definitions and transport-neutral mesh core
-├-- tests/c/                # Host compile and mesh_core tests
-├-- tests/python/           # Benchmark/parser tests
+├-- shared/                 # Shared wire formats and transport-neutral mesh code
+├-- scripts/                # Acceptance and development utilities
+├-- tests/
+|   ├-- c/                  # Host-side C unit and compile tests
+|   └-- python/             # Python acceptance and telemetry tests
 |
 └-- docs/                   # Documentation
 ```
-
-## Continuous Integration
-
-GitHub Actions builds the ESP32-S3 firmware with ESP-IDF v5.5 and the XIAO
-nRF52840 firmware with nRF Connect SDK v2.7.0. A host job runs `pytest`, compiles
-the shared wire headers with strict C11 warnings, and builds/runs the shared
-`mesh_core` tests.
 
 ---
 
@@ -153,15 +164,6 @@ sudo usermod -a -G dialout $USER
 - Use a data cable (not charge-only)
 - Try a different USB port
 - Check `dmesg | tail -20` for connection events
-
-### PSRAM Not Detected
-
-Verify boot log shows:
-```
-I (xxx) esp_psram: Found 8MB PSRAM
-```
-
-If missing, ensure you have the N8R8 variant board.
 
 ---
 
