@@ -894,10 +894,15 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         transmit_relay_entry();
         s_relay_contention_turn = false;
     } else {
-        /* NOTE: the ESP frame clock and the TDMA slot clock are independent
-         * 20 ms cadences, so a slot can fire just before its frame arrives
-         * over SPI.  The next slot carries that frame with prev1/prev2
-         * redundancy, so residual starvation costs latency, not loss. */
+        /* FIXME(timing): the ESP frame clock and the TDMA slot clock are
+         * independent 20 ms cadences, so the arrival phase drifts through a
+         * 2-4 ms risk zone around the slot and ~7% of scheduled slots fire
+         * just before their frame arrives over SPI (see [APHASE]/[TXSTARVE]
+         * telemetry).  The next slot carries that frame with prev1/prev2
+         * redundancy, so starvation costs +20 ms latency, not loss.  Fix by
+         * feeding the measured arrival phase back to the ESP via bridge
+         * status so it can skip samples once and center its frame boundary
+         * mid-frame. */
         mesh_tx_metrics_input_t input = {
             .scheduled_local_slot = true,
             .relay_pending = relay_pending,
