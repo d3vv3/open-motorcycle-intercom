@@ -3,7 +3,6 @@
  * @brief OMI - Open Motorcycle Intercom
  *
  * Main entry point for the ESP32-S3 firmware.
- * Phase 2: Single-hop RF link with TDMA mesh
  */
 
 #include <inttypes.h>
@@ -51,7 +50,7 @@ static const char *TAG = "omi";
 
 /* Test knob: bypass VOX gating and always transmit microphone frames.
  * 0 = normal VOX behavior (DTX silence suppression active), 1 = force continuous TX. */
-#define FORCE_TX_ALWAYS_FOR_TEST 0
+#define FORCE_TX_ALWAYS_FOR_TEST 1
 
 /* ============================================================================
  * State
@@ -179,18 +178,16 @@ static void disable_esp_radios_for_nrf_transport(void)
 #endif
 }
 
-/* ============================================================================
- * Audio <-> Transport Integration
- *
- * Runtime transport selection: nRF52840 (ESB via UART) or ESP-NOW (WiFi).
- * On boot, attempt UART detection. If nRF52840 responds, use it.
+/*
+ * Runtime transport selection: nRF52840 (ESB via SPI bridge) or ESP-NOW (WiFi).
+ * On boot, attempt SPI-bridge detection. If nRF52840 responds, use it.
  * Otherwise, fallback to ESP-NOW mesh.
- * ============================================================================ */
+ */
 
 typedef enum {
     TRANSPORT_NONE,
     TRANSPORT_ESP_NOW,  /* ESP-NOW mesh (WiFi) */
-    TRANSPORT_NRF52840, /* nRF52840 ESB (via UART bridge) */
+    TRANSPORT_NRF52840, /* nRF52840 ESB via SPI bridge */
 } transport_type_t;
 
 static transport_type_t s_active_transport = TRANSPORT_NONE;
@@ -349,7 +346,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
             }
             if (ret != ESP_OK) {
                 s_pipe_spi_enqueue_fail++;
-                ESP_LOGD(TAG, "Failed to send audio via UART: %s", esp_err_to_name(ret));
+                ESP_LOGD(TAG, "Failed to send audio via SPI bridge: %s", esp_err_to_name(ret));
             } else {
                 s_pipe_spi_enqueue_ok++;
                 int64_t now_us = esp_timer_get_time();
@@ -460,7 +457,7 @@ static void offer_nrf_predecessor(uint8_t src_id, const uint8_t *data, size_t le
 }
 
 /**
- * @brief Callback from UART bridge when audio is received (nRF52840)
+ * @brief Callback from SPI bridge when audio is received (nRF52840)
  */
 static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t len,
                                    int64_t timestamp_us, bool redundant_bundle)
@@ -684,9 +681,9 @@ static void bridge_status_callback(const uart_bridge_status_t *status)
     xSemaphoreGive(s_nrf_membership_mutex);
 
     if (logged_join) {
-        ESP_LOGI(TAG, "nRF peer count increased to %u", status->peer_count);
+        ESP_LOGI(TAG, "nRF peer count is now %u", status->peer_count);
     } else if (logged_leave) {
-        ESP_LOGI(TAG, "nRF peer count decreased to %u", status->peer_count);
+        ESP_LOGI(TAG, "nRF peer count is now %u", status->peer_count);
     }
 }
 
@@ -872,18 +869,15 @@ void app_main(void)
     int64_t boot_time = get_time_ms();
     rtt_probe_init();
 
-    ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "OMI - Open Motorcycle Intercom");
 #if ENABLE_MESH_MODE
-    ESP_LOGI(TAG, "Phase 2: Single-Hop RF Link");
+    ESP_LOGI(TAG, "Mesh transport enabled");
 #else
-    ESP_LOGI(TAG, "Phase 1: Audio Pipeline Loopback");
+    ESP_LOGI(TAG, "Audio pipeline loopback");
 #endif
-    ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "Boot time: %" PRId64 " ms", boot_time);
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "========================================");
 
     /* Initialize NVS */
     ESP_ERROR_CHECK(init_nvs());
@@ -893,7 +887,7 @@ void app_main(void)
     s_nrf_membership_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(s_nrf_membership_mutex ? ESP_OK : ESP_ERR_NO_MEM);
 
-    /* Initialize power management (Phase 3) */
+    /* Initialize power management. */
     esp_err_t ret = power_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize power management: %s", esp_err_to_name(ret));
@@ -917,13 +911,13 @@ void app_main(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Detecting mesh transport...");
 
-    /* Try UART bridge first */
+    /* Try the nRF SPI bridge first. */
     ret = uart_bridge_init();
     /* Probe for nRF52840 (send ping and wait up to 2s, with retries) */
     if (ret == ESP_OK && uart_bridge_probe(2000)) {
-        /* nRF52840 detected - use ESB via UART */
+        /* nRF52840 detected: use ESB via SPI bridge. */
         s_active_transport = TRANSPORT_NRF52840;
-        ESP_LOGI(TAG, "nRF52840 detected on UART - using ESB transport");
+        ESP_LOGI(TAG, "nRF52840 detected on SPI bridge - using ESB transport");
 
         uart_bridge_set_audio_callback(bridge_audio_callback);
         uart_bridge_set_event_callback(bridge_event_callback);
@@ -1032,19 +1026,6 @@ void app_main(void)
     ESP_LOGI(TAG, "System running!");
     ESP_LOGI(TAG, "");
 
-#if ENABLE_MESH_MODE
-    ESP_LOGI(TAG, "=== Phase 2 Exit Criteria ===");
-    ESP_LOGI(TAG, "1. Clear voice at 50-100m LOS");
-    ESP_LOGI(TAG, "2. Packet loss < 10%% sustained");
-    ESP_LOGI(TAG, "3. Dynamic join/leave working");
-#else
-    ESP_LOGI(TAG, "=== Phase 1 Exit Criteria ===");
-    ESP_LOGI(TAG, "1. Latency must be < 50 ms");
-    ESP_LOGI(TAG, "2. No audio glitches over 30 minutes");
-#endif
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "========================================");
-
     /* Main loop - log system health periodically
      * - Quick stats every 10 seconds for active debugging
      * - Full health check every 60 seconds
@@ -1066,7 +1047,7 @@ void app_main(void)
         int64_t now_ms = get_time_ms();
 
 #if ENABLE_MESH_MODE
-        /* Quick stats every 10 seconds for Phase 2 validation */
+        /* Quick stats for mesh validation. */
         if (s_mesh_active && mesh_is_initialized() &&
             (now_ms - last_quick_stats) >= quick_stats_interval_ms) {
             mesh_stats_t mesh_stats;

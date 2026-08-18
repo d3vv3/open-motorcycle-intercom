@@ -1,21 +1,4 @@
-/**
- * @file mesh.h
- * @brief OMI Mesh Networking Interface - Phase 2
- *
- * Phase 2 Implementation:
- * - ESP-NOW transport layer
- * - TDMA frame timing (20ms frames, 2ms slots)
- * - Dynamic join/leave protocol
- * - Time synchronization
- * - Simple jitter buffer
- *
- * This component handles:
- * - ESP-NOW transport
- * - TDMA scheduling
- * - Slot management
- * - TDMA packet transport with bounded relay flooding
- * - Time synchronization
- */
+/** @file mesh.h @brief ESP-NOW mesh networking interface. */
 
 #ifndef OMI_MESH_H
 #define OMI_MESH_H
@@ -33,13 +16,8 @@
 extern "C" {
 #endif
 
-/* ============================================================================
- * Constants
- *
- * Wire-protocol constants, enums (mesh_role_t / mesh_state_t / mesh_pkt_type_t),
- * the packet header, and payload structs come from shared/mesh_protocol_defs.h
- * (included above). Only ESP-NOW-specific items are defined here.
- * ============================================================================ */
+/* Wire-protocol constants, enums, headers, and payloads come from
+ * shared/mesh_protocol_defs.h. Only ESP-NOW-specific items are defined here. */
 
 /** @brief Control window duration in milliseconds */
 #define MESH_CONTROL_MS 2
@@ -55,10 +33,6 @@ extern "C" {
 
 /** @brief Maximum pending ESP-NOW control packets */
 #define MESH_CONTROL_QUEUE_CAPACITY 12
-
-/* ============================================================================
- * ESP-NOW-specific protocol types
- * ============================================================================ */
 
 /**
  * @brief SYNC payload - ESP-NOW variant (6-byte WiFi MAC for tiebreaking)
@@ -161,7 +135,7 @@ typedef struct {
  * @param len Length of audio data
  * @param src_id Source node ID
  * @param audio_flags Per-frame audio activity flags
- * @param timestamp_us Receive timestamp (microseconds)
+ * @param timestamp_us Original ESP-NOW receive timestamp (microseconds)
  */
 typedef void (*mesh_audio_cb_t)(const uint8_t *data, uint16_t len, uint8_t src_id,
                                  uint8_t audio_flags, int64_t timestamp_us);
@@ -181,10 +155,6 @@ typedef void (*mesh_state_cb_t)(mesh_state_t old_state, mesh_state_t new_state);
  * @param joined true if joined, false if left
  */
 typedef void (*mesh_peer_cb_t)(const mesh_peer_info_t *peer, bool joined);
-
-/* ============================================================================
- * Public Functions
- * ============================================================================ */
 
 /**
  * @brief Initialize the mesh subsystem with default configuration

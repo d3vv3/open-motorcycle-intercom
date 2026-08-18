@@ -2,7 +2,13 @@
 # Always build - runtime detection determines if it's used
 
 idf_component_register(
-    SRCS "mesh.c" "../../shared/mesh_core.c"
+    SRCS
+        "mesh.c"
+        "mesh_transport.c"
+        "mesh_tdma.c"
+        "mesh_audio.c"
+        "mesh_session.c"
+        "../../shared/mesh_core.c"
     INCLUDE_DIRS "include" "../../shared"
     REQUIRES 
         esp_wifi
