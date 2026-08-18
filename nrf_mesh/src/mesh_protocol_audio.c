@@ -95,6 +95,7 @@ static struct k_work s_audio_ingress_work;
 #define s_e2e_spi_out_frames s_context.e2e_spi_out_frames
 
 static void audio_ingress_work_handler(struct k_work *work);
+static void drain_audio_ingress(void);
 static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter);
 
 void mesh_protocol_audio_init(void)
@@ -190,9 +191,10 @@ static void note_tx_starvation(void)
 {
     if (mesh_tx_metrics_should_log_starvation(s_stat_tx_starvation)) {
         int32_t tts = tdma_get_time_to_slot_us();
-        printk("[TXSTARVE] total=%u r=%u id=%u sl=%d q=%u tts=%d\n",
+        printk("[TXSTARVE] total=%u r=%u id=%u sl=%d q=%u mq=%u tts=%d\n",
                s_stat_tx_starvation, s_role, s_node_id, s_slot_index,
-               s_tx_queue_depth_dbg, tts);
+               s_tx_queue_depth_dbg,
+               k_msgq_num_used_get(&s_audio_ingress_queue), tts);
     }
 }
 
@@ -821,6 +823,12 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     ARG_UNUSED(slot_index);
     ARG_UNUSED(frame_counter);
 
+    /* Pull any ingress that is still queued behind this work item on the
+     * same workqueue.  A frame put by the SPI thread just before the slot
+     * timer fired would otherwise wait a full extra frame, and its slot
+     * would be misreported as starved. */
+    drain_audio_ingress();
+
     uint32_t now = k_uptime_get_32();
     bool has_audio_source = s_stat_spi_audio_in != 0 &&
                             (now - s_last_audio_in_time) < 120;
@@ -886,6 +894,10 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         transmit_relay_entry();
         s_relay_contention_turn = false;
     } else {
+        /* NOTE: the ESP frame clock and the TDMA slot clock are independent
+         * 20 ms cadences, so a slot can fire just before its frame arrives
+         * over SPI.  The next slot carries that frame with prev1/prev2
+         * redundancy, so residual starvation costs latency, not loss. */
         mesh_tx_metrics_input_t input = {
             .scheduled_local_slot = true,
             .relay_pending = relay_pending,
@@ -1035,13 +1047,18 @@ int mesh_protocol_send_audio_v2(const uint8_t *data, uint8_t len)
                                MESH_PKT_AUDIO_V2);
 }
 
-static void audio_ingress_work_handler(struct k_work *work)
+static void drain_audio_ingress(void)
 {
-    ARG_UNUSED(work);
     struct audio_ingress_entry entry;
 
     while (k_msgq_get(&s_audio_ingress_queue, &entry, K_NO_WAIT) == 0) {
         (void)process_audio_ingress(entry.data, entry.len, entry.audio_flags,
                                     entry.packet_type);
     }
+}
+
+static void audio_ingress_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    drain_audio_ingress();
 }
