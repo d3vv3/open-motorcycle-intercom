@@ -126,10 +126,9 @@ open-motorcycle-intercom/
 |
 ├-- nrf_mesh/               # nRF52840 (Zephyr) radio firmware: ESB, TDMA, mesh
 ├-- shared/                 # Shared wire formats and transport-neutral mesh code
-├-- scripts/                # Acceptance and development utilities
 ├-- tests/
 |   ├-- c/                  # Host-side C unit and compile tests
-|   └-- python/             # Python acceptance and telemetry tests
+|   └-- python/             # Telemetry-parsing tests for benchmark.py
 |
 └-- docs/                   # Documentation
 ```
