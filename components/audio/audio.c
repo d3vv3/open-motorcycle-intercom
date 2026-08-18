@@ -1072,7 +1072,9 @@ static void capture_task(void *arg)
         }
 
         int64_t processing_time_us = esp_timer_get_time() - frame_start_us;
-        /* Two descriptors bound queued speaker data to roughly one or two frames. */
+        /* NOTE: latency stats cover local processing plus this DMA estimate;
+         * they do not measure mouth-to-ear latency over the radio. Two
+         * descriptors bound queued speaker data to roughly one or two frames. */
         int64_t dma_latency_us = ((int64_t)I2S_DMA_BUFFER_COUNT / 2) * 20000;
         int64_t total_latency_us = processing_time_us + dma_latency_us;
         latency_sum += total_latency_us;
@@ -1377,6 +1379,8 @@ bool audio_vox_active(void)
     return stats.vox_active;
 }
 
+/* FIXME(api): legacy pull API kept only for link compatibility; frames flow
+ * through the TX callback. Remove together with the header declaration. */
 esp_err_t audio_get_tx_frame(audio_frame_t *frame, uint32_t timeout_ms)
 {
     if (!s_initialized || frame == NULL) {

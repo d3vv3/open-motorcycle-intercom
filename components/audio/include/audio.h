@@ -3,11 +3,12 @@
  * @brief OMI Audio Subsystem Interface
  *
  * This component handles:
- * - Microphone capture (I2S)
- * - Speaker output (I2S)
+ * - Microphone capture (ADC continuous mode, MAX9814 analog mic)
+ * - Speaker output (I2S TX to the PCM5102A DAC)
  * - Opus encode/decode
  * - VOX detection
  * - Packet-store and adaptive PCM playout
+ * - Notification tone synthesis
  */
 
 #ifndef OMI_AUDIO_H
@@ -25,15 +26,17 @@ extern "C" {
 /*
  * I2S GPIO Pin Definitions
  *
- * Default pin assignments for ESP32-S3-DevKitC-1:
- *   - BCLK (bit clock):  GPIO 4 - shared between mic and speaker
- *   - WS (word select):  GPIO 5 - shared between mic and speaker
- *   - DIN (data in):     GPIO 6 - from INMP441 microphone
- *   - DOUT (data out):   GPIO 7 - to MAX98357A amplifier
+ * The I2S bus only drives the speaker DAC; the microphone is sampled by the
+ * ADC (see audio_adc_config_t).
+ *   - BCLK (bit clock):  GPIO 4
+ *   - WS (word select):  GPIO 5
+ *   - DOUT (data out):   GPIO 7 - to the PCM5102A DAC
  */
 #define AUDIO_I2S_BCLK_GPIO 4 /**< I2S bit clock GPIO */
 #define AUDIO_I2S_WS_GPIO   5 /**< I2S word select (LRCLK) GPIO */
-#define AUDIO_I2S_DIN_GPIO  6 /**< I2S data in (from mic) GPIO */
+/* FIXME(api): DIN is unused; capture moved to the ADC. Remove this constant
+ * and audio_i2s_pins_t.din_gpio together on the next config change. */
+#define AUDIO_I2S_DIN_GPIO  6 /**< Unused I2S data-in GPIO */
 #define AUDIO_I2S_DOUT_GPIO 7 /**< I2S data out (to speaker) GPIO */
 
 /** Matches the mesh grant limit while keeping audio independent of mesh headers. */
@@ -45,7 +48,7 @@ extern "C" {
 typedef struct {
     int bclk_gpio; /**< Bit clock GPIO */
     int ws_gpio;   /**< Word select (LRCLK) GPIO */
-    int din_gpio;  /**< Data in GPIO (microphone) */
+    int din_gpio;  /**< Unused; the microphone is sampled by the ADC */
     int dout_gpio; /**< Data out GPIO (speaker) */
 } audio_i2s_pins_t;
 
@@ -104,9 +107,15 @@ typedef struct {
  * @brief Audio operating mode
  */
 typedef enum {
-    AUDIO_MODE_LOOPBACK = 0, /**< Phase 1: Local loopback for testing */
-    AUDIO_MODE_MESH,         /**< Phase 2+: Send/receive via mesh */
+    AUDIO_MODE_LOOPBACK = 0, /**< Local encode/decode loopback for bench testing */
+    AUDIO_MODE_MESH,         /**< Send/receive via the mesh transport */
 } audio_mode_t;
+
+/**
+ * @brief Callback for VOX activity transitions
+ * @param active true when speech starts, false when it ends
+ */
+typedef void (*audio_activity_cb_t)(bool active);
 
 /**
  * @brief Callback for encoded audio frames (TX)
@@ -119,8 +128,6 @@ typedef enum {
  * @param active true when VOX marks the frame as active speech
  * @param timestamp_us Capture timestamp in microseconds
  */
-typedef void (*audio_activity_cb_t)(bool active);
-
 typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active,
                               int64_t timestamp_us);
 
@@ -185,8 +192,10 @@ typedef struct {
     uint32_t encode_time_us_max; /**< Maximum encode time in microseconds */
     uint32_t decode_time_us_avg; /**< Average decode time in microseconds */
     uint32_t decode_time_us_max; /**< Maximum decode time in microseconds */
-    uint32_t latency_ms_avg;     /**< Average end-to-end latency in milliseconds */
-    uint32_t latency_ms_max;     /**< Maximum end-to-end latency in milliseconds */
+    /* NOTE: latency_ms_* cover local capture processing plus an I2S DMA
+     * estimate only; mouth-to-ear latency over the radio is not measured. */
+    uint32_t latency_ms_avg;     /**< Average local pipeline latency in milliseconds */
+    uint32_t latency_ms_max;     /**< Maximum local pipeline latency in milliseconds */
     uint32_t tx_pipe_us_avg;     /**< Mic capture -> transport enqueue latency avg (us) */
     uint32_t tx_pipe_us_max;     /**< Mic capture -> transport enqueue latency max (us) */
     uint32_t rx_pipe_us_avg;     /**< RX packet enqueue -> speaker write latency avg (us) */
@@ -255,31 +264,35 @@ esp_err_t audio_deinit(void);
 
 /**
  * @brief Start audio capture and playback
+ *
+ * Blocks until both worker tasks report ready or a startup failure.
+ *
  * @return ESP_OK on success
- * @note TODO: Phase 1 - Enable I2S streams
  */
 esp_err_t audio_start(void);
 
 /**
  * @brief Stop audio capture and playback
  * @return ESP_OK on success
- * @note TODO: Phase 1 - Disable I2S streams
  */
 esp_err_t audio_stop(void);
 
 /**
  * @brief Check if VOX is currently active (speech detected)
  * @return true if speech detected
- * @note TODO: Phase 1 - Implement VOX detection
  */
 bool audio_vox_active(void);
 
 /**
- * @brief Get the next encoded audio frame for transmission
+ * @brief Legacy pull API for encoded frames
+ *
+ * FIXME(api): always returns ESP_ERR_NOT_SUPPORTED; TX frames are delivered
+ * through audio_register_tx_callback(). Remove this function once callers
+ * are confirmed gone.
+ *
  * @param frame Output frame buffer
  * @param timeout_ms Timeout in milliseconds
- * @return ESP_OK if frame available, ESP_ERR_TIMEOUT otherwise
- * @note TODO: Phase 1 - Implement Opus encoding
+ * @return ESP_ERR_NOT_SUPPORTED
  */
 esp_err_t audio_get_tx_frame(audio_frame_t *frame, uint32_t timeout_ms);
 
@@ -288,7 +301,6 @@ esp_err_t audio_get_tx_frame(audio_frame_t *frame, uint32_t timeout_ms);
  * @param frame Received frame
  * @param source_id Source node ID
  * @return ESP_OK on success
- * @note TODO: Phase 1 - Implement jitter buffer and Opus decoding
  */
 esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id);
 
