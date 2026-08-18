@@ -51,18 +51,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4.2.2
 
-      - name: Set up Python
-        uses: actions/setup-python@v5.6.0
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
         with:
-          python-version: '3.12'
-          cache: pip
-          cache-dependency-path: tests/python/requirements.txt
-
-      - name: Install test dependencies
-        run: python -m pip install -r tests/python/requirements.txt
+          enable-cache: true
 
       - name: Run repository Python tests
-        run: python -m pytest tests/python
+        run: uv run --frozen pytest
 
       - name: Compile shared wire headers
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -fsyntax-only tests/c/wire_headers_compile.c

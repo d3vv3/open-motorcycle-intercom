@@ -565,7 +565,7 @@ class PipelineLogTest(unittest.TestCase):
         self.assertEqual(link["status"], "inconsistent correlated data")
         self.assertIsNone(link["delivery_pct"])
 
-    @patch("benchmark.list_ports.comports")
+    @patch("benchtool.capture.list_ports.comports")
     def test_reconnect_candidates_follow_stable_usb_identity(self, comports):
         comports.return_value = [
             SimpleNamespace(device="/dev/ttyACM1", serial_number="abc", vid=1, pid=2),

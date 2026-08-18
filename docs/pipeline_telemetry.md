@@ -65,6 +65,6 @@ identity.
 ## Commands
 
 ```bash
-python benchmark.py --duration 120
-python -m pytest tests/python
+uv run benchmark.py --duration 120
+uv run pytest
 ```

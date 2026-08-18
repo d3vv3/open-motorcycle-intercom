@@ -1,0 +1,20 @@
+[project]
+name = "omi-benchtool"
+version = "0.1.0"
+description = "Serial benchmark and telemetry tooling for the OMI intercom rig"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial==3.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["."]
+
+[tool.uv]
+package = false
