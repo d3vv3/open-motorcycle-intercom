@@ -112,7 +112,8 @@ _SNAPSHOT_GAUGE_KEYS = {
 MESH_RE = re.compile(
     r"tx=(?P<tx>\d+)\(err=(?P<tx_err>\d+)\) rx=(?P<rx>\d+) drop=(?P<drop>\d+) "
     r"fwd=(?P<fwd>\d+) \| spi_in=(?P<spi_in>\d+) overwr=(?P<overwr>\d+) "
-    r"under=(?P<under>\d+) q=(?P<q>\d+)"
+    r"(?:(?:starve=(?P<starve>\d+)(?: drain=(?P<drain>\d+))?)|under=(?P<under>\d+)) "
+    r"q=(?P<q>\d+)"
 )
 
 SPI_RE = re.compile(
@@ -183,11 +184,13 @@ NRF_UFLOW_RE = re.compile(
     r"\[UFLOW\].*under=(?P<under>\d+).*reason=(?P<reason>[A-Za-z0-9_\-]+)"
 )
 
+NRF_TXSTARVE_RE = re.compile(r"\[TXSTARVE\]\s+total=(?P<total>\d+)\b")
+
 NRF_AUDIO_RX_RE = re.compile(r"uart_bridge: Audio:\s*(?P<rx_pkts>\d+)\s*pkts received")
 
 NRF_ATUNE_RE = re.compile(
     r"\[ATUNE\]\s+r=(?P<r>\d+)\s+id=(?P<id>\d+)\s+q=(?P<q>\d+)\s+"
-    r"under_d=(?P<under_d>\d+)\s+skip=(?P<skip>\d+)/(?P<ticks>\d+)\s+"
+    r"(?:under_d=(?P<under_d>\d+)\s+)?skip=(?P<skip>\d+)/(?P<ticks>\d+)\s+"
     r"ws_e=(?P<ws_edges>\d+)\s+ws_n=(?P<ws_samples>\d+)\s+"
     r"ws_ok=(?P<ws_valid>\d+)\s+ws_no=(?P<ws_no_signal>\d+)\s+"
     r"ws_rej=(?P<ws_rejected>\d+)\s+ws_delta=(?P<ws_delta>\d+)\s+"
@@ -216,6 +219,7 @@ NRF_E2E_RE = re.compile(
 # All regex + field-name pairs for simple "first/last int dict" parsing.
 _SIMPLE_PARSERS: list[tuple[re.Pattern, str]] = [
     (MESH_RE, "mesh"),
+    (NRF_TXSTARVE_RE, "txstarve"),
     (SPI_RE, "spi"),
     (ESP_AUDIO_PIPE_RE, "audio_pipe"),
     (ESP_AUDIO_GLITCH_RE, "glitch"),
@@ -329,6 +333,32 @@ def _scalar_series_delta(values: list[int]) -> int | None:
     return _reset_aware_delta([{"value": value} for value in values])[0]["value"]
 
 
+_U32_MAX = (1 << 32) - 1
+_U32_ROLLOVER_HIGH_WATER = 0xF0000000
+_U32_ROLLOVER_LOW_WATER = 0x0FFFFFFF
+
+
+def _u32_cumulative_series_delta(values: list[int]) -> tuple[int | None, int]:
+    """Sum a uint32 cumulative series and return its true reset count."""
+    if len(values) < 2:
+        return None, 0
+    total = 0
+    reset_count = 0
+    for previous, current in zip(values, values[1:]):
+        if current >= previous:
+            total += current - previous
+        elif (
+            previous >= _U32_ROLLOVER_HIGH_WATER
+            and current <= _U32_ROLLOVER_LOW_WATER
+        ):
+            total += (_U32_MAX - previous) + 1 + current
+        else:
+            # A non-boundary decrease starts a new counter epoch.
+            total += current
+            reset_count += 1
+    return total, reset_count
+
+
 def _rate_per_min(value: int | None, duration_s: int) -> float | None:
     if value is None or duration_s <= 0:
         return None
@@ -416,6 +446,7 @@ class PortStats:
     vox_samples: int = 0
     rx_depth_samples: int = 0
     frame_counts_samples: int = 0
+    txstarve_samples: int = 0
     uflow_events: int = 0
     nrf_audio_samples: int = 0
     atune_samples: int = 0
@@ -451,6 +482,8 @@ class PortStats:
     last_rx_depth: dict = field(default_factory=dict)
     first_frame_counts: dict = field(default_factory=dict)
     last_frame_counts: dict = field(default_factory=dict)
+    first_txstarve: dict = field(default_factory=dict)
+    last_txstarve: dict = field(default_factory=dict)
     first_e2e_esp: dict = field(default_factory=dict)
     last_e2e_esp: dict = field(default_factory=dict)
     first_e2e_nrf: dict = field(default_factory=dict)
@@ -466,7 +499,6 @@ class PortStats:
 
     # Scalars
     latency_max_peak_ms: int = 0
-    uflow_reason_counts: dict = field(default_factory=dict)
     first_uflow_under: int | None = None
     last_uflow_under: int | None = None
     first_nrf_audio_rx_pkts: int | None = None
@@ -509,6 +541,56 @@ class PortStats:
         first = getattr(self, f"first_{name}")
         last = getattr(self, f"last_{name}")
         return _reset_aware_delta([first, last], excluded)[1]
+
+
+def _cumulative_samples(s: PortStats, name: str, key: str) -> list[dict]:
+    history = s.sample_history.get(name)
+    if history:
+        return [sample for sample in history if key in sample]
+    return [
+        sample
+        for sample in (getattr(s, f"first_{name}"), getattr(s, f"last_{name}"))
+        if key in sample
+    ]
+
+
+def _nrf_starvation_source(s: PortStats) -> tuple[list[dict], str] | None:
+    """Select a cumulative series with enough samples to calculate a delta."""
+    mesh_samples = _cumulative_samples(s, "mesh", "starve")
+    if len(mesh_samples) >= 2:
+        return mesh_samples, "starve"
+
+    txstarve_samples = _cumulative_samples(s, "txstarve", "total")
+    if len(txstarve_samples) >= 2:
+        return txstarve_samples, "total"
+
+    return None
+
+
+def _nrf_starvation_delta(s: PortStats) -> int | None:
+    source = _nrf_starvation_source(s)
+    if source is None:
+        return None
+    samples, key = source
+    delta, _ = _u32_cumulative_series_delta([int(sample[key]) for sample in samples])
+    return delta
+
+
+def _mesh_starvation_series(s: PortStats) -> tuple[int | None, int]:
+    samples = _cumulative_samples(s, "mesh", "starve")
+    return _u32_cumulative_series_delta([int(sample["starve"]) for sample in samples])
+
+
+def _nrf_starvation_total(s: PortStats) -> int | None:
+    source = _nrf_starvation_source(s)
+    if source is not None:
+        samples, key = source
+        return int(samples[-1][key])
+    if "starve" in s.last_mesh:
+        return s.last_mesh["starve"]
+    if s.last_txstarve:
+        return s.last_txstarve["total"]
+    return None
 
 
 # =============================================================================
@@ -783,13 +865,11 @@ class PortReader(threading.Thread):
         m = NRF_UFLOW_RE.search(line)
         if m:
             under = int(m.group("under"))
-            reason = m.group("reason")
             if s.first_uflow_under is None:
                 s.first_uflow_under = under
             s.last_uflow_under = under
             s.uflow_under_history.append(under)
             s.uflow_events += 1
-            s.uflow_reason_counts[reason] = s.uflow_reason_counts.get(reason, 0) + 1
 
         # nRF audio RX packet count
         m = NRF_AUDIO_RX_RE.search(line)
@@ -837,6 +917,7 @@ _SNAPSHOT_NAMES = [
     "vox",
     "rx_depth",
     "frame_counts",
+    "txstarve",
     "e2e_esp",
     "e2e_nrf",
     "atune",
@@ -850,6 +931,17 @@ def _snapshot_json(s: PortStats, name: str) -> dict[str, Any]:
     history = s.sample_history.get(name, [first, last] if first and last else [])
     excluded = _IDENTITY_KEYS | _SNAPSHOT_GAUGE_KEYS.get(name, set())
     delta, resets = _reset_aware_delta(history, excluded)
+    if name == "mesh":
+        starve_delta, starve_resets = _mesh_starvation_series(s)
+        if starve_delta is None:
+            delta.pop("starve", None)
+            resets.pop("starve", None)
+        else:
+            delta["starve"] = starve_delta
+            if starve_resets:
+                resets["starve"] = starve_resets
+            else:
+                resets.pop("starve", None)
     if name == "e2e_esp" and delta:
         delta["effective_gap"] = max(
             delta.get("gap_fr", 0) - delta.get("recovered", 0), 0
@@ -885,8 +977,8 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
         "vox_samples": s.vox_samples,
         "rx_depth_samples": s.rx_depth_samples,
         "frame_counts_samples": s.frame_counts_samples,
+        "txstarve_samples": s.txstarve_samples,
         "uflow_events": s.uflow_events,
-        "uflow_reason_counts": s.uflow_reason_counts,
         "nrf_audio_samples": s.nrf_audio_samples,
         "atune_samples": s.atune_samples,
         "e2e_esp_samples": s.e2e_esp_samples,
@@ -984,7 +1076,8 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         f"latency={s.latency_samples} enc={s.encode_samples} "
         f"dec={s.decode_samples} txp={s.tx_pipeline_samples} rxp={s.rx_pipeline_samples} "
         f"vox={s.vox_samples} depth={s.rx_depth_samples} "
-        f"uflow={s.uflow_events} nrf_audio={s.nrf_audio_samples} "
+        f"txstarve={s.txstarve_samples} legacy_uflow={s.uflow_events} "
+        f"nrf_audio={s.nrf_audio_samples} "
         f"atune={s.atune_samples} e2e_esp={s.e2e_esp_samples} "
         f"e2e_nrf={s.e2e_nrf_samples}"
     )
@@ -1004,17 +1097,32 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     # Mesh
     if s.last_mesh:
         m, d = s.last_mesh, s.delta("mesh")
+        if "starve" in m:
+            mesh_starve_delta, _ = _mesh_starvation_series(s)
+            if mesh_starve_delta is not None:
+                d = dict(d)
+                d["starve"] = mesh_starve_delta
+        starvation_field = (
+            f"starve={m['starve']}" if "starve" in m else f"legacy_under={m.get('under', 0)}"
+        )
+        starvation_delta_field = (
+            f"starve={d.get('starve', 0)}"
+            if "starve" in m
+            else f"legacy_under={d.get('under', 0)}"
+        )
+        drain = m.get("drain")
         out.append(
             f"  Last MESH: tx={m['tx']} err={m['tx_err']} rx={m['rx']} "
             f"drop={m['drop']} fwd={m['fwd']} spi_in={m['spi_in']} "
-            f"overwr={m['overwr']} under={m['under']} q={m['q']}"
+            f"overwr={m['overwr']} {starvation_field}"
+            f"{' drain=' + str(drain) if drain is not None else ''} q={m['q']}"
         )
         if d:
             out.append(
                 f"  Delta MESH: tx={d.get('tx', 0)} err={d.get('tx_err', 0)} "
                 f"rx={d.get('rx', 0)} drop={d.get('drop', 0)} fwd={d.get('fwd', 0)} "
                 f"spi_in={d.get('spi_in', 0)} overwr={d.get('overwr', 0)} "
-                f"under={d.get('under', 0)}"
+                f"{starvation_delta_field} drain={d.get('drain', 0)}"
             )
 
     # SPI
@@ -1171,20 +1279,21 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
                 f"decoded={d.get('decoded_frames', 0)}"
             )
 
-    # nRF underflow
-    if s.uflow_events > 0:
-        ud = _scalar_series_delta(s.uflow_under_history)
-        reasons = ", ".join(
-            f"{k}={v}"
-            for k, v in sorted(s.uflow_reason_counts.items(), key=lambda kv: -kv[1])
-        )
+    # nRF local slot starvation
+    starve_delta = _nrf_starvation_delta(s)
+    starve_total = _nrf_starvation_total(s)
+    if starve_total is not None:
         out.append(
-            f"  nRF Underflow: events={s.uflow_events} "
-            f"under_delta={ud if ud is not None else 'n/a'} "
-            f"(events/min={_rate_per_min(s.uflow_events, duration)})"
+            f"  nRF TX starvation: total={starve_total} "
+            f"delta={starve_delta if starve_delta is not None else 'n/a'} "
+            f"(events/min={_rate_per_min(starve_delta, duration)})"
         )
-        if reasons:
-            out.append(f"  nRF Underflow reasons: {reasons}")
+    if s.last_uflow_under is not None:
+        legacy_delta = _scalar_series_delta(s.uflow_under_history)
+        out.append(
+            f"  nRF legacy UFLOW: total={s.last_uflow_under} "
+            f"delta={legacy_delta if legacy_delta is not None else 'n/a'} (not health)"
+        )
 
     # nRF bridge audio RX
     if s.last_nrf_audio_rx_pkts is not None:
@@ -1199,7 +1308,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     if s.last_atune:
         m, d = s.last_atune, s.delta("atune")
         out.append(
-            f"  nRF AutoTune: last_q={m.get('q')} under_d={m.get('under_d')} "
+            f"  nRF AutoTune: last_q={m.get('q')} "
             f"skip={m.get('skip', 0)}/{m.get('ticks', 0)} "
             f"skip_pct={m.get('skip_pct', 'n/a')}% "
             f"ws_edges={m.get('ws_edges', 'n/a')} "
@@ -1207,8 +1316,7 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
         )
         if d:
             out.append(
-                f"  Delta AutoTune: q={d.get('q', 0)} under_d={d.get('under_d', 0)} "
-                f"skip={d.get('skip', 0)}"
+                f"  Delta AutoTune: q={d.get('q', 0)} skip={d.get('skip', 0)}"
             )
 
     # E2E ESP
@@ -1290,7 +1398,7 @@ def _health_line(s: PortStats) -> str:
             if v > 0:
                 issues.append(f"{name}_{k}+{v}")
 
-    _check_delta("mesh", ["tx_err", "drop", "under"])
+    _check_delta("mesh", ["tx_err", "drop"])
     _check_delta("spi", ["crc_fail", "q_over"])
 
     audio_d = s.delta("audio_pipe")
@@ -1309,9 +1417,9 @@ def _health_line(s: PortStats) -> str:
     if decoded > 0 and rx_und > 0 and (rx_und / decoded) > 0.1:
         issues.append(f"esp_und_per_decoded={rx_und / decoded:.2f}")
 
-    uflow_d = _scalar_series_delta(s.uflow_under_history)
-    if uflow_d is not None and uflow_d > 0:
-        issues.append(f"nrf_under+{uflow_d}")
+    starve_d = _nrf_starvation_delta(s)
+    if starve_d is not None and starve_d > 0:
+        issues.append(f"nrf_starve+{starve_d}")
 
     e2e_esp_d = s.delta("e2e_esp")
     effective_gap = max(

@@ -7,8 +7,10 @@ from benchmark import (
     PortStats,
     _build_port_json,
     _health_line,
+    _nrf_starvation_delta,
     _reconnect_candidates,
     _report_lines_for_port,
+    _u32_cumulative_series_delta,
     compute_correlated_delivery,
     compute_hop_pct,
     parse_pipeline_logfmt,
@@ -111,6 +113,110 @@ class PipelineLogTest(unittest.TestCase):
         for gauge in ("ws_corr", "ws_drift", "td_sum", "td_pend", "td_last", "td_jit"):
             self.assertNotIn(gauge, summary["atune_delta"])
             self.assertNotIn(gauge, summary["atune_reset_epochs"])
+
+    def test_parses_cumulative_tx_starvation_and_avoids_duplicate_warning(self):
+        stats = PortStats(port="test", open_ok=True, lines=4)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        for line in (
+            "[MESH] r=1 id=2 sl=1 tx=10(err=0) rx=5 drop=0 fwd=2 | "
+            "spi_in=10 overwr=0 starve=4 drain=8 q=0",
+            "[TXSTARVE] total=4 r=1 id=2 sl=1 q=0 tts=100",
+            "[MESH] r=1 id=2 sl=1 tx=12(err=0) rx=7 drop=0 fwd=3 | "
+            "spi_in=12 overwr=0 starve=6 drain=11 q=0",
+            "[TXSTARVE] total=6 r=1 id=2 sl=1 q=0 tts=100",
+        ):
+            reader._parse_line(line)
+
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["first_mesh"]["starve"], 4)
+        self.assertEqual(summary["last_mesh"]["starve"], 6)
+        self.assertEqual(summary["mesh_delta"]["starve"], 2)
+        self.assertEqual(summary["mesh_delta"]["drain"], 3)
+        self.assertNotIn("starve", summary["mesh_reset_epochs"])
+        self.assertEqual(summary["txstarve_delta"]["total"], 2)
+        health = _health_line(stats)
+        self.assertEqual(health, "WARN (nrf_starve+2)")
+        self.assertEqual(health.count("nrf_starve+2"), 1)
+        report = "\n".join(_report_lines_for_port(stats, 60))
+        self.assertIn("nRF TX starvation: total=6 delta=2 (events/min=2.0)", report)
+        self.assertIn("Delta MESH:", report)
+        self.assertIn("starve=2", report)
+
+    def test_legacy_uflow_is_visible_but_never_gates_starvation_health(self):
+        stats = PortStats(port="test", open_ok=True, lines=2)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line("[UFLOW] under=64 reason=drain0")
+        reader._parse_line("[UFLOW] under=65 reason=empty")
+
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["uflow_under_delta"], 1)
+        self.assertIsNone(_nrf_starvation_delta(stats))
+        self.assertEqual(_health_line(stats), "OK (no error/drops/CRC growth observed)")
+        report = "\n".join(_report_lines_for_port(stats, 60))
+        self.assertIn("nRF legacy UFLOW: total=65 delta=1 (not health)", report)
+        self.assertNotIn("nRF TX starvation", report)
+        self.assertNotIn("reasons", report)
+
+    def test_single_mesh_starve_sample_falls_back_to_txstarve_series(self):
+        stats = PortStats(port="test", open_ok=True, lines=3)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "[MESH] r=1 id=2 sl=1 tx=10(err=0) rx=5 drop=0 fwd=2 | "
+            "spi_in=10 overwr=0 starve=99 drain=8 q=0"
+        )
+        reader._parse_line("[TXSTARVE] total=4 r=1 id=2 sl=1 q=0 tts=100")
+        reader._parse_line("[TXSTARVE] total=7 r=1 id=2 sl=1 q=0 tts=100")
+
+        self.assertEqual(_health_line(stats), "WARN (nrf_starve+3)")
+        report = "\n".join(_report_lines_for_port(stats, 60))
+        self.assertIn("nRF TX starvation: total=7 delta=3 (events/min=3.0)", report)
+
+    def test_u32_starvation_delta_recognizes_rollover_but_not_reset(self):
+        self.assertEqual(_u32_cumulative_series_delta([0xFFFFFFFD, 3]), (6, 0))
+        self.assertEqual(_u32_cumulative_series_delta([100, 4, 9]), (9, 1))
+
+    def test_mesh_starvation_uses_u32_rollover_delta(self):
+        stats = PortStats(port="test", open_ok=True, lines=2)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        for total in (0xFFFFFFFD, 3):
+            reader._parse_line(
+                "[MESH] r=1 id=2 sl=1 tx=10(err=0) rx=5 drop=0 fwd=2 | "
+                f"spi_in=10 overwr=0 starve={total} drain=8 q=0"
+            )
+
+        self.assertEqual(_nrf_starvation_delta(stats), 6)
+        self.assertEqual(_health_line(stats), "WARN (nrf_starve+6)")
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["mesh_delta"]["starve"], 6)
+        self.assertNotIn("starve", summary["mesh_reset_epochs"])
+        self.assertIn("starve=6", "\n".join(_report_lines_for_port(stats, 60)))
+
+    def test_mesh_starvation_reset_matches_json_text_and_health(self):
+        stats = PortStats(port="test", open_ok=True, lines=3)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        for total in (100, 4, 9):
+            reader._parse_line(
+                "[MESH] r=1 id=2 sl=1 tx=10(err=0) rx=5 drop=0 fwd=2 | "
+                f"spi_in=10 overwr=0 starve={total} drain=8 q=0"
+            )
+
+        summary = _build_port_json(stats)
+        self.assertEqual(summary["mesh_delta"]["starve"], 9)
+        self.assertEqual(summary["mesh_reset_epochs"]["starve"], 1)
+        self.assertEqual(_nrf_starvation_delta(stats), 9)
+        self.assertEqual(_health_line(stats), "WARN (nrf_starve+9)")
+        self.assertIn("starve=9", "\n".join(_report_lines_for_port(stats, 60)))
+
+    def test_txstarve_uses_u32_rollover_delta(self):
+        stats = PortStats(port="test", open_ok=True, lines=2)
+        reader = PortReader("test", 115200, None, "unused", stats)
+        reader._parse_line(
+            "[TXSTARVE] total=4294967293 r=1 id=2 sl=1 q=0 tts=100"
+        )
+        reader._parse_line("[TXSTARVE] total=3 r=1 id=2 sl=1 q=0 tts=100")
+
+        self.assertEqual(_nrf_starvation_delta(stats), 6)
+        self.assertEqual(_health_line(stats), "WARN (nrf_starve+6)")
 
     def test_parses_current_adaptive_playout_and_per_source_depth_lines(self):
         stats = PortStats(port="test")

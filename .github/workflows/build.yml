@@ -70,6 +70,9 @@ jobs:
       - name: Run shared mesh core tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/mesh_core_test && /tmp/mesh_core_test
 
+      - name: Run mesh TX metrics tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_tx_metrics_test.c -o /tmp/mesh_tx_metrics_test && /tmp/mesh_tx_metrics_test
+
       - name: Run audio bundle tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/audio_bundle_test && /tmp/audio_bundle_test
 
@@ -103,6 +106,7 @@ jobs:
           SAN="-fsanitize=address,undefined -fno-sanitize-recover=all -g -O1"
           FLAGS="-std=c11 -Wall -Wextra -Werror -pedantic"
           cc $FLAGS $SAN -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/san_mesh_core && /tmp/san_mesh_core
+          cc $FLAGS $SAN -I. tests/c/mesh_tx_metrics_test.c -o /tmp/san_mesh_tx_metrics && /tmp/san_mesh_tx_metrics
           cc $FLAGS $SAN -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/san_audio_bundle && /tmp/san_audio_bundle
           cc $FLAGS $SAN -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/san_audio_tx_cache && /tmp/san_audio_tx_cache
           cc $FLAGS $SAN -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/san_bridge_frame && /tmp/san_bridge_frame
