@@ -11,6 +11,11 @@ target_sources(app PRIVATE
     src/tdma.c
     src/uart_bridge.c
     src/mesh_protocol.c
+    src/mesh_protocol_rx.c
+    src/mesh_protocol_runtime.c
+    src/mesh_protocol_membership.c
+    src/mesh_protocol_audio.c
+    src/mesh_protocol_tx.c
     src/ws_sync.c
     ../shared/audio_bundle.c
     ../shared/bridge_frame.c
