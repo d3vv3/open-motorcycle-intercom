@@ -139,6 +139,11 @@ static void status_work_handler(struct k_work *work)
         printk("[ESB_TIM] tx=%u to=%u txwait=%u/%u rxpause=%u/%u us\n", esb_stats.tx_count,
                esb_stats.tx_timeout_count, esb_stats.tx_wait_us_avg, esb_stats.tx_wait_us_max,
                esb_stats.rx_pause_us_avg, esb_stats.rx_pause_us_max);
+        /* Cumulative 2 ms histogram of time-to-own-slot at audio ingress. */
+        printk("[APHASE] id=%u h=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", s_node_id,
+               C->aphase_hist[0], C->aphase_hist[1], C->aphase_hist[2], C->aphase_hist[3],
+               C->aphase_hist[4], C->aphase_hist[5], C->aphase_hist[6], C->aphase_hist[7],
+               C->aphase_hist[8], C->aphase_hist[9]);
     }
 
     s_auto_ticks++;

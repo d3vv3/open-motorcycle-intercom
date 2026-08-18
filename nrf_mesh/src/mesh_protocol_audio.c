@@ -958,6 +958,13 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
     s_last_audio_in_time = k_uptime_get_32();
     if (!is_diagnostic) {
         note_audio_activity(s_node_id, audio_flags);
+        if (s_slot_index >= 0) {
+            int32_t tts_us = tdma_get_time_to_slot_us();
+            if (tts_us >= 0) {
+                uint32_t bucket = (uint32_t)tts_us / 2000U;
+                s_context.aphase_hist[MIN(bucket, 9U)]++;
+            }
+        }
     }
 
     if (!is_diagnostic && s_role == MESH_ROLE_COORDINATOR) {

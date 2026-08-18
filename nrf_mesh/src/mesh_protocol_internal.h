@@ -154,6 +154,11 @@ typedef struct {
     uint32_t stat_bundle_max_bytes;
     uint32_t stat_local_deferred_recovery;
     uint32_t last_audio_in_time;
+    /* Ingress arrival phase: histogram of time-to-own-slot at SPI audio
+     * arrival, 2 ms buckets over one 20 ms frame. Bucket 0 = arrived just
+     * before our slot (sent immediately); bucket 9 = arrived just after
+     * (waits a full frame). */
+    uint32_t aphase_hist[10];
     uint8_t tx_queue_depth_dbg;
     uint32_t status_log_decim;
     mesh_core_seq16_t e2e_spi_in_src[256];
