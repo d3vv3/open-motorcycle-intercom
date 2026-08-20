@@ -94,8 +94,7 @@ typedef struct {
     uint8_t affected_node_id;
 } mesh_membership_result_t;
 
-mesh_membership_result_t
-mesh_membership_reduce(const mesh_membership_snapshot_t *current,
-                       const mesh_membership_event_t *event);
+mesh_membership_result_t mesh_membership_reduce(const mesh_membership_snapshot_t *current,
+                                                const mesh_membership_event_t *event);
 
 #endif /* OMI_MESH_MEMBERSHIP_H */

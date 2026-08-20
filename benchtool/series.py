@@ -54,8 +54,7 @@ def _u32_cumulative_series_delta(values: list[int]) -> tuple[int | None, int]:
         if current >= previous:
             total += current - previous
         elif (
-            previous >= _U32_ROLLOVER_HIGH_WATER
-            and current <= _U32_ROLLOVER_LOW_WATER
+            previous >= _U32_ROLLOVER_HIGH_WATER and current <= _U32_ROLLOVER_LOW_WATER
         ):
             total += (_U32_MAX - previous) + 1 + current
         else:

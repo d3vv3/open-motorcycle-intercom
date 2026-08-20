@@ -26,8 +26,8 @@
 
 static const char *TAG = "omi";
 
-#define NRF_RECONCILE_INTERVAL_MS 2000
-#define NRF_RECONCILE_MAX_ATTEMPTS 3
+#define NRF_RECONCILE_INTERVAL_MS   2000
+#define NRF_RECONCILE_MAX_ATTEMPTS  3
 #define NRF_NOTIFICATION_QUEUE_SIZE 8
 
 typedef struct {
@@ -133,8 +133,7 @@ void transport_nrf_set_user_enabled(bool enabled)
     xSemaphoreGive(s_membership_mutex);
 }
 
-void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active,
-                              int64_t timestamp_us)
+void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us)
 {
     e2e_pipe_counters_t *pipe = e2e_diag_counters();
     uint16_t seq = e2e_diag_next_tx_seq();
@@ -149,8 +148,7 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active,
      * Opus PLC covers the rare two-in-a-row loss. prev2 measured near-zero
      * additional recovery for ~1/3 of the airtime budget. */
     uint16_t previous1_len = 0;
-    const uint8_t *previous1_data =
-        audio_tx_cache_previous(&s_previous_audio, seq, &previous1_len);
+    const uint8_t *previous1_data = audio_tx_cache_previous(&s_previous_audio, seq, &previous1_len);
     bool attach_previous1 = previous1_data != NULL;
     uint8_t bundle_buf[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
     size_t bundle_len = 0;
@@ -168,17 +166,15 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active,
     if (attach_previous1) {
         bundle.flags |= AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT | AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
     }
-    bool bundle_encoded = audio_bundle_encode(&bundle, bundle_buf, sizeof(bundle_buf),
-                                              &bundle_len);
+    bool bundle_encoded = audio_bundle_encode(&bundle, bundle_buf, sizeof(bundle_buf), &bundle_len);
 
     audio_tx_cache_store(&s_previous_audio, data, len, active, seq, mesh_intent_enabled());
 
     xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
     if (mesh_intent_enabled() && uart_bridge_is_mesh_ready()) {
         pipe->spi_attempts++;
-        esp_err_t ret = bundle_encoded
-                            ? uart_bridge_send_audio_v2(bundle_buf, (uint16_t)bundle_len)
-                            : ESP_ERR_INVALID_SIZE;
+        esp_err_t ret = bundle_encoded ? uart_bridge_send_audio_v2(bundle_buf, (uint16_t)bundle_len)
+                                       : ESP_ERR_INVALID_SIZE;
         if (ret == ESP_OK) {
             pipe->bundle_tx++;
             if (attach_previous1) {
@@ -226,27 +222,41 @@ static esp_err_t submit_audio_frame(const audio_frame_t *frame, uint8_t src_id, 
     return ret;
 }
 
-static void offer_predecessor(uint8_t src_id, const uint8_t *data, size_t len, uint16_t seq,
-                              bool active, int64_t timestamp_us, uint32_t *offer_count,
-                              uint32_t *accept_count, uint32_t *reject_count)
+typedef struct {
+    uint32_t *offer_count;
+    uint32_t *accept_count;
+    uint32_t *reject_count;
+} predecessor_counter_targets_t;
+
+typedef struct {
+    uint8_t src_id;
+    const uint8_t *data;
+    size_t len;
+    uint16_t seq;
+    bool active;
+    int64_t timestamp_us;
+    predecessor_counter_targets_t counters;
+} predecessor_offer_t;
+
+static void offer_predecessor(const predecessor_offer_t *offer)
 {
     audio_frame_t frame;
 
-    (*offer_count)++;
-    memcpy(frame.data, data, len);
-    frame.len = (uint16_t)len;
-    frame.timestamp_ms = timestamp_us / 1000;
-    frame.active = active;
-    frame.seq = seq;
+    (*offer->counters.offer_count)++;
+    memcpy(frame.data, offer->data, offer->len);
+    frame.len = (uint16_t)offer->len;
+    frame.timestamp_ms = offer->timestamp_us / 1000;
+    frame.active = offer->active;
+    frame.seq = offer->seq;
     frame.has_seq = true;
 
-    bool queue_succeeded = submit_audio_frame(&frame, src_id, NULL) == ESP_OK;
+    bool queue_succeeded = submit_audio_frame(&frame, offer->src_id, NULL) == ESP_OK;
     if (queue_succeeded) {
-        (*accept_count)++;
+        (*offer->counters.accept_count)++;
     } else {
-        (*reject_count)++;
+        (*offer->counters.reject_count)++;
     }
-    e2e_diag_credit_predecessor(src_id, queue_succeeded);
+    e2e_diag_credit_predecessor(offer->src_id, queue_succeeded);
 }
 
 /**
@@ -304,18 +314,36 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     }
 
     if (bundle.previous2_len != 0) {
-        offer_predecessor(src_id, bundle.previous2_data, bundle.previous2_len,
-                          (uint16_t)(e2e_seq - 2u),
-                          (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0,
-                          timestamp_us - 40000, &pipe->prev2_offer, &pipe->prev2_accept,
-                          &pipe->prev2_reject);
+        offer_predecessor(&(predecessor_offer_t){
+            .src_id = src_id,
+            .data = bundle.previous2_data,
+            .len = bundle.previous2_len,
+            .seq = (uint16_t)(e2e_seq - 2u),
+            .active = (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0,
+            .timestamp_us = timestamp_us - 40000,
+            .counters =
+                {
+                    .offer_count = &pipe->prev2_offer,
+                    .accept_count = &pipe->prev2_accept,
+                    .reject_count = &pipe->prev2_reject,
+                },
+        });
     }
     if (bundle.previous1_len != 0) {
-        offer_predecessor(src_id, bundle.previous1_data, bundle.previous1_len,
-                          (uint16_t)(e2e_seq - 1u),
-                          (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0,
-                          timestamp_us - 20000, &pipe->prev1_offer, &pipe->prev1_accept,
-                          &pipe->prev1_reject);
+        offer_predecessor(&(predecessor_offer_t){
+            .src_id = src_id,
+            .data = bundle.previous1_data,
+            .len = bundle.previous1_len,
+            .seq = (uint16_t)(e2e_seq - 1u),
+            .active = (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0,
+            .timestamp_us = timestamp_us - 20000,
+            .counters =
+                {
+                    .offer_count = &pipe->prev1_offer,
+                    .accept_count = &pipe->prev1_accept,
+                    .reject_count = &pipe->prev1_reject,
+                },
+        });
     }
 
     memcpy(frame.data, bundle.current_data, bundle.current_len);

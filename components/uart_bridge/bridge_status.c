@@ -7,12 +7,12 @@
  * then see the bridge as disconnected and queued audio gets discarded.
  */
 
-#include "bridge_internal.h"
-
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "bridge_internal.h"
 
 static const char *TAG = "spi_bridge";
 
@@ -74,10 +74,11 @@ void bridge_status_log_telemetry(int64_t now_us)
     portEXIT_CRITICAL(&g_bridge_status_lock);
 
     ESP_LOGI(TAG,
-             "PIPE v=1 dev=esp stage=bridge_status valid_rx=%lu expire=%lu age_ms=%lu max_age_ms=%lu gen=%lu state=%u exp_gen=%lu exp_state=%u gate_stale=%lu gate_inactive=%lu gate_disconnected=%lu gate_invalid_node=%lu",
-             valid_rx, expiration_count, age_ms, max_age_ms, generation, state,
-             expired_generation, expired_state, gate_stale, gate_inactive, gate_disconnected,
-             gate_invalid_node);
+             "PIPE v=1 dev=esp stage=bridge_status valid_rx=%lu expire=%lu age_ms=%lu "
+             "max_age_ms=%lu gen=%lu state=%u exp_gen=%lu exp_state=%u gate_stale=%lu "
+             "gate_inactive=%lu gate_disconnected=%lu gate_invalid_node=%lu",
+             valid_rx, expiration_count, age_ms, max_age_ms, generation, state, expired_generation,
+             expired_state, gate_stale, gate_inactive, gate_disconnected, gate_invalid_node);
     last_log_us = now_us;
 }
 
@@ -92,10 +93,9 @@ static bool commit_status(const uart_bridge_status_t *incoming, bool detect_chan
     int64_t received_at_us = esp_timer_get_time();
 
     portENTER_CRITICAL(&g_bridge_status_lock);
-    bool continuity_lost = g_bridge.status.received_at_us > 0 &&
-                           received_at_us >= g_bridge.status.received_at_us &&
-                           received_at_us - g_bridge.status.received_at_us >
-                               BRIDGE_STATUS_STALE_TIMEOUT_US;
+    bool continuity_lost =
+        g_bridge.status.received_at_us > 0 && received_at_us >= g_bridge.status.received_at_us &&
+        received_at_us - g_bridge.status.received_at_us > BRIDGE_STATUS_STALE_TIMEOUT_US;
     if (continuity_lost && !g_bridge.status_expired) {
         update_status_age_locked(received_at_us);
         g_bridge.status_expiration_count++;
@@ -104,8 +104,7 @@ static bool commit_status(const uart_bridge_status_t *incoming, bool detect_chan
     }
 
     bool changed = detect_change &&
-                   ((!g_bridge.connected) ||
-                    (g_bridge.status.mesh_state != incoming->mesh_state) ||
+                   ((!g_bridge.connected) || (g_bridge.status.mesh_state != incoming->mesh_state) ||
                     (g_bridge.status.role != incoming->role) ||
                     (g_bridge.status.peer_count != incoming->peer_count) ||
                     (g_bridge.status.node_id != incoming->node_id));
@@ -130,8 +129,7 @@ static bool commit_status(const uart_bridge_status_t *incoming, bool detect_chan
 
 void bridge_status_apply_v2(const bridge_status_payload_t *payload)
 {
-    if (payload->version != BRIDGE_PROTOCOL_VERSION ||
-        payload->marker != BRIDGE_STATUS_V2_MARKER ||
+    if (payload->version != BRIDGE_PROTOCOL_VERSION || payload->marker != BRIDGE_STATUS_V2_MARKER ||
         payload->mesh_state > BRIDGE_MESH_STATE_ACTIVE) {
         ESP_LOGW(TAG, "Ignoring invalid bridge v2 status (version=%u marker=0x%02X)",
                  payload->version, payload->marker);
@@ -165,8 +163,8 @@ void bridge_status_apply_v2(const bridge_status_payload_t *payload)
 void bridge_status_apply_legacy(const uint8_t payload[3])
 {
     uart_bridge_status_t incoming = {
-        .mesh_state = payload[0] != 0 && payload[2] != 0 ? BRIDGE_MESH_STATE_ACTIVE
-                                                         : BRIDGE_MESH_STATE_IDLE,
+        .mesh_state =
+            payload[0] != 0 && payload[2] != 0 ? BRIDGE_MESH_STATE_ACTIVE : BRIDGE_MESH_STATE_IDLE,
         .role = payload[0],
         .node_id = payload[2],
         .slot_index = UINT8_MAX,

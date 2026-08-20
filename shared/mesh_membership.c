@@ -38,8 +38,7 @@ static bool join_ack_valid(const mesh_membership_snapshot_t *current,
     const uint8_t address_len = event->data.join_ack.address_len;
     return current->state == MESH_STATE_JOINING && event->payload_valid &&
            address_length_valid(address_len) && address_len == current->address_len &&
-           memcmp(event->data.join_ack.target_address, current->local_address,
-                  address_len) == 0 &&
+           memcmp(event->data.join_ack.target_address, current->local_address, address_len) == 0 &&
            node_id_valid(event->data.join_ack.assigned_id) &&
            event->data.join_ack.slot_index > 0U &&
            event->data.join_ack.slot_index < MESH_MAX_NODES &&
@@ -51,8 +50,7 @@ static bool join_ack_valid(const mesh_membership_snapshot_t *current,
 }
 
 static bool slot_map_valid(const mesh_slot_map_payload_t *slot_map, uint8_t local_node_id,
-                           uint8_t coordinator_id, int8_t *local_slot,
-                           uint8_t *member_count)
+                           uint8_t coordinator_id, int8_t *local_slot, uint8_t *member_count)
 {
     uint8_t member_bitmap = 0U;
     int8_t parsed_local_slot = -1;
@@ -106,7 +104,7 @@ static bool slot_map_valid(const mesh_slot_map_payload_t *slot_map, uint8_t loca
 }
 
 static mesh_membership_result_t reduce_sync(const mesh_membership_snapshot_t *current,
-                                              const mesh_membership_event_t *event)
+                                            const mesh_membership_event_t *event)
 {
     mesh_membership_result_t result = {.next = *current};
     if (!event->payload_valid || !node_id_valid(event->sender_id)) {
@@ -117,8 +115,7 @@ static mesh_membership_result_t reduce_sync(const mesh_membership_snapshot_t *cu
     if (!address_length_valid(address_len) || address_len != current->address_len ||
         address_all(event->data.sync.coordinator_address, address_len, 0U) ||
         address_all(event->data.sync.coordinator_address, address_len, UINT8_MAX) ||
-        memcmp(event->data.sync.coordinator_address, current->local_address,
-               address_len) == 0) {
+        memcmp(event->data.sync.coordinator_address, current->local_address, address_len) == 0) {
         return result;
     }
 
@@ -142,8 +139,8 @@ static mesh_membership_result_t reduce_sync(const mesh_membership_snapshot_t *cu
         return result;
     }
 
-    int comparison = address_compare(event->data.sync.coordinator_address,
-                                     current->local_address, current->address_len);
+    int comparison = address_compare(event->data.sync.coordinator_address, current->local_address,
+                                     current->address_len);
     if (comparison < 0) {
         result.next.state = MESH_STATE_JOINING;
         result.next.role = MESH_ROLE_NONE;
@@ -163,7 +160,7 @@ static mesh_membership_result_t reduce_sync(const mesh_membership_snapshot_t *cu
 }
 
 static mesh_membership_result_t reduce_join_ack(const mesh_membership_snapshot_t *current,
-                                                 const mesh_membership_event_t *event)
+                                                const mesh_membership_event_t *event)
 {
     mesh_membership_result_t result = {.next = *current};
     if (!join_ack_valid(current, event)) {
@@ -182,15 +179,15 @@ static mesh_membership_result_t reduce_join_ack(const mesh_membership_snapshot_t
 }
 
 static mesh_membership_result_t reduce_slot_map(const mesh_membership_snapshot_t *current,
-                                                 const mesh_membership_event_t *event)
+                                                const mesh_membership_event_t *event)
 {
     mesh_membership_result_t result = {.next = *current};
     int8_t local_slot;
     uint8_t member_count;
     if (current->state != MESH_STATE_ACTIVE || current->role != MESH_ROLE_PARTICIPANT ||
         event->sender_id != current->coordinator_id || !event->payload_valid ||
-        !slot_map_valid(&event->data.slot_map, current->node_id,
-                        current->coordinator_id, &local_slot, &member_count)) {
+        !slot_map_valid(&event->data.slot_map, current->node_id, current->coordinator_id,
+                        &local_slot, &member_count)) {
         return result;
     }
 
@@ -202,7 +199,7 @@ static mesh_membership_result_t reduce_slot_map(const mesh_membership_snapshot_t
 }
 
 static mesh_membership_result_t reduce_leave(const mesh_membership_snapshot_t *current,
-                                              const mesh_membership_event_t *event)
+                                             const mesh_membership_event_t *event)
 {
     mesh_membership_result_t result = {.next = *current};
     if (!node_id_valid(event->sender_id) || event->sender_id == current->node_id) {
@@ -219,8 +216,8 @@ static mesh_membership_result_t reduce_leave(const mesh_membership_snapshot_t *c
     if (event->data.leave.identity == MESH_MEMBERSHIP_LEAVE_ADDRESS &&
         address_length_valid(peer->address_len) &&
         event->data.leave.address_len == peer->address_len) {
-        identity_matches = memcmp(event->data.leave.sender_address, peer->address,
-                                  peer->address_len) == 0;
+        identity_matches =
+            memcmp(event->data.leave.sender_address, peer->address, peer->address_len) == 0;
     }
     if (!identity_matches) {
         return result;
@@ -240,9 +237,8 @@ static mesh_membership_result_t reduce_leave(const mesh_membership_snapshot_t *c
     return result;
 }
 
-mesh_membership_result_t
-mesh_membership_reduce(const mesh_membership_snapshot_t *current,
-                       const mesh_membership_event_t *event)
+mesh_membership_result_t mesh_membership_reduce(const mesh_membership_snapshot_t *current,
+                                                const mesh_membership_event_t *event)
 {
     mesh_membership_result_t result = {0};
     if (current == NULL || event == NULL) {

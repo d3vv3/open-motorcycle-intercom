@@ -3,13 +3,13 @@
  * @brief Capture task: ADC read, DSP chain, VOX, Opus encode, TX handoff.
  */
 
-#include "audio_internal.h"
-
 #include <math.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "audio_internal.h"
 #include "hal/adc_types.h"
 #include "soc/soc.h"
 
@@ -33,9 +33,8 @@ static void hpf_process(audio_hpf_state_t *state, int16_t *samples, size_t count
 {
     for (size_t i = 0; i < count; ++i) {
         float input = (float)samples[i] / 32768.0f;
-        float output = state->b0 * input + state->b1 * state->x1 +
-                       state->b2 * state->x2 - state->a1 * state->y1 -
-                       state->a2 * state->y2;
+        float output = state->b0 * input + state->b1 * state->x1 + state->b2 * state->x2 -
+                       state->a1 * state->y1 - state->a2 * state->y2;
         state->x2 = state->x1;
         state->x1 = input;
         state->y2 = state->y1;
@@ -69,8 +68,7 @@ static void convert_adc_frame(const uint8_t *adc_buffer, size_t adc_samples)
             size_t index = i * ADC_OVERSAMPLE_FACTOR + j;
             if (index < adc_samples) {
                 const adc_digi_output_data_t *sample =
-                    (const adc_digi_output_data_t *)&adc_buffer[index *
-                                                                SOC_ADC_DIGI_RESULT_BYTES];
+                    (const adc_digi_output_data_t *)&adc_buffer[index * SOC_ADC_DIGI_RESULT_BYTES];
                 sum += sample->type2.data;
                 valid++;
             }
@@ -119,12 +117,11 @@ static bool detect_voice_activity(void)
     return vox_active;
 }
 
-static int encode_frame(const int16_t *input, int64_t *encode_time_sum,
-                        uint32_t *encoded_frames)
+static int encode_frame(const int16_t *input, int64_t *encode_time_sum, uint32_t *encoded_frames)
 {
     int64_t encode_start = esp_timer_get_time();
-    int encoded = opus_encode(g_audio.opus_encoder, input, AUDIO_FRAME_SAMPLES,
-                              g_audio.opus_buffer, sizeof(g_audio.opus_buffer));
+    int encoded = opus_encode(g_audio.opus_encoder, input, AUDIO_FRAME_SAMPLES, g_audio.opus_buffer,
+                              sizeof(g_audio.opus_buffer));
     int64_t encode_time = esp_timer_get_time() - encode_start;
     if (encoded <= 0) {
         AUDIO_STATS_LOCK();
@@ -136,8 +133,7 @@ static int encode_frame(const int16_t *input, int64_t *encode_time_sum,
     *encode_time_sum += encode_time;
     AUDIO_STATS_LOCK();
     g_audio.stats.frames_encoded++;
-    g_audio.stats.encode_time_us_avg =
-        (uint32_t)(*encode_time_sum / g_audio.stats.frames_encoded);
+    g_audio.stats.encode_time_us_avg = (uint32_t)(*encode_time_sum / g_audio.stats.frames_encoded);
     if ((uint32_t)encode_time > g_audio.stats.encode_time_us_max) {
         g_audio.stats.encode_time_us_max = (uint32_t)encode_time;
     }
@@ -155,8 +151,7 @@ static void deliver_encoded_frame(int encoded, bool tx_active, int64_t frame_sta
             audio_tx_cb_t tx_callback = g_audio.tx_callback;
             portEXIT_CRITICAL(&g_audio_task_lock);
             if (tx_callback != NULL) {
-                tx_callback(g_audio.opus_buffer, (uint16_t)encoded, tx_active,
-                            frame_start_us);
+                tx_callback(g_audio.opus_buffer, (uint16_t)encoded, tx_active, frame_start_us);
             }
         } else {
             AUDIO_STATS_LOCK();
@@ -188,8 +183,7 @@ static void record_frame_latency(int64_t frame_start_us, int64_t *latency_sum,
     int64_t total_latency_us = processing_time_us + dma_latency_us;
     *latency_sum += total_latency_us;
     AUDIO_STATS_LOCK();
-    g_audio.stats.latency_ms_avg =
-        (uint32_t)((*latency_sum / (int64_t)encoded_frames) / 1000);
+    g_audio.stats.latency_ms_avg = (uint32_t)((*latency_sum / (int64_t)encoded_frames) / 1000);
     uint32_t latency_ms = (uint32_t)(total_latency_us / 1000);
     if (latency_ms > g_audio.stats.latency_ms_max) {
         g_audio.stats.latency_ms_max = latency_ms;
@@ -221,8 +215,8 @@ static uint32_t read_adc_frame(uint8_t *adc_buffer, size_t buffer_size)
     }
 
     uint32_t bytes_read = 0;
-    esp_err_t ret = adc_continuous_read(g_audio.adc_handle, adc_buffer, buffer_size,
-                                        &bytes_read, 0);
+    esp_err_t ret =
+        adc_continuous_read(g_audio.adc_handle, adc_buffer, buffer_size, &bytes_read, 0);
     if (ret == ESP_ERR_TIMEOUT) {
         if (notified) {
             AUDIO_STATS_LOCK();

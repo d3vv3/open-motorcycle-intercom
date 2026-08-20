@@ -1,7 +1,5 @@
 /** @file mesh.c @brief ESP-NOW mesh implementation. */
 
-#include "mesh_internal.h"
-
 #include <string.h>
 
 #include "esp_event.h"
@@ -9,6 +7,8 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+
+#include "mesh_internal.h"
 
 const char *const TAG = "mesh";
 const uint8_t s_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -59,8 +59,7 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
 
     if (!s_peer_mutex || !s_jitter_mutex || !s_slot_semaphore || !s_control_semaphore ||
         !s_tx_done_semaphore || !s_task_stopped_semaphore || !s_audio_producer_mutex ||
-        !s_stop_mutex || !s_frame_timer_mutex ||
-        !s_frame_event_queue || !s_timer_queue_set) {
+        !s_stop_mutex || !s_frame_timer_mutex || !s_frame_event_queue || !s_timer_queue_set) {
         ESP_LOGE(TAG, "Failed to create semaphores");
         return ESP_ERR_NO_MEM;
     }
@@ -311,9 +310,8 @@ esp_err_t mesh_stop(void)
 
     xSemaphoreGive(s_slot_semaphore);
     xSemaphoreGive(s_control_semaphore);
-    if (s_mesh_task != NULL &&
-        xSemaphoreTake(s_task_stopped_semaphore, pdMS_TO_TICKS(TASK_QUIESCE_TIMEOUT_MS)) !=
-            pdTRUE) {
+    if (s_mesh_task != NULL && xSemaphoreTake(s_task_stopped_semaphore,
+                                              pdMS_TO_TICKS(TASK_QUIESCE_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Timed out stopping mesh task");
         TaskHandle_t task = s_mesh_task;
         s_mesh_task = NULL;

@@ -131,7 +131,11 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
             "last_uflow_under": s.last_uflow_under,
             "uflow_under_delta": _scalar_series_delta(
                 s.uflow_under_history
-                or [value for value in (s.first_uflow_under, s.last_uflow_under) if value is not None]
+                or [
+                    value
+                    for value in (s.first_uflow_under, s.last_uflow_under)
+                    if value is not None
+                ]
             ),
             "first_nrf_audio_rx_pkts": s.first_nrf_audio_rx_pkts,
             "last_nrf_audio_rx_pkts": s.last_nrf_audio_rx_pkts,
@@ -193,12 +197,16 @@ def _header_lines(s: PortStats) -> list[str]:
     )
     for name in sorted(s.first_pipe):
         delta, resets = _pipe_delta_and_resets(s, name)
-        fields = " ".join(f"{key}={value}" for key, value in delta.items() if value != 0)
+        fields = " ".join(
+            f"{key}={value}" for key, value in delta.items() if value != 0
+        )
         if resets:
             fields += " resets=" + ",".join(
                 f"{key}:{count}" for key, count in sorted(resets.items())
             )
-        out.append(f"  PIPE {name} samples={s.pipe_samples.get(name, 0)} {fields}".rstrip())
+        out.append(
+            f"  PIPE {name} samples={s.pipe_samples.get(name, 0)} {fields}".rstrip()
+        )
     return out
 
 
@@ -213,7 +221,9 @@ def _mesh_lines(s: PortStats) -> list[str]:
             d = dict(d)
             d["starve"] = mesh_starve_delta
     starvation_field = (
-        f"starve={m['starve']}" if "starve" in m else f"legacy_under={m.get('under', 0)}"
+        f"starve={m['starve']}"
+        if "starve" in m
+        else f"legacy_under={m.get('under', 0)}"
     )
     starvation_delta_field = (
         f"starve={d.get('starve', 0)}"
@@ -425,9 +435,7 @@ def _nrf_lines(s: PortStats, duration: int) -> list[str]:
             f"ws_corr={m.get('ws_corr', 'n/a')} ws_drift={m.get('ws_drift', 'n/a')}"
         )
         if d:
-            out.append(
-                f"  Delta AutoTune: q={d.get('q', 0)} skip={d.get('skip', 0)}"
-            )
+            out.append(f"  Delta AutoTune: q={d.get('q', 0)} skip={d.get('skip', 0)}")
     return out
 
 
@@ -522,7 +530,9 @@ def write_human_report(
         lines.append(f"  {correlation['reason']}")
     for link in correlation["links"]:
         delivery = (
-            f"{link['delivery_pct']}%" if link["delivery_pct"] is not None else "not reported"
+            f"{link['delivery_pct']}%"
+            if link["delivery_pct"] is not None
+            else "not reported"
         )
         lines.append(
             f"  session={link['session']} {link['sender_node']}->{link['receiver_node']} "

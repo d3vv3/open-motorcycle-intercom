@@ -40,13 +40,11 @@ void audio_rx_tracker_reset_sources(audio_rx_tracker_t *tracker);
 /* Reset both source state and cumulative counters. */
 void audio_rx_tracker_reset(audio_rx_tracker_t *tracker);
 
-audio_rx_tracker_result_t audio_rx_tracker_accept(audio_rx_tracker_t *tracker,
-                                                  uint8_t source_id,
+audio_rx_tracker_result_t audio_rx_tracker_accept(audio_rx_tracker_t *tracker, uint8_t source_id,
                                                   uint16_t seq);
 
 /* Credit one queued predecessor when it corresponds to an outstanding gap. */
-bool audio_rx_tracker_credit_predecessor(audio_rx_tracker_t *tracker,
-                                         uint8_t source_id,
+bool audio_rx_tracker_credit_predecessor(audio_rx_tracker_t *tracker, uint8_t source_id,
                                          bool queue_succeeded);
 
 #endif /* OMI_AUDIO_RX_TRACKER_H */

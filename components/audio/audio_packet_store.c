@@ -18,8 +18,7 @@ static size_t audio_packet_sequence_slot(uint16_t sequence)
     return (size_t)(sequence % AUDIO_PACKET_STORE_CAPACITY);
 }
 
-static void audio_packet_store_advance_sequence(audio_packet_store_t *store,
-                                                uint16_t count,
+static void audio_packet_store_advance_sequence(audio_packet_store_t *store, uint16_t count,
                                                 bool delivered)
 {
     if (count >= 16u) {
@@ -33,8 +32,7 @@ static void audio_packet_store_advance_sequence(audio_packet_store_t *store,
     store->expected_sequence = (uint16_t)(store->expected_sequence + count);
 }
 
-static bool audio_packet_store_was_delivered(const audio_packet_store_t *store,
-                                             uint16_t sequence)
+static bool audio_packet_store_was_delivered(const audio_packet_store_t *store, uint16_t sequence)
 {
     uint16_t age = (uint16_t)(store->expected_sequence - sequence);
     if (age == 0u || age > 16u) {
@@ -43,8 +41,7 @@ static bool audio_packet_store_was_delivered(const audio_packet_store_t *store,
     return (store->delivered_history & (uint16_t)(UINT16_C(1) << (age - 1u))) != 0u;
 }
 
-static bool audio_packet_store_can_move_start(const audio_packet_store_t *store,
-                                              uint16_t sequence)
+static bool audio_packet_store_can_move_start(const audio_packet_store_t *store, uint16_t sequence)
 {
     size_t index;
 
@@ -73,9 +70,8 @@ size_t audio_packet_store_depth(const audio_packet_store_t *store)
     return store == NULL ? 0u : store->depth;
 }
 
-audio_packet_store_push_result_t audio_packet_store_push(audio_packet_store_t *store,
-                                                         const audio_packet_t *packet,
-                                                         uint64_t now_ms)
+audio_packet_store_push_result_t
+audio_packet_store_push(audio_packet_store_t *store, const audio_packet_t *packet, uint64_t now_ms)
 {
     size_t slot;
 
@@ -106,10 +102,8 @@ audio_packet_store_push_result_t audio_packet_store_push(audio_packet_store_t *s
         } else {
             distance = (uint16_t)(packet->sequence - store->expected_sequence);
             if (store->sequence_uncertain) {
-                uint16_t speculative_age =
-                    (uint16_t)(store->expected_sequence - packet->sequence);
-                if (distance >= UINT16_C(0x8000) &&
-                    store->depth == 0u &&
+                uint16_t speculative_age = (uint16_t)(store->expected_sequence - packet->sequence);
+                if (distance >= UINT16_C(0x8000) && store->depth == 0u &&
                     speculative_age <= store->consecutive_empty_missing) {
                     store->expected_sequence = packet->sequence;
                     store->delivered_history = 0u;
@@ -169,8 +163,7 @@ static audio_packet_store_pop_result_t audio_packet_store_pop_arrival(audio_pack
     audio_packet_t current;
 
     if (store->depth == 0u) {
-        return store->dtx_idle ? AUDIO_PACKET_STORE_POP_DTX_IDLE
-                               : AUDIO_PACKET_STORE_POP_MISSING;
+        return store->dtx_idle ? AUDIO_PACKET_STORE_POP_DTX_IDLE : AUDIO_PACKET_STORE_POP_MISSING;
     }
     current = store->packets[store->arrival_head];
     store->occupied[store->arrival_head] = false;
@@ -188,8 +181,7 @@ static audio_packet_store_pop_result_t audio_packet_store_pop_sequenced(audio_pa
 {
     size_t slot = audio_packet_sequence_slot(store->expected_sequence);
 
-    if (store->occupied[slot] &&
-        store->packets[slot].sequence == store->expected_sequence) {
+    if (store->occupied[slot] && store->packets[slot].sequence == store->expected_sequence) {
         audio_packet_t current = store->packets[slot];
         store->occupied[slot] = false;
         --store->depth;
@@ -219,8 +211,7 @@ static audio_packet_store_pop_result_t audio_packet_store_pop_sequenced(audio_pa
     return AUDIO_PACKET_STORE_POP_MISSING;
 }
 
-audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *store,
-                                                       uint64_t now_ms,
+audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *store, uint64_t now_ms,
                                                        audio_packet_t *packet)
 {
     bool packet_ready;
@@ -242,11 +233,10 @@ audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *sto
         packet_ready = store->depth > 0u;
     } else {
         size_t slot = audio_packet_sequence_slot(store->expected_sequence);
-        packet_ready = store->occupied[slot] &&
-                       store->packets[slot].sequence == store->expected_sequence;
+        packet_ready =
+            store->occupied[slot] && store->packets[slot].sequence == store->expected_sequence;
     }
-    if (!packet_ready &&
-        now_ms < store->next_deadline_ms + AUDIO_PACKET_STORE_LATE_GRACE_MS) {
+    if (!packet_ready && now_ms < store->next_deadline_ms + AUDIO_PACKET_STORE_LATE_GRACE_MS) {
         return AUDIO_PACKET_STORE_POP_NOT_DUE;
     }
 

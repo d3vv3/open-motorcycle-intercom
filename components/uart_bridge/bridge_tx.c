@@ -9,14 +9,13 @@
  * together on purpose.
  */
 
-#include "bridge_internal.h"
-
 #include <string.h>
-
-#include "audio_bundle.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "audio_bundle.h"
+#include "bridge_internal.h"
 
 static const char *TAG = "spi_bridge";
 
@@ -260,14 +259,18 @@ static void log_audio_pipe_stats(void)
     }
 
     ESP_LOGI(TAG,
-             "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu ack_spur=%lu ack_to=%lu waiting=%d",
+             "Audio pipe: tx_queued=%lu tx_overwr=%lu rx_from_nrf=%lu tx_q=%u ctrl_pending=%d "
+             "bad_sync=%lu bad_len=%lu trunc=%lu crc_fail=%lu seq_gap=%lu ack_irq=%lu ack_rel=%lu "
+             "ack_spur=%lu ack_to=%lu waiting=%d",
              g_bridge.audio_tx_queued, g_bridge.audio_tx_overwrite, g_bridge.audio_rx_count,
              bridge_tx_audio_depth(), g_bridge.ctrl_pending_valid ? 1 : 0, g_bridge.rx_bad_sync,
              g_bridge.rx_bad_len, g_bridge.rx_trunc, g_bridge.rx_crc_fail, g_bridge.rx_seq_gaps,
              g_bridge.ack_irq_count, g_bridge.ack_release_count, g_bridge.ack_spurious_count,
              g_bridge.ack_timeout_count, g_bridge.waiting_ack ? 1 : 0);
     ESP_LOGI(TAG,
-             "PIPE v=1 dev=esp stage=spi tx_q_ok=%lu tx_q_timeout=%lu tx_size_drop=%lu tx_stale_drop=%lu tx_wait_avg_us=%lu tx_wait_max_us=%lu rx_ok=%lu crc_drop=%lu sync_drop=%lu len_drop=%lu trunc_drop=%lu seq_gap=%lu ack_timeout=%lu q_depth=%u",
+             "PIPE v=1 dev=esp stage=spi tx_q_ok=%lu tx_q_timeout=%lu tx_size_drop=%lu "
+             "tx_stale_drop=%lu tx_wait_avg_us=%lu tx_wait_max_us=%lu rx_ok=%lu crc_drop=%lu "
+             "sync_drop=%lu len_drop=%lu trunc_drop=%lu seq_gap=%lu ack_timeout=%lu q_depth=%u",
              g_bridge.audio_tx_queued, g_bridge.audio_tx_enqueue_timeout,
              g_bridge.audio_tx_invalid_size, g_bridge.audio_tx_stale_drop,
              g_bridge.audio_tx_wait_count

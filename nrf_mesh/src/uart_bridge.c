@@ -22,9 +22,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-#include "mesh_protocol.h"
 #include "audio_bundle.h"
 #include "bridge_frame.h"
+#include "mesh_protocol.h"
 
 LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
 
@@ -32,7 +32,7 @@ LOG_MODULE_REGISTER(uart_bridge, LOG_LEVEL_INF);
  * Constants
  * ============================================================================ */
 
-#define SPI_MAX_PAYLOAD 208
+#define SPI_MAX_PAYLOAD     208
 #define TX_AUDIO_QUEUE_SIZE 16
 
 _Static_assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE + 1 <= SPI_MAX_PAYLOAD,
@@ -76,7 +76,8 @@ static struct tx_entry s_audio_q[TX_AUDIO_QUEUE_SIZE];
 static uint8_t s_audio_head = 0;
 static uint8_t s_audio_tail = 0;
 
-/* Control packet FIFO (replaces single-slot buffer to prevent event loss) */
+/* Control events can outpace an SPI poll; this FIFO prevents overwriting an unread event. */
+/* aislop-ignore-next-line ai-slop/trivial-comment -- C preprocessor directive */
 #define TX_CTRL_QUEUE_SIZE 4
 static struct tx_entry s_ctrl_q[TX_CTRL_QUEUE_SIZE];
 static uint8_t s_ctrl_head = 0;
@@ -180,8 +181,7 @@ static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
 static void parse_rx(const uint8_t *buf, size_t len)
 {
     bridge_frame_view_t frame;
-    bridge_frame_decode_result_t result =
-        bridge_frame_decode(buf, len, SPI_MAX_PAYLOAD, &frame);
+    bridge_frame_decode_result_t result = bridge_frame_decode(buf, len, SPI_MAX_PAYLOAD, &frame);
 
     if (result == BRIDGE_FRAME_IDLE || result == BRIDGE_FRAME_BAD_SYNC ||
         (result == BRIDGE_FRAME_TRUNCATED && len < BRIDGE_FRAME_OVERHEAD)) {
@@ -581,17 +581,19 @@ void uart_bridge_process(void)
 
     if ((txn_count % 2500) == 0 && s_poll_dt_count > 0) {
         uint32_t avg = (uint32_t)(s_poll_dt_sum_us / s_poll_dt_count);
-        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u seq_gap=%u crc_fail=%u ack_pulse=%u\n",
+        printk("[spi_bridge] poll_us min/avg/max=%u/%u/%u q_over=%u seq_gap=%u crc_fail=%u "
+               "ack_pulse=%u\n",
                s_poll_dt_min_us, avg, s_poll_dt_max_us, s_audio_q_overwrite, s_bridge_rx_seq_gap,
-                s_bridge_rx_crc_fail, s_ack_pulse_count);
-        printk("PIPE v=1 dev=nrf stage=spi ingress_ok=%u ingress_reject=%u ingress_dup=%u rx_seq_gap=%u rx_crc_drop=%u ack=%u audio_q_drop=%u control_q_drop=%u tx_audio=%u tx_control=%u tx_idle=%u tx_fail=%u poll_max_us=%u status_enqueue=%u status_tx=%u status_drop=%u\n",
+               s_bridge_rx_crc_fail, s_ack_pulse_count);
+        printk("PIPE v=1 dev=nrf stage=spi ingress_ok=%u ingress_reject=%u ingress_dup=%u "
+               "rx_seq_gap=%u rx_crc_drop=%u ack=%u audio_q_drop=%u control_q_drop=%u tx_audio=%u "
+               "tx_control=%u tx_idle=%u tx_fail=%u poll_max_us=%u status_enqueue=%u status_tx=%u "
+               "status_drop=%u\n",
                s_audio_ingress_ok, s_audio_ingress_reject, s_audio_ingress_duplicate,
-               s_bridge_rx_seq_gap, s_bridge_rx_crc_fail, s_ack_pulse_count,
-               s_audio_q_overwrite, s_control_q_overwrite, s_spi_tx_audio,
-               s_spi_tx_control, s_spi_tx_idle, s_spi_tx_fail, s_poll_dt_max_us,
-               s_status_enqueue, s_status_tx, s_status_drop);
+               s_bridge_rx_seq_gap, s_bridge_rx_crc_fail, s_ack_pulse_count, s_audio_q_overwrite,
+               s_control_q_overwrite, s_spi_tx_audio, s_spi_tx_control, s_spi_tx_idle,
+               s_spi_tx_fail, s_poll_dt_max_us, s_status_enqueue, s_status_tx, s_status_drop);
     }
-
 }
 
 bool uart_bridge_is_initialized(void)

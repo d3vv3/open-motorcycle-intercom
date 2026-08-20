@@ -26,8 +26,8 @@ typedef struct {
     uint8_t flags;
 } audio_bundle_view_t;
 
-bool audio_bundle_encode(const audio_bundle_view_t *bundle, uint8_t *output,
-                         size_t output_capacity, size_t *output_len);
+bool audio_bundle_encode(const audio_bundle_view_t *bundle, uint8_t *output, size_t output_capacity,
+                         size_t *output_len);
 bool audio_bundle_parse(const uint8_t *data, size_t data_len, audio_bundle_view_t *bundle);
 bool audio_bundle_strip_oldest(uint8_t *data, size_t *data_len);
 

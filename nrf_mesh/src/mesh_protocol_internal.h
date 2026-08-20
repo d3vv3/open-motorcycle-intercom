@@ -13,26 +13,26 @@
 #include "mesh_core.h"
 #include "mesh_protocol.h"
 
-#define SCAN_TIMEOUT_MS 3000
-#define SCAN_BACKOFF_MAX_MS 500
-#define JOIN_TIMEOUT_MS 5000
-#define JOIN_RETRY_MS 500
-#define JOIN_RETRY_COUNT 10
-#define STATUS_INTERVAL_MS 1000
+#define SCAN_TIMEOUT_MS           3000
+#define SCAN_BACKOFF_MAX_MS       500
+#define JOIN_TIMEOUT_MS           5000
+#define JOIN_RETRY_MS             500
+#define JOIN_RETRY_COUNT          10
+#define STATUS_INTERVAL_MS        1000
 #define ACTIVE_SPEAKER_TIMEOUT_MS 1500
-#define RELAY_RING_SIZE 16
-#define CONTROL_RING_SIZE 32
-#define TX_AUDIO_RING_SIZE 16
-#define RX_RING_SIZE 8
-#define NRF_SYNC_RX_LATENCY_US 300
-#define MESH_PACKET_PAYLOAD_MAX MESH_AUDIO_V2_MAX_BUNDLE_SIZE
-#define MESH_PACKET_OUTER_MAX MESH_AUDIO_V2_MAX_PACKET_SIZE
-#define ESB_NORMAL_RAMP_US 129U
+#define RELAY_RING_SIZE           16
+#define CONTROL_RING_SIZE         32
+#define TX_AUDIO_RING_SIZE        16
+#define RX_RING_SIZE              8
+#define NRF_SYNC_RX_LATENCY_US    300
+#define MESH_PACKET_PAYLOAD_MAX   MESH_AUDIO_V2_MAX_BUNDLE_SIZE
+#define MESH_PACKET_OUTER_MAX     MESH_AUDIO_V2_MAX_PACKET_SIZE
+#define ESB_NORMAL_RAMP_US        129U
 /* 2 Mbps on-air overhead: 2-byte preamble + 5-byte address + ~2-byte PCF + 2-byte CRC. */
 #define ESB_2MBPS_OVERHEAD_BYTES 11U
-#define ESB_2MBPS_US_PER_BYTE 4U
-#define AUDIO_TX_MARGIN_US 100U
-#define SYNC_TIMEOUT_MS 5000 /* 5 seconds timeout to allow for some packet loss */
+#define ESB_2MBPS_US_PER_BYTE    4U
+#define AUDIO_TX_MARGIN_US       100U
+#define SYNC_TIMEOUT_MS          5000 /* 5 seconds timeout to allow for some packet loss */
 
 struct audio_ingress_entry {
     uint8_t data[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
@@ -199,7 +199,7 @@ uint32_t mesh_protocol_membership_scan_timeout_ms(void);
 uint8_t mesh_protocol_membership_bridge_peer_count(void);
 void mesh_protocol_membership_reset_session_data(void);
 bool mesh_protocol_membership_process_rx_packet(const mesh_header_t *hdr, const uint8_t *payload,
-                                                 int8_t rssi, int64_t timestamp_us);
+                                                int8_t rssi, int64_t timestamp_us);
 void mesh_protocol_membership_scan_work_handler(struct k_work *work);
 void mesh_protocol_membership_join_work_handler(struct k_work *work);
 void mesh_protocol_membership_check_peer_timeouts(void);

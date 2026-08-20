@@ -1,5 +1,3 @@
-#include "mesh_internal.h"
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +6,7 @@
 #include "esp_random.h"
 #include "esp_wifi.h"
 
+#include "mesh_internal.h"
 #include "power.h"
 
 static control_priority_t control_priority(uint8_t type)
@@ -30,9 +29,8 @@ static control_priority_t control_priority(uint8_t type)
 
 static bool control_type_replaceable(uint8_t type)
 {
-    return type == MESH_PKT_STATUS || type == MESH_PKT_KEEPALIVE ||
-           type == MESH_PKT_SLOT_MAP || type == MESH_PKT_SPEAKER_GRANT ||
-           type == MESH_PKT_JOIN_ACK;
+    return type == MESH_PKT_STATUS || type == MESH_PKT_KEEPALIVE || type == MESH_PKT_SLOT_MAP ||
+           type == MESH_PKT_SPEAKER_GRANT || type == MESH_PKT_JOIN_ACK;
 }
 
 static void stats_set_control_depth(uint8_t depth, bool update_high_watermark)
@@ -61,7 +59,7 @@ void mesh_transport_restore_status_bitmaps(const control_tx_item_t *item)
 }
 
 esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len,
-                                        const uint8_t *dest_mac)
+                                 const uint8_t *dest_mac)
 {
     if (type == MESH_PKT_SYNC) {
         return ESP_ERR_INVALID_ARG;
@@ -266,8 +264,7 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     }
 
     uint16_t payload_len = rx.header.payload_len;
-    if (payload_len > sizeof(rx.payload) ||
-        payload_len > (uint16_t)(len - sizeof(mesh_header_t))) {
+    if (payload_len > sizeof(rx.payload) || payload_len > (uint16_t)(len - sizeof(mesh_header_t))) {
         goto done;
     }
     if (payload_len > 0) {
@@ -333,7 +330,7 @@ esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
 }
 
 esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint16_t len,
-                                       const uint8_t *dest_mac)
+                                const uint8_t *dest_mac)
 {
     if (len > sizeof(s_control_queue[0].data) - sizeof(mesh_header_t) ||
         (len > 0 && payload == NULL) || dest_mac == NULL) {
@@ -354,43 +351,50 @@ esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint1
     if (len > 0) {
         memcpy(buffer + sizeof(mesh_header_t), payload, len);
     }
-    return tracked_esp_now_send(dest_mac, buffer, sizeof(mesh_header_t) + len, type, 0, 0,
-                                &s_control_tx_seq, false);
+    return tracked_esp_now_send(&(tracked_esp_now_send_request_t){
+        .dest_mac = dest_mac,
+        .data = buffer,
+        .len = sizeof(mesh_header_t) + len,
+        .type = type,
+        .heard_bitmap = 0,
+        .relay_bitmap = 0,
+        .sequence = &s_control_tx_seq,
+        .audio_origin = false,
+    });
 }
 
-esp_err_t tracked_esp_now_send(const uint8_t *dest_mac, uint8_t *data, size_t len,
-                                      uint8_t type, uint8_t heard_bitmap, uint8_t relay_bitmap,
-                                      uint8_t *sequence, bool audio_origin)
+esp_err_t tracked_esp_now_send(const tracked_esp_now_send_request_t *request)
 {
-    if (dest_mac == NULL || data == NULL || len < sizeof(mesh_header_t)) {
+    if (request == NULL || request->dest_mac == NULL || request->data == NULL ||
+        request->len < sizeof(mesh_header_t)) {
         return ESP_ERR_INVALID_ARG;
     }
 
     taskENTER_CRITICAL(&s_transport_mux);
-    if (s_tx_inflight.active || (s_stopping && type != MESH_PKT_LEAVE)) {
+    if (s_tx_inflight.active || (s_stopping && request->type != MESH_PKT_LEAVE)) {
         taskEXIT_CRITICAL(&s_transport_mux);
         return ESP_ERR_INVALID_STATE;
     }
-    mesh_header_t *header = (mesh_header_t *)data;
-    if (sequence != NULL) {
-        header->seq = *sequence;
-        (*sequence)++;
+    mesh_header_t *header = (mesh_header_t *)request->data;
+    if (request->sequence != NULL) {
+        header->seq = *request->sequence;
+        (*request->sequence)++;
     }
     s_tx_inflight = (tx_inflight_t){
-        .type = type,
-        .heard_bitmap = heard_bitmap,
-        .relay_bitmap = relay_bitmap,
-        .audio_origin = audio_origin,
+        .type = request->type,
+        .heard_bitmap = request->heard_bitmap,
+        .relay_bitmap = request->relay_bitmap,
+        .audio_origin = request->audio_origin,
         .active = true,
     };
     taskEXIT_CRITICAL(&s_transport_mux);
 
-    esp_err_t ret = esp_now_send(dest_mac, data, len);
+    esp_err_t ret = esp_now_send(request->dest_mac, request->data, request->len);
     if (ret != ESP_OK) {
         taskENTER_CRITICAL(&s_transport_mux);
         s_tx_inflight.active = false;
-        if (sequence != NULL) {
-            (*sequence)--;
+        if (request->sequence != NULL) {
+            (*request->sequence)--;
         }
         taskEXIT_CRITICAL(&s_transport_mux);
     }
@@ -504,11 +508,18 @@ esp_err_t send_join_request(void)
 
     memcpy(buffer + sizeof(mesh_header_t), &payload, sizeof(payload));
 
-    esp_err_t ret = tracked_esp_now_send(s_broadcast_mac, buffer, sizeof(buffer), MESH_PKT_JOIN, 0,
-                                         0, &s_control_tx_seq, false);
+    esp_err_t ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){
+        .dest_mac = s_broadcast_mac,
+        .data = buffer,
+        .len = sizeof(buffer),
+        .type = MESH_PKT_JOIN,
+        .heard_bitmap = 0,
+        .relay_bitmap = 0,
+        .sequence = &s_control_tx_seq,
+        .audio_origin = false,
+    });
     uint32_t jitter_ms = esp_random() % (CONTENTION_JITTER_MS + 1);
-    s_contention_next_tx_us = now_us +
-                              ((CONTENTION_MIN_INTERVAL_MS + jitter_ms) * 1000);
+    s_contention_next_tx_us = now_us + ((CONTENTION_MIN_INTERVAL_MS + jitter_ms) * 1000);
     if (ret == ESP_OK) {
         STATS_INC(contention_tx);
     }

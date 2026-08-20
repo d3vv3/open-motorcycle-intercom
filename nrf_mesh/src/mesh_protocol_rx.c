@@ -3,25 +3,24 @@
  * @brief ESB receive handoff: ISR ring publication and thread-context dispatch
  */
 
-#include "mesh_protocol_internal.h"
-
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 
 #include "esb_radio.h"
+#include "mesh_protocol_internal.h"
 
 LOG_MODULE_DECLARE(mesh);
 
-#define C mesh_protocol_context_get()
-#define s_rx_ring C->rx_ring
-#define s_rx_ring_head C->rx_ring_head
-#define s_rx_ring_tail C->rx_ring_tail
-#define s_coordinator_id C->coordinator_id
-#define s_stat_rx_drop C->stat_rx_drop
-#define s_stat_rx_count C->stat_rx_count
-#define s_stat_rf_rx_malformed C->stat_rf_rx_malformed
+#define C                         mesh_protocol_context_get()
+#define s_rx_ring                 C->rx_ring
+#define s_rx_ring_head            C->rx_ring_head
+#define s_rx_ring_tail            C->rx_ring_tail
+#define s_coordinator_id          C->coordinator_id
+#define s_stat_rx_drop            C->stat_rx_drop
+#define s_stat_rx_count           C->stat_rx_count
+#define s_stat_rf_rx_malformed    C->stat_rf_rx_malformed
 #define s_stat_rf_rx_version_drop C->stat_rf_rx_version_drop
 
 /* NOTE: The ISR only publishes into this spinlock-protected ring; all other
@@ -30,8 +29,7 @@ static struct k_spinlock s_rx_ring_lock;
 static struct k_work s_rx_work;
 
 /* Thread-context packet processing: validate structure, then dispatch by family. */
-static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
-                              int64_t timestamp_us)
+static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi, int64_t timestamp_us)
 {
     if (len < sizeof(mesh_header_t)) {
         s_stat_rf_rx_malformed++;

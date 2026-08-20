@@ -3,97 +3,96 @@
  * @brief Mesh protocol lifecycle, bridge command coalescing, and status work
  */
 
-#include "mesh_protocol.h"
-#include "mesh_protocol_internal.h"
-
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 
 #include "esb_radio.h"
+#include "mesh_protocol.h"
+#include "mesh_protocol_internal.h"
 #include "tdma.h"
 #include "uart_bridge.h"
 #include "ws_sync.h"
 
 LOG_MODULE_DECLARE(mesh);
 
-#define C mesh_protocol_context_get()
-#define s_state C->state
-#define s_role C->role
-#define s_node_id C->node_id
-#define s_slot_index C->slot_index
-#define s_coordinator_id C->coordinator_id
-#define s_local_addr C->local_addr
-#define s_peers C->peers
-#define s_peer_count C->peer_count
-#define s_dedupe C->dedupe
-#define s_relay_ring C->relay_ring
-#define s_relay_head C->relay_head
-#define s_relay_tail C->relay_tail
-#define s_control_ring C->control_ring
-#define s_control_head C->control_head
-#define s_control_tail C->control_tail
-#define s_active_speaker_deadline_ms C->active_speaker_deadline_ms
-#define s_speaker_active_since_ms C->speaker_active_since_ms
-#define s_heard_bitmap C->heard_bitmap
-#define s_relay_bitmap C->relay_bitmap
-#define s_skip_count C->skip_count
-#define s_auto_ticks C->auto_ticks
-#define s_status_log_decim C->status_log_decim
-#define s_tx_queue_depth_dbg C->tx_queue_depth_dbg
-#define s_requested_enabled C->requested_enabled
-#define s_control_pending C->control_pending
-#define s_status_pending C->status_pending
-#define s_requested_command C->requested_command
-#define s_requested_generation C->requested_generation
-#define s_stat_tx_count C->stat_tx_count
-#define s_stat_tx_fail C->stat_tx_fail
-#define s_stat_tx_starvation C->stat_tx_starvation
-#define s_stat_tx_queue_drain C->stat_tx_queue_drain
-#define s_stat_rx_count C->stat_rx_count
-#define s_stat_rx_drop C->stat_rx_drop
-#define s_stat_audio_fwd C->stat_audio_fwd
-#define s_stat_tx_overwrite C->stat_tx_overwrite
-#define s_stat_spi_audio_in C->stat_spi_audio_in
-#define s_stat_ingress_inactive_drop C->stat_ingress_inactive_drop
-#define s_stat_ingress_msgq_drop C->stat_ingress_msgq_drop
-#define s_stat_ingress_purge_drop C->stat_ingress_purge_drop
-#define s_stat_tx_ring_drop C->stat_tx_ring_drop
-#define s_stat_tx_purge_drop C->stat_tx_purge_drop
-#define s_stat_relay_ring_drop C->stat_relay_ring_drop
-#define s_stat_control_ring_drop C->stat_control_ring_drop
-#define s_stat_rf_audio_try C->stat_rf_audio_try
-#define s_stat_rf_audio_ok C->stat_rf_audio_ok
-#define s_stat_rf_audio_fail C->stat_rf_audio_fail
-#define s_stat_rf_rx_audio_ok C->stat_rf_rx_audio_ok
-#define s_stat_rf_rx_malformed C->stat_rf_rx_malformed
-#define s_stat_rf_rx_version_drop C->stat_rf_rx_version_drop
-#define s_stat_rf_rx_self_drop C->stat_rf_rx_self_drop
-#define s_stat_rf_rx_duplicate_drop C->stat_rf_rx_duplicate_drop
-#define s_stat_rf_rx_inactive_drop C->stat_rf_rx_inactive_drop
-#define s_stat_spi_out_ok C->stat_spi_out_ok
-#define s_stat_spi_out_drop C->stat_spi_out_drop
-#define s_stat_bundle_tx C->stat_bundle_tx
-#define s_stat_bundle_rx C->stat_bundle_rx
-#define s_stat_bundle_bad C->stat_bundle_bad
-#define s_stat_prev1_forwarded C->stat_prev1_forwarded
-#define s_stat_prev2_forwarded C->stat_prev2_forwarded
-#define s_stat_prev1_stripped C->stat_prev1_stripped
-#define s_stat_prev2_stripped C->stat_prev2_stripped
-#define s_stat_bundle_late_drop C->stat_bundle_late_drop
-#define s_stat_bundle_max_bytes C->stat_bundle_max_bytes
+#define C                              mesh_protocol_context_get()
+#define s_state                        C->state
+#define s_role                         C->role
+#define s_node_id                      C->node_id
+#define s_slot_index                   C->slot_index
+#define s_coordinator_id               C->coordinator_id
+#define s_local_addr                   C->local_addr
+#define s_peers                        C->peers
+#define s_peer_count                   C->peer_count
+#define s_dedupe                       C->dedupe
+#define s_relay_ring                   C->relay_ring
+#define s_relay_head                   C->relay_head
+#define s_relay_tail                   C->relay_tail
+#define s_control_ring                 C->control_ring
+#define s_control_head                 C->control_head
+#define s_control_tail                 C->control_tail
+#define s_active_speaker_deadline_ms   C->active_speaker_deadline_ms
+#define s_speaker_active_since_ms      C->speaker_active_since_ms
+#define s_heard_bitmap                 C->heard_bitmap
+#define s_relay_bitmap                 C->relay_bitmap
+#define s_skip_count                   C->skip_count
+#define s_auto_ticks                   C->auto_ticks
+#define s_status_log_decim             C->status_log_decim
+#define s_tx_queue_depth_dbg           C->tx_queue_depth_dbg
+#define s_requested_enabled            C->requested_enabled
+#define s_control_pending              C->control_pending
+#define s_status_pending               C->status_pending
+#define s_requested_command            C->requested_command
+#define s_requested_generation         C->requested_generation
+#define s_stat_tx_count                C->stat_tx_count
+#define s_stat_tx_fail                 C->stat_tx_fail
+#define s_stat_tx_starvation           C->stat_tx_starvation
+#define s_stat_tx_queue_drain          C->stat_tx_queue_drain
+#define s_stat_rx_count                C->stat_rx_count
+#define s_stat_rx_drop                 C->stat_rx_drop
+#define s_stat_audio_fwd               C->stat_audio_fwd
+#define s_stat_tx_overwrite            C->stat_tx_overwrite
+#define s_stat_spi_audio_in            C->stat_spi_audio_in
+#define s_stat_ingress_inactive_drop   C->stat_ingress_inactive_drop
+#define s_stat_ingress_msgq_drop       C->stat_ingress_msgq_drop
+#define s_stat_ingress_purge_drop      C->stat_ingress_purge_drop
+#define s_stat_tx_ring_drop            C->stat_tx_ring_drop
+#define s_stat_tx_purge_drop           C->stat_tx_purge_drop
+#define s_stat_relay_ring_drop         C->stat_relay_ring_drop
+#define s_stat_control_ring_drop       C->stat_control_ring_drop
+#define s_stat_rf_audio_try            C->stat_rf_audio_try
+#define s_stat_rf_audio_ok             C->stat_rf_audio_ok
+#define s_stat_rf_audio_fail           C->stat_rf_audio_fail
+#define s_stat_rf_rx_audio_ok          C->stat_rf_rx_audio_ok
+#define s_stat_rf_rx_malformed         C->stat_rf_rx_malformed
+#define s_stat_rf_rx_version_drop      C->stat_rf_rx_version_drop
+#define s_stat_rf_rx_self_drop         C->stat_rf_rx_self_drop
+#define s_stat_rf_rx_duplicate_drop    C->stat_rf_rx_duplicate_drop
+#define s_stat_rf_rx_inactive_drop     C->stat_rf_rx_inactive_drop
+#define s_stat_spi_out_ok              C->stat_spi_out_ok
+#define s_stat_spi_out_drop            C->stat_spi_out_drop
+#define s_stat_bundle_tx               C->stat_bundle_tx
+#define s_stat_bundle_rx               C->stat_bundle_rx
+#define s_stat_bundle_bad              C->stat_bundle_bad
+#define s_stat_prev1_forwarded         C->stat_prev1_forwarded
+#define s_stat_prev2_forwarded         C->stat_prev2_forwarded
+#define s_stat_prev1_stripped          C->stat_prev1_stripped
+#define s_stat_prev2_stripped          C->stat_prev2_stripped
+#define s_stat_bundle_late_drop        C->stat_bundle_late_drop
+#define s_stat_bundle_max_bytes        C->stat_bundle_max_bytes
 #define s_stat_local_deferred_recovery C->stat_local_deferred_recovery
-#define s_e2e_spi_in_frames C->e2e_spi_in_frames
-#define s_e2e_spi_in_gap_evt C->e2e_spi_in_gap_evt
-#define s_e2e_spi_in_gap_fr C->e2e_spi_in_gap_fr
-#define s_e2e_spi_in_reset_evt C->e2e_spi_in_reset_evt
-#define s_e2e_rf_tx_frames C->e2e_rf_tx_frames
-#define s_e2e_rf_rx_frames C->e2e_rf_rx_frames
-#define s_e2e_rf_rx_gap_evt C->e2e_rf_rx_gap_evt
-#define s_e2e_rf_rx_gap_fr C->e2e_rf_rx_gap_fr
-#define s_e2e_rf_rx_reset_evt C->e2e_rf_rx_reset_evt
-#define s_e2e_spi_out_frames C->e2e_spi_out_frames
+#define s_e2e_spi_in_frames            C->e2e_spi_in_frames
+#define s_e2e_spi_in_gap_evt           C->e2e_spi_in_gap_evt
+#define s_e2e_spi_in_gap_fr            C->e2e_spi_in_gap_fr
+#define s_e2e_spi_in_reset_evt         C->e2e_spi_in_reset_evt
+#define s_e2e_rf_tx_frames             C->e2e_rf_tx_frames
+#define s_e2e_rf_rx_frames             C->e2e_rf_rx_frames
+#define s_e2e_rf_rx_gap_evt            C->e2e_rf_rx_gap_evt
+#define s_e2e_rf_rx_gap_fr             C->e2e_rf_rx_gap_fr
+#define s_e2e_rf_rx_reset_evt          C->e2e_rf_rx_reset_evt
+#define s_e2e_spi_out_frames           C->e2e_spi_out_frames
 
 /* Work items: the runtime owns scheduling; membership borrows scan/join/status
  * through mesh_protocol_membership_bind_work(). */
@@ -131,19 +130,20 @@ static void status_work_handler(struct k_work *work)
 
     bool log_now = ((s_status_log_decim++ % 2) == 0);
     if (log_now) {
-        printk("[MESH] r=%u id=%u sl=%d tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u starve=%u drain=%u q=%u\n",
+        printk("[MESH] r=%u id=%u sl=%d tx=%u(err=%u) rx=%u drop=%u fwd=%u | spi_in=%u overwr=%u "
+               "starve=%u drain=%u q=%u\n",
                s_role, s_node_id, s_slot_index, s_stat_tx_count, s_stat_tx_fail, s_stat_rx_count,
                (uint32_t)atomic_get(&s_stat_rx_drop), s_stat_audio_fwd, s_stat_spi_audio_in,
-               (uint32_t)atomic_get(&s_stat_tx_overwrite),
-                s_stat_tx_starvation, s_stat_tx_queue_drain, s_tx_queue_depth_dbg);
+               (uint32_t)atomic_get(&s_stat_tx_overwrite), s_stat_tx_starvation,
+               s_stat_tx_queue_drain, s_tx_queue_depth_dbg);
         printk("[ESB_TIM] tx=%u to=%u txwait=%u/%u rxpause=%u/%u us\n", esb_stats.tx_count,
                esb_stats.tx_timeout_count, esb_stats.tx_wait_us_avg, esb_stats.tx_wait_us_max,
                esb_stats.rx_pause_us_avg, esb_stats.rx_pause_us_max);
         /* Cumulative 2 ms histogram of time-to-own-slot at audio ingress. */
-        printk("[APHASE] id=%u h=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", s_node_id,
-               C->aphase_hist[0], C->aphase_hist[1], C->aphase_hist[2], C->aphase_hist[3],
-               C->aphase_hist[4], C->aphase_hist[5], C->aphase_hist[6], C->aphase_hist[7],
-               C->aphase_hist[8], C->aphase_hist[9]);
+        printk("[APHASE] id=%u h=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", s_node_id, C->aphase_hist[0],
+               C->aphase_hist[1], C->aphase_hist[2], C->aphase_hist[3], C->aphase_hist[4],
+               C->aphase_hist[5], C->aphase_hist[6], C->aphase_hist[7], C->aphase_hist[8],
+               C->aphase_hist[9]);
     }
 
     s_auto_ticks++;
@@ -151,60 +151,71 @@ static void status_work_handler(struct k_work *work)
     if (log_now) {
         ws_sync_diag_t ws_diag = {0};
         ws_sync_get_diag(&ws_diag);
-        printk("[ATUNE] r=%u id=%u q=%u skip=%u/%u ws_e=%u ws_n=%u ws_ok=%u ws_no=%u ws_rej=%u ws_delta=%u ws_c=%d ws_d=%d td_req=%u td_app=%u td_sum=%lld td_pend=%d td_last=%d td_cmd=%u td_meas=%u td_jit=%d td_jit_max=%u\n",
-               s_role, s_node_id, s_tx_queue_depth_dbg,
-               s_skip_count, s_auto_ticks,
+        printk("[ATUNE] r=%u id=%u q=%u skip=%u/%u ws_e=%u ws_n=%u ws_ok=%u ws_no=%u ws_rej=%u "
+               "ws_delta=%u ws_c=%d ws_d=%d td_req=%u td_app=%u td_sum=%lld td_pend=%d td_last=%d "
+               "td_cmd=%u td_meas=%u td_jit=%d td_jit_max=%u\n",
+               s_role, s_node_id, s_tx_queue_depth_dbg, s_skip_count, s_auto_ticks,
                ws_diag.total_edges, ws_diag.sample_count, ws_diag.valid_count,
-               ws_diag.no_signal_count, ws_diag.rejected_count,
-               ws_diag.last_delta_edges, ws_diag.last_correction_us,
-               ws_diag.cumulative_drift_us, tdma_stats.tune_request_count,
-               tdma_stats.correction_apply_count,
-               (long long)tdma_stats.correction_applied_us,
-               tdma_stats.correction_pending_us, tdma_stats.last_correction_us,
-               tdma_stats.commanded_period_us, tdma_stats.measured_interval_us,
-               tdma_stats.callback_jitter_us, tdma_stats.callback_jitter_max_us);
-        printk("[E2E_NRF] id=%u spi_in=%u spi_gap=%u/%u spi_reset=%u rf_tx=%u rf_rx=%u rf_gap=%u/%u rf_reset=%u spi_out=%u\n",
-               s_node_id,
-               s_e2e_spi_in_frames, s_e2e_spi_in_gap_evt, s_e2e_spi_in_gap_fr, s_e2e_spi_in_reset_evt,
-               s_e2e_rf_tx_frames, s_e2e_rf_rx_frames, s_e2e_rf_rx_gap_evt, s_e2e_rf_rx_gap_fr,
-               s_e2e_rf_rx_reset_evt,
-                s_e2e_spi_out_frames);
-        printk("PIPE v=1 dev=nrf stage=mesh node=%u ingress_ok=%u ingress_inactive_drop=%u ingress_q_drop=%u ingress_purge_drop=%u tx_ring_drop=%u tx_purge_drop=%u prefill_skip=%u rf_tx_try=%u rf_tx_ok=%u rf_tx_fail=%u rf_rx_ok=%u rf_rx_ring_drop=%u rf_rx_malformed=%u rf_rx_version_drop=%u rf_rx_self_drop=%u rf_rx_dup_drop=%u rf_rx_inactive_drop=%u relay_q_drop=%u control_q_drop=%u spi_out_ok=%u spi_out_drop=%u q_depth=%u bundle_tx=%u bundle_rx=%u bundle_bad=%u prev1_forwarded=%u prev2_forwarded=%u prev1_stripped=%u prev2_stripped=%u bundle_late_drop=%u bundle_max_bytes=%u local_deferred_recovery=%u tx_duration_max_us=%u\n",
-               s_node_id, s_stat_spi_audio_in, s_stat_ingress_inactive_drop,
-               (uint32_t)atomic_get(&s_stat_ingress_msgq_drop), s_stat_ingress_purge_drop,
-               s_stat_tx_ring_drop, s_stat_tx_purge_drop, s_skip_count,
-               s_stat_rf_audio_try, s_stat_rf_audio_ok,
-               s_stat_rf_audio_fail, s_stat_rf_rx_audio_ok,
-               (uint32_t)atomic_get(&s_stat_rx_drop), s_stat_rf_rx_malformed,
-               s_stat_rf_rx_version_drop, s_stat_rf_rx_self_drop,
-               s_stat_rf_rx_duplicate_drop, s_stat_rf_rx_inactive_drop,
-               s_stat_relay_ring_drop, s_stat_control_ring_drop, s_stat_spi_out_ok,
-                s_stat_spi_out_drop, s_tx_queue_depth_dbg, s_stat_bundle_tx,
-                 s_stat_bundle_rx, s_stat_bundle_bad, s_stat_prev1_forwarded,
-                 s_stat_prev2_forwarded, s_stat_prev1_stripped,
-                 s_stat_prev2_stripped, s_stat_bundle_late_drop,
-                 s_stat_bundle_max_bytes, s_stat_local_deferred_recovery,
-                 esb_stats.tx_wait_us_max);
-        printk("PIPE v=1 dev=nrf stage=tdma node=%u slot_due=%u slot_submit_drop=%u slot_late_drop=%u control_due=%u control_submit_drop=%u control_late_drop=%u discipline_due=%u discipline_submit_drop=%u discipline_capture_drop=%u tune_req=%u tune_clamp=%u correction_apply=%u correction_applied_us=%lld correction_pending_us=%d last_correction_us=%d commanded_period_us=%u measured_interval_us=%u callback_jitter_us=%d callback_jitter_max_us=%u skipped_frames=%u sync_acquire=%u sync_reacquire=%u sync_history_miss=%u sync_frame_diff=%d sync_phase_us=%d\n",
-               s_node_id, tdma_stats.slot_due, tdma_stats.slot_submit_drop,
-               tdma_stats.slot_late_drop, tdma_stats.control_due,
-               tdma_stats.control_submit_drop, tdma_stats.control_late_drop,
-               tdma_stats.discipline_due, tdma_stats.discipline_submit_drop,
-               tdma_stats.discipline_capture_drop, tdma_stats.tune_request_count,
-               tdma_stats.tune_clamp_count, tdma_stats.correction_apply_count,
-               (long long)tdma_stats.correction_applied_us,
-               tdma_stats.correction_pending_us, tdma_stats.last_correction_us,
-               tdma_stats.commanded_period_us, tdma_stats.measured_interval_us,
-               tdma_stats.callback_jitter_us, tdma_stats.callback_jitter_max_us,
-               tdma_stats.skipped_frame_count, tdma_stats.sync_acquire_count,
-               tdma_stats.sync_reacquire_count, tdma_stats.sync_history_miss_count,
-               tdma_stats.sync_frame_diff, tdma_stats.sync_phase_correction_us);
-        printk("PIPE v=1 dev=nrf stage=rf node=%u tx_ok=%u tx_timeout=%u tx_busy=%u tx_write_drop=%u tx_event_fail=%u rx_no_callback=%u rx_flush_drop=%u rx_restart_drop=%u tx_wait_max_us=%u rx_pause_max_us=%u\n",
-               s_node_id, esb_stats.tx_count, esb_stats.tx_timeout_count,
-               esb_stats.tx_busy_count, esb_stats.tx_write_fail_count,
-               esb_stats.tx_failed_event_count, esb_stats.rx_no_callback_count,
-               esb_stats.rx_flush_drop_count, esb_stats.rx_restart_fail_count,
-               esb_stats.tx_wait_us_max, esb_stats.rx_pause_us_max);
+               ws_diag.no_signal_count, ws_diag.rejected_count, ws_diag.last_delta_edges,
+               ws_diag.last_correction_us, ws_diag.cumulative_drift_us,
+               tdma_stats.tune_request_count, tdma_stats.correction_apply_count,
+               (long long)tdma_stats.correction_applied_us, tdma_stats.correction_pending_us,
+               tdma_stats.last_correction_us, tdma_stats.commanded_period_us,
+               tdma_stats.measured_interval_us, tdma_stats.callback_jitter_us,
+               tdma_stats.callback_jitter_max_us);
+        printk("[E2E_NRF] id=%u spi_in=%u spi_gap=%u/%u spi_reset=%u rf_tx=%u rf_rx=%u "
+               "rf_gap=%u/%u rf_reset=%u spi_out=%u\n",
+               s_node_id, s_e2e_spi_in_frames, s_e2e_spi_in_gap_evt, s_e2e_spi_in_gap_fr,
+               s_e2e_spi_in_reset_evt, s_e2e_rf_tx_frames, s_e2e_rf_rx_frames, s_e2e_rf_rx_gap_evt,
+               s_e2e_rf_rx_gap_fr, s_e2e_rf_rx_reset_evt, s_e2e_spi_out_frames);
+        printk(
+            "PIPE v=1 dev=nrf stage=mesh node=%u ingress_ok=%u ingress_inactive_drop=%u "
+            "ingress_q_drop=%u ingress_purge_drop=%u tx_ring_drop=%u tx_purge_drop=%u "
+            "prefill_skip=%u rf_tx_try=%u rf_tx_ok=%u rf_tx_fail=%u rf_rx_ok=%u rf_rx_ring_drop=%u "
+            "rf_rx_malformed=%u rf_rx_version_drop=%u rf_rx_self_drop=%u rf_rx_dup_drop=%u "
+            "rf_rx_inactive_drop=%u relay_q_drop=%u control_q_drop=%u spi_out_ok=%u "
+            "spi_out_drop=%u q_depth=%u bundle_tx=%u bundle_rx=%u bundle_bad=%u prev1_forwarded=%u "
+            "prev2_forwarded=%u prev1_stripped=%u prev2_stripped=%u bundle_late_drop=%u "
+            "bundle_max_bytes=%u local_deferred_recovery=%u tx_duration_max_us=%u\n",
+            s_node_id, s_stat_spi_audio_in, s_stat_ingress_inactive_drop,
+            (uint32_t)atomic_get(&s_stat_ingress_msgq_drop), s_stat_ingress_purge_drop,
+            s_stat_tx_ring_drop, s_stat_tx_purge_drop, s_skip_count, s_stat_rf_audio_try,
+            s_stat_rf_audio_ok, s_stat_rf_audio_fail, s_stat_rf_rx_audio_ok,
+            (uint32_t)atomic_get(&s_stat_rx_drop), s_stat_rf_rx_malformed,
+            s_stat_rf_rx_version_drop, s_stat_rf_rx_self_drop, s_stat_rf_rx_duplicate_drop,
+            s_stat_rf_rx_inactive_drop, s_stat_relay_ring_drop, s_stat_control_ring_drop,
+            s_stat_spi_out_ok, s_stat_spi_out_drop, s_tx_queue_depth_dbg, s_stat_bundle_tx,
+            s_stat_bundle_rx, s_stat_bundle_bad, s_stat_prev1_forwarded, s_stat_prev2_forwarded,
+            s_stat_prev1_stripped, s_stat_prev2_stripped, s_stat_bundle_late_drop,
+            s_stat_bundle_max_bytes, s_stat_local_deferred_recovery, esb_stats.tx_wait_us_max);
+        printk(
+            "PIPE v=1 dev=nrf stage=tdma node=%u slot_due=%u slot_submit_drop=%u slot_late_drop=%u "
+            "control_due=%u control_submit_drop=%u control_late_drop=%u discipline_due=%u "
+            "discipline_submit_drop=%u discipline_capture_drop=%u tune_req=%u tune_clamp=%u "
+            "correction_apply=%u correction_applied_us=%lld correction_pending_us=%d "
+            "last_correction_us=%d commanded_period_us=%u measured_interval_us=%u "
+            "callback_jitter_us=%d callback_jitter_max_us=%u skipped_frames=%u sync_acquire=%u "
+            "sync_reacquire=%u sync_history_miss=%u sync_frame_diff=%d sync_phase_us=%d\n",
+            s_node_id, tdma_stats.slot_due, tdma_stats.slot_submit_drop, tdma_stats.slot_late_drop,
+            tdma_stats.control_due, tdma_stats.control_submit_drop, tdma_stats.control_late_drop,
+            tdma_stats.discipline_due, tdma_stats.discipline_submit_drop,
+            tdma_stats.discipline_capture_drop, tdma_stats.tune_request_count,
+            tdma_stats.tune_clamp_count, tdma_stats.correction_apply_count,
+            (long long)tdma_stats.correction_applied_us, tdma_stats.correction_pending_us,
+            tdma_stats.last_correction_us, tdma_stats.commanded_period_us,
+            tdma_stats.measured_interval_us, tdma_stats.callback_jitter_us,
+            tdma_stats.callback_jitter_max_us, tdma_stats.skipped_frame_count,
+            tdma_stats.sync_acquire_count, tdma_stats.sync_reacquire_count,
+            tdma_stats.sync_history_miss_count, tdma_stats.sync_frame_diff,
+            tdma_stats.sync_phase_correction_us);
+        printk("PIPE v=1 dev=nrf stage=rf node=%u tx_ok=%u tx_timeout=%u tx_busy=%u "
+               "tx_write_drop=%u tx_event_fail=%u rx_no_callback=%u rx_flush_drop=%u "
+               "rx_restart_drop=%u tx_wait_max_us=%u rx_pause_max_us=%u\n",
+               s_node_id, esb_stats.tx_count, esb_stats.tx_timeout_count, esb_stats.tx_busy_count,
+               esb_stats.tx_write_fail_count, esb_stats.tx_failed_event_count,
+               esb_stats.rx_no_callback_count, esb_stats.rx_flush_drop_count,
+               esb_stats.rx_restart_fail_count, esb_stats.tx_wait_us_max,
+               esb_stats.rx_pause_us_max);
     }
 
     if (mesh_protocol_membership_handle_coordinator_timeout()) {

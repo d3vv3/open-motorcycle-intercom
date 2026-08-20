@@ -13,9 +13,10 @@
  */
 
 #include "mesh_protocol.h"
-#include "mesh_protocol_internal.h"
 
 #include <zephyr/logging/log.h>
+
+#include "mesh_protocol_internal.h"
 
 LOG_MODULE_REGISTER(mesh, LOG_LEVEL_INF);
 

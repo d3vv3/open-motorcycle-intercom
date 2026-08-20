@@ -57,10 +57,8 @@ typedef struct {
  */
 #define AUDIO_I2S_PINS_DEFAULT()                                                                   \
     {                                                                                              \
-        .bclk_gpio = AUDIO_I2S_BCLK_GPIO,                                                          \
-        .ws_gpio = AUDIO_I2S_WS_GPIO,                                                              \
-        .din_gpio = AUDIO_I2S_DIN_GPIO,                                                            \
-        .dout_gpio = AUDIO_I2S_DOUT_GPIO,                                                          \
+        .bclk_gpio = AUDIO_I2S_BCLK_GPIO, .ws_gpio = AUDIO_I2S_WS_GPIO,                            \
+        .din_gpio = AUDIO_I2S_DIN_GPIO, .dout_gpio = AUDIO_I2S_DOUT_GPIO,                          \
     }
 
 /**
@@ -77,9 +75,9 @@ typedef struct {
  */
 #define AUDIO_ADC_CONFIG_DEFAULT()                                                                 \
     {                                                                                              \
-        .adc_channel = 0, /* ADC1_CHANNEL_0 = GPIO1 */                                             \
-        .adc_unit = 1,    /* ADC_UNIT_1 */                                                         \
-        .adc_atten = 3,   /* ADC_ATTEN_DB_12 - full 3.3V range for MAX9814 active mic */           \
+        .adc_channel = 0,   /* ADC1_CHANNEL_0 = GPIO1 */                                           \
+            .adc_unit = 1,  /* ADC_UNIT_1 */                                                       \
+            .adc_atten = 3, /* ADC_ATTEN_DB_12 - full 3.3V range for MAX9814 active mic */         \
     }
 
 /**
@@ -97,10 +95,10 @@ typedef struct {
  */
 #define AUDIO_VOX_CONFIG_DEFAULT()                                                                 \
     {                                                                                              \
-        .activation_threshold = 0.03f,    /* Normal sensitive threshold */                         \
-        .deactivation_threshold = 0.010f, /* 67% of activation (hysteresis) */                     \
-        .min_active_ms = 500,             /* Keep TX active for at least 500ms */                  \
-        .hangover_ms = 500,               /* 500ms hangover for smoother speech tails */            \
+        .activation_threshold = 0.03f,        /* Normal sensitive threshold */                     \
+            .deactivation_threshold = 0.010f, /* 67% of activation (hysteresis) */                 \
+            .min_active_ms = 500,             /* Keep TX active for at least 500ms */              \
+            .hangover_ms = 500,               /* 500ms hangover for smoother speech tails */       \
     }
 
 /**
@@ -128,8 +126,7 @@ typedef void (*audio_activity_cb_t)(bool active);
  * @param active true when VOX marks the frame as active speech
  * @param timestamp_us Capture timestamp in microseconds
  */
-typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active,
-                              int64_t timestamp_us);
+typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us);
 
 /**
  * @brief Audio configuration parameters
@@ -152,20 +149,13 @@ typedef struct {
 /**
  * @brief Default audio configuration
  */
-#define AUDIO_CONFIG_DEFAULT()      \
-    {                               \
-        .sample_rate = 16000,       \
-        .channels = 1,              \
-        .bits_per_sample = 16,      \
-        .frame_size_ms = 20,        \
-        .opus_bitrate = 12000,      \
-        .i2s_pins = AUDIO_I2S_PINS_DEFAULT(), \
-        .adc_config = AUDIO_ADC_CONFIG_DEFAULT(), \
-        .vox_config = AUDIO_VOX_CONFIG_DEFAULT(), \
-        .enable_hpf = true,         \
-        .hpf_cutoff_hz = 80.0f,     \
-        .force_tx_always = false,   \
-        .mode = AUDIO_MODE_LOOPBACK, \
+#define AUDIO_CONFIG_DEFAULT()                                                                     \
+    {                                                                                              \
+        .sample_rate = 16000, .channels = 1, .bits_per_sample = 16, .frame_size_ms = 20,           \
+        .opus_bitrate = 12000, .i2s_pins = AUDIO_I2S_PINS_DEFAULT(),                               \
+        .adc_config = AUDIO_ADC_CONFIG_DEFAULT(), .vox_config = AUDIO_VOX_CONFIG_DEFAULT(),        \
+        .enable_hpf = true, .hpf_cutoff_hz = 80.0f, .force_tx_always = false,                      \
+        .mode = AUDIO_MODE_LOOPBACK,                                                               \
     }
 
 /**
@@ -194,53 +184,53 @@ typedef struct {
     uint32_t decode_time_us_max; /**< Maximum decode time in microseconds */
     /* NOTE: latency_ms_* cover local capture processing plus an I2S DMA
      * estimate only; mouth-to-ear latency over the radio is not measured. */
-    uint32_t latency_ms_avg;     /**< Average local pipeline latency in milliseconds */
-    uint32_t latency_ms_max;     /**< Maximum local pipeline latency in milliseconds */
-    uint32_t tx_pipe_us_avg;     /**< Mic capture -> transport enqueue latency avg (us) */
-    uint32_t tx_pipe_us_max;     /**< Mic capture -> transport enqueue latency max (us) */
-    uint32_t rx_pipe_us_avg;     /**< RX packet enqueue -> speaker write latency avg (us) */
-    uint32_t rx_pipe_us_max;     /**< RX packet enqueue -> speaker write latency max (us) */
-    uint32_t glitches_detected;  /**< Number of audio glitches detected */
-    uint32_t rx_queue_underruns; /**< Legacy alias count for PCM source underruns */
-    uint32_t i2s_write_incomplete; /**< I2S short/timeout writes */
-    uint32_t plc_frames;         /**< PLC generated during intentional DTX idle */
-    uint32_t grace_empty_polls;  /**< Legacy compatibility counter; remains zero */
-    uint32_t hold_frames;        /**< Legacy compatibility counter; remains zero */
-    uint32_t catchup_frames;     /**< Legacy compatibility counter; remains zero */
-    uint32_t conceal_loss_frames; /**< PLC frames generated for a detected sequence hole */
-    uint32_t seq_gap_frames;     /**< Missing frames detected by playout sequence tracking */
-    uint32_t seq_resets;         /**< Sequence discontinuities too large to conceal */
-    uint32_t seq_stale_drops;    /**< Duplicate or late reordered packets discarded */
-    uint8_t jitter_buffer_depth; /**< Current jitter buffer depth */
-    uint8_t rx_q_depth_min;      /**< Minimum observed RX queue depth */
-    uint8_t rx_q_depth_avg;      /**< Average observed RX queue depth */
-    uint8_t rx_q_depth_max;      /**< Maximum observed RX queue depth */
-    uint32_t task_loops;         /**< Audio task loop count (health indicator) */
-    uint32_t adc_overruns;       /**< ADC buffer overrun count */
-    uint32_t tx_dtx_suppressed;  /**< Silence frames dropped before transmit (DTX) */
-    uint32_t capture_frames_ok;  /**< Complete ADC capture frames */
-    uint32_t capture_short_reads; /**< Partial ADC capture frames */
-    uint32_t capture_timeouts;   /**< ADC notification/read timeouts */
-    uint32_t encode_errors;      /**< Opus encode failures */
-    uint32_t decode_errors;      /**< Opus decode and PLC failures */
-    uint32_t rx_queue_overflows; /**< Frames rejected because the playback queue was full */
-    uint32_t rx_lock_drops;      /**< Frames rejected because the source lock was unavailable */
-    uint32_t rx_source_rejections; /**< Frames rejected because all source slots are occupied */
-    uint32_t rx_source_evictions;  /**< Silent sources displaced by a newly active talker */
-    uint32_t jitter_trim_frames; /**< Legacy compatibility counter; remains zero */
+    uint32_t latency_ms_avg;         /**< Average local pipeline latency in milliseconds */
+    uint32_t latency_ms_max;         /**< Maximum local pipeline latency in milliseconds */
+    uint32_t tx_pipe_us_avg;         /**< Mic capture -> transport enqueue latency avg (us) */
+    uint32_t tx_pipe_us_max;         /**< Mic capture -> transport enqueue latency max (us) */
+    uint32_t rx_pipe_us_avg;         /**< RX packet enqueue -> speaker write latency avg (us) */
+    uint32_t rx_pipe_us_max;         /**< RX packet enqueue -> speaker write latency max (us) */
+    uint32_t glitches_detected;      /**< Number of audio glitches detected */
+    uint32_t rx_queue_underruns;     /**< Legacy alias count for PCM source underruns */
+    uint32_t i2s_write_incomplete;   /**< I2S short/timeout writes */
+    uint32_t plc_frames;             /**< PLC generated during intentional DTX idle */
+    uint32_t grace_empty_polls;      /**< Legacy compatibility counter; remains zero */
+    uint32_t hold_frames;            /**< Legacy compatibility counter; remains zero */
+    uint32_t catchup_frames;         /**< Legacy compatibility counter; remains zero */
+    uint32_t conceal_loss_frames;    /**< PLC frames generated for a detected sequence hole */
+    uint32_t seq_gap_frames;         /**< Missing frames detected by playout sequence tracking */
+    uint32_t seq_resets;             /**< Sequence discontinuities too large to conceal */
+    uint32_t seq_stale_drops;        /**< Duplicate or late reordered packets discarded */
+    uint8_t jitter_buffer_depth;     /**< Current jitter buffer depth */
+    uint8_t rx_q_depth_min;          /**< Minimum observed RX queue depth */
+    uint8_t rx_q_depth_avg;          /**< Average observed RX queue depth */
+    uint8_t rx_q_depth_max;          /**< Maximum observed RX queue depth */
+    uint32_t task_loops;             /**< Audio task loop count (health indicator) */
+    uint32_t adc_overruns;           /**< ADC buffer overrun count */
+    uint32_t tx_dtx_suppressed;      /**< Silence frames dropped before transmit (DTX) */
+    uint32_t capture_frames_ok;      /**< Complete ADC capture frames */
+    uint32_t capture_short_reads;    /**< Partial ADC capture frames */
+    uint32_t capture_timeouts;       /**< ADC notification/read timeouts */
+    uint32_t encode_errors;          /**< Opus encode failures */
+    uint32_t decode_errors;          /**< Opus decode and PLC failures */
+    uint32_t rx_queue_overflows;     /**< Frames rejected because the playback queue was full */
+    uint32_t rx_lock_drops;          /**< Frames rejected because the source lock was unavailable */
+    uint32_t rx_source_rejections;   /**< Frames rejected because all source slots are occupied */
+    uint32_t rx_source_evictions;    /**< Silent sources displaced by a newly active talker */
+    uint32_t jitter_trim_frames;     /**< Legacy compatibility counter; remains zero */
     uint32_t packet_duplicate_drops; /**< Sequenced packets rejected as duplicates */
-    uint32_t packet_late_drops;  /**< Sequenced packets rejected after their deadline */
-    uint32_t packet_future_drops; /**< Sequenced packets beyond the bounded window */
-    uint32_t pcm_fifo_overflows; /**< Decoded PCM blocks rejected by a source ASRC */
-    uint32_t pcm_underruns;      /**< Source ASRC underruns */
-    int32_t asrc_correction_ppm; /**< Current signed correction for the most-adjusted source */
-    uint32_t asrc_correction_abs_max_ppm; /**< Maximum absolute ASRC correction */
-    bool asrc_recovery_active;   /**< ASRC is draining compressed packet backlog */
-    uint32_t playout_task_loops; /**< I2S-paced playout loop count */
+    uint32_t packet_late_drops;      /**< Sequenced packets rejected after their deadline */
+    uint32_t packet_future_drops;    /**< Sequenced packets beyond the bounded window */
+    uint32_t pcm_fifo_overflows;     /**< Decoded PCM blocks rejected by a source ASRC */
+    uint32_t pcm_underruns;          /**< Source ASRC underruns */
+    int32_t asrc_correction_ppm;     /**< Current signed correction for the most-adjusted source */
+    uint32_t asrc_correction_abs_max_ppm;  /**< Maximum absolute ASRC correction */
+    bool asrc_recovery_active;             /**< ASRC is draining compressed packet backlog */
+    uint32_t playout_task_loops;           /**< I2S-paced playout loop count */
     uint32_t notification_queue_overflows; /**< Notification requests dropped while queue is full */
-    uint32_t playback_frames;    /**< Complete I2S playback writes */
-    uint8_t active_rx_sources;   /**< Remote source slots currently assigned */
-    bool vox_active;             /**< Current VOX state */
+    uint32_t playback_frames;              /**< Complete I2S playback writes */
+    uint8_t active_rx_sources;             /**< Remote source slots currently assigned */
+    bool vox_active;                       /**< Current VOX state */
 } audio_stats_t;
 
 /**

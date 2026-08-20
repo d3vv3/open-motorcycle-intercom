@@ -61,9 +61,9 @@ typedef struct {
 #define POWER_CONFIG_DEFAULT()                                                                     \
     {                                                                                              \
         .deep_sleep_timeout_sec = 300, /* 5 minutes */                                             \
-        .standby_beacon_ms = 1000,                                                                 \
+            .standby_beacon_ms = 1000,                                                             \
         .enable_radio_duty_cycle = false, /* Disabled: per-frame toggling adds overhead */         \
-        .enable_light_sleep = true,                                                                \
+            .enable_light_sleep = true,                                                            \
     }
 
 /**

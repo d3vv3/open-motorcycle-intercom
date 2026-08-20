@@ -3,11 +3,11 @@
  * @brief Audio subsystem facade: lifecycle, configuration, and public API.
  */
 
-#include "audio_internal.h"
-
 #include <string.h>
 
 #include "esp_log.h"
+
+#include "audio_internal.h"
 
 static const char *TAG = "audio";
 
@@ -45,8 +45,8 @@ static void delete_sync_resources(void)
         g_audio.loopback_queue = NULL;
     }
     SemaphoreHandle_t *semaphores[] = {
-        &g_audio.rx_sources_mutex, &g_audio.rx_reset_mutex, &g_audio.rx_reset_done,
-        &g_audio.playout_started, &g_audio.capture_started, &g_audio.capture_done,
+        &g_audio.rx_sources_mutex, &g_audio.rx_reset_mutex,  &g_audio.rx_reset_done,
+        &g_audio.playout_started,  &g_audio.capture_started, &g_audio.capture_done,
         &g_audio.playout_done,
     };
     for (size_t i = 0; i < sizeof(semaphores) / sizeof(semaphores[0]); ++i) {
@@ -82,8 +82,8 @@ static esp_err_t create_sync_resources(void)
 
 static bool config_supported(const audio_config_t *config)
 {
-    return config->sample_rate == 16000 && config->channels == 1 &&
-           config->bits_per_sample == 16 && config->frame_size_ms == 20;
+    return config->sample_rate == 16000 && config->channels == 1 && config->bits_per_sample == 16 &&
+           config->frame_size_ms == 20;
 }
 
 static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
@@ -154,12 +154,11 @@ esp_err_t audio_init_with_config(const audio_config_t *config)
         return ESP_ERR_INVALID_STATE;
     }
     if (g_audio.lifecycle_mutex == NULL) {
-        g_audio.lifecycle_mutex =
-            xSemaphoreCreateMutexStatic(&g_audio.lifecycle_mutex_storage);
+        g_audio.lifecycle_mutex = xSemaphoreCreateMutexStatic(&g_audio.lifecycle_mutex_storage);
     }
     xSemaphoreTake(g_audio.lifecycle_mutex, portMAX_DELAY);
-    esp_err_t ret = g_audio.deinitializing ? ESP_ERR_INVALID_STATE
-                                           : audio_init_with_config_locked(config);
+    esp_err_t ret =
+        g_audio.deinitializing ? ESP_ERR_INVALID_STATE : audio_init_with_config_locked(config);
     xSemaphoreGive(g_audio.lifecycle_mutex);
     return ret;
 }
@@ -295,8 +294,8 @@ esp_err_t audio_start(void)
         return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(g_audio.lifecycle_mutex, portMAX_DELAY);
-    esp_err_t ret = (g_audio.stopping || g_audio.deinitializing) ? ESP_ERR_INVALID_STATE
-                                                                 : audio_start_locked();
+    esp_err_t ret =
+        (g_audio.stopping || g_audio.deinitializing) ? ESP_ERR_INVALID_STATE : audio_start_locked();
     xSemaphoreGive(g_audio.lifecycle_mutex);
     return ret;
 }

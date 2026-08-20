@@ -4,8 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BRIDGE_PROTOCOL_VERSION 2
-#define BRIDGE_STATUS_V2_MARKER 0xA5
+#define BRIDGE_PROTOCOL_VERSION   2
+#define BRIDGE_STATUS_V2_MARKER   0xA5
 #define BRIDGE_PEER_COUNT_UNKNOWN 0xFF
 
 #define BRIDGE_PKT_AUDIO      0x01

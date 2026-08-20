@@ -1,5 +1,3 @@
-#include "mesh_internal.h"
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +6,7 @@
 #include "esp_random.h"
 #include "esp_wifi.h"
 
+#include "mesh_internal.h"
 #include "power.h"
 
 typedef struct {
@@ -51,8 +50,9 @@ static void mesh_task_scan(mesh_task_state_t *task, int64_t now)
             return;
         }
 
-        if (rx.header.type == MESH_PKT_SYNC && rx.header.payload_len == sizeof(mesh_sync_payload_t) &&
-            rx.header.src_id > 0 && rx.header.src_id <= MESH_MAX_NODES) {
+        if (rx.header.type == MESH_PKT_SYNC &&
+            rx.header.payload_len == sizeof(mesh_sync_payload_t) && rx.header.src_id > 0 &&
+            rx.header.src_id <= MESH_MAX_NODES) {
             ESP_LOGI(TAG, "Found existing mesh, coordinator=%d", rx.header.src_id);
             s_coordinator_id = rx.header.src_id;
             memcpy(s_coordinator_mac, rx.src_mac, sizeof(s_coordinator_mac));
@@ -222,8 +222,7 @@ void mesh_task(void *arg)
         .scan_start = esp_timer_get_time(),
         .prev_state = s_state,
     };
-    s_contention_next_tx_us =
-        task.scan_start + (esp_random() % (CONTENTION_JITTER_MS + 1)) * 1000;
+    s_contention_next_tx_us = task.scan_start + (esp_random() % (CONTENTION_JITTER_MS + 1)) * 1000;
 
     while (1) {
         taskENTER_CRITICAL(&s_transport_mux);
@@ -569,8 +568,7 @@ void handle_sync_packet(const mesh_rx_item_t *rx)
         int32_t frame_delta = (int32_t)(sync->frame_counter - local_frame_counter);
         int64_t expected_frame_start = local_frame_start_us + (MESH_FRAME_US * frame_delta);
         int64_t actual_frame_start =
-            rx->timestamp_us - (MESH_VOICE_SLOTS * MESH_SLOT_US) -
-            ESPNOW_SYNC_RX_LATENCY_US;
+            rx->timestamp_us - (MESH_VOICE_SLOTS * MESH_SLOT_US) - ESPNOW_SYNC_RX_LATENCY_US;
         int32_t drift_us = (int32_t)(actual_frame_start - expected_frame_start);
 
         /* Bound each correction to 500 us. */
@@ -732,9 +730,8 @@ void check_peer_timeouts(void)
 
         ESP_LOGW(TAG, "Node %d timeout (last seen %lld ms ago)", s_peers[i].info.node_id, age);
         timed_out[timed_out_count++] = s_peers[i].info;
-        coordinator_lost = coordinator_lost ||
-                           (s_role == MESH_ROLE_PARTICIPANT &&
-                            s_peers[i].info.node_id == s_coordinator_id);
+        coordinator_lost = coordinator_lost || (s_role == MESH_ROLE_PARTICIPANT &&
+                                                s_peers[i].info.node_id == s_coordinator_id);
         s_peers[i].info.active = false;
         if (s_peer_count > 0) {
             s_peer_count--;

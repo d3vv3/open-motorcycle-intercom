@@ -3,13 +3,12 @@
  * @brief Mesh Protocol Control Transmission
  */
 
-#include "mesh_protocol_internal.h"
-
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include "esb_radio.h"
+#include "mesh_protocol_internal.h"
 #include "tdma.h"
 
 LOG_MODULE_DECLARE(mesh);
@@ -53,7 +52,7 @@ int mesh_protocol_tx_send_packet(mesh_protocol_context_t *context, mesh_pkt_type
                                  const void *payload, uint16_t len)
 {
     return mesh_protocol_tx_send_packet_ex(type, payload, len, 0, 0, context->node_id,
-                                            context->tx_seq++);
+                                           context->tx_seq++);
 }
 
 int mesh_protocol_tx_queue_control(mesh_protocol_context_t *context, mesh_pkt_type_t type,
@@ -162,8 +161,7 @@ int mesh_protocol_tx_send_join_ack(mesh_protocol_context_t *context, uint8_t ass
     };
     memcpy(payload.target_addr, target_addr, sizeof(payload.target_addr));
     LOG_INF("Sending JOIN_ACK: id=%d, slot=%d", assigned_id, slot_index);
-    return mesh_protocol_tx_queue_control(context, MESH_PKT_JOIN_ACK_V2, &payload,
-                                          sizeof(payload));
+    return mesh_protocol_tx_queue_control(context, MESH_PKT_JOIN_ACK_V2, &payload, sizeof(payload));
 }
 
 void mesh_protocol_tx_control_handler(uint32_t frame_counter)

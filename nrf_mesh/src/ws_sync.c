@@ -11,15 +11,15 @@
 
 #include "ws_sync.h"
 
-#include <string.h>
-#include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
+#include <hal/nrf_gpio.h>
+#include <hal/nrf_gpiote.h>
+#include <hal/nrf_timer.h>
 #include <nrfx_gpiote.h>
 #include <nrfx_ppi.h>
 #include <nrfx_timer.h>
-#include <hal/nrf_gpiote.h>
-#include <hal/nrf_gpio.h>
-#include <hal/nrf_timer.h>
+#include <string.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(ws_sync, LOG_LEVEL_INF);
@@ -29,11 +29,11 @@ LOG_MODULE_REGISTER(ws_sync, LOG_LEVEL_INF);
  * ============================================================================ */
 
 /* GPIO pin receiving ESP32 I2S WS signal (XIAO D0 = P0.02) */
-#define WS_PIN       2
-#define WS_PORT      0   /* NRF_P0 */
+#define WS_PIN  2
+#define WS_PORT 0 /* NRF_P0 */
 
 /* Expected WS edges per 20 ms TDMA frame (16 kHz × 0.020 s) */
-#define EXPECTED_EDGES_PER_FRAME  320
+#define EXPECTED_EDGES_PER_FRAME 320
 
 /* GPIOTE and PPI channels are allocated to avoid colliding with other nrfx users. */
 static uint8_t s_gpiote_channel;
@@ -47,10 +47,10 @@ static const nrfx_timer_t s_timer = NRFX_TIMER_INSTANCE(1);
  * State
  * ============================================================================ */
 
-static bool     s_initialized  = false;
-static bool     s_running      = false;
-static uint32_t s_last_count   = 0;   /* Previous snapshot of edge counter   */
-static bool     s_first_sample = true; /* Skip first delta (no baseline)      */
+static bool s_initialized = false;
+static bool s_running = false;
+static uint32_t s_last_count = 0;  /* Previous snapshot of edge counter   */
+static bool s_first_sample = true; /* Skip first delta (no baseline)      */
 static uint32_t s_last_frame_counter;
 static ws_sync_diag_t s_diag;
 
@@ -101,10 +101,10 @@ int ws_sync_init(void)
 
     /* --- TIMER1 in counter mode (counts external events via PPI) --- */
     nrfx_timer_config_t tcfg = {
-        .frequency  = NRFX_MHZ_TO_HZ(1),       /* irrelevant in counter mode */
-        .mode       = NRF_TIMER_MODE_COUNTER,
-        .bit_width  = NRF_TIMER_BIT_WIDTH_32,
-        .p_context  = NULL,
+        .frequency = NRFX_MHZ_TO_HZ(1), /* irrelevant in counter mode */
+        .mode = NRF_TIMER_MODE_COUNTER,
+        .bit_width = NRF_TIMER_BIT_WIDTH_32,
+        .p_context = NULL,
     };
     err = nrfx_timer_init(&s_timer, &tcfg, timer_dummy_handler);
     if (err != NRFX_SUCCESS) {
@@ -121,8 +121,7 @@ int ws_sync_init(void)
 
     /* Connect the input buffer; reset-state GPIO inputs are disconnected. */
     nrf_gpio_cfg_input(NRF_GPIO_PIN_MAP(WS_PORT, WS_PIN), NRF_GPIO_PIN_NOPULL);
-    nrf_gpiote_event_configure(NRF_GPIOTE, s_gpiote_channel,
-                               NRF_GPIO_PIN_MAP(WS_PORT, WS_PIN),
+    nrf_gpiote_event_configure(NRF_GPIOTE, s_gpiote_channel, NRF_GPIO_PIN_MAP(WS_PORT, WS_PIN),
                                NRF_GPIOTE_POLARITY_LOTOHI);
     nrf_gpiote_event_enable(NRF_GPIOTE, s_gpiote_channel);
 
@@ -137,10 +136,8 @@ int ws_sync_init(void)
     }
 
     uint32_t gpiote_evt_addr =
-        nrf_gpiote_event_address_get(NRF_GPIOTE,
-                                     nrf_gpiote_in_event_get(s_gpiote_channel));
-    uint32_t timer_task_addr =
-        nrfx_timer_task_address_get(&s_timer, NRF_TIMER_TASK_COUNT);
+        nrf_gpiote_event_address_get(NRF_GPIOTE, nrf_gpiote_in_event_get(s_gpiote_channel));
+    uint32_t timer_task_addr = nrfx_timer_task_address_get(&s_timer, NRF_TIMER_TASK_COUNT);
 
     err = nrfx_ppi_channel_assign(s_ppi_channel, gpiote_evt_addr, timer_task_addr);
     if (err != NRFX_SUCCESS) {
@@ -153,8 +150,8 @@ int ws_sync_init(void)
     }
 
     s_initialized = true;
-    LOG_INF("WS sync capture initialized (P%d.%02d, GPIOTE ch %d, TIMER1 counter)",
-            WS_PORT, WS_PIN, s_gpiote_channel);
+    LOG_INF("WS sync capture initialized (P%d.%02d, GPIOTE ch %d, TIMER1 counter)", WS_PORT, WS_PIN,
+            s_gpiote_channel);
     return 0;
 }
 
@@ -171,7 +168,7 @@ void ws_sync_start(void)
     /* Enable PPI channel */
     nrfx_ppi_channel_enable(s_ppi_channel);
 
-    s_last_count   = 0;
+    s_last_count = 0;
     s_first_sample = true;
     s_last_frame_counter = 0;
     memset(&s_diag, 0, sizeof(s_diag));
@@ -203,8 +200,7 @@ bool ws_sync_capture(uint32_t *edge_count)
     return true;
 }
 
-bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count,
-                    int32_t *correction_us)
+bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count, int32_t *correction_us)
 {
     if (!s_running || correction_us == NULL) {
         return false;
@@ -270,8 +266,8 @@ bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count,
     }
 
     s_diag.last_correction_us = correction;
-    s_diag.cumulative_drift_us = CLAMP((int64_t)s_diag.cumulative_drift_us + error_us,
-                                       INT32_MIN, INT32_MAX);
+    s_diag.cumulative_drift_us =
+        CLAMP((int64_t)s_diag.cumulative_drift_us + error_us, INT32_MIN, INT32_MAX);
     s_diag.valid_count++;
     *correction_us = correction;
 

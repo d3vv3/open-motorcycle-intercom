@@ -18,43 +18,43 @@
 #ifndef OMI_MESH_PROTOCOL_DEFS_H
 #define OMI_MESH_PROTOCOL_DEFS_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* ============================================================================
  * Protocol constants (wire-visible)
  * ============================================================================ */
 
-#define MESH_MAX_NODES             8
-#define MESH_FRAME_MS              20   /* TDMA frame duration (aligned with Opus) */
-#define MESH_SLOT_MS               2    /* TDMA slot duration */
-#define MESH_GUARD_US              500  /* Guard time between slots */
-#define MESH_SYNC_INTERVAL_FRAMES  10   /* SYNC broadcast cadence */
-#define MESH_NODE_TIMEOUT_MS       3000 /* Drop peer after this silence */
-#define MESH_KEEPALIVE_INTERVAL_MS 500  /* KEEPALIVE cadence */
-#define MESH_PROTOCOL_VERSION      0x02
-#define MESH_MAX_OPUS_BYTES        64
-#define MESH_E2E_SEQUENCE_BYTES    2
-#define MESH_MAX_AUDIO_PAYLOAD     (MESH_MAX_OPUS_BYTES + MESH_E2E_SEQUENCE_BYTES)
+#define MESH_MAX_NODES                  8
+#define MESH_FRAME_MS                   20   /* TDMA frame duration (aligned with Opus) */
+#define MESH_SLOT_MS                    2    /* TDMA slot duration */
+#define MESH_GUARD_US                   500  /* Guard time between slots */
+#define MESH_SYNC_INTERVAL_FRAMES       10   /* SYNC broadcast cadence */
+#define MESH_NODE_TIMEOUT_MS            3000 /* Drop peer after this silence */
+#define MESH_KEEPALIVE_INTERVAL_MS      500  /* KEEPALIVE cadence */
+#define MESH_PROTOCOL_VERSION           0x02
+#define MESH_MAX_OPUS_BYTES             64
+#define MESH_E2E_SEQUENCE_BYTES         2
+#define MESH_MAX_AUDIO_PAYLOAD          (MESH_MAX_OPUS_BYTES + MESH_E2E_SEQUENCE_BYTES)
 #define MESH_AUDIO_V2_CODEC_OPUS        0x01
 #define MESH_AUDIO_V2_FRAME_MS          20
 #define MESH_AUDIO_V2_FIXED_HEADER_SIZE 8
 #define MESH_AUDIO_V2_MAX_FRAME_BYTES   64
 #define MESH_AUDIO_V2_MAX_FRAME_DATA    (3 * MESH_AUDIO_V2_MAX_FRAME_BYTES)
-#define MESH_AUDIO_V2_MAX_BUNDLE_SIZE   \
+#define MESH_AUDIO_V2_MAX_BUNDLE_SIZE                                                              \
     (MESH_AUDIO_V2_FIXED_HEADER_SIZE + MESH_AUDIO_V2_MAX_FRAME_DATA)
-#define MESH_AUDIO_V2_MAX_PACKET_SIZE    (8 + MESH_AUDIO_V2_MAX_BUNDLE_SIZE)
-#define MESH_MAX_ACTIVE_SPEAKERS   2    /* Concurrent relay-granted speakers */
-#define MESH_AUDIO_TTL_DEFAULT     2    /* Default relay TTL */
+#define MESH_AUDIO_V2_MAX_PACKET_SIZE (8 + MESH_AUDIO_V2_MAX_BUNDLE_SIZE)
+#define MESH_MAX_ACTIVE_SPEAKERS      2 /* Concurrent relay-granted speakers */
+#define MESH_AUDIO_TTL_DEFAULT        2 /* Default relay TTL */
 
 /* Header control flags */
-#define MESH_FLAG_RELAY_REQUEST    0x01
-#define MESH_FLAG_RELAYED          0x02
-#define MESH_FLAG_SPEAKER_GRANTED  0x04
+#define MESH_FLAG_RELAY_REQUEST   0x01
+#define MESH_FLAG_RELAYED         0x02
+#define MESH_FLAG_SPEAKER_GRANTED 0x04
 
 /* Audio payload flags */
-#define MESH_AUDIO_FLAG_ACTIVE     0x01
-#define MESH_AUDIO_V2_FLAG_CURRENT_ACTIVE   0x01
+#define MESH_AUDIO_FLAG_ACTIVE               0x01
+#define MESH_AUDIO_V2_FLAG_CURRENT_ACTIVE    0x01
 #define MESH_AUDIO_V2_FLAG_PREVIOUS1_PRESENT 0x02
 #define MESH_AUDIO_V2_FLAG_PREVIOUS1_ACTIVE  0x04
 #define MESH_AUDIO_V2_FLAG_PREVIOUS2_PRESENT 0x08
@@ -192,16 +192,12 @@ MESH_STATIC_ASSERT(sizeof(mesh_speaker_grant_payload_t) == 5,
                    "mesh_speaker_grant_payload_t wire size changed");
 MESH_STATIC_ASSERT(sizeof(mesh_speaker_release_payload_t) == 3,
                    "mesh_speaker_release_payload_t wire size changed");
-MESH_STATIC_ASSERT(MESH_AUDIO_V2_FIXED_HEADER_SIZE == 8,
-                   "audio v2 fixed header size changed");
-MESH_STATIC_ASSERT(MESH_AUDIO_V2_FRAME_MS == MESH_FRAME_MS,
-                   "audio v2 frame duration changed");
+MESH_STATIC_ASSERT(MESH_AUDIO_V2_FIXED_HEADER_SIZE == 8, "audio v2 fixed header size changed");
+MESH_STATIC_ASSERT(MESH_AUDIO_V2_FRAME_MS == MESH_FRAME_MS, "audio v2 frame duration changed");
 MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_FRAME_BYTES == MESH_MAX_OPUS_BYTES,
                    "audio v2 frame limit changed");
-MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_BUNDLE_SIZE == 200,
-                   "audio v2 bundle limit changed");
-MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_PACKET_SIZE == 208,
-                   "audio v2 mesh packet limit changed");
+MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_BUNDLE_SIZE == 200, "audio v2 bundle limit changed");
+MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_PACKET_SIZE == 208, "audio v2 mesh packet limit changed");
 MESH_STATIC_ASSERT(sizeof(mesh_header_t) + MESH_AUDIO_V2_MAX_BUNDLE_SIZE ==
                        MESH_AUDIO_V2_MAX_PACKET_SIZE,
                    "audio v2 packet size no longer matches mesh envelope");

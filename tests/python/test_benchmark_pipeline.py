@@ -1,6 +1,7 @@
 import unittest
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from benchmark import (
     PortReader,
@@ -37,11 +38,11 @@ class PipelineLogTest(unittest.TestCase):
     def test_rejects_unknown_or_incomplete_schema(self):
         self.assertIsNone(parse_pipeline_logfmt("PIPE v=2 dev=nrf stage=rf tx_done=1"))
         self.assertIsNone(parse_pipeline_logfmt("PIPE v=1 stage=rf tx_done=1"))
+        self.assertIsNone(parse_pipeline_logfmt("PIPE v=1 dev=nrf stage=rf tx_ok=-1"))
         self.assertIsNone(
-            parse_pipeline_logfmt("PIPE v=1 dev=nrf stage=rf tx_ok=-1")
-        )
-        self.assertIsNone(
-            parse_pipeline_logfmt("PIPE v=1 dev=nrf stage=tdma node=-1 sync_frame_diff=-2")
+            parse_pipeline_logfmt(
+                "PIPE v=1 dev=nrf stage=tdma node=-1 sync_frame_diff=-2"
+            )
         )
         self.assertIsNone(parse_pipeline_logfmt("ordinary firmware log"))
 
@@ -210,9 +211,7 @@ class PipelineLogTest(unittest.TestCase):
     def test_txstarve_uses_u32_rollover_delta(self):
         stats = PortStats(port="test", open_ok=True, lines=2)
         reader = PortReader("test", 115200, None, "unused", stats)
-        reader._parse_line(
-            "[TXSTARVE] total=4294967293 r=1 id=2 sl=1 q=0 tts=100"
-        )
+        reader._parse_line("[TXSTARVE] total=4294967293 r=1 id=2 sl=1 q=0 tts=100")
         reader._parse_line("[TXSTARVE] total=3 r=1 id=2 sl=1 q=0 tts=100")
 
         self.assertEqual(_nrf_starvation_delta(stats), 6)
@@ -288,8 +287,12 @@ class PipelineLogTest(unittest.TestCase):
             "PIPE v=1 dev=esp stage=audio capture_ok={ok} conceal={conceal} "
             "rx_sources=1 asrc_ppm={ppm} asrc_abs_max_ppm={maximum} asrc_recovery={recovery}"
         )
-        reader._parse_line(base.format(ok=100, conceal=2, ppm=-375, maximum=375, recovery=0))
-        reader._parse_line(base.format(ok=200, conceal=7, ppm=250, maximum=500, recovery=1))
+        reader._parse_line(
+            base.format(ok=100, conceal=2, ppm=-375, maximum=375, recovery=0)
+        )
+        reader._parse_line(
+            base.format(ok=200, conceal=7, ppm=250, maximum=500, recovery=1)
+        )
 
         pipeline = _build_port_json(stats)["pipeline"]["esp:audio:na"]
         self.assertEqual(pipeline["delta"]["capture_ok"], 100)
@@ -397,9 +400,7 @@ class PipelineLogTest(unittest.TestCase):
     def test_e2e_recovery_keeps_legacy_logs_and_clears_health_when_repaired(self):
         legacy = PortStats(port="legacy")
         legacy_reader = PortReader("legacy", 115200, None, "unused", legacy)
-        legacy_reader._parse_line(
-            "[E2E_ESP] tx=10 rx=8 gap_evt=1 gap_fr=2 reset_evt=0"
-        )
+        legacy_reader._parse_line("[E2E_ESP] tx=10 rx=8 gap_evt=1 gap_fr=2 reset_evt=0")
         self.assertNotIn("recovered", legacy.last_e2e_esp)
 
         repaired = PortStats(port="test", open_ok=True, lines=2)
@@ -412,7 +413,9 @@ class PipelineLogTest(unittest.TestCase):
             "[E2E_ESP] tx=120 rx=98 gap_evt=12 gap_fr=15 reset_evt=0 "
             "recovered=9 effective_gap=6"
         )
-        self.assertEqual(_health_line(repaired), "OK (no error/drops/CRC growth observed)")
+        self.assertEqual(
+            _health_line(repaired), "OK (no error/drops/CRC growth observed)"
+        )
 
     def test_e2e_recovery_credits_only_outstanding_raw_gaps(self):
         scenarios = (
@@ -451,9 +454,7 @@ class PipelineLogTest(unittest.TestCase):
                 if expected_effective == 0:
                     self.assertEqual(health, "OK (no error/drops/CRC growth observed)")
                 else:
-                    self.assertIn(
-                        f"e2e_esp_effective_gap+{expected_effective}", health
-                    )
+                    self.assertIn(f"e2e_esp_effective_gap+{expected_effective}", health)
 
     def test_late_current_does_not_create_a_later_effective_gap(self):
         stats = PortStats(port="test", open_ok=True, lines=3)
@@ -501,9 +502,7 @@ class PipelineLogTest(unittest.TestCase):
         stats = PortStats(port="test")
         reader = PortReader("test", 115200, None, "unused", stats)
         for value in (100, 120, 3, 8):
-            reader._parse_line(
-                f"PIPE v=1 dev=nrf stage=mesh node=3 ingress_ok={value}"
-            )
+            reader._parse_line(f"PIPE v=1 dev=nrf stage=mesh node=3 ingress_ok={value}")
 
         pipeline = _build_port_json(stats)["pipeline"]["nrf:mesh:3"]
         self.assertEqual(pipeline["delta"]["ingress_ok"], 28)
@@ -588,6 +587,72 @@ class PipelineLogTest(unittest.TestCase):
             _reconnect_candidates("/dev/ttyACM0", ("abc", 1, 2)),
             ["/dev/ttyACM1"],
         )
+
+
+class PortReaderLifecycleTest(unittest.TestCase):
+    @patch("benchtool.capture.serial.Serial")
+    @patch("benchtool.capture._reconnect_candidates")
+    @patch("benchtool.capture._serial_identity", return_value=("id", 1, 2))
+    def test_reconnects_using_candidates_in_order(self, _, candidates, serial):
+        stop_event = Mock()
+        stop_event.is_set.side_effect = [False, False, False, True]
+        first_connection = Mock()
+        first_connection.readline.side_effect = OSError("disconnected")
+        second_connection = Mock()
+        second_connection.readline.return_value = b""
+        candidates.return_value = ["/dev/ttyACM0", "/dev/ttyACM1"]
+        serial.side_effect = [
+            OSError("missing"),
+            OSError("unavailable"),
+            first_connection,
+            second_connection,
+        ]
+        stats = PortStats(port="/dev/ttyACM0")
+
+        def record_wait(timeout):
+            if timeout == 0.25:
+                self.assertEqual(stats.open_error, "Open error: unavailable")
+
+        stop_event.wait.side_effect = record_wait
+        with TemporaryDirectory() as directory:
+            PortReader(
+                "/dev/ttyACM0", 115200, stop_event, f"{directory}/port.log", stats
+            ).run()
+        self.assertEqual(
+            [serial_call.args[0] for serial_call in serial.call_args_list],
+            [
+                "/dev/ttyACM0",
+                "/dev/ttyACM1",
+                "/dev/ttyACM0",
+                "/dev/ttyACM0",
+            ],
+        )
+        self.assertTrue(stats.open_ok)
+        self.assertIsNone(stats.open_error)
+        self.assertEqual(stats.reconnects, 1)
+        self.assertEqual(stop_event.wait.call_args_list, [call(0.25), call(0.1)])
+        first_connection.close.assert_called_once_with()
+        second_connection.close.assert_called_once_with()
+
+    @patch("benchtool.capture.serial.Serial")
+    @patch("benchtool.capture._serial_identity", return_value=(None, None, None))
+    def test_ignores_os_error_when_closing_after_read_failure(self, _, serial):
+        stop_event = Mock()
+        stop_event.is_set.side_effect = [False, True]
+        connection = Mock()
+        connection.readline.side_effect = OSError("disconnected")
+        connection.close.side_effect = OSError("close failed")
+        serial.return_value = connection
+        stats = PortStats(port="/dev/ttyACM0")
+
+        with TemporaryDirectory() as directory:
+            PortReader(
+                "/dev/ttyACM0", 115200, stop_event, f"{directory}/port.log", stats
+            ).run()
+
+        self.assertEqual(stats.open_error, "Read error: disconnected")
+        connection.close.assert_called_once_with()
+        stop_event.wait.assert_called_once_with(0.1)
 
 
 if __name__ == "__main__":

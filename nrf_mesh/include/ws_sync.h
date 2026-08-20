@@ -10,8 +10,8 @@
 #ifndef OMI_WS_SYNC_H
 #define OMI_WS_SYNC_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * @brief Initialize WS sync capture hardware (GPIOTE + PPI + TIMER1).
@@ -50,8 +50,7 @@ bool ws_sync_capture(uint32_t *edge_count);
  * @return true if a valid measurement was produced, false if not enough
  *         data yet (e.g. first call, or WS signal absent).
  */
-bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count,
-                    int32_t *correction_us);
+bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count, int32_t *correction_us);
 
 typedef struct {
     uint32_t total_edges;

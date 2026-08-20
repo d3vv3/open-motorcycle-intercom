@@ -3,36 +3,35 @@
  * @brief Mesh Protocol Membership State Machine
  */
 
-#include "mesh_protocol_internal.h"
-#include "mesh_membership.h"
-
 #include <stdarg.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include "esb_radio.h"
+#include "mesh_membership.h"
+#include "mesh_protocol_internal.h"
 #include "tdma.h"
 #include "uart_bridge.h"
 
 LOG_MODULE_DECLARE(mesh);
 
-#define C mesh_protocol_context_get()
-#define s_state C->state
-#define s_role C->role
-#define s_node_id C->node_id
-#define s_slot_index C->slot_index
-#define s_coordinator_id C->coordinator_id
+#define C                              mesh_protocol_context_get()
+#define s_state                        C->state
+#define s_role                         C->role
+#define s_node_id                      C->node_id
+#define s_slot_index                   C->slot_index
+#define s_coordinator_id               C->coordinator_id
 #define s_participant_membership_known C->participant_membership_known
-#define s_local_addr C->local_addr
-#define s_peers C->peers
-#define s_peer_count C->peer_count
-#define s_last_sync_time C->last_sync_time
-#define s_join_attempts C->join_attempts
-#define s_dedupe C->dedupe
-#define s_control_ring C->control_ring
-#define s_control_head C->control_head
-#define s_control_tail C->control_tail
+#define s_local_addr                   C->local_addr
+#define s_peers                        C->peers
+#define s_peer_count                   C->peer_count
+#define s_last_sync_time               C->last_sync_time
+#define s_join_attempts                C->join_attempts
+#define s_dedupe                       C->dedupe
+#define s_control_ring                 C->control_ring
+#define s_control_head                 C->control_head
+#define s_control_tail                 C->control_tail
 
 static struct k_work_delayable *s_scan_work;
 static struct k_work_delayable *s_join_work;
@@ -172,8 +171,8 @@ static void process_sync(const mesh_header_t *hdr, const uint8_t *payload, int64
         k_work_schedule(s_join_work, K_NO_WAIT);
     } else if (transition.action == MESH_MEMBERSHIP_ACTION_ACCEPT_SYNC) {
         const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
-        int64_t frame_start_us = timestamp_us - (MESH_MAX_NODES * MESH_SLOT_MS * 1000) -
-                                 NRF_SYNC_RX_LATENCY_US;
+        int64_t frame_start_us =
+            timestamp_us - (MESH_MAX_NODES * MESH_SLOT_MS * 1000) - NRF_SYNC_RX_LATENCY_US;
         tdma_sync(sync->frame_counter, sync->drift_ppm, frame_start_us);
         s_last_sync_time = k_uptime_get_32();
     } else if (transition.action == MESH_MEMBERSHIP_ACTION_DEMOTE_COORDINATOR) {
@@ -269,8 +268,8 @@ static void process_join_ack(const mesh_header_t *hdr, const uint8_t *payload)
         tdma_start(s_slot_index, false);
         s_last_sync_time = k_uptime_get_32();
         k_work_schedule(s_status_work, K_MSEC(STATUS_INTERVAL_MS));
-        uart_bridge_send_status(s_state, s_role, BRIDGE_PEER_COUNT_UNKNOWN, s_node_id,
-                                s_slot_index, s_coordinator_id);
+        uart_bridge_send_status(s_state, s_role, BRIDGE_PEER_COUNT_UNKNOWN, s_node_id, s_slot_index,
+                                s_coordinator_id);
         uart_bridge_send_event(BRIDGE_EVENT_MESH_READY, NULL, 0);
     }
 }
@@ -336,8 +335,8 @@ static void process_leave(const mesh_header_t *hdr, const uint8_t *payload)
     mesh_membership_event_t event = {
         .type = MESH_MEMBERSHIP_EVENT_LEAVE,
         .sender_id = hdr->src_id,
-        .payload_valid = hdr->payload_len == 0U ||
-                         hdr->payload_len == sizeof(mesh_leave_v2_payload_t),
+        .payload_valid =
+            hdr->payload_len == 0U || hdr->payload_len == sizeof(mesh_leave_v2_payload_t),
     };
     if (hdr->payload_len == 0U) {
         event.data.leave.identity = MESH_MEMBERSHIP_LEAVE_LEGACY;
@@ -358,8 +357,7 @@ static void process_leave(const mesh_header_t *hdr, const uint8_t *payload)
             event.data.leave.peer.announced = s_peers[i].announced;
             event.data.leave.peer.node_id = s_peers[i].node_id;
             event.data.leave.peer.address_len = sizeof(s_peers[i].esb_addr);
-            memcpy(event.data.leave.peer.address, s_peers[i].esb_addr,
-                   sizeof(s_peers[i].esb_addr));
+            memcpy(event.data.leave.peer.address, s_peers[i].esb_addr, sizeof(s_peers[i].esb_addr));
             break;
         }
     }
@@ -388,7 +386,7 @@ static void process_leave(const mesh_header_t *hdr, const uint8_t *payload)
 }
 
 bool mesh_protocol_membership_process_rx_packet(const mesh_header_t *hdr, const uint8_t *payload,
-                                                 int8_t rssi, int64_t timestamp_us)
+                                                int8_t rssi, int64_t timestamp_us)
 {
     switch (hdr->type) {
     case MESH_PKT_SYNC:
@@ -444,8 +442,8 @@ void mesh_protocol_membership_scan_work_handler(struct k_work *work)
     tdma_start(s_slot_index, true);
     k_work_schedule(s_status_work, K_MSEC(STATUS_INTERVAL_MS));
     LOG_INF("ACTIVE as coordinator, node_id=%d, slot=%d", s_node_id, s_slot_index);
-    uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(), s_node_id,
-                            s_slot_index, s_coordinator_id);
+    uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
+                            s_node_id, s_slot_index, s_coordinator_id);
     uart_bridge_send_event(BRIDGE_EVENT_BECAME_COORDINATOR, NULL, 0);
     uart_bridge_send_event(BRIDGE_EVENT_MESH_READY, NULL, 0);
 }
@@ -529,8 +527,8 @@ bool mesh_protocol_membership_handle_coordinator_timeout(void)
     s_slot_index = -1;
     s_coordinator_id = 0;
     uint32_t delay_ms = mesh_protocol_membership_scan_timeout_ms();
-    uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(), s_node_id,
-                            s_slot_index, s_coordinator_id);
+    uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
+                            s_node_id, s_slot_index, s_coordinator_id);
     k_work_schedule(s_scan_work, K_MSEC(delay_ms));
     return true;
 }

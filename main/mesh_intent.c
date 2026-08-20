@@ -8,11 +8,12 @@
 #include <stdatomic.h>
 
 #include "esp_log.h"
+
 #include "nvs.h"
 
 static const char *TAG = "omi";
 
-#define MESH_NVS_NAMESPACE "omi"
+#define MESH_NVS_NAMESPACE   "omi"
 #define MESH_NVS_ENABLED_KEY "mesh_enabled"
 
 static _Atomic bool s_enabled = false;

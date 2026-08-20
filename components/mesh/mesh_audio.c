@@ -1,5 +1,3 @@
-#include "mesh_internal.h"
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +6,7 @@
 #include "esp_random.h"
 #include "esp_wifi.h"
 
+#include "mesh_internal.h"
 #include "power.h"
 
 bool relay_queue_empty(void)
@@ -53,7 +52,7 @@ void clear_speaker_state(void)
 /* NOTE: Keep speaker-state critical sections to plain array copies; never send,
  * log, or take s_peer_mutex while holding s_speaker_mux. */
 void speaker_state_get(uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS],
-                              uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS])
+                       uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS])
 {
     taskENTER_CRITICAL(&s_speaker_mux);
     if (ids) {
@@ -66,7 +65,7 @@ void speaker_state_get(uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS],
 }
 
 void speaker_state_set(const uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS],
-                              const uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS])
+                       const uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS])
 {
     taskENTER_CRITICAL(&s_speaker_mux);
     memcpy(s_active_speaker_ids, ids, sizeof(s_active_speaker_ids));
@@ -155,7 +154,8 @@ void update_speaker_grants(void)
     memcpy(deadlines, s_active_speaker_deadline_ms, sizeof(deadlines));
     taskEXIT_CRITICAL(&s_speaker_mux);
 
-    for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES && idx < MESH_MAX_ACTIVE_SPEAKERS; node_id++) {
+    for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES && idx < MESH_MAX_ACTIVE_SPEAKERS;
+         node_id++) {
         if (deadlines[node_id] > now_ms) {
             selected[idx] = node_id;
             relay_masks[idx] = compute_relay_mask(node_id);
@@ -237,8 +237,7 @@ void handle_audio_packet(const mesh_rx_item_t *rx)
         return;
     }
 
-    if (!mesh_core_dedupe_accept(&s_dedupe, rx->header.type, rx->header.src_id,
-                                 rx->header.seq)) {
+    if (!mesh_core_dedupe_accept(&s_dedupe, rx->header.type, rx->header.src_id, rx->header.seq)) {
         return;
     }
 
@@ -307,9 +306,16 @@ esp_err_t send_audio_in_slot(void)
         if (!relay_queue_empty()) {
             relay_entry_t *entry = &s_relay_ring[s_relay_tail];
             mesh_header_t *relay_header = (mesh_header_t *)entry->data;
-            esp_err_t relay_ret = tracked_esp_now_send(
-                s_broadcast_mac, entry->data, entry->len,
-                ((const mesh_header_t *)entry->data)->type, 0, 0, NULL, false);
+            esp_err_t relay_ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){
+                .dest_mac = s_broadcast_mac,
+                .data = entry->data,
+                .len = entry->len,
+                .type = ((const mesh_header_t *)entry->data)->type,
+                .heard_bitmap = 0,
+                .relay_bitmap = 0,
+                .sequence = NULL,
+                .audio_origin = false,
+            });
 
             if (relay_ret == ESP_OK) {
                 taskENTER_CRITICAL(&s_speaker_mux);
@@ -352,9 +358,16 @@ esp_err_t send_audio_in_slot(void)
     audio->audio_flags = tx_item.audio_flags;
     memcpy(audio->data, tx_item.data, tx_item.len);
 
-    esp_err_t ret = tracked_esp_now_send(s_broadcast_mac, buffer,
-                                         sizeof(mesh_header_t) + 4 + tx_item.len,
-                                         MESH_PKT_AUDIO, 0, 0, &s_audio_tx_seq, true);
+    esp_err_t ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){
+        .dest_mac = s_broadcast_mac,
+        .data = buffer,
+        .len = sizeof(mesh_header_t) + 4 + tx_item.len,
+        .type = MESH_PKT_AUDIO,
+        .heard_bitmap = 0,
+        .relay_bitmap = 0,
+        .sequence = &s_audio_tx_seq,
+        .audio_origin = true,
+    });
 
     if (ret == ESP_OK) {
         (void)xQueueReceive(s_tx_queue, &tx_item, 0);

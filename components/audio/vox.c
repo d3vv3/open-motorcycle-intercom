@@ -41,7 +41,8 @@ void vox_init(vox_state_t *state, const audio_vox_config_t *config)
     ESP_LOGI(TAG, "Initialized");
     ESP_LOGI(TAG, "  Activation threshold: %.3f", config->activation_threshold);
     ESP_LOGI(TAG, "  Deactivation threshold: %.3f", config->deactivation_threshold);
-    ESP_LOGI(TAG, "  Min active: %u ms (%u frames)", config->min_active_ms, state->min_active_frames);
+    ESP_LOGI(TAG, "  Min active: %u ms (%u frames)", config->min_active_ms,
+             state->min_active_frames);
     ESP_LOGI(TAG, "  Hangover: %u ms (%u frames)", config->hangover_ms, state->hangover_frames);
 }
 

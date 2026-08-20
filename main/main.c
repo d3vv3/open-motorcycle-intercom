@@ -12,9 +12,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_event.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -256,7 +256,8 @@ static void log_quick_stats(void)
                                 : (s_active_transport == TRANSPORT_ESP_NOW) ? "ESP-NOW"
                                                                             : "NONE";
 
-    ESP_LOGI(TAG, "[STATS] Trans:%s | TX:%lu RX:%lu Lost:%lu (%.1f%%) | Enc:%lu Dec:%lu | Jitter:%u",
+    ESP_LOGI(TAG,
+             "[STATS] Trans:%s | TX:%lu RX:%lu Lost:%lu (%.1f%%) | Enc:%lu Dec:%lu | Jitter:%u",
              transport_str, mesh_stats.audio_frames_tx, mesh_stats.audio_frames_rx,
              mesh_stats.audio_frames_lost, loss_pct, audio_stats.frames_encoded,
              audio_stats.frames_decoded, mesh_stats.jitter_depth);
@@ -264,8 +265,8 @@ static void log_quick_stats(void)
     if (s_active_transport == TRANSPORT_NRF52840) {
         rtt_probe_stats_t rtt = {0};
         rtt_probe_get_stats(&rtt);
-        ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
-                 rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max, rtt.jitter_ms_avg,
+        ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums", rtt.sent,
+                 rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max, rtt.jitter_ms_avg,
                  rtt.jitter_ms_max);
     }
 }
@@ -342,9 +343,8 @@ static void select_transport(void)
     }
 }
 
-void app_main(void)
+static esp_err_t initialize_application(int64_t boot_time)
 {
-    int64_t boot_time = get_time_ms();
     rtt_probe_init();
 
     ESP_LOGI(TAG, "OMI - Open Motorcycle Intercom");
@@ -363,7 +363,7 @@ void app_main(void)
     esp_err_t ret = power_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize power management: %s", esp_err_to_name(ret));
-        goto error_halt;
+        return ret;
     }
     ESP_LOGI(TAG, "[%" PRId64 " ms] Power management initialized", get_time_ms());
 
@@ -372,7 +372,7 @@ void app_main(void)
     ret = button_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize button: %s", esp_err_to_name(ret));
-        goto error_halt;
+        return ret;
     }
     ESP_LOGI(TAG, "[%" PRId64 " ms] Button handler initialized", get_time_ms());
 
@@ -383,7 +383,7 @@ void app_main(void)
     ret = init_audio_with_test_flags();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize audio: %s", esp_err_to_name(ret));
-        goto error_halt;
+        return ret;
     }
     ESP_LOGI(TAG, "Audio test flags: force_tx_always=%s", FORCE_TX_ALWAYS_FOR_TEST ? "YES" : "no");
 
@@ -391,7 +391,7 @@ void app_main(void)
     ret = audio_set_mode(AUDIO_MODE_MESH);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set audio mode: %s", esp_err_to_name(ret));
-        goto error_halt;
+        return ret;
     }
 
     audio_register_tx_callback(audio_tx_callback);
@@ -402,14 +402,14 @@ void app_main(void)
         ret = transport_espnow_init();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initialize mesh: %s", esp_err_to_name(ret));
-            goto error_halt;
+            return ret;
         }
 
         if (mesh_intent_enabled()) {
             ret = mesh_start();
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to restore persisted mesh intent: %s", esp_err_to_name(ret));
-                goto error_halt;
+                return ret;
             }
             atomic_store(&g_mesh_active, true);
         }
@@ -432,7 +432,7 @@ void app_main(void)
     ret = audio_start();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start audio: %s", esp_err_to_name(ret));
-        goto error_halt;
+        return ret;
     }
 
     /* The persisted user policy is reconciled with the selected transport. */
@@ -446,6 +446,11 @@ void app_main(void)
     ESP_LOGI(TAG, "System running!");
     ESP_LOGI(TAG, "");
 
+    return ESP_OK;
+}
+
+static void run_runtime_health_loop(int64_t boot_time)
+{
     /* Main loop - log system health periodically */
     int64_t last_health_check = get_time_ms();
     int64_t last_quick_stats = get_time_ms();
@@ -492,6 +497,17 @@ void app_main(void)
             last_health_check = now_ms;
         }
     }
+}
+
+void app_main(void)
+{
+    int64_t boot_time = get_time_ms();
+
+    if (initialize_application(boot_time) != ESP_OK) {
+        goto error_halt;
+    }
+
+    run_runtime_health_loop(boot_time);
 
     /* Cleanup (unreachable in normal operation) */
     mesh_stop();

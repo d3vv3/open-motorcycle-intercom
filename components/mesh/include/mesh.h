@@ -62,9 +62,7 @@ typedef struct {
  */
 #define MESH_CONFIG_DEFAULT()                                                                      \
     {                                                                                              \
-        .node_id = 0,                                                                              \
-        .tx_power = 20,                                                                            \
-        .channel = 1,                                                                              \
+        .node_id = 0, .tx_power = 20, .channel = 1,                                                \
     }
 
 /**
@@ -138,7 +136,7 @@ typedef struct {
  * @param timestamp_us Original ESP-NOW receive timestamp (microseconds)
  */
 typedef void (*mesh_audio_cb_t)(const uint8_t *data, uint16_t len, uint8_t src_id,
-                                 uint8_t audio_flags, int64_t timestamp_us);
+                                uint8_t audio_flags, int64_t timestamp_us);
 
 /**
  * @brief Callback for mesh state changes

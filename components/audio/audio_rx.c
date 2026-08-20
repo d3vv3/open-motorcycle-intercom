@@ -3,12 +3,12 @@
  * @brief RX packet admission and source reset handshakes.
  */
 
-#include "audio_internal.h"
-#include "audio_rx_source_select.h"
-
 #include <string.h>
 
 #include "esp_timer.h"
+
+#include "audio_internal.h"
+#include "audio_rx_source_select.h"
 
 /* Caller holds rx_sources_mutex. Decoder and resampler resets remain playout-owned. */
 void audio_rx_reset_source_metadata_locked(void)
@@ -55,12 +55,10 @@ static audio_packet_t packet_from_frame(const audio_frame_t *frame)
     audio_packet_t packet = {
         .length = frame->len,
         .sequence = frame->seq,
-        .mode = frame->has_seq ? AUDIO_PACKET_MODE_SEQUENCED
-                               : AUDIO_PACKET_MODE_ARRIVAL_ORDER,
+        .mode = frame->has_seq ? AUDIO_PACKET_MODE_SEQUENCED : AUDIO_PACKET_MODE_ARRIVAL_ORDER,
         .active = frame->active,
-        .received_us = frame->timestamp_ms > 0
-                           ? (uint64_t)frame->timestamp_ms * UINT64_C(1000)
-                           : 0u,
+        .received_us =
+            frame->timestamp_ms > 0 ? (uint64_t)frame->timestamp_ms * UINT64_C(1000) : 0u,
     };
     memcpy(packet.data, frame->data, frame->len);
     return packet;
@@ -103,8 +101,8 @@ static audio_rx_source_t *admit_source_locked(const audio_frame_t *frame, uint8_
 
 /* Caller holds rx_sources_mutex. */
 static audio_packet_store_push_result_t push_packet_locked(audio_rx_source_t *source,
-                                                           audio_packet_t *packet,
-                                                           uint64_t now_ms, bool *reanchored)
+                                                           audio_packet_t *packet, uint64_t now_ms,
+                                                           bool *reanchored)
 {
     audio_packet_store_push_result_t result =
         audio_packet_store_push(&source->packet_store, packet, now_ms);
@@ -197,9 +195,8 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         xSemaphoreGive(g_audio.lifecycle_mutex);
         return ESP_ERR_TIMEOUT;
     }
-    if (!g_audio.initialized ||
-        !atomic_load_explicit(&g_audio.running, memory_order_acquire) || source_id == 0 ||
-        g_audio.config.mode != AUDIO_MODE_MESH) {
+    if (!g_audio.initialized || !atomic_load_explicit(&g_audio.running, memory_order_acquire) ||
+        source_id == 0 || g_audio.config.mode != AUDIO_MODE_MESH) {
         xSemaphoreGive(g_audio.rx_sources_mutex);
         xSemaphoreGive(g_audio.lifecycle_mutex);
         return ESP_ERR_INVALID_STATE;

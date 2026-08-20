@@ -3,12 +3,12 @@
  * @brief Playout task: decode, adaptive render, mixing, I2S writes, heartbeat.
  */
 
-#include "audio_internal.h"
-
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "audio_internal.h"
 
 static const char *TAG = "audio";
 
@@ -42,8 +42,7 @@ static void advance_far_reference_after_write(void)
     portEXIT_CRITICAL(&g_audio_far_ref_lock);
 }
 
-static void record_decode_result(int samples, int64_t decode_time_us,
-                                 int64_t *decode_time_sum)
+static void record_decode_result(int samples, int64_t decode_time_us, int64_t *decode_time_sum)
 {
     if (samples != AUDIO_FRAME_SAMPLES) {
         AUDIO_STATS_LOCK();
@@ -55,8 +54,7 @@ static void record_decode_result(int samples, int64_t decode_time_us,
     *decode_time_sum += decode_time_us;
     AUDIO_STATS_LOCK();
     g_audio.stats.frames_decoded++;
-    g_audio.stats.decode_time_us_avg =
-        (uint32_t)(*decode_time_sum / g_audio.stats.frames_decoded);
+    g_audio.stats.decode_time_us_avg = (uint32_t)(*decode_time_sum / g_audio.stats.frames_decoded);
     if ((uint32_t)decode_time_us > g_audio.stats.decode_time_us_max) {
         g_audio.stats.decode_time_us_max = (uint32_t)decode_time_us;
     }
@@ -74,10 +72,9 @@ static void update_depth_stats(uint16_t packet_depth)
     if (depth > g_audio.stats.rx_q_depth_max) {
         g_audio.stats.rx_q_depth_max = depth;
     }
-    uint64_t previous = (uint64_t)g_audio.stats.rx_q_depth_avg *
-                        (uint64_t)(g_audio.stats.playout_task_loops - 1u);
-    g_audio.stats.rx_q_depth_avg =
-        (uint8_t)((previous + depth) / g_audio.stats.playout_task_loops);
+    uint64_t previous =
+        (uint64_t)g_audio.stats.rx_q_depth_avg * (uint64_t)(g_audio.stats.playout_task_loops - 1u);
+    g_audio.stats.rx_q_depth_avg = (uint8_t)((previous + depth) / g_audio.stats.playout_task_loops);
     AUDIO_STATS_UNLOCK();
 }
 
@@ -92,8 +89,7 @@ static void record_rx_pipe_latency(const audio_packet_t *packet, int64_t decode_
     g_audio.rx_pipe_sum_us += rx_pipe_us;
     g_audio.stats.rx_pipe_us_avg = (uint32_t)(g_audio.rx_pipe_sum_us / g_audio.rx_pipe_count);
     if (rx_pipe_us > g_audio.stats.rx_pipe_us_max) {
-        g_audio.stats.rx_pipe_us_max =
-            rx_pipe_us > UINT32_MAX ? UINT32_MAX : (uint32_t)rx_pipe_us;
+        g_audio.stats.rx_pipe_us_max = rx_pipe_us > UINT32_MAX ? UINT32_MAX : (uint32_t)rx_pipe_us;
     }
     AUDIO_STATS_UNLOCK();
 }
@@ -156,8 +152,7 @@ static bool pop_due_events(audio_rx_source_t *source, uint64_t now_ms,
         size_t count;
         for (count = 0; count < event_limit; ++count) {
             audio_playout_event_t *event = &events[count];
-            event->result =
-                audio_packet_store_pop(&source->packet_store, now_ms, &event->packet);
+            event->result = audio_packet_store_pop(&source->packet_store, now_ms, &event->packet);
             if (event->result == AUDIO_PACKET_STORE_POP_NOT_DUE) {
                 break;
             }
@@ -173,8 +168,7 @@ static bool pop_due_events(audio_rx_source_t *source, uint64_t now_ms,
     return assigned;
 }
 
-static void decode_event_into_resampler(audio_rx_source_t *source,
-                                        audio_playout_event_t *event,
+static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout_event_t *event,
                                         int64_t *decode_time_sum)
 {
     bool packet_event = event->result == AUDIO_PACKET_STORE_POP_PACKET;
@@ -186,12 +180,11 @@ static void decode_event_into_resampler(audio_rx_source_t *source,
 
     int16_t decoded[AUDIO_FRAME_SAMPLES];
     int64_t decode_start = esp_timer_get_time();
-    int samples = packet_event
-                      ? opus_decode(source->decoder, event->packet.data,
-                                    (opus_int32)event->packet.length, decoded,
-                                    AUDIO_FRAME_SAMPLES, 0)
-                      : opus_decode(source->decoder, NULL, 0, decoded,
-                                    AUDIO_FRAME_SAMPLES, 0);
+    int samples =
+        packet_event
+            ? opus_decode(source->decoder, event->packet.data, (opus_int32)event->packet.length,
+                          decoded, AUDIO_FRAME_SAMPLES, 0)
+            : opus_decode(source->decoder, NULL, 0, decoded, AUDIO_FRAME_SAMPLES, 0);
     int64_t decode_time = esp_timer_get_time() - decode_start;
 
     if (packet_event) {
@@ -235,8 +228,7 @@ static bool decode_and_buffer_source(audio_rx_source_t *source, uint64_t now_ms,
     }
     audio_playout_event_t events[AUDIO_PACKET_STORE_CAPACITY];
     size_t event_count = 0;
-    if (!pop_due_events(source, now_ms, events, &event_count, packet_depth,
-                        upstream_samples)) {
+    if (!pop_due_events(source, now_ms, events, &event_count, packet_depth, upstream_samples)) {
         return false;
     }
     for (size_t i = 0; i < event_count; ++i) {
@@ -258,8 +250,8 @@ static bool render_remote_sources(uint64_t now_ms, int64_t *decode_time_sum)
     for (size_t source_index = 0; source_index < AUDIO_MAX_RX_SOURCES; ++source_index) {
         audio_rx_source_t *source = &g_audio.rx_sources[source_index];
         size_t upstream_samples = 0u;
-        bool assigned = decode_and_buffer_source(source, now_ms, decode_time_sum,
-                                                 &packet_depth, &upstream_samples);
+        bool assigned = decode_and_buffer_source(source, now_ms, decode_time_sum, &packet_depth,
+                                                 &upstream_samples);
         if (!assigned) {
             continue;
         }
@@ -275,14 +267,13 @@ static bool render_remote_sources(uint64_t now_ms, int64_t *decode_time_sum)
             g_audio.stats.glitches_detected++;
             AUDIO_STATS_UNLOCK();
         }
-        int32_t abs_ppm = render.correction_ppm < 0 ? -render.correction_ppm
-                                                    : render.correction_ppm;
+        int32_t abs_ppm =
+            render.correction_ppm < 0 ? -render.correction_ppm : render.correction_ppm;
         if (abs_ppm > current_abs_ppm) {
             current_abs_ppm = abs_ppm;
             current_ppm = render.correction_ppm;
         }
-        if (render.audible_active &&
-            (render.started || (was_started && render.underrun))) {
+        if (render.audible_active && (render.started || (was_started && render.underrun))) {
             active_sources++;
             for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
                 g_audio.mix_frame[i] += rendered[i];
@@ -328,8 +319,8 @@ static void render_loopback(int64_t *decode_time_sum)
         return;
     }
     int64_t decode_start = esp_timer_get_time();
-    int samples = opus_decode(g_audio.loopback_decoder, item.data, item.length,
-                              g_audio.pcm_output, AUDIO_FRAME_SAMPLES, 0);
+    int samples = opus_decode(g_audio.loopback_decoder, item.data, item.length, g_audio.pcm_output,
+                              AUDIO_FRAME_SAMPLES, 0);
     int64_t decode_time = esp_timer_get_time() - decode_start;
     record_decode_result(samples, decode_time, decode_time_sum);
     if (samples != AUDIO_FRAME_SAMPLES) {
@@ -340,9 +331,8 @@ static void render_loopback(int64_t *decode_time_sum)
 static void log_audio_stats(void)
 {
     audio_stats_t stats = audio_stats_snapshot();
-    ESP_LOGI(TAG, "Audio loops capture=%lu playout=%lu encoded=%lu decoded=%lu",
-             stats.task_loops, stats.playout_task_loops, stats.frames_encoded,
-             stats.frames_decoded);
+    ESP_LOGI(TAG, "Audio loops capture=%lu playout=%lu encoded=%lu decoded=%lu", stats.task_loops,
+             stats.playout_task_loops, stats.frames_encoded, stats.frames_decoded);
     ESP_LOGI(TAG, "  Encoded: %lu frames", stats.frames_encoded);
     ESP_LOGI(TAG, "  Decoded: %lu frames", stats.frames_decoded);
     ESP_LOGI(TAG, "  VOX activations: %lu (active: %s)", stats.vox_activations,
@@ -355,32 +345,29 @@ static void log_audio_stats(void)
              stats.tx_pipe_us_max);
     ESP_LOGI(TAG, "  RX pipeline: avg=%lu us, max=%lu us", stats.rx_pipe_us_avg,
              stats.rx_pipe_us_max);
-    ESP_LOGI(TAG, "  Latency: avg=%lu ms, max=%lu ms", stats.latency_ms_avg,
-             stats.latency_ms_max);
+    ESP_LOGI(TAG, "  Latency: avg=%lu ms, max=%lu ms", stats.latency_ms_avg, stats.latency_ms_max);
     ESP_LOGI(TAG, "  Glitches: %lu (rx_und=%lu i2s_inc=%lu), ADC overruns: %lu",
-             stats.glitches_detected, stats.rx_queue_underruns,
-             stats.i2s_write_incomplete, stats.adc_overruns);
+             stats.glitches_detected, stats.rx_queue_underruns, stats.i2s_write_incomplete,
+             stats.adc_overruns);
     ESP_LOGI(TAG,
              "  Concealment: plc=%lu grace_empty=%lu conceal=%lu seq_gap=%lu "
              "seq_reset=%lu seq_stale=%lu",
              stats.plc_frames, stats.grace_empty_polls, stats.conceal_loss_frames,
              stats.seq_gap_frames, stats.seq_resets, stats.seq_stale_drops);
-    ESP_LOGI(TAG, "  Adaptive playout: hold=%lu catchup=%lu sources=%u",
-             stats.hold_frames, stats.catchup_frames, stats.active_rx_sources);
+    ESP_LOGI(TAG, "  Adaptive playout: hold=%lu catchup=%lu sources=%u", stats.hold_frames,
+             stats.catchup_frames, stats.active_rx_sources);
     ESP_LOGI(TAG, "  RX queue depth/source: min=%u avg=%u max=%u (total now=%u)",
              stats.rx_q_depth_min, stats.rx_q_depth_avg, stats.rx_q_depth_max,
              stats.jitter_buffer_depth);
-    ESP_LOGI(TAG,
-             "Packet drops duplicate=%lu late=%lu future=%lu full=%lu source=%lu lock=%lu",
-             stats.packet_duplicate_drops, stats.packet_late_drops,
-             stats.packet_future_drops, stats.rx_queue_overflows,
-             stats.rx_source_rejections, stats.rx_lock_drops);
+    ESP_LOGI(TAG, "Packet drops duplicate=%lu late=%lu future=%lu full=%lu source=%lu lock=%lu",
+             stats.packet_duplicate_drops, stats.packet_late_drops, stats.packet_future_drops,
+             stats.rx_queue_overflows, stats.rx_source_rejections, stats.rx_lock_drops);
     ESP_LOGI(TAG,
              "Playout plc=%lu conceal=%lu seq_gap=%lu pcm_overflow=%lu pcm_underrun=%lu "
              "asrc_ppm=%ld asrc_abs_max=%lu",
              stats.plc_frames, stats.conceal_loss_frames, stats.seq_gap_frames,
-             stats.pcm_fifo_overflows, stats.pcm_underruns,
-             (long)stats.asrc_correction_ppm, stats.asrc_correction_abs_max_ppm);
+             stats.pcm_fifo_overflows, stats.pcm_underruns, (long)stats.asrc_correction_ppm,
+             stats.asrc_correction_abs_max_ppm);
     ESP_LOGI(TAG,
              "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu "
              "capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu "
@@ -392,20 +379,17 @@ static void log_audio_stats(void)
              "pcm_underrun=%lu asrc_ppm=%ld asrc_abs_max_ppm=%lu asrc_recovery=%u "
              "playout_loops=%lu",
              stats.capture_frames_ok, stats.capture_short_reads, stats.capture_timeouts,
-             stats.adc_overruns, stats.frames_encoded, stats.encode_errors,
-             stats.tx_dtx_suppressed, stats.rx_queue_overflows, stats.rx_lock_drops,
-             stats.rx_source_rejections, stats.rx_source_evictions,
-             stats.jitter_trim_frames, stats.frames_decoded,
-             stats.decode_errors, stats.plc_frames, stats.hold_frames,
-             stats.catchup_frames, stats.conceal_loss_frames, stats.seq_gap_frames,
-             stats.seq_resets, stats.seq_stale_drops, stats.glitches_detected,
-             stats.playback_frames, stats.i2s_write_incomplete,
-             stats.notification_queue_overflows, stats.active_rx_sources,
-             stats.packet_duplicate_drops, stats.packet_late_drops,
+             stats.adc_overruns, stats.frames_encoded, stats.encode_errors, stats.tx_dtx_suppressed,
+             stats.rx_queue_overflows, stats.rx_lock_drops, stats.rx_source_rejections,
+             stats.rx_source_evictions, stats.jitter_trim_frames, stats.frames_decoded,
+             stats.decode_errors, stats.plc_frames, stats.hold_frames, stats.catchup_frames,
+             stats.conceal_loss_frames, stats.seq_gap_frames, stats.seq_resets,
+             stats.seq_stale_drops, stats.glitches_detected, stats.playback_frames,
+             stats.i2s_write_incomplete, stats.notification_queue_overflows,
+             stats.active_rx_sources, stats.packet_duplicate_drops, stats.packet_late_drops,
              stats.packet_future_drops, stats.pcm_fifo_overflows, stats.pcm_underruns,
              (long)stats.asrc_correction_ppm, stats.asrc_correction_abs_max_ppm,
-             stats.asrc_recovery_active ? 1u : 0u,
-             stats.playout_task_loops);
+             stats.asrc_recovery_active ? 1u : 0u, stats.playout_task_loops);
 }
 
 static void playout_task_finish(void)
@@ -429,8 +413,8 @@ static bool prepare_i2s_output(void)
 {
     for (size_t i = 0; i < I2S_DMA_BUFFER_COUNT; ++i) {
         size_t bytes_loaded = 0;
-        esp_err_t preload = i2s_channel_preload_data(
-            g_audio.tx_chan, g_audio.i2s_silence, sizeof(g_audio.i2s_silence), &bytes_loaded);
+        esp_err_t preload = i2s_channel_preload_data(g_audio.tx_chan, g_audio.i2s_silence,
+                                                     sizeof(g_audio.i2s_silence), &bytes_loaded);
         if (preload != ESP_OK || bytes_loaded != sizeof(g_audio.i2s_silence)) {
             ESP_LOGE(TAG, "I2S silence preload %zu failed: %s (%zu bytes)", i,
                      esp_err_to_name(preload), bytes_loaded);
@@ -452,17 +436,16 @@ static void write_playout_frame(void)
         g_audio.pcm_stereo[i * 2 + 1] = g_audio.pcm_output[i];
     }
     size_t bytes_written = 0;
-    esp_err_t ret = i2s_channel_write(g_audio.tx_chan, g_audio.pcm_stereo,
-                                      sizeof(g_audio.pcm_stereo), &bytes_written,
-                                      I2S_WRITE_TIMEOUT_MS);
+    esp_err_t ret =
+        i2s_channel_write(g_audio.tx_chan, g_audio.pcm_stereo, sizeof(g_audio.pcm_stereo),
+                          &bytes_written, I2S_WRITE_TIMEOUT_MS);
     if (ret != ESP_OK || bytes_written != sizeof(g_audio.pcm_stereo)) {
         AUDIO_STATS_LOCK();
         g_audio.stats.i2s_write_incomplete++;
         g_audio.stats.glitches_detected++;
         AUDIO_STATS_UNLOCK();
         audio_playout_reset_far_reference();
-        ESP_LOGW(TAG, "I2S write incomplete: %s (%zu bytes)", esp_err_to_name(ret),
-                 bytes_written);
+        ESP_LOGW(TAG, "I2S write incomplete: %s (%zu bytes)", esp_err_to_name(ret), bytes_written);
     } else {
         advance_far_reference_after_write();
         AUDIO_STATS_LOCK();
@@ -498,8 +481,7 @@ void audio_playout_task(void *arg)
         if (g_audio.config.mode == AUDIO_MODE_LOOPBACK) {
             render_loopback(&decode_time_sum);
         } else {
-            (void)render_remote_sources((uint64_t)(esp_timer_get_time() / 1000),
-                                        &decode_time_sum);
+            (void)render_remote_sources((uint64_t)(esp_timer_get_time() / 1000), &decode_time_sum);
         }
         audio_notify_mix_frame();
         write_playout_frame();

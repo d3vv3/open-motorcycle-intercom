@@ -7,10 +7,10 @@
  * by watching the reported mesh state change instead.
  */
 
-#include "bridge_internal.h"
-
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "bridge_internal.h"
 
 static const char *TAG = "spi_bridge";
 
@@ -93,8 +93,8 @@ static esp_err_t send_mesh_command(bridge_command_t command)
     __atomic_store_n(&g_bridge.command_ack_received, false, __ATOMIC_RELEASE);
 
     for (int attempt = 1; attempt <= BRIDGE_COMMAND_MAX_ATTEMPTS; attempt++) {
-        result = bridge_tx_queue_control(BRIDGE_PKT_CONTROL, (const uint8_t *)&payload,
-                                         sizeof(payload));
+        result =
+            bridge_tx_queue_control(BRIDGE_PKT_CONTROL, (const uint8_t *)&payload, sizeof(payload));
         if (result != ESP_OK) {
             break;
         }
@@ -111,12 +111,12 @@ static esp_err_t send_mesh_command(bridge_command_t command)
             uart_bridge_status_t status;
             if (uart_bridge_get_status(&status) == ESP_OK &&
                 status.generation != initial_status_generation) {
-                bool observed = command == BRIDGE_COMMAND_MESH_START
-                                    ? (status.has_mesh_state
-                                           ? status.mesh_state != BRIDGE_MESH_STATE_IDLE
-                                           : status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
-                                                 status.node_id != 0)
-                                    : status.mesh_state == BRIDGE_MESH_STATE_IDLE;
+                bool observed =
+                    command == BRIDGE_COMMAND_MESH_START
+                        ? (status.has_mesh_state ? status.mesh_state != BRIDGE_MESH_STATE_IDLE
+                                                 : status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
+                                                       status.node_id != 0)
+                        : status.mesh_state == BRIDGE_MESH_STATE_IDLE;
                 if (observed) {
                     ESP_LOGI(TAG, "Command 0x%02X confirmed by bridge status (legacy ACK fallback)",
                              command);

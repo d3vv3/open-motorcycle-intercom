@@ -26,18 +26,14 @@ static bool audio_bundle_fields_valid(const audio_bundle_view_t *bundle)
 
     previous1_present = (bundle->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT) != 0u;
     previous2_present = (bundle->flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT) != 0u;
-    if ((!previous1_present &&
-         (bundle->previous1_len != 0u ||
-          (bundle->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u)) ||
-        (previous1_present &&
-         (bundle->previous1_data == NULL || bundle->previous1_len == 0u ||
-          bundle->previous1_len > MESH_AUDIO_V2_MAX_FRAME_BYTES)) ||
-        (!previous2_present &&
-         (bundle->previous2_len != 0u ||
-          (bundle->flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0u)) ||
+    if ((!previous1_present && (bundle->previous1_len != 0u ||
+                                (bundle->flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u)) ||
+        (previous1_present && (bundle->previous1_data == NULL || bundle->previous1_len == 0u ||
+                               bundle->previous1_len > MESH_AUDIO_V2_MAX_FRAME_BYTES)) ||
+        (!previous2_present && (bundle->previous2_len != 0u ||
+                                (bundle->flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0u)) ||
         (previous2_present &&
-         (!previous1_present || bundle->previous2_data == NULL ||
-          bundle->previous2_len == 0u ||
+         (!previous1_present || bundle->previous2_data == NULL || bundle->previous2_len == 0u ||
           bundle->previous2_len > MESH_AUDIO_V2_MAX_FRAME_BYTES))) {
         return false;
     }
@@ -46,8 +42,8 @@ static bool audio_bundle_fields_valid(const audio_bundle_view_t *bundle)
            MESH_AUDIO_V2_MAX_FRAME_DATA;
 }
 
-bool audio_bundle_encode(const audio_bundle_view_t *bundle, uint8_t *output,
-                         size_t output_capacity, size_t *output_len)
+bool audio_bundle_encode(const audio_bundle_view_t *bundle, uint8_t *output, size_t output_capacity,
+                         size_t *output_len)
 {
     size_t encoded_len;
     size_t offset;
@@ -60,8 +56,8 @@ bool audio_bundle_encode(const audio_bundle_view_t *bundle, uint8_t *output,
         return false;
     }
 
-    encoded_len = MESH_AUDIO_V2_FIXED_HEADER_SIZE + bundle->previous2_len +
-                  bundle->previous1_len + bundle->current_len;
+    encoded_len = MESH_AUDIO_V2_FIXED_HEADER_SIZE + bundle->previous2_len + bundle->previous1_len +
+                  bundle->current_len;
     if (encoded_len > MESH_AUDIO_V2_MAX_BUNDLE_SIZE || output_capacity < encoded_len) {
         return false;
     }
@@ -107,8 +103,7 @@ bool audio_bundle_parse(const uint8_t *data, size_t data_len, audio_bundle_view_
     parsed.current_len = data[AUDIO_BUNDLE_CURRENT_LEN_OFFSET];
     parsed.previous1_len = data[AUDIO_BUNDLE_PREVIOUS1_LEN_OFFSET];
     frame_data_len = data_len - MESH_AUDIO_V2_FIXED_HEADER_SIZE;
-    if (parsed.current_len == 0u ||
-        parsed.current_len > MESH_AUDIO_V2_MAX_FRAME_BYTES ||
+    if (parsed.current_len == 0u || parsed.current_len > MESH_AUDIO_V2_MAX_FRAME_BYTES ||
         parsed.previous1_len > MESH_AUDIO_V2_MAX_FRAME_BYTES ||
         parsed.current_len + parsed.previous1_len > frame_data_len) {
         return false;
@@ -118,30 +113,24 @@ bool audio_bundle_parse(const uint8_t *data, size_t data_len, audio_bundle_view_
     parsed.flags = data[AUDIO_BUNDLE_FLAGS_OFFSET];
     previous1_present = (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT) != 0u;
     previous2_present = (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT) != 0u;
-    if ((!previous1_present &&
-         (parsed.previous1_len != 0u ||
-          (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u)) ||
+    if ((!previous1_present && (parsed.previous1_len != 0u ||
+                                (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u)) ||
         (previous1_present && parsed.previous1_len == 0u) ||
-        (!previous2_present &&
-         (parsed.previous2_len != 0u ||
-          (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0u)) ||
-        (previous2_present &&
-         (!previous1_present || parsed.previous2_len == 0u ||
-          parsed.previous2_len > MESH_AUDIO_V2_MAX_FRAME_BYTES))) {
+        (!previous2_present && (parsed.previous2_len != 0u ||
+                                (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0u)) ||
+        (previous2_present && (!previous1_present || parsed.previous2_len == 0u ||
+                               parsed.previous2_len > MESH_AUDIO_V2_MAX_FRAME_BYTES))) {
         return false;
     }
 
     parsed.stream_id = data[AUDIO_BUNDLE_STREAM_ID_OFFSET];
     parsed.current_seq = (uint16_t)((uint16_t)data[AUDIO_BUNDLE_SEQUENCE_MSB_OFFSET] << 8) |
                          data[AUDIO_BUNDLE_SEQUENCE_LSB_OFFSET];
-    parsed.previous2_data = previous2_present
-                                ? data + MESH_AUDIO_V2_FIXED_HEADER_SIZE
-                                : NULL;
-    parsed.previous1_data = previous1_present
-                                ? data + MESH_AUDIO_V2_FIXED_HEADER_SIZE + parsed.previous2_len
-                                : NULL;
-    parsed.current_data = data + MESH_AUDIO_V2_FIXED_HEADER_SIZE + parsed.previous2_len +
-                          parsed.previous1_len;
+    parsed.previous2_data = previous2_present ? data + MESH_AUDIO_V2_FIXED_HEADER_SIZE : NULL;
+    parsed.previous1_data =
+        previous1_present ? data + MESH_AUDIO_V2_FIXED_HEADER_SIZE + parsed.previous2_len : NULL;
+    parsed.current_data =
+        data + MESH_AUDIO_V2_FIXED_HEADER_SIZE + parsed.previous2_len + parsed.previous1_len;
     *bundle = parsed;
     return true;
 }
@@ -159,17 +148,14 @@ bool audio_bundle_strip_oldest(uint8_t *data, size_t *data_len)
         retained_len = bundle.previous1_len + bundle.current_len;
         memmove(data + MESH_AUDIO_V2_FIXED_HEADER_SIZE, bundle.previous1_data, retained_len);
         data[AUDIO_BUNDLE_FLAGS_OFFSET] &=
-            (uint8_t)~(AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT |
-                       AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE);
+            (uint8_t) ~(AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT | AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE);
         *data_len -= bundle.previous2_len;
         return true;
     }
     if (bundle.previous1_len != 0u) {
-        memmove(data + MESH_AUDIO_V2_FIXED_HEADER_SIZE, bundle.current_data,
-                bundle.current_len);
+        memmove(data + MESH_AUDIO_V2_FIXED_HEADER_SIZE, bundle.current_data, bundle.current_len);
         data[AUDIO_BUNDLE_FLAGS_OFFSET] &=
-            (uint8_t)~(AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
-                       AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE);
+            (uint8_t) ~(AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT | AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE);
         data[AUDIO_BUNDLE_PREVIOUS1_LEN_OFFSET] = 0u;
         *data_len = MESH_AUDIO_V2_FIXED_HEADER_SIZE + bundle.current_len;
         return true;

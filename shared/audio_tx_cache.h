@@ -53,9 +53,8 @@ void audio_tx_cache_reset(audio_tx_cache_t *cache);
  * @param eligible Whether the frame may later be attached as previous1
  *                 (in main.c: the mesh-user-enabled gate at TX time).
  */
-void audio_tx_cache_store(audio_tx_cache_t *cache, const uint8_t *data,
-                          uint16_t len, bool active, uint16_t seq,
-                          bool eligible);
+void audio_tx_cache_store(audio_tx_cache_t *cache, const uint8_t *data, uint16_t len, bool active,
+                          uint16_t seq, bool eligible);
 
 /**
  * @brief Fetch the cached frame if it qualifies as previous1 for @p current_seq.
@@ -65,8 +64,7 @@ void audio_tx_cache_store(audio_tx_cache_t *cache, const uint8_t *data,
  * sequence number immediately precedes @p current_seq (uint16 wraparound
  * aware). Returns NULL (and *len_out = 0) otherwise.
  */
-const uint8_t *audio_tx_cache_previous(const audio_tx_cache_t *cache,
-                                       uint16_t current_seq,
+const uint8_t *audio_tx_cache_previous(const audio_tx_cache_t *cache, uint16_t current_seq,
                                        uint16_t *len_out);
 
 #endif /* OMI_AUDIO_TX_CACHE_H */

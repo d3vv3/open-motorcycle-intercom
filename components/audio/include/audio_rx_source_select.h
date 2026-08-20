@@ -54,9 +54,9 @@ typedef struct {
  *  4. Otherwise the frame is rejected (REJECT). Keepalive (inactive) frames
  *     never evict.
  */
-audio_rx_select_decision_t audio_rx_source_select(
-    const audio_rx_slot_snapshot_t *slots, size_t slot_count,
-    uint8_t source_id, bool frame_active, uint64_t now_ms);
+audio_rx_select_decision_t audio_rx_source_select(const audio_rx_slot_snapshot_t *slots,
+                                                  size_t slot_count, uint8_t source_id,
+                                                  bool frame_active, uint64_t now_ms);
 
 #ifdef __cplusplus
 }

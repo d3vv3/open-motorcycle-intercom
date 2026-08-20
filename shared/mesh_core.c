@@ -181,8 +181,7 @@ int64_t mesh_core_recover_frame_boundary(int64_t expected_us, int64_t now_us, in
     return expected_us + ((now_us - expected_us) / frame_us) * frame_us;
 }
 
-uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
-                             uint8_t local_heard_bitmap,
+uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id, uint8_t local_heard_bitmap,
                              const mesh_core_peer_snapshot_t *peers, size_t peer_count)
 {
     uint8_t speaker_bit = mesh_core_node_bit(speaker_id);
@@ -199,9 +198,8 @@ uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
             continue;
         }
         uint8_t peer_bit = mesh_core_node_bit(peers[i].node_id);
-        uint8_t heard_bitmap = peers[i].node_id == local_node_id
-                                   ? local_heard_bitmap
-                                   : peers[i].heard_bitmap;
+        uint8_t heard_bitmap =
+            peers[i].node_id == local_node_id ? local_heard_bitmap : peers[i].heard_bitmap;
         members |= peer_bit;
         member_count++;
         if ((heard_bitmap & speaker_bit) != 0) {
@@ -266,8 +264,8 @@ size_t mesh_core_select_speakers(const uint8_t *previous, size_t slot_count,
     return count;
 }
 
-uint32_t mesh_core_esb_tx_us(uint32_t ramp_us, uint32_t us_per_byte,
-                             uint32_t overhead_bytes, uint32_t outer_packet_bytes)
+uint32_t mesh_core_esb_tx_us(uint32_t ramp_us, uint32_t us_per_byte, uint32_t overhead_bytes,
+                             uint32_t outer_packet_bytes)
 {
     return ramp_us + us_per_byte * (outer_packet_bytes + overhead_bytes);
 }
@@ -280,9 +278,9 @@ int mesh_core_fit_airtime(uint32_t remaining_us, uint32_t margin_us, uint32_t ra
         return -1;
     }
     for (size_t i = 0; i < candidate_count; i++) {
-        uint32_t required_us = mesh_core_esb_tx_us(ramp_us, us_per_byte, overhead_bytes,
-                                                   candidate_outer_lens[i]) +
-                               margin_us;
+        uint32_t required_us =
+            mesh_core_esb_tx_us(ramp_us, us_per_byte, overhead_bytes, candidate_outer_lens[i]) +
+            margin_us;
         /* required_us <= remaining_us sends; the TX paths strip/drop only on
          * the strict `required_us > remaining_us`, so the exact-margin
          * boundary still transmits. */
@@ -293,14 +291,13 @@ int mesh_core_fit_airtime(uint32_t remaining_us, uint32_t margin_us, uint32_t ra
     return -1;
 }
 
-bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending,
-                                bool relay_contention_turn, bool tail_is_active_bundle)
+bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending, bool relay_contention_turn,
+                                bool tail_is_active_bundle)
 {
     return local_pending && relay_pending && relay_contention_turn && tail_is_active_bundle;
 }
 
-bool mesh_core_successor_carries_prev1(uint16_t deferred_seq,
-                                       const audio_bundle_view_t *tail,
+bool mesh_core_successor_carries_prev1(uint16_t deferred_seq, const audio_bundle_view_t *tail,
                                        const audio_bundle_view_t *successor)
 {
     if (tail == NULL || successor == NULL || tail->current_seq != deferred_seq ||
@@ -314,9 +311,8 @@ bool mesh_core_successor_carries_prev1(uint16_t deferred_seq,
     return memcmp(successor->previous1_data, tail->current_data, tail->current_len) == 0;
 }
 
-bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
-                                     uint8_t sender_id, uint8_t expected_coordinator_id,
-                                     uint8_t slot_count)
+bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment, uint8_t sender_id,
+                                     uint8_t expected_coordinator_id, uint8_t slot_count)
 {
     return assignment != NULL && slot_count > 1 && slot_count <= MESH_MAX_NODES &&
            mesh_core_node_id_valid(assignment->assigned_id) && assignment->slot_index > 0 &&
@@ -324,8 +320,7 @@ bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
            mesh_core_node_id_valid(assignment->coordinator_id) &&
            assignment->assigned_id != assignment->coordinator_id &&
            sender_id == assignment->coordinator_id &&
-           (expected_coordinator_id == 0 ||
-            expected_coordinator_id == assignment->coordinator_id);
+           (expected_coordinator_id == 0 || expected_coordinator_id == assignment->coordinator_id);
 }
 
 bool mesh_core_slot_map_valid(const mesh_slot_map_payload_t *slot_map, uint8_t local_node_id,

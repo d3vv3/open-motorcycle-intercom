@@ -5,12 +5,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define AUDIO_PACKET_STORE_CAPACITY 16u
-#define AUDIO_PACKET_MAX_SIZE 64u
-#define AUDIO_PACKET_STORE_PREFILL_PACKETS 3u
-#define AUDIO_PACKET_STORE_PREFILL_MS 60u
-#define AUDIO_PACKET_STORE_FRAME_MS 20u
-#define AUDIO_PACKET_STORE_LATE_GRACE_MS 40u
+#define AUDIO_PACKET_STORE_CAPACITY            16u
+#define AUDIO_PACKET_MAX_SIZE                  64u
+#define AUDIO_PACKET_STORE_PREFILL_PACKETS     3u
+#define AUDIO_PACKET_STORE_PREFILL_MS          60u
+#define AUDIO_PACKET_STORE_FRAME_MS            20u
+#define AUDIO_PACKET_STORE_LATE_GRACE_MS       40u
 #define AUDIO_PACKET_STORE_EMPTY_MISSING_LIMIT 5u
 
 _Static_assert(AUDIO_PACKET_STORE_CAPACITY < UINT16_C(0x8000),
@@ -69,11 +69,9 @@ typedef struct {
 
 void audio_packet_store_reset(audio_packet_store_t *store);
 size_t audio_packet_store_depth(const audio_packet_store_t *store);
-audio_packet_store_push_result_t audio_packet_store_push(audio_packet_store_t *store,
-                                                         const audio_packet_t *packet,
-                                                         uint64_t now_ms);
-audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *store,
-                                                       uint64_t now_ms,
+audio_packet_store_push_result_t
+audio_packet_store_push(audio_packet_store_t *store, const audio_packet_t *packet, uint64_t now_ms);
+audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *store, uint64_t now_ms,
                                                        audio_packet_t *packet);
 
 #endif

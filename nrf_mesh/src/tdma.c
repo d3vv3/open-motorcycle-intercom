@@ -21,17 +21,17 @@ LOG_MODULE_REGISTER(tdma, LOG_LEVEL_INF);
  * Constants
  * ============================================================================ */
 
-#define FRAME_US (MESH_FRAME_MS * 1000)
-#define SLOT_US  (MESH_SLOT_MS * 1000)
-#define CONTROL_OFFSET_US (MESH_MAX_NODES * SLOT_US)
-#define CONTROL_WINDOW_US 2000
-#define TIMER_QUANTUM_US (1000000 / CONFIG_SYS_CLOCK_TICKS_PER_SEC)
-#define MAX_FRAME_CORRECTION_US TIMER_QUANTUM_US
-#define MAX_PENDING_CORRECTION_US 2000
-#define MAX_SYNC_DRIFT_PPM 5000
-#define SYNC_REACQUIRE_FRAME_THRESHOLD 4
+#define FRAME_US                          (MESH_FRAME_MS * 1000)
+#define SLOT_US                           (MESH_SLOT_MS * 1000)
+#define CONTROL_OFFSET_US                 (MESH_MAX_NODES * SLOT_US)
+#define CONTROL_WINDOW_US                 2000
+#define TIMER_QUANTUM_US                  (1000000 / CONFIG_SYS_CLOCK_TICKS_PER_SEC)
+#define MAX_FRAME_CORRECTION_US           TIMER_QUANTUM_US
+#define MAX_PENDING_CORRECTION_US         2000
+#define MAX_SYNC_DRIFT_PPM                5000
+#define SYNC_REACQUIRE_FRAME_THRESHOLD    4
 #define SYNC_REACQUIRE_PHASE_THRESHOLD_US MESH_GUARD_US
-#define FRAME_HISTORY_SIZE 16
+#define FRAME_HISTORY_SIZE                16
 
 /* ============================================================================
  * Static Variables
@@ -92,7 +92,7 @@ static void frame_history_invalidate_locked(void)
 
 static void frame_history_record_locked(uint32_t frame_counter, int64_t start_us)
 {
-    s_frame_history[s_frame_history_head] = (struct frame_boundary) {
+    s_frame_history[s_frame_history_head] = (struct frame_boundary){
         .frame_counter = frame_counter,
         .start_us = start_us,
         .valid = true,
@@ -103,8 +103,7 @@ static void frame_history_record_locked(uint32_t frame_counter, int64_t start_us
 static bool frame_history_lookup_locked(uint32_t frame_counter, int64_t *start_us)
 {
     for (int i = 0; i < FRAME_HISTORY_SIZE; i++) {
-        if (s_frame_history[i].valid &&
-            s_frame_history[i].frame_counter == frame_counter) {
+        if (s_frame_history[i].valid && s_frame_history[i].frame_counter == frame_counter) {
             *start_us = s_frame_history[i].start_us;
             return true;
         }
@@ -114,14 +113,12 @@ static bool frame_history_lookup_locked(uint32_t frame_counter, int64_t *start_u
 
 static int32_t clamp_pending_correction(int64_t correction_us)
 {
-    return (int32_t)CLAMP(correction_us, -MAX_PENDING_CORRECTION_US,
-                          MAX_PENDING_CORRECTION_US);
+    return (int32_t)CLAMP(correction_us, -MAX_PENDING_CORRECTION_US, MAX_PENDING_CORRECTION_US);
 }
 
 static void set_rate_correction_locked(int32_t drift_ppm)
 {
-    int32_t scaled = CLAMP(drift_ppm, -MAX_SYNC_DRIFT_PPM,
-                           MAX_SYNC_DRIFT_PPM) * FRAME_US;
+    int32_t scaled = CLAMP(drift_ppm, -MAX_SYNC_DRIFT_PPM, MAX_SYNC_DRIFT_PPM) * FRAME_US;
     s_rate_whole_us = scaled / 1000000;
     s_rate_fraction = scaled % 1000000;
 }
@@ -242,17 +239,13 @@ static void frame_timer_handler(struct k_timer *timer)
 
     int64_t scheduled_start_us = s_next_frame_deadline_us;
     int64_t callback_jitter_us = now_us - scheduled_start_us;
-    s_stats.callback_jitter_us = (int32_t)CLAMP(callback_jitter_us,
-                                                INT32_MIN, INT32_MAX);
-    uint64_t jitter_abs = callback_jitter_us >= 0
-                              ? (uint64_t)callback_jitter_us
-                              : (uint64_t)-callback_jitter_us;
+    s_stats.callback_jitter_us = (int32_t)CLAMP(callback_jitter_us, INT32_MIN, INT32_MAX);
+    uint64_t jitter_abs =
+        callback_jitter_us >= 0 ? (uint64_t)callback_jitter_us : (uint64_t)-callback_jitter_us;
     uint32_t jitter_abs_us = (uint32_t)MIN(jitter_abs, (uint64_t)UINT32_MAX);
-    s_stats.callback_jitter_max_us = MAX(s_stats.callback_jitter_max_us,
-                                         jitter_abs_us);
+    s_stats.callback_jitter_max_us = MAX(s_stats.callback_jitter_max_us, jitter_abs_us);
     if (s_last_callback_us != 0) {
-        s_stats.measured_interval_us = (uint32_t)CLAMP(now_us - s_last_callback_us,
-                                                       0, UINT32_MAX);
+        s_stats.measured_interval_us = (uint32_t)CLAMP(now_us - s_last_callback_us, 0, UINT32_MAX);
     }
     s_last_callback_us = now_us;
 
@@ -269,8 +262,8 @@ static void frame_timer_handler(struct k_timer *timer)
         } else {
             for (uint32_t i = 0; i < skipped; i++) {
                 s_frame_counter++;
-                frame_history_record_locked(
-                    s_frame_counter, scheduled_start_us + (int64_t)(i + 1U) * FRAME_US);
+                frame_history_record_locked(s_frame_counter,
+                                            scheduled_start_us + (int64_t)(i + 1U) * FRAME_US);
             }
         }
         s_stats.skipped_frame_count += skipped;
@@ -285,8 +278,8 @@ static void frame_timer_handler(struct k_timer *timer)
         rate_correction_us--;
         s_rate_residual += 1000000;
     }
-    s_pending_correction_us = clamp_pending_correction(
-        (int64_t)s_pending_correction_us + rate_correction_us);
+    s_pending_correction_us =
+        clamp_pending_correction((int64_t)s_pending_correction_us + rate_correction_us);
     if (s_pending_correction_us >= TIMER_QUANTUM_US) {
         applied_correction_us = MAX_FRAME_CORRECTION_US;
     } else if (s_pending_correction_us <= -TIMER_QUANTUM_US) {
@@ -358,8 +351,8 @@ static void frame_timer_handler(struct k_timer *timer)
     }
 }
 
-static void acquire_sync(uint32_t frame_counter, int16_t drift_ppm,
-                         int64_t frame_start_us, bool reacquire)
+static void acquire_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us,
+                         bool reacquire)
 {
     int64_t now_us = k_ticks_to_us_floor64(k_uptime_ticks());
     int64_t next_deadline_us = frame_start_us + FRAME_US;
@@ -428,8 +421,8 @@ static void acquire_sync(uint32_t frame_counter, int16_t drift_ppm,
     k_timer_start(&s_frame_timer, K_USEC(next_deadline_us - now_us), K_NO_WAIT);
     k_spin_unlock(&s_tdma_lock, key);
 
-    LOG_INF("SYNC %s: frame=%u drift=%d ppm", reacquire ? "reacquired" : "acquired",
-            frame_counter, drift_ppm);
+    LOG_INF("SYNC %s: frame=%u drift=%d ppm", reacquire ? "reacquired" : "acquired", frame_counter,
+            drift_ppm);
 }
 
 /* ============================================================================
@@ -483,8 +476,7 @@ int tdma_start(int8_t slot_index, bool synchronized)
     s_timer_quiesced = false;
     int64_t arm_now_us = k_ticks_to_us_floor64(k_uptime_ticks());
     k_timer_start(&s_frame_timer,
-                  K_USEC(MAX(s_next_frame_deadline_us - arm_now_us, TIMER_QUANTUM_US)),
-                  K_NO_WAIT);
+                  K_USEC(MAX(s_next_frame_deadline_us - arm_now_us, TIMER_QUANTUM_US)), K_NO_WAIT);
     k_spin_unlock(&s_tdma_lock, key);
 
     LOG_INF("TDMA started (adaptive absolute), slot=%d", slot_index);
@@ -584,8 +576,7 @@ uint32_t tdma_get_current_slot_remaining_us(void)
         return 0;
     }
 
-    uint32_t remaining_us =
-        (uint32_t)CLAMP(s_slot_deadline_us - now_us, 0, UINT32_MAX);
+    uint32_t remaining_us = (uint32_t)CLAMP(s_slot_deadline_us - now_us, 0, UINT32_MAX);
     k_spin_unlock(&s_tdma_lock, key);
     return remaining_us;
 }
@@ -642,8 +633,7 @@ void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us
     }
 
     int32_t phase_error_us = (int32_t)CLAMP(frame_start_us - local_frame_start_us,
-                                             -MAX_PENDING_CORRECTION_US,
-                                             MAX_PENDING_CORRECTION_US);
+                                            -MAX_PENDING_CORRECTION_US, MAX_PENDING_CORRECTION_US);
     s_stats.sync_phase_correction_us = phase_error_us;
     if (phase_error_us > SYNC_REACQUIRE_PHASE_THRESHOLD_US ||
         phase_error_us < -SYNC_REACQUIRE_PHASE_THRESHOLD_US) {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import threading
+from contextlib import suppress
 from datetime import datetime, timezone
 
 import serial
@@ -96,30 +97,16 @@ class PortReader(threading.Thread):
         with open(self.out_path, "w", encoding="utf-8", errors="replace") as fh:
             while not self.stop_event.is_set():
                 if ser is None:
-                    last_error = None
-                    for candidate in _reconnect_candidates(self.port, identity):
-                        try:
-                            ser = serial.Serial(candidate, self.baud, timeout=0.2)
-                            self.stats.open_ok = True
-                            self.stats.open_error = None
-                            if connected_once:
-                                self.stats.reconnects += 1
-                            connected_once = True
-                            break
-                        except Exception as exc:
-                            last_error = exc
+                    ser, connected_once = self._open_serial(identity, connected_once)
                     if ser is None:
-                        self.stats.open_error = f"Open error: {last_error}"
                         self.stop_event.wait(0.25)
                         continue
                 try:
                     raw = ser.readline()
                 except Exception as exc:
                     self.stats.open_error = f"Read error: {exc}"
-                    try:
+                    with suppress(OSError):
                         ser.close()
-                    except Exception:
-                        pass
                     ser = None
                     self.stop_event.wait(0.1)
                     continue
@@ -133,6 +120,26 @@ class PortReader(threading.Thread):
                 self._parse_line(line)
         if ser is not None:
             ser.close()
+
+    def _open_serial(
+        self,
+        identity: tuple[str | None, int | None, int | None],
+        connected_once: bool,
+    ) -> tuple[serial.Serial | None, bool]:
+        """Open the first available candidate and update connection state."""
+        last_error = None
+        for candidate in _reconnect_candidates(self.port, identity):
+            try:
+                ser = serial.Serial(candidate, self.baud, timeout=0.2)
+                self.stats.open_ok = True
+                self.stats.open_error = None
+                if connected_once:
+                    self.stats.reconnects += 1
+                return ser, True
+            except Exception as exc:
+                last_error = exc
+        self.stats.open_error = f"Open error: {last_error}"
+        return None, connected_once
 
     def _parse_line(self, line: str) -> None:
         s = self.stats

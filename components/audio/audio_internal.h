@@ -17,21 +17,23 @@
 #ifndef AUDIO_INTERNAL_H
 #define AUDIO_INTERNAL_H
 
-#include "audio.h"
-#include "audio_packet_store.h"
-#include "audio_pcm_resampler.h"
-#include "voice_cleanup.h"
-#include "vox.h"
-
 #include <stdatomic.h>
 
-#include "driver/i2s_std.h"
-#include "esp_adc/adc_continuous.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+
+#include "esp_adc/adc_continuous.h"
+
+#include "driver/i2s_std.h"
+
+#include "audio.h"
+#include "audio_packet_store.h"
+#include "audio_pcm_resampler.h"
 #include "opus.h"
+#include "voice_cleanup.h"
+#include "vox.h"
 
 #define AUDIO_CAPTURE_TASK_STACK_SIZE 32768
 #define AUDIO_PLAYOUT_TASK_STACK_SIZE 32768
@@ -57,7 +59,7 @@
 #define OPUS_EXPECTED_LOSS_PERC   5
 #define RX_SOURCE_IDLE_TIMEOUT_MS 1000
 /* RX_SOURCE_EVICT_SILENCE_MS lives in audio_rx_source_select.h. */
-#define RX_ENQUEUE_LOCK_WAIT_MS   1
+#define RX_ENQUEUE_LOCK_WAIT_MS 1
 
 #define LOOPBACK_QUEUE_SIZE       8
 #define NOTIFICATION_QUEUE_SIZE   4

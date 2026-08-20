@@ -27,12 +27,10 @@ typedef struct {
 
 uint8_t bridge_frame_crc8(const uint8_t *data, size_t len);
 
-size_t bridge_frame_encode(uint8_t *dst, size_t dst_capacity, size_t max_payload,
-                           uint8_t seq, uint8_t type, const uint8_t *payload,
-                           size_t payload_len);
+size_t bridge_frame_encode(uint8_t *dst, size_t dst_capacity, size_t max_payload, uint8_t seq,
+                           uint8_t type, const uint8_t *payload, size_t payload_len);
 
 bridge_frame_decode_result_t bridge_frame_decode(const uint8_t *frame, size_t frame_len,
-                                                  size_t max_payload,
-                                                  bridge_frame_view_t *view);
+                                                 size_t max_payload, bridge_frame_view_t *view);
 
 #endif /* OMI_BRIDGE_FRAME_H */

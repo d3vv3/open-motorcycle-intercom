@@ -45,9 +45,7 @@ def _health_line(s: PortStats) -> str:
         issues.append(f"nrf_starve+{starve_d}")
 
     e2e_esp_d = s.delta("e2e_esp")
-    effective_gap = max(
-        e2e_esp_d.get("gap_fr", 0) - e2e_esp_d.get("recovered", 0), 0
-    )
+    effective_gap = max(e2e_esp_d.get("gap_fr", 0) - e2e_esp_d.get("recovered", 0), 0)
     if effective_gap > 0:
         issues.append(f"e2e_esp_effective_gap+{effective_gap}")
 

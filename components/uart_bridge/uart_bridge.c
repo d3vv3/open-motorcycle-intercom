@@ -14,14 +14,14 @@
  * "uart_bridge" naming retained for API compatibility.
  */
 
-#include "bridge_internal.h"
-
 #include <string.h>
 
 #include "esp_log.h"
 
 #include "driver/gpio.h"
 #include "driver/spi_slave.h"
+
+#include "bridge_internal.h"
 
 static const char *TAG = "spi_bridge";
 
@@ -80,8 +80,8 @@ static void spi_slave_task(void *arg)
         /* Log the first transactions for boot verification */
         if (txn_count <= 3) {
             ESP_LOGI(TAG, "SPI txn #%lu: %u bytes, rx[0..3]: %02X %02X %02X %02X", txn_count,
-                     (unsigned)rx_bytes, g_bridge_rx_dma[0], g_bridge_rx_dma[1],
-                     g_bridge_rx_dma[2], g_bridge_rx_dma[3]);
+                     (unsigned)rx_bytes, g_bridge_rx_dma[0], g_bridge_rx_dma[1], g_bridge_rx_dma[2],
+                     g_bridge_rx_dma[3]);
         }
 
         if (rx_bytes > 0) {
@@ -186,10 +186,9 @@ esp_err_t uart_bridge_init(void)
     gpio_set_pull_mode(BRIDGE_SPI_CS_PIN, GPIO_PULLUP_ONLY);
 
     /* SPI slave task runs on core 0 so audio stays on core 1 */
-    BaseType_t ret = xTaskCreatePinnedToCore(spi_slave_task, "spi_bridge_rx",
-                                             BRIDGE_RX_TASK_STACK_SIZE, NULL,
-                                             BRIDGE_RX_TASK_PRIORITY, &g_bridge.rx_task,
-                                             BRIDGE_RX_TASK_CORE);
+    BaseType_t ret =
+        xTaskCreatePinnedToCore(spi_slave_task, "spi_bridge_rx", BRIDGE_RX_TASK_STACK_SIZE, NULL,
+                                BRIDGE_RX_TASK_PRIORITY, &g_bridge.rx_task, BRIDGE_RX_TASK_CORE);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create SPI task");
         spi_slave_free(BRIDGE_SPI_HOST);

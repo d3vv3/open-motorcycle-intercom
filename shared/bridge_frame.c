@@ -16,25 +16,21 @@ uint8_t bridge_frame_crc8(const uint8_t *data, size_t len)
 
         crc ^= data[i];
         for (bit = 0u; bit < 8u; ++bit) {
-            crc = (crc & UINT8_C(0x80)) != 0u
-                      ? (uint8_t)((uint8_t)(crc << 1) ^ UINT8_C(0x07))
-                      : (uint8_t)(crc << 1);
+            crc = (crc & UINT8_C(0x80)) != 0u ? (uint8_t)((uint8_t)(crc << 1) ^ UINT8_C(0x07))
+                                              : (uint8_t)(crc << 1);
         }
     }
     return crc;
 }
 
-size_t bridge_frame_encode(uint8_t *dst, size_t dst_capacity, size_t max_payload,
-                           uint8_t seq, uint8_t type, const uint8_t *payload,
-                           size_t payload_len)
+size_t bridge_frame_encode(uint8_t *dst, size_t dst_capacity, size_t max_payload, uint8_t seq,
+                           uint8_t type, const uint8_t *payload, size_t payload_len)
 {
     size_t frame_len;
     uint8_t wire_len;
 
-    if (dst == NULL || max_payload > BRIDGE_FRAME_MAX_PAYLOAD ||
-        payload_len > max_payload ||
-        (payload_len != 0u && payload == NULL) ||
-        payload_len > SIZE_MAX - BRIDGE_FRAME_OVERHEAD) {
+    if (dst == NULL || max_payload > BRIDGE_FRAME_MAX_PAYLOAD || payload_len > max_payload ||
+        (payload_len != 0u && payload == NULL) || payload_len > SIZE_MAX - BRIDGE_FRAME_OVERHEAD) {
         return 0u;
     }
 
@@ -56,8 +52,7 @@ size_t bridge_frame_encode(uint8_t *dst, size_t dst_capacity, size_t max_payload
 }
 
 bridge_frame_decode_result_t bridge_frame_decode(const uint8_t *frame, size_t frame_len,
-                                                  size_t max_payload,
-                                                  bridge_frame_view_t *view)
+                                                 size_t max_payload, bridge_frame_view_t *view)
 {
     bridge_frame_view_t decoded = {0};
     size_t payload_len;
@@ -96,8 +91,7 @@ bridge_frame_decode_result_t bridge_frame_decode(const uint8_t *frame, size_t fr
     if (frame_len < declared_len) {
         return BRIDGE_FRAME_TRUNCATED;
     }
-    if (frame[declared_len - 1u] !=
-        bridge_frame_crc8(frame + 1u, payload_len + 3u)) {
+    if (frame[declared_len - 1u] != bridge_frame_crc8(frame + 1u, payload_len + 3u)) {
         return BRIDGE_FRAME_BAD_CRC;
     }
 

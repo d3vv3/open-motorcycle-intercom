@@ -33,7 +33,7 @@ mesh_tx_metrics_classify(const mesh_tx_metrics_input_t *input)
         .queue_drained = input->local_consumed && input->local_consumed_successfully &&
                          input->local_queue_empty_after_consume,
         .slot_starved = input->scheduled_local_slot && !input->local_consumed &&
-                         !input->local_pending && !input->relay_pending && input->ingress_recent,
+                        !input->local_pending && !input->relay_pending && input->ingress_recent,
     };
 
     return result;

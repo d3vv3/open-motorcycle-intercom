@@ -214,9 +214,7 @@ def compute_hop_pct(s: PortStats) -> dict[str, float | None]:
         spi_gaps = e2e_nrf_d.get("spi_gap_fr", 0)
         rf_gaps = e2e_nrf_d.get("rf_gap_fr", 0)
         out["nrf_spi_gap_pct"] = _pct(spi_gaps, spi_in + spi_gaps)
-        out["nrf_rf_gap_pct"] = _pct(
-            rf_gaps, e2e_nrf_d.get("rf_rx", 0) + rf_gaps
-        )
+        out["nrf_rf_gap_pct"] = _pct(rf_gaps, e2e_nrf_d.get("rf_rx", 0) + rf_gaps)
 
     return out
 
@@ -247,7 +245,9 @@ def _endpoint(record: dict, direction: str) -> tuple[Any, Any] | None:
     return source, destination
 
 
-def _counter_value(delta: dict[str, int], aliases: tuple[str, ...]) -> tuple[str, int] | None:
+def _counter_value(
+    delta: dict[str, int], aliases: tuple[str, ...]
+) -> tuple[str, int] | None:
     for name in aliases:
         if name in delta:
             return name, delta[name]
@@ -276,14 +276,24 @@ def compute_correlated_delivery(all_stats: list[PortStats]) -> dict[str, Any]:
                 if endpoints:
                     link = (identity["session"], endpoints[0], endpoints[1], semantic)
                     transmitters.setdefault(link, []).append(
-                        {"port": stats.port, "counter": tx[0], "value": tx[1], "resets": resets}
+                        {
+                            "port": stats.port,
+                            "counter": tx[0],
+                            "value": tx[1],
+                            "resets": resets,
+                        }
                     )
             if rx is not None:
                 endpoints = _endpoint(identity, "rx")
                 if endpoints:
                     link = (identity["session"], endpoints[0], endpoints[1], semantic)
                     receivers.setdefault(link, []).append(
-                        {"port": stats.port, "counter": rx[0], "value": rx[1], "resets": resets}
+                        {
+                            "port": stats.port,
+                            "counter": rx[0],
+                            "value": rx[1],
+                            "resets": resets,
+                        }
                     )
 
     links: list[dict[str, Any]] = []
@@ -295,9 +305,7 @@ def compute_correlated_delivery(all_stats: list[PortStats]) -> dict[str, Any]:
         tx, rx = tx_entries[0], rx_entries[0]
         status = "ok"
         percentage = _pct(rx["value"], tx["value"])
-        reset_in_window = (
-            tx["counter"] in tx["resets"] or rx["counter"] in rx["resets"]
-        )
+        reset_in_window = tx["counter"] in tx["resets"] or rx["counter"] in rx["resets"]
         if reset_in_window or (percentage is not None and percentage > 100.0):
             status = "inconsistent correlated data"
             percentage = None
@@ -322,5 +330,9 @@ def compute_correlated_delivery(all_stats: list[PortStats]) -> dict[str, Any]:
             "reason": "PIPE records require matching session, sender, receiver, and stage semantics",
             "links": [],
         }
-    overall_status = "ok" if all(link["status"] == "ok" for link in links) else "inconsistent correlated data"
+    overall_status = (
+        "ok"
+        if all(link["status"] == "ok" for link in links)
+        else "inconsistent correlated data"
+    )
     return {"status": overall_status, "links": links}

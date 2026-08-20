@@ -3,9 +3,9 @@
  * @brief Notification tone synthesis mixed into the playout frame.
  */
 
-#include "audio_internal.h"
-
 #include <math.h>
+
+#include "audio_internal.h"
 
 static uint8_t notification_tone_count(audio_notify_t type)
 {
@@ -56,8 +56,7 @@ void audio_notify_mix_frame(void)
         }
         int32_t tone = 0;
         if (!note->in_gap) {
-            float phase = 2.0f * M_PI *
-                          notification_frequency(note->type, note->tone_index) *
+            float phase = 2.0f * M_PI * notification_frequency(note->type, note->tone_index) *
                           note->segment_sample / g_audio.config.sample_rate;
             tone = (int32_t)(NOTIFICATION_AMPLITUDE * 32767.0f * sinf(phase));
         }

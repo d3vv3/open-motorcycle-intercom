@@ -77,8 +77,7 @@ mesh_core_seq_result_t mesh_core_seq16_accept(mesh_core_seq16_t *state, uint16_t
 int mesh_core_address_compare(const uint8_t *a, const uint8_t *b, size_t address_len);
 int64_t mesh_core_recover_frame_boundary(int64_t expected_us, int64_t now_us, int64_t frame_us);
 
-uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id,
-                             uint8_t local_heard_bitmap,
+uint8_t mesh_core_relay_mask(uint8_t speaker_id, uint8_t local_node_id, uint8_t local_heard_bitmap,
                              const mesh_core_peer_snapshot_t *peers, size_t peer_count);
 
 /**
@@ -102,8 +101,8 @@ size_t mesh_core_select_speakers(const uint8_t *previous, size_t slot_count,
  * Mirrors the nRF radio model used by mesh_protocol.c:
  * ramp_us + us_per_byte * (outer_packet_bytes + overhead_bytes).
  */
-uint32_t mesh_core_esb_tx_us(uint32_t ramp_us, uint32_t us_per_byte,
-                             uint32_t overhead_bytes, uint32_t outer_packet_bytes);
+uint32_t mesh_core_esb_tx_us(uint32_t ramp_us, uint32_t us_per_byte, uint32_t overhead_bytes,
+                             uint32_t outer_packet_bytes);
 
 /**
  * Decide how many predecessor frames must be stripped from an audio bundle
@@ -130,8 +129,8 @@ int mesh_core_fit_airtime(uint32_t remaining_us, uint32_t margin_us, uint32_t ra
  * an active AUDIO_V2 bundle: an inactive or non-bundle tail transmits
  * immediately because no successor bundle will re-carry it as prev1.
  */
-bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending,
-                                bool relay_contention_turn, bool tail_is_active_bundle);
+bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending, bool relay_contention_turn,
+                                bool tail_is_active_bundle);
 
 /**
  * Proof that a deferred local tail is safe to skip: its immediate successor
@@ -143,13 +142,11 @@ bool mesh_core_defer_local_tail(bool local_pending, bool relay_pending,
  * Both views must come from successful audio_bundle_parse() calls (parse
  * guarantees previous1_data is non-NULL whenever PREVIOUS1_PRESENT is set).
  */
-bool mesh_core_successor_carries_prev1(uint16_t deferred_seq,
-                                       const audio_bundle_view_t *tail,
+bool mesh_core_successor_carries_prev1(uint16_t deferred_seq, const audio_bundle_view_t *tail,
                                        const audio_bundle_view_t *successor);
 
-bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment,
-                                     uint8_t sender_id, uint8_t expected_coordinator_id,
-                                     uint8_t slot_count);
+bool mesh_core_join_assignment_valid(const mesh_join_ack_payload_t *assignment, uint8_t sender_id,
+                                     uint8_t expected_coordinator_id, uint8_t slot_count);
 bool mesh_core_slot_map_valid(const mesh_slot_map_payload_t *slot_map, uint8_t local_node_id,
                               uint8_t coordinator_id, mesh_core_slot_map_result_t *result);
 

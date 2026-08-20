@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_timer.h"
+
 #include "rtt_probe_defs.h"
 #include "uart_bridge.h"
 
@@ -31,14 +32,7 @@ static void send_probe(void)
 {
     uint8_t id = ++s_probe_id;
     uint8_t pkt[RTT_PKT_LEN + 1] = {
-        0,
-        ++s_diag_tx_seq,
-        RTT_MAGIC0,
-        RTT_MAGIC1,
-        RTT_MAGIC2,
-        RTT_MAGIC3,
-        RTT_TYPE_REQ,
-        id,
+        0, ++s_diag_tx_seq, RTT_MAGIC0, RTT_MAGIC1, RTT_MAGIC2, RTT_MAGIC3, RTT_TYPE_REQ, id,
     };
 
     if (uart_bridge_send_audio(pkt, sizeof(pkt)) == ESP_OK) {
@@ -107,14 +101,7 @@ bool rtt_probe_handle_packet(uint8_t src_id, const uint8_t *data, uint16_t len)
 
     if (type == RTT_TYPE_REQ) {
         uint8_t rsp[RTT_PKT_LEN + 1] = {
-            0,
-            ++s_diag_tx_seq,
-            RTT_MAGIC0,
-            RTT_MAGIC1,
-            RTT_MAGIC2,
-            RTT_MAGIC3,
-            RTT_TYPE_RSP,
-            id,
+            0, ++s_diag_tx_seq, RTT_MAGIC0, RTT_MAGIC1, RTT_MAGIC2, RTT_MAGIC3, RTT_TYPE_RSP, id,
         };
         (void)uart_bridge_send_audio(rsp, sizeof(rsp));
         return true;

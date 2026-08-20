@@ -1,7 +1,7 @@
 #include "voice_cleanup.h"
 
-#include <stdbool.h>
 #include <math.h>
+#include <stdbool.h>
 
 #define AEC_GAIN_SMOOTH_ALPHA      0.10f
 #define AEC_GAIN_MAX               2.5f

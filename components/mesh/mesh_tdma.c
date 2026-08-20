@@ -1,5 +1,3 @@
-#include "mesh_internal.h"
-
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +6,7 @@
 #include "esp_random.h"
 #include "esp_wifi.h"
 
+#include "mesh_internal.h"
 #include "power.h"
 
 bool owns_control_window(uint32_t frame_counter)
@@ -53,8 +52,8 @@ void service_frame_boundary(const frame_event_t *event)
         return;
     }
 
-    esp_err_t timer_ret = arm_frame_timer_at_generation_locked(
-        event->timestamp_us + MESH_FRAME_US, event->generation);
+    esp_err_t timer_ret = arm_frame_timer_at_generation_locked(event->timestamp_us + MESH_FRAME_US,
+                                                               event->generation);
     if (timer_ret != ESP_OK) {
         xSemaphoreGive(s_frame_timer_mutex);
         if (timer_ret == ESP_ERR_INVALID_STATE) {
@@ -67,9 +66,8 @@ void service_frame_boundary(const frame_event_t *event)
     int64_t frame_start_us = event->timestamp_us;
     taskENTER_CRITICAL(&s_tdma_mux);
     int64_t frame_delta_us = frame_start_us - s_frame_start_us;
-    uint32_t elapsed_frames = frame_delta_us > MESH_FRAME_US
-                                  ? (uint32_t)(frame_delta_us / MESH_FRAME_US)
-                                  : 1;
+    uint32_t elapsed_frames =
+        frame_delta_us > MESH_FRAME_US ? (uint32_t)(frame_delta_us / MESH_FRAME_US) : 1;
     s_frame_counter += elapsed_frames;
     uint32_t frame_counter = s_frame_counter;
     s_frame_start_us = frame_start_us;
@@ -158,14 +156,12 @@ void service_control_window(void)
     if (!owns_control_window(frame_counter)) {
         return;
     }
-    bool sync_due = s_role == MESH_ROLE_COORDINATOR &&
-                    (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0;
+    bool sync_due =
+        s_role == MESH_ROLE_COORDINATOR && (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0;
 
     if (!wait_for_tx_idle(0)) {
         int64_t remaining_us = control_deadline_us - esp_timer_get_time();
-        TickType_t wait_ticks = remaining_us > 0
-                                    ? pdMS_TO_TICKS((remaining_us + 999) / 1000)
-                                    : 0;
+        TickType_t wait_ticks = remaining_us > 0 ? pdMS_TO_TICKS((remaining_us + 999) / 1000) : 0;
         if (!wait_for_tx_idle(wait_ticks) || esp_timer_get_time() > control_deadline_us) {
             if (sync_due) {
                 STATS_INC(control_queue_drops);
@@ -200,8 +196,16 @@ void service_control_window(void)
             heard_bitmap = status->heard_bitmap;
             relay_bitmap = status->relay_bitmap;
         }
-        esp_err_t ret = tracked_esp_now_send(item.dest_mac, item.data, item.len, item.type,
-                                             heard_bitmap, relay_bitmap, &s_control_tx_seq, false);
+        esp_err_t ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){
+            .dest_mac = item.dest_mac,
+            .data = item.data,
+            .len = item.len,
+            .type = item.type,
+            .heard_bitmap = heard_bitmap,
+            .relay_bitmap = relay_bitmap,
+            .sequence = &s_control_tx_seq,
+            .audio_origin = false,
+        });
         if (ret != ESP_OK) {
             mesh_transport_restore_status_bitmaps(&item);
             STATS_INC(control_queue_drops);

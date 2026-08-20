@@ -78,20 +78,27 @@ void e2e_diag_log(uint8_t node_id)
     portEXIT_CRITICAL(&s_rx_lock);
 
     ESP_LOGI(TAG,
-             "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu recovered=%lu effective_gap=%lu",
+             "[E2E_ESP] tx=%lu rx=%lu gap_evt=%lu gap_fr=%lu reset_evt=%lu recovered=%lu "
+             "effective_gap=%lu",
              s_tx_frames, rx_frames, rx_gap_events, rx_gap_frames, rx_reordered, rx_recovered,
              rx_gap_frames > rx_recovered ? rx_gap_frames - rx_recovered : 0);
+    ESP_LOGI(
+        TAG,
+        "PIPE v=1 dev=esp stage=transport node=%u source=%lu gate_drop=%lu spi_try=%lu spi_ok=%lu "
+        "spi_fail=%lu spi_oversize=%lu spi_rx=%lu spi_gap=%lu spi_invalid=%lu spi_self=%lu "
+        "probe_rx=%lu play_q_ok=%lu play_q_drop=%lu bundle_tx=%lu bundle_rx=%lu bundle_bad=%lu "
+        "prev1_attached=%lu prev2_attached=%lu prev1_offer=%lu prev1_accept=%lu prev1_reject=%lu "
+        "prev2_offer=%lu prev2_accept=%lu prev2_reject=%lu recovered=%lu",
+        node_id, s_pipe.source_frames, s_pipe.gate_drops, s_pipe.spi_attempts,
+        s_pipe.spi_enqueue_ok, s_pipe.spi_enqueue_fail, s_pipe.spi_oversize, s_pipe.spi_rx,
+        rx_gap_frames, s_pipe.spi_rx_invalid, s_pipe.spi_rx_self, s_pipe.probe_rx,
+        s_pipe.play_queue_ok, s_pipe.play_queue_drop, s_pipe.bundle_tx, s_pipe.bundle_rx,
+        s_pipe.bundle_bad, s_pipe.prev1_attached, s_pipe.prev2_attached, s_pipe.prev1_offer,
+        s_pipe.prev1_accept, s_pipe.prev1_reject, s_pipe.prev2_offer, s_pipe.prev2_accept,
+        s_pipe.prev2_reject, rx_recovered);
     ESP_LOGI(TAG,
-             "PIPE v=1 dev=esp stage=transport node=%u source=%lu gate_drop=%lu spi_try=%lu spi_ok=%lu spi_fail=%lu spi_oversize=%lu spi_rx=%lu spi_gap=%lu spi_invalid=%lu spi_self=%lu probe_rx=%lu play_q_ok=%lu play_q_drop=%lu bundle_tx=%lu bundle_rx=%lu bundle_bad=%lu prev1_attached=%lu prev2_attached=%lu prev1_offer=%lu prev1_accept=%lu prev1_reject=%lu prev2_offer=%lu prev2_accept=%lu prev2_reject=%lu recovered=%lu",
-             node_id, s_pipe.source_frames, s_pipe.gate_drops, s_pipe.spi_attempts,
-             s_pipe.spi_enqueue_ok, s_pipe.spi_enqueue_fail, s_pipe.spi_oversize, s_pipe.spi_rx,
-             rx_gap_frames, s_pipe.spi_rx_invalid, s_pipe.spi_rx_self, s_pipe.probe_rx,
-             s_pipe.play_queue_ok, s_pipe.play_queue_drop, s_pipe.bundle_tx, s_pipe.bundle_rx,
-             s_pipe.bundle_bad, s_pipe.prev1_attached, s_pipe.prev2_attached, s_pipe.prev1_offer,
-             s_pipe.prev1_accept, s_pipe.prev1_reject, s_pipe.prev2_offer, s_pipe.prev2_accept,
-             s_pipe.prev2_reject, rx_recovered);
-    ESP_LOGI(TAG,
-             "Redundancy: tx=%lu rx=%lu attached=%lu/%lu prev1=%lu/%lu/%lu prev2=%lu/%lu/%lu recovered=%lu",
+             "Redundancy: tx=%lu rx=%lu attached=%lu/%lu prev1=%lu/%lu/%lu prev2=%lu/%lu/%lu "
+             "recovered=%lu",
              s_pipe.bundle_tx, s_pipe.bundle_rx, s_pipe.prev1_attached, s_pipe.prev2_attached,
              s_pipe.prev1_offer, s_pipe.prev1_accept, s_pipe.prev1_reject, s_pipe.prev2_offer,
              s_pipe.prev2_accept, s_pipe.prev2_reject, rx_recovered);

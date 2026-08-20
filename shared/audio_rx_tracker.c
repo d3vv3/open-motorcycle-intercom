@@ -23,8 +23,7 @@ void audio_rx_tracker_reset(audio_rx_tracker_t *tracker)
     memset(tracker, 0, sizeof(*tracker));
 }
 
-audio_rx_tracker_result_t audio_rx_tracker_accept(audio_rx_tracker_t *tracker,
-                                                  uint8_t source_id,
+audio_rx_tracker_result_t audio_rx_tracker_accept(audio_rx_tracker_t *tracker, uint8_t source_id,
                                                   uint16_t seq)
 {
     audio_rx_tracker_source_t *source = &tracker->sources[source_id];
@@ -63,8 +62,7 @@ audio_rx_tracker_result_t audio_rx_tracker_accept(audio_rx_tracker_t *tracker,
     return result;
 }
 
-bool audio_rx_tracker_credit_predecessor(audio_rx_tracker_t *tracker,
-                                         uint8_t source_id,
+bool audio_rx_tracker_credit_predecessor(audio_rx_tracker_t *tracker, uint8_t source_id,
                                          bool queue_succeeded)
 {
     audio_rx_tracker_source_t *source = &tracker->sources[source_id];

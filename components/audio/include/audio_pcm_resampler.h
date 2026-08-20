@@ -5,14 +5,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define AUDIO_PCM_RESAMPLER_RATE_HZ 16000u
+#define AUDIO_PCM_RESAMPLER_RATE_HZ       16000u
 #define AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES 320u
-#define AUDIO_PCM_RESAMPLER_RING_SAMPLES 2880u
+#define AUDIO_PCM_RESAMPLER_RING_SAMPLES  2880u
 /* Four 20 ms frames provide 80 ms of producer-gap tolerance. */
-#define AUDIO_PCM_RESAMPLER_TARGET_SAMPLES 1280u
-#define AUDIO_PCM_RESAMPLER_START_SAMPLES 1280u
-#define AUDIO_PCM_RESAMPLER_MAX_CORRECTION_PPM 1000
-#define AUDIO_PCM_RESAMPLER_MAX_RECOVERY_PPM 20000
+#define AUDIO_PCM_RESAMPLER_TARGET_SAMPLES       1280u
+#define AUDIO_PCM_RESAMPLER_START_SAMPLES        1280u
+#define AUDIO_PCM_RESAMPLER_MAX_CORRECTION_PPM   1000
+#define AUDIO_PCM_RESAMPLER_MAX_RECOVERY_PPM     20000
 #define AUDIO_PCM_RESAMPLER_RESTART_FADE_SAMPLES 32u
 
 typedef struct {
@@ -49,11 +49,13 @@ void audio_pcm_resampler_reset(audio_pcm_resampler_t *resampler);
 size_t audio_pcm_resampler_available(const audio_pcm_resampler_t *resampler);
 size_t audio_pcm_resampler_depth(const audio_pcm_resampler_t *resampler);
 
-audio_pcm_resampler_telemetry_t audio_pcm_resampler_push(
-    audio_pcm_resampler_t *resampler, const int16_t *samples, size_t sample_count, bool active);
+audio_pcm_resampler_telemetry_t audio_pcm_resampler_push(audio_pcm_resampler_t *resampler,
+                                                         const int16_t *samples,
+                                                         size_t sample_count, bool active);
 
-audio_pcm_resampler_telemetry_t audio_pcm_resampler_render(
-    audio_pcm_resampler_t *resampler,
-    int16_t output[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES], size_t upstream_samples);
+audio_pcm_resampler_telemetry_t
+audio_pcm_resampler_render(audio_pcm_resampler_t *resampler,
+                           int16_t output[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES],
+                           size_t upstream_samples);
 
 #endif

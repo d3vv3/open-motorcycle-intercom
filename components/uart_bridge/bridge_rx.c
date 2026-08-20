@@ -3,12 +3,12 @@
  * @brief Validation and dispatch of frames received from the nRF master.
  */
 
-#include "bridge_internal.h"
-
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"
+
+#include "bridge_internal.h"
 
 static const char *TAG = "spi_bridge";
 

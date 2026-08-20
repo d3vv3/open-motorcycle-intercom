@@ -15,8 +15,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "bridge_protocol_defs.h"
 #include "esp_err.h"
+
+#include "bridge_protocol_defs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,7 +62,7 @@ typedef struct {
 /* Both audio packet versions carry a bridge source prefix. The callback receives
  * that source separately and data points to the intact legacy payload or v2 bundle. */
 typedef void (*uart_bridge_audio_cb_t)(uint8_t src_id, const uint8_t *data, uint16_t len,
-                                        int64_t timestamp_us, bool redundant_bundle);
+                                       int64_t timestamp_us, bool redundant_bundle);
 
 /* Callback for mesh events */
 typedef void (*uart_bridge_event_cb_t)(uart_bridge_event_t event, const uint8_t *data,

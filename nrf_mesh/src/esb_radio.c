@@ -109,6 +109,63 @@ static void on_esb_event(struct esb_evt const *event)
     }
 }
 
+static int restart_rx_after_tx(void)
+{
+    int ret = esb_start_rx();
+
+    if (ret == 0) {
+        s_rx_active = true;
+    } else {
+        s_rx_restart_fail_count++;
+    }
+    return ret;
+}
+
+static void account_tx_wait(int64_t tx_start_us)
+{
+    s_tx_timing_count++;
+    uint32_t tx_wait_us = (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - tx_start_us);
+
+    s_tx_wait_sum_us += tx_wait_us;
+    if (tx_wait_us > s_tx_wait_max_us) {
+        s_tx_wait_max_us = tx_wait_us;
+    }
+}
+
+static void account_rx_pause(int64_t rx_pause_start_us)
+{
+    if (rx_pause_start_us > 0) {
+        uint32_t pause_us = (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - rx_pause_start_us);
+        s_rx_pause_sum_us += pause_us;
+        if (pause_us > s_rx_pause_max_us) {
+            s_rx_pause_max_us = pause_us;
+        }
+    }
+}
+
+static void recover_tx_timeout(bool was_rx_active, int64_t tx_start_us, int64_t rx_pause_start_us)
+{
+    LOG_ERR("TX timed out");
+    s_tx_timeout_count++;
+    account_tx_wait(tx_start_us);
+    esb_flush_tx();
+    for (int wait = 0; wait < 100 && !esb_is_idle(); wait++) {
+        k_busy_wait(10);
+    }
+    k_sem_reset(&s_tx_done_sem);
+    bool radio_idle = esb_is_idle();
+    s_tx_recovery_pending = !radio_idle;
+    s_tx_in_progress = false;
+    if (was_rx_active) {
+        if (!radio_idle) {
+            s_recovery_restart_rx = true;
+        } else {
+            (void)restart_rx_after_tx();
+        }
+        account_rx_pause(rx_pause_start_us);
+    }
+}
+
 /* ============================================================================
  * Public Functions
  * ============================================================================ */
@@ -227,11 +284,9 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         k_sem_reset(&s_tx_done_sem);
         s_tx_recovery_pending = false;
         if (s_recovery_restart_rx) {
-            if (esb_start_rx() == 0) {
-                s_rx_active = true;
+            if (restart_rx_after_tx() == 0) {
                 s_recovery_restart_rx = false;
             } else {
-                s_rx_restart_fail_count++;
                 s_tx_recovery_pending = true;
                 return -EIO;
             }
@@ -263,11 +318,7 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         LOG_ERR("Set TX addr failed: %d", ret);
         s_tx_in_progress = false;
         if (was_rx_active) {
-            if (esb_start_rx() == 0) {
-                s_rx_active = true;
-            } else {
-                s_rx_restart_fail_count++;
-            }
+            (void)restart_rx_after_tx();
         }
         return ret;
     }
@@ -288,52 +339,14 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         LOG_ERR("TX write failed: %d", ret);
         s_tx_in_progress = false;
         if (was_rx_active) {
-            if (esb_start_rx() == 0) {
-                s_rx_active = true;
-            } else {
-                s_rx_restart_fail_count++;
-            }
+            (void)restart_rx_after_tx();
         }
         return ret;
     }
 
     /* Keep a lost completion event from occupying more than one TDMA slot. */
     if (k_sem_take(&s_tx_done_sem, K_USEC(TX_DONE_TIMEOUT_US)) != 0) {
-        LOG_ERR("TX timed out");
-        s_tx_timeout_count++;
-        s_tx_timing_count++;
-        uint32_t timeout_wait_us =
-            (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - tx_start_us);
-        s_tx_wait_sum_us += timeout_wait_us;
-        if (timeout_wait_us > s_tx_wait_max_us) {
-            s_tx_wait_max_us = timeout_wait_us;
-        }
-        esb_flush_tx();
-        for (int wait = 0; wait < 100 && !esb_is_idle(); wait++) {
-            k_busy_wait(10);
-        }
-        k_sem_reset(&s_tx_done_sem);
-        bool radio_idle = esb_is_idle();
-        s_tx_recovery_pending = !radio_idle;
-        s_tx_in_progress = false;
-        if (was_rx_active) {
-            if (!radio_idle) {
-                s_recovery_restart_rx = true;
-            } else if (esb_start_rx() == 0) {
-                s_rx_active = true;
-            } else {
-                s_rx_restart_fail_count++;
-            }
-
-            if (rx_pause_start_us > 0) {
-                uint32_t pause_us =
-                    (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - rx_pause_start_us);
-                s_rx_pause_sum_us += pause_us;
-                if (pause_us > s_rx_pause_max_us) {
-                    s_rx_pause_max_us = pause_us;
-                }
-            }
-        }
+        recover_tx_timeout(was_rx_active, tx_start_us, rx_pause_start_us);
         return -ETIMEDOUT;
     }
 
@@ -348,20 +361,10 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
 
     /* Resume RX mode only if it was active before */
     if (was_rx_active) {
-        int rx_ret = esb_start_rx();
+        int rx_ret = restart_rx_after_tx();
         if (rx_ret == 0) {
-            s_rx_active = true;
-
-            if (rx_pause_start_us > 0) {
-                uint32_t pause_us =
-                    (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - rx_pause_start_us);
-                s_rx_pause_sum_us += pause_us;
-                if (pause_us > s_rx_pause_max_us) {
-                    s_rx_pause_max_us = pause_us;
-                }
-            }
+            account_rx_pause(rx_pause_start_us);
         } else {
-            s_rx_restart_fail_count++;
             LOG_ERR("Failed to resume RX after TX: %d", rx_ret);
             s_rx_active = false;
         }
@@ -370,12 +373,7 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
     if (s_last_tx_status == 0) {
         s_tx_count++;
     }
-    s_tx_timing_count++;
-    uint32_t tx_wait_us = (uint32_t)(k_ticks_to_us_floor64(k_uptime_ticks()) - tx_start_us);
-    s_tx_wait_sum_us += tx_wait_us;
-    if (tx_wait_us > s_tx_wait_max_us) {
-        s_tx_wait_max_us = tx_wait_us;
-    }
+    account_tx_wait(tx_start_us);
 
     return s_last_tx_status;
 }
