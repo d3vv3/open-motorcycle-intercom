@@ -9563,9 +9563,9 @@
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
-		(in_bom yes)
+		(in_bom no)
 		(on_board yes)
-		(in_pos_files yes)
+		(in_pos_files no)
 		(dnp no)
 		(uuid "4b40651b-cc68-4a1d-bd64-68d54c0f028f")
 		(property "Reference" "J3"

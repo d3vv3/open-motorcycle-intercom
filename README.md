@@ -90,7 +90,12 @@ The nRF52840 firmware uses the radio's +8 dBm output directly. An nRF21540 is op
 - [ ] Open-source manufacturing files
 - [ ] Testing on real motorcycle rides
 
-Rev2 is a design in progress, not completed hardware. DRC closure, manufacturing output generation, assembly, and board bring-up are unfinished.
+Rev2 is a design in progress, not completed hardware. Current configured ERC,
+PCB DRC, and schematic parity checks pass. Fabrication-rule review, final
+manufacturing outputs, assembly, and board bring-up remain unfinished.
+
+See the [KiCad design status](docs/pcb.md) for the project map, current ERC/DRC
+and schematic parity results, and remaining fabrication and layout reviews.
 
 ### Niceties
 

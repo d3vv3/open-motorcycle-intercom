@@ -1,0 +1,51 @@
+{
+  "repository": "https://github.com/KiCad/kicad-packages3D",
+  "revision": "b8b3cfdfad88ba66f21002b3de51dc6f7d55ba5a",
+  "models": [
+    {
+      "file": "C_0201_0603Metric.step",
+      "upstream_path": "Capacitor_SMD.3dshapes/C_0201_0603Metric.step",
+      "sha256": "453afba1c6e8ad718c79c3b370606cdf345221d24ac8202778236e8b3bfb19c7"
+    },
+    {
+      "file": "C_0603_1608Metric.step",
+      "upstream_path": "Capacitor_SMD.3dshapes/C_0603_1608Metric.step",
+      "sha256": "4857b3dc717675bf1fb22edda622ac3b3ae03cf44d81eefaf3fa3ba3a86d84c1"
+    },
+    {
+      "file": "C_0805_2012Metric.step",
+      "upstream_path": "Capacitor_SMD.3dshapes/C_0805_2012Metric.step",
+      "sha256": "9a669c1a2f1ea25b88b401acef6efeaa80a067bd7da9db6993de719a7fbe155c"
+    },
+    {
+      "file": "C_1206_3216Metric.step",
+      "upstream_path": "Capacitor_SMD.3dshapes/C_1206_3216Metric.step",
+      "sha256": "11e948c72c90e2b6322436b72745f40ff4e8ba0da64fb2a0df943dfa61e89c1a"
+    },
+    {
+      "file": "PinHeader_1x06_P2.54mm_Vertical.step",
+      "upstream_path": "Connector_PinHeader_2.54mm.3dshapes/PinHeader_1x06_P2.54mm_Vertical.step",
+      "sha256": "d6113af109a14a67c50dcefd1cfc7b43b59b59afa85d808b2319e2452da91318"
+    },
+    {
+      "file": "L_0201_0603Metric.step",
+      "upstream_path": "Inductor_SMD.3dshapes/L_0201_0603Metric.step",
+      "sha256": "303a886d7d6d526df33deb11f533d5e25b0f1acdadadb70657d7df635d21352e"
+    },
+    {
+      "file": "L_0603_1608Metric.step",
+      "upstream_path": "Inductor_SMD.3dshapes/L_0603_1608Metric.step",
+      "sha256": "b0136ad7160588d2f5dac8c85da84a35646db656b5bc54bbb873b6b548eedbb3"
+    },
+    {
+      "file": "R_0201_0603Metric.step",
+      "upstream_path": "Resistor_SMD.3dshapes/R_0201_0603Metric.step",
+      "sha256": "33893da67f0e1d523ba6096fc78c9fb67e7770efb072fcf51f480f9365706a1d"
+    },
+    {
+      "file": "R_0603_1608Metric.step",
+      "upstream_path": "Resistor_SMD.3dshapes/R_0603_1608Metric.step",
+      "sha256": "1875571c326d0d9e96f36b4efeb8094068ef7619f0a449c781caf0b49c2e5861"
+    }
+  ]
+}

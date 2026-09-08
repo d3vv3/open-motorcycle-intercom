@@ -1,19 +1,19 @@
 (version 1)
 
 (rule "nRF52840 RF ball escape"
-  (condition "A.Type == 'Track' && A.NetName == 'NRF_RF_RAW'")
+  (condition "A.Type == 'Track' && A.NetName == '/Radio/NRF_RF_RAW'")
   (constraint track_width (min 0.10mm)))
 
 (rule "RF 50 ohm candidate geometry"
-  (condition "A.Type == 'Track' && (A.NetName == 'FEM_TRX' || A.NetName == 'FEM_ANT1_RAW' || A.NetName == 'FEM_ANT1_MID' || A.NetName == 'FEM_RF_50R' || A.NetName == 'ANT_TUNED')")
+  (condition "A.Type == 'Track' && (A.NetName == '/Radio/FEM_TRX' || A.NetName == '/Radio/FEM_ANT1_RAW' || A.NetName == '/Radio/FEM_ANT1_MID' || A.NetName == '/Radio/FEM_RF_50R' || A.NetName == '/Radio/ANT_TUNED')")
   (constraint track_width (min 0.35mm) (opt 0.35mm)))
 
 (rule "RF matching component neck-down"
-  (condition "A.Type == 'Track' && A.NetName == 'FEM_RF_50R' && A.intersectsArea('RF matching neck-down')")
+  (condition "A.Type == 'Track' && A.NetName == '/Radio/FEM_RF_50R' && A.intersectsArea('RF matching neck-down')")
   (constraint track_width (min 0.20mm) (opt 0.20mm)))
 
 (rule "USB data"
-  (condition "A.Type == 'Track' && (A.NetName == 'ESP_USB_D+' || A.NetName == 'ESP_USB_D-' || A.NetName == 'USB_D+_CONN' || A.NetName == 'USB_D-_CONN' || A.NetName == 'USB_D+_PROTECTED' || A.NetName == 'USB_D-_PROTECTED')")
+  (condition "A.Type == 'Track' && (A.NetName == '/ESP_USB_D+' || A.NetName == '/ESP_USB_D-' || A.NetName == '/USB_Power/USB_D+_CONN' || A.NetName == '/USB_Power/USB_D-_CONN' || A.NetName == '/USB_Power/USB_D+_PROTECTED' || A.NetName == '/USB_Power/USB_D-_PROTECTED')")
   (constraint track_width (min 0.18mm) (opt 0.18mm)))
 
 (rule "USB-C edge-mount copper"
@@ -33,50 +33,50 @@
   (constraint track_width (min 0.10mm)))
 
 (rule "Regulator switching-node escape"
-  (condition "A.Type == 'Track' && (A.NetName == 'REG_L1' || A.NetName == 'REG_L2')")
+  (condition "A.Type == 'Track' && (A.NetName == '/USB_Power/REG_L1' || A.NetName == '/USB_Power/REG_L2')")
   (constraint track_width (min 0.20mm)))
 
 (rule "VBUS and SYS_OUT local fanout"
-  (condition "A.Type == 'Track' && (A.NetName == 'VBUS' || A.NetName == 'SYS_OUT') && A.Layer == 'F.Cu'")
+  (condition "A.Type == 'Track' && (A.NetName == '/USB_Power/VBUS' || A.NetName == '/USB_Power/SYS_OUT') && A.Layer == 'F.Cu'")
   (constraint track_width (min 0.10mm)))
 
 (rule "VBUS and SYS_OUT trunk"
-  (condition "A.Type == 'Track' && (A.NetName == 'VBUS' || A.NetName == 'SYS_OUT') && A.Layer != 'F.Cu'")
+  (condition "A.Type == 'Track' && (A.NetName == '/USB_Power/VBUS' || A.NetName == '/USB_Power/SYS_OUT') && A.Layer != 'F.Cu'")
   (constraint track_width (min 0.40mm) (opt 0.40mm)))
 
 (rule "USB VBUS connector neck-down"
-  (condition "A.Type == 'Track' && A.NetName == 'VBUS' && A.enclosedByArea('USB VBUS connector neck-down')")
+  (condition "A.Type == 'Track' && A.NetName == '/USB_Power/VBUS' && A.enclosedByArea('USB VBUS connector neck-down')")
   (constraint track_width (min 0.20mm)))
 
 (rule "VBUS charger neck-down"
-  (condition "A.Type == 'Track' && A.NetName == 'VBUS' && A.enclosedByArea('VBUS charger neck-down')")
+  (condition "A.Type == 'Track' && A.NetName == '/USB_Power/VBUS' && A.enclosedByArea('VBUS charger neck-down')")
   (constraint track_width (min 0.35mm)))
 
 (rule "Battery local fanout"
-  (condition "A.Type == 'Track' && A.NetName == 'BAT+' && A.Layer == 'F.Cu'")
+  (condition "A.Type == 'Track' && A.NetName == '/USB_Power/BAT+' && A.Layer == 'F.Cu'")
   (constraint track_width (min 0.20mm)))
 
 (rule "Battery trunk"
-  (condition "A.Type == 'Track' && A.NetName == 'BAT+' && A.Layer != 'F.Cu'")
+  (condition "A.Type == 'Track' && A.NetName == '/USB_Power/BAT+' && A.Layer != 'F.Cu'")
   (constraint track_width (min 0.40mm) (opt 0.40mm)))
 
 (rule "NRF_RX package fanout clearance"
-  (condition "(A.NetName == 'NRF_RX' || B.NetName == 'NRF_RX') && A.intersectsArea('NRF_RX U2 fanout') && B.intersectsArea('NRF_RX U2 fanout')")
+  (condition "(A.NetName == '/NRF_RX' || B.NetName == '/NRF_RX') && A.intersectsArea('NRF_RX U2 fanout') && B.intersectsArea('NRF_RX U2 fanout')")
   (constraint clearance (min 0.075mm))
   (constraint hole_clearance (min 0.20mm)))
 
 (rule "NRF_TX package fanout clearance"
-  (condition "(A.NetName == 'NRF_TX' || B.NetName == 'NRF_TX') && A.intersectsArea('NRF_TX U2 fanout') && B.intersectsArea('NRF_TX U2 fanout')")
+  (condition "(A.NetName == '/NRF_TX' || B.NetName == '/NRF_TX') && A.intersectsArea('NRF_TX U2 fanout') && B.intersectsArea('NRF_TX U2 fanout')")
   (constraint clearance (min 0.075mm))
   (constraint hole_clearance (min 0.20mm)))
 
 (rule "NRF_SCK package fanout clearance"
-  (condition "(A.NetName == 'NRF_SCK' || B.NetName == 'NRF_SCK') && A.intersectsArea('NRF_SCK U2 fanout') && B.intersectsArea('NRF_SCK U2 fanout')")
+  (condition "(A.NetName == '/NRF_SCK' || B.NetName == '/NRF_SCK') && A.intersectsArea('NRF_SCK U2 fanout') && B.intersectsArea('NRF_SCK U2 fanout')")
   (constraint clearance (min 0.075mm))
   (constraint hole_clearance (min 0.20mm)))
 
 (rule "NRF_MISO package fanout clearance"
-  (condition "(A.NetName == 'NRF_MISO' || B.NetName == 'NRF_MISO') && A.intersectsArea('NRF_MISO U2 fanout') && B.intersectsArea('NRF_MISO U2 fanout')")
+  (condition "(A.NetName == '/NRF_MISO' || B.NetName == '/NRF_MISO') && A.intersectsArea('NRF_MISO U2 fanout') && B.intersectsArea('NRF_MISO U2 fanout')")
   (constraint clearance (min 0.075mm))
   (constraint hole_clearance (min 0.20mm)))
 
