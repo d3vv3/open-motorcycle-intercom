@@ -6,9 +6,13 @@
 #include "esb_radio.h"
 
 #include <esb.h>
+#include <nrfx_clock.h>
+#include <zephyr/drivers/clock_control/nrf_clock_control.h>
+#include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/onoff.h>
 
 LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 
@@ -48,6 +52,13 @@ static bool s_tx_in_progress = false; /* Prevent re-entry during TX */
 static bool s_rx_active = false;      /* Track if RX mode is running */
 static bool s_tx_recovery_pending = false;
 static bool s_recovery_restart_rx = false;
+
+/* The radio needs the external 32 MHz crystal (HFXO). The ESB library does not
+ * request it; without this request the radio runs from the internal RC clock
+ * and is off-frequency whenever nothing else (such as USB) holds HFXO on. */
+static struct onoff_manager *s_hfclk_mgr = NULL;
+static struct onoff_client s_hfclk_cli;
+static bool s_hfclk_requested = false;
 
 /* ESB TX/RX timing diagnostics */
 static uint32_t s_tx_count = 0;
@@ -166,6 +177,79 @@ static void recover_tx_timeout(bool was_rx_active, int64_t tx_start_us, int64_t 
     }
 }
 
+/* UF2/USB bootloaders can hand over with HFXO already running. nrfx then
+ * triggers HFCLKSTART on a running crystal, no HFCLKSTARTED event follows and
+ * the clock manager stays in "turning on" forever. Stop it before the clock
+ * driver initializes so the first request starts from a clean state. */
+static int hfclk_release_bootloader_state(void)
+{
+    nrf_clock_hfclk_t src = NRF_CLOCK_HFCLK_LOW_ACCURACY;
+
+    if (nrf_clock_is_running(NRF_CLOCK, NRF_CLOCK_DOMAIN_HFCLK, &src) &&
+        src == NRF_CLOCK_HFCLK_HIGH_ACCURACY) {
+        nrf_clock_int_disable(NRF_CLOCK, NRF_CLOCK_INT_HF_STARTED_MASK);
+        nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_HFCLKSTOP);
+        nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_HFCLKSTARTED);
+    }
+    return 0;
+}
+SYS_INIT(hfclk_release_bootloader_state, PRE_KERNEL_1, 0);
+
+static int hfclk_start(void)
+{
+    if (s_hfclk_requested) {
+        return 0;
+    }
+
+    s_hfclk_mgr = z_nrf_clock_control_get_onoff(CLOCK_CONTROL_NRF_SUBSYS_HF);
+    if (s_hfclk_mgr == NULL) {
+        LOG_ERR("HF clock manager unavailable");
+        return -ENXIO;
+    }
+
+    sys_notify_init_spinwait(&s_hfclk_cli.notify);
+    int ret = onoff_request(s_hfclk_mgr, &s_hfclk_cli);
+    if (ret < 0) {
+        LOG_ERR("HF clock request failed: %d", ret);
+        return ret;
+    }
+    int ret_req = ret;
+    s_hfclk_requested = true;
+
+    int res = 0;
+    int64_t deadline = k_uptime_get() + 100;
+    while ((ret = sys_notify_fetch_result(&s_hfclk_cli.notify, &res)) == -EAGAIN) {
+        if (k_uptime_get() > deadline) {
+            nrf_clock_hfclk_t src = NRF_CLOCK_HFCLK_LOW_ACCURACY;
+            bool running = nrfx_clock_is_running(NRF_CLOCK_DOMAIN_HFCLK, &src);
+            if (running && src == NRF_CLOCK_HFCLK_HIGH_ACCURACY) {
+                LOG_WRN("HF clock manager stuck (state %d) but HFXO is running; continuing",
+                        ret_req);
+                return 0;
+            }
+            LOG_ERR("HF clock start timed out (state=%d running=%d src=%d)",
+                    ret_req, (int)running, (int)src);
+            return -ETIMEDOUT;
+        }
+        k_busy_wait(50);
+    }
+    if (ret < 0 || res < 0) {
+        LOG_ERR("HF clock could not be started: %d/%d", ret, res);
+        return ret < 0 ? ret : res;
+    }
+
+    LOG_INF("HFXO running for radio");
+    return 0;
+}
+
+static void hfclk_stop(void)
+{
+    if (s_hfclk_requested && s_hfclk_mgr != NULL) {
+        (void)onoff_cancel_or_release(s_hfclk_mgr, &s_hfclk_cli);
+    }
+    s_hfclk_requested = false;
+}
+
 /* ============================================================================
  * Public Functions
  * ============================================================================ */
@@ -178,6 +262,12 @@ int esb_radio_init(uint8_t channel)
     }
 
     LOG_INF("Initializing ESB radio on channel %d", channel);
+
+    int clk_ret = hfclk_start();
+    if (clk_ret) {
+        hfclk_stop();
+        return clk_ret;
+    }
 
     /* Generate local address from device ID */
     /* Use last 5 bytes of device ID as ESB address */
@@ -249,6 +339,7 @@ void esb_radio_deinit(void)
     }
 
     esb_disable();
+    hfclk_stop();
     s_initialized = false;
     LOG_INF("ESB radio deinitialized");
 }
