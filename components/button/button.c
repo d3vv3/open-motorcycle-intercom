@@ -9,6 +9,8 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include <stdatomic.h>
+
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -22,8 +24,9 @@ static const char *TAG = "button";
 
 static QueueHandle_t s_button_queue = NULL;
 static TaskHandle_t s_button_task = NULL;
-static button_long_press_cb_t s_long_press_callback = NULL;
+static button_gesture_cb_t s_gesture_callback = NULL;
 static bool s_initialized = false;
+static atomic_uint s_queue_overflows;
 
 /* Button event structure for queue */
 typedef struct {
@@ -50,7 +53,9 @@ static void IRAM_ATTR button_isr_handler(void *arg)
         .timestamp_us = esp_timer_get_time(),
     };
 
-    xQueueSendFromISR(s_button_queue, &evt, NULL);
+    if (xQueueSendFromISR(s_button_queue, &evt, NULL) != pdTRUE) {
+        atomic_fetch_add_explicit(&s_queue_overflows, 1u, memory_order_relaxed);
+    }
 }
 
 /* ============================================================================
@@ -67,44 +72,41 @@ static void button_task(void *arg)
     button_event_t evt;
     int64_t press_start_us = 0;
     bool button_pressed = false;
-    bool long_press_triggered = false;
+    unsigned last_reported_overflows = 0u;
 
     ESP_LOGI(TAG, "Button task started");
 
     while (1) {
         if (xQueueReceive(s_button_queue, &evt, pdMS_TO_TICKS(100))) {
-            /* Button pressed (active low) */
-            if (evt.level == 0 && !button_pressed) {
-                press_start_us = evt.timestamp_us;
+            while (xQueueReceive(s_button_queue, &evt,
+                                 pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) == pdTRUE) {
+                /* Restart the quiet interval after each bounce edge. */
+            }
+            int stable_level = gpio_get_level(BUTTON_BOOT_GPIO);
+            int64_t stable_timestamp_us = esp_timer_get_time();
+            /* Button pressed (active low). */
+            if (stable_level == 0 && !button_pressed) {
+                press_start_us = stable_timestamp_us;
                 button_pressed = true;
-                long_press_triggered = false;
                 ESP_LOGD(TAG, "Button pressed");
             }
-            /* Button released */
-            else if (evt.level == 1 && button_pressed) {
-                int64_t press_duration_ms = (evt.timestamp_us - press_start_us) / 1000;
+            /* Button released. */
+            else if (stable_level == 1 && button_pressed) {
+                int64_t press_duration_ms = (stable_timestamp_us - press_start_us) / 1000;
                 button_pressed = false;
                 ESP_LOGD(TAG, "Button released after %lld ms", press_duration_ms);
 
-                /* Reset for next press */
-                long_press_triggered = false;
-            }
-        }
-
-        /* Check for long press while button is held */
-        if (button_pressed && !long_press_triggered) {
-            int64_t now_us = esp_timer_get_time();
-            int64_t press_duration_ms = (now_us - press_start_us) / 1000;
-
-            if (press_duration_ms >= BUTTON_LONG_PRESS_MS) {
-                ESP_LOGI(TAG, "Long press detected (%lld ms)", press_duration_ms);
-                long_press_triggered = true;
-
-                /* Invoke callback if registered */
-                if (s_long_press_callback) {
-                    s_long_press_callback(evt.gpio);
+                button_gesture_t gesture = button_classify_release_ms(press_duration_ms);
+                if (gesture != BUTTON_GESTURE_NONE && s_gesture_callback != NULL) {
+                    s_gesture_callback(gesture, BUTTON_BOOT_GPIO);
                 }
             }
+        }
+        unsigned overflows = atomic_load_explicit(&s_queue_overflows, memory_order_relaxed);
+        if (overflows != last_reported_overflows) {
+            ESP_LOGW(TAG, "Button event queue overflowed %u time(s)",
+                     overflows - last_reported_overflows);
+            last_reported_overflows = overflows;
         }
     }
 }
@@ -202,18 +204,18 @@ void button_deinit(void)
         s_button_queue = NULL;
     }
 
-    s_long_press_callback = NULL;
+    s_gesture_callback = NULL;
     s_initialized = false;
 
     ESP_LOGI(TAG, "Button handler deinitialized");
 }
 
-void button_register_long_press_callback(button_long_press_cb_t callback)
+void button_register_gesture_callback(button_gesture_cb_t callback)
 {
-    s_long_press_callback = callback;
+    s_gesture_callback = callback;
     if (callback) {
-        ESP_LOGI(TAG, "Long press callback registered");
+        ESP_LOGI(TAG, "Gesture callback registered");
     } else {
-        ESP_LOGI(TAG, "Long press callback unregistered");
+        ESP_LOGI(TAG, "Gesture callback unregistered");
     }
 }

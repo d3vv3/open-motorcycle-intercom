@@ -110,13 +110,16 @@ esp_err_t power_init_with_config(const power_config_t *config)
     ESP_LOGI(TAG, "  Deep sleep timeout: %lu sec", (unsigned long)s_config.deep_sleep_timeout_sec);
 
     /* Check wake reason */
-    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    uint64_t wake_causes = esp_sleep_get_wakeup_causes();
     s_is_deep_sleep_wake =
-        (wake_cause == ESP_SLEEP_WAKEUP_TIMER || wake_cause == ESP_SLEEP_WAKEUP_GPIO ||
-         wake_cause == ESP_SLEEP_WAKEUP_EXT0 || wake_cause == ESP_SLEEP_WAKEUP_EXT1);
+        ((wake_causes & (UINT64_C(1) << ESP_SLEEP_WAKEUP_TIMER)) != 0 ||
+         (wake_causes & (UINT64_C(1) << ESP_SLEEP_WAKEUP_GPIO)) != 0 ||
+         (wake_causes & (UINT64_C(1) << ESP_SLEEP_WAKEUP_EXT0)) != 0 ||
+         (wake_causes & (UINT64_C(1) << ESP_SLEEP_WAKEUP_EXT1)) != 0);
 
     if (s_is_deep_sleep_wake) {
-        ESP_LOGI(TAG, "Woke from deep sleep (cause: %d)", wake_cause);
+        ESP_LOGI(TAG, "Woke from deep sleep (causes: 0x%llx)",
+                 (unsigned long long)wake_causes);
     }
 
     /* Create state mutex */

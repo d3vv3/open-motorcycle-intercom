@@ -4,3 +4,9 @@
 dependencies:
   78/esp-opus:
     version: "^1.0.0"
+  espressif/esp_codec_dev:
+    version: "2.0.0-beta5"
+    require: private
+  espressif/esp-sr:
+    version: "2.5.4"
+    require: private

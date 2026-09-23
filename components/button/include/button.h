@@ -1,9 +1,10 @@
 /**
  * @file button.h
- * @brief Button handler for boot button with long press detection
+ * @brief Button handler for release-classified boot-button gestures
  *
- * This module provides button handling with debouncing and long press detection.
- * On ESP32-S3, GPIO 0 is the boot button.
+ * This module provides button handling with timestamped debounce and release
+ * classified gestures.
+ * The Function CoreBoard-1 boot button is on the board-defined GPIO.
  */
 
 #ifndef OMI_BUTTON_H
@@ -12,6 +13,9 @@
 #include <stdbool.h>
 
 #include "esp_err.h"
+
+#include "button_gesture.h"
+#include "omi_board_pins.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,15 +26,13 @@ extern "C" {
  * ============================================================================ */
 
 /**
- * @brief Boot button GPIO (GPIO 0 on ESP32-S3)
+ * @brief Boot button GPIO on the Function CoreBoard-1
  */
-#define BUTTON_BOOT_GPIO 0
+#define BUTTON_BOOT_GPIO OMI_BOARD_GPIO_BOOT_BUTTON
 
 /**
- * @brief Long press duration in milliseconds (2 seconds)
+ * Gesture thresholds in milliseconds. Classification happens only on release.
  */
-#define BUTTON_LONG_PRESS_MS 2000
-
 /**
  * @brief Button debounce time in milliseconds
  */
@@ -41,13 +43,12 @@ extern "C" {
  * ============================================================================ */
 
 /**
- * @brief Button long press callback function type
+ * @brief Release-classified boot-button gesture
  *
- * Called when the boot button has been held for BUTTON_LONG_PRESS_MS.
- *
- * @param button_gpio GPIO number of the button that was pressed
+ * Releases from 50 ms to less than 2000 ms produce SHORT_PRESS. A hold of
+ * exactly 6000 ms is a pairing gesture. Releases under 50 ms produce NONE.
  */
-typedef void (*button_long_press_cb_t)(int button_gpio);
+typedef void (*button_gesture_cb_t)(button_gesture_t gesture, int button_gpio);
 
 /* ============================================================================
  * Public API
@@ -70,14 +71,13 @@ esp_err_t button_init(void);
 void button_deinit(void);
 
 /**
- * @brief Register callback for long press events
+ * @brief Register callback for release-classified gestures
  *
- * The callback will be invoked from the button task when a long press
- * is detected (button held for BUTTON_LONG_PRESS_MS).
+ * The callback runs in the button task after a debounced release.
  *
- * @param callback Function to call on long press, or NULL to unregister
+ * @param callback Function to call for a classified gesture, or NULL to unregister
  */
-void button_register_long_press_callback(button_long_press_cb_t callback);
+void button_register_gesture_callback(button_gesture_cb_t callback);
 
 #ifdef __cplusplus
 }

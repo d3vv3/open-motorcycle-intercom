@@ -1,332 +1,293 @@
 /**
  * @file hwtest.c
- * @brief Hardware validation tests for OMI
+ * @brief Hardware validation tests for OMI.
  *
- * Simple tests to validate speaker (I2S) and microphone (ADC) hardware.
+ * These tests exercise the production audio path, including the ES8311 codec.
  */
 
 #include "hwtest.h"
 
-#include <math.h>
-#include <string.h>
+#include <stdbool.h>
+#include <stddef.h>
 
+#include "audio.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "esp_adc/adc_oneshot.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-
-#include "driver/i2s_std.h"
-
 static const char *TAG = "hwtest";
 
-/* Pin definitions (match wiring.md) */
-#define SPEAKER_BCLK_GPIO 4
-#define SPEAKER_WS_GPIO   5
-#define SPEAKER_DOUT_GPIO 7
-#define MIC_ADC_CHANNEL   ADC_CHANNEL_0 /* GPIO1 */
+#define MIC_TEST_DURATION_SEC 5
+#define SPEAKER_TEST_DURATION_SEC 4
+#define AUDIO_FRAMES_PER_SEC 50
+#define MIC_MIN_FRAME_PERCENT 80
+#define LOOPBACK_MIN_FRAME_PERCENT 75
+#define SPEAKER_MIN_FRAME_PERCENT 75
+#define MAX_ERROR_PERCENT 20
+#define MAX_IO_ERROR_PERCENT 5
+#define MIC_MIN_PEAK_ABS 512
+#define LOOPBACK_MIN_PEAK_ABS MIC_MIN_PEAK_ABS
+#define TEST_DELAY_CHUNK_MS 100
 
-/* Audio parameters */
-#define SAMPLE_RATE    16000
-#define TONE_FREQ_HZ   1000
-#define TONE_AMPLITUDE 16000 /* ~50% of int16_t max */
+static esp_err_t hwtest_audio_start(const audio_config_t *config)
+{
+    return audio_init_and_start_with_config(config);
+}
 
-/* ============================================================================
- * Speaker Test - Generate 1kHz tone
- * ============================================================================ */
+static esp_err_t hwtest_audio_stop(void)
+{
+    esp_err_t ret = ESP_OK;
+    if (audio_is_running()) {
+        ret = audio_stop();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Audio stop failed: %s", esp_err_to_name(ret));
+        }
+    }
+    esp_err_t deinit_ret = audio_deinit();
+    if (deinit_ret == ESP_ERR_INVALID_STATE && !audio_is_running()) {
+        /* An external deinit may have completed the exclusive test already. */
+        deinit_ret = ESP_OK;
+    } else if (deinit_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Audio deinit failed: %s", esp_err_to_name(deinit_ret));
+    }
+    return ret != ESP_OK ? ret : deinit_ret;
+}
 
+static uint32_t minimum_frames(uint64_t expected, uint32_t percent)
+{
+    if (expected <= 4u) {
+        return 1u;
+    }
+    uint64_t minimum = (expected * percent + 99u) / 100u;
+    return minimum > UINT32_MAX ? UINT32_MAX : (uint32_t)minimum;
+}
+
+static uint32_t maximum_errors(uint64_t expected, uint32_t percent)
+{
+    uint64_t limit64 = (expected * percent) / 100u;
+    uint32_t limit = limit64 > UINT32_MAX ? UINT32_MAX : (uint32_t)limit64;
+    return limit == 0u ? 1u : limit;
+}
+
+static bool wait_for_audio(uint64_t duration_ms)
+{
+    while (duration_ms != 0u && audio_is_running()) {
+        uint32_t chunk_ms = duration_ms > TEST_DELAY_CHUNK_MS ? TEST_DELAY_CHUNK_MS : (uint32_t)duration_ms;
+        vTaskDelay(pdMS_TO_TICKS(chunk_ms));
+        duration_ms -= chunk_ms;
+    }
+    return audio_is_running();
+}
+
+/**
+ * Run the production notification path through the ES8311 speaker.
+ *
+ * The counters validate that the digital codec/I2S write path is operating.
+ * Audible output is still a required physical observation; software cannot
+ * detect a disconnected speaker or amplifier.
+ */
 esp_err_t hwtest_speaker(void)
 {
     ESP_LOGI(TAG, "=== SPEAKER TEST ===");
-    ESP_LOGI(TAG, "Playing 1kHz tone for 2 seconds...");
-    ESP_LOGI(TAG, "I2S pins: BCLK=%d, WS=%d, DOUT=%d", SPEAKER_BCLK_GPIO, SPEAKER_WS_GPIO,
-             SPEAKER_DOUT_GPIO);
+    ESP_LOGI(TAG, "Playing production audio notifications for about %d seconds; verify audible output",
+             SPEAKER_TEST_DURATION_SEC);
 
-    esp_err_t ret;
-    i2s_chan_handle_t tx_chan = NULL;
-
-    /* Create I2S TX channel */
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 4;
-    chan_cfg.dma_frame_num = 256;
-
-    ret = i2s_new_channel(&chan_cfg, &tx_chan, NULL);
+    audio_config_t config = AUDIO_CONFIG_DEFAULT();
+    esp_err_t ret = hwtest_audio_start(&config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create I2S channel: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to start production audio: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    /* Configure I2S standard mode */
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg =
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg =
-            {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = SPEAKER_BCLK_GPIO,
-                .ws = SPEAKER_WS_GPIO,
-                .dout = SPEAKER_DOUT_GPIO,
-                .din = I2S_GPIO_UNUSED,
-                .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
-            },
+    const audio_notify_t sequence[] = {
+        AUDIO_NOTIFY_STARTUP,
+        AUDIO_NOTIFY_PEER_JOIN,
+        AUDIO_NOTIFY_PEER_LEAVE,
     };
-
-    ret = i2s_channel_init_std_mode(tx_chan, &std_cfg);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init I2S: %s", esp_err_to_name(ret));
-        i2s_del_channel(tx_chan);
-        return ret;
-    }
-
-    ret = i2s_channel_enable(tx_chan);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable I2S: %s", esp_err_to_name(ret));
-        i2s_del_channel(tx_chan);
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "I2S initialized, generating tone...");
-
-    /* Generate and play sine wave */
-    const int samples_per_cycle = SAMPLE_RATE / TONE_FREQ_HZ;
-    const int total_samples = SAMPLE_RATE * 2; /* 2 seconds */
-    int16_t buffer[256];
-    size_t bytes_written;
-
-    for (int i = 0; i < total_samples; i += 256) {
-        for (int j = 0; j < 256 && (i + j) < total_samples; j++) {
-            float phase = 2.0f * M_PI * (float)((i + j) % samples_per_cycle) / samples_per_cycle;
-            buffer[j] = (int16_t)(TONE_AMPLITUDE * sinf(phase));
+    for (size_t i = 0; i < sizeof(sequence) / sizeof(sequence[0]); ++i) {
+        ret = audio_play_notification(sequence[i]);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to queue speaker notification: %s", esp_err_to_name(ret));
+            (void)hwtest_audio_stop();
+            return ret;
         }
-
-        i2s_channel_write(tx_chan, buffer, sizeof(buffer), &bytes_written, portMAX_DELAY);
     }
 
-    ESP_LOGI(TAG, "Tone complete, cleaning up...");
-
-    /* Cleanup */
-    i2s_channel_disable(tx_chan);
-    i2s_del_channel(tx_chan);
+    (void)wait_for_audio((uint64_t)SPEAKER_TEST_DURATION_SEC * 1000u);
+    audio_stats_t stats;
+    ret = audio_get_stats(&stats);
+    if (ret == ESP_OK) {
+        const uint64_t expected = (uint64_t)SPEAKER_TEST_DURATION_SEC * AUDIO_FRAMES_PER_SEC;
+        const uint32_t minimum = minimum_frames(expected, SPEAKER_MIN_FRAME_PERCENT);
+        const uint32_t error_limit = maximum_errors(expected, MAX_IO_ERROR_PERCENT);
+        if (stats.playback_frames < minimum || stats.i2s_write_incomplete > error_limit) {
+            ESP_LOGE(TAG, "Digital speaker path invalid: playback=%lu minimum=%lu incomplete=%lu limit=%lu",
+                     (unsigned long)stats.playback_frames, (unsigned long)minimum,
+                     (unsigned long)stats.i2s_write_incomplete, (unsigned long)error_limit);
+            ret = ESP_FAIL;
+        }
+    }
+    if (ret != ESP_OK) {
+        (void)hwtest_audio_stop();
+        return ret;
+    }
+    ret = hwtest_audio_stop();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to stop production audio: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     ESP_LOGI(TAG, "=== SPEAKER TEST DONE ===");
-    ESP_LOGI(TAG, "Did you hear a 1kHz tone? If yes, speaker is working!");
-
     return ESP_OK;
 }
 
-/* ============================================================================
- * Microphone Test - Read ADC levels
- * ============================================================================ */
-
+/**
+ * Run production codec capture and report public audio pipeline statistics.
+ */
 esp_err_t hwtest_mic(void)
 {
     ESP_LOGI(TAG, "=== MICROPHONE TEST ===");
-    ESP_LOGI(TAG, "Reading ADC levels for 5 seconds...");
-    ESP_LOGI(TAG, "ADC channel: %d (GPIO1)", MIC_ADC_CHANNEL);
-    ESP_LOGI(TAG, "Speak into the mic to see level changes!");
+    ESP_LOGI(TAG, "Capturing and encoding through the ES8311 for %d seconds",
+             MIC_TEST_DURATION_SEC);
+    ESP_LOGI(TAG, "Speak near the microphone during this five-second test");
 
-    esp_err_t ret;
-    adc_oneshot_unit_handle_t adc_handle;
+    audio_config_t config = AUDIO_CONFIG_DEFAULT();
+    config.force_tx_always = true;
 
-    /* Initialize ADC */
-    adc_oneshot_unit_init_cfg_t init_cfg = {
-        .unit_id = ADC_UNIT_1,
-    };
-
-    ret = adc_oneshot_new_unit(&init_cfg, &adc_handle);
+    esp_err_t ret = hwtest_audio_start(&config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create ADC unit: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to start production audio: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .bitwidth = ADC_BITWIDTH_12,
-        .atten = ADC_ATTEN_DB_12,
-    };
+    for (int second = 0; second < MIC_TEST_DURATION_SEC; ++second) {
+        (void)wait_for_audio(1000u);
 
-    ret = adc_oneshot_config_channel(adc_handle, MIC_ADC_CHANNEL, &chan_cfg);
+        audio_stats_t stats;
+        ret = audio_get_stats(&stats);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read audio statistics: %s", esp_err_to_name(ret));
+            (void)hwtest_audio_stop();
+            return ret;
+        }
+        ESP_LOGI(TAG, "Audio stats: capture=%lu encoded=%lu capture_errors=%lu timeouts=%lu",
+                 (unsigned long)stats.capture_frames_ok, (unsigned long)stats.frames_encoded,
+                 (unsigned long)stats.capture_errors, (unsigned long)stats.capture_timeouts);
+    }
+
+    audio_stats_t stats;
+    ret = audio_get_stats(&stats);
+    if (ret == ESP_OK) {
+        const uint64_t expected = (uint64_t)MIC_TEST_DURATION_SEC * AUDIO_FRAMES_PER_SEC;
+        const uint32_t minimum = minimum_frames(expected, MIC_MIN_FRAME_PERCENT);
+        const uint32_t error_limit = maximum_errors(expected, MAX_ERROR_PERCENT);
+        if (stats.capture_frames_ok < minimum || stats.frames_encoded < minimum) {
+            ESP_LOGE(TAG, "Too few mic frames: capture=%lu encode=%lu minimum=%lu",
+                     (unsigned long)stats.capture_frames_ok, (unsigned long)stats.frames_encoded,
+                     (unsigned long)minimum);
+            ret = ESP_FAIL;
+        } else if (stats.capture_peak_abs < MIC_MIN_PEAK_ABS) {
+            ESP_LOGE(TAG, "Mic input peak too low: peak=%u minimum=%u; speak during the test",
+                     stats.capture_peak_abs, MIC_MIN_PEAK_ABS);
+            ret = ESP_FAIL;
+        } else if (stats.capture_errors > error_limit || stats.capture_timeouts > error_limit ||
+                   stats.encode_errors > error_limit) {
+            ESP_LOGE(TAG, "Too many mic pipeline errors: capture=%lu timeout=%lu encode=%lu limit=%lu",
+                     (unsigned long)stats.capture_errors, (unsigned long)stats.capture_timeouts,
+                     (unsigned long)stats.encode_errors, (unsigned long)error_limit);
+            ret = ESP_FAIL;
+        }
+    }
+
+    esp_err_t cleanup_ret = hwtest_audio_stop();
+    if (ret == ESP_OK && cleanup_ret != ESP_OK) {
+        ret = cleanup_ret;
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to config ADC channel: %s", esp_err_to_name(ret));
-        adc_oneshot_del_unit(adc_handle);
+        ESP_LOGE(TAG, "=== MICROPHONE TEST FAILED: %s ===", esp_err_to_name(ret));
         return ret;
     }
 
-    ESP_LOGI(TAG, "ADC initialized, reading samples...");
-    ESP_LOGI(TAG, "");
-
-    /* Read ADC for 5 seconds */
-    int64_t start_time = esp_timer_get_time();
-    int64_t end_time = start_time + (5 * 1000000); /* 5 seconds */
-
-    int min_val = 4095, max_val = 0;
-    int sample_count = 0;
-    int64_t sum = 0;
-
-    while (esp_timer_get_time() < end_time) {
-        /* Take 100 samples quickly */
-        int batch_min = 4095, batch_max = 0;
-        int64_t batch_sum = 0;
-
-        for (int i = 0; i < 100; i++) {
-            int raw;
-            ret = adc_oneshot_read(adc_handle, MIC_ADC_CHANNEL, &raw);
-            if (ret == ESP_OK) {
-                batch_sum += raw;
-                if (raw < batch_min)
-                    batch_min = raw;
-                if (raw > batch_max)
-                    batch_max = raw;
-                sample_count++;
-            }
-        }
-
-        int batch_avg = batch_sum / 100;
-        int batch_range = batch_max - batch_min;
-
-        /* Update overall stats */
-        sum += batch_sum;
-        if (batch_min < min_val)
-            min_val = batch_min;
-        if (batch_max > max_val)
-            max_val = batch_max;
-
-        /* Visual level meter */
-        int level = batch_range / 50; /* Scale to 0-80 roughly */
-        if (level > 40)
-            level = 40;
-
-        char meter[42];
-        memset(meter, ' ', 41);
-        meter[41] = '\0';
-        for (int i = 0; i < level; i++) {
-            meter[i] = '#';
-        }
-
-        ESP_LOGI(TAG, "ADC: avg=%4d range=%4d [%s]", batch_avg, batch_range, meter);
-
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-
-    /* Final stats */
-    int avg_val = (sample_count > 0) ? (sum / sample_count) : 0;
-
-    ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "=== MICROPHONE TEST DONE ===");
-    ESP_LOGI(TAG, "Samples: %d", sample_count);
-    ESP_LOGI(TAG, "Min: %d, Max: %d, Avg: %d", min_val, max_val, avg_val);
-    ESP_LOGI(TAG, "Range: %d (should vary when speaking)", max_val - min_val);
-    ESP_LOGI(TAG, "");
-
-    if (max_val - min_val < 50) {
-        ESP_LOGW(TAG, "Low variance detected - check mic wiring!");
-        ESP_LOGW(TAG, "Expected: Bias ~2048, Range >100 when speaking");
-    } else if (avg_val < 1500 || avg_val > 2500) {
-        ESP_LOGW(TAG, "DC bias seems off (expected ~2048) - check bias resistors");
-    } else {
-        ESP_LOGI(TAG, "Microphone appears to be working!");
-    }
-
-    adc_oneshot_del_unit(adc_handle);
-
     return ESP_OK;
 }
 
-/* ============================================================================
- * Loopback Test - Mic to Speaker passthrough
- * ============================================================================ */
-
+/**
+ * Run the production codec capture -> Opus -> playout loopback path.
+ */
 esp_err_t hwtest_loopback(uint32_t duration_sec)
 {
     ESP_LOGI(TAG, "=== LOOPBACK TEST ===");
-    ESP_LOGI(TAG, "Mic -> Speaker passthrough for %lu seconds", duration_sec);
-    ESP_LOGI(TAG, "(duration=0 means run until reset)");
+    ESP_LOGI(TAG, "Codec capture -> Opus -> playout for %lu seconds", (unsigned long)duration_sec);
+    ESP_LOGI(TAG, "(duration=0 runs until an external stop or deinit)");
 
-    esp_err_t ret;
-    i2s_chan_handle_t tx_chan = NULL;
-    adc_oneshot_unit_handle_t adc_handle = NULL;
+    audio_config_t config = AUDIO_CONFIG_DEFAULT();
+    config.mode = AUDIO_MODE_LOOPBACK;
+    config.force_tx_always = true;
 
-    /* Initialize ADC for mic */
-    adc_oneshot_unit_init_cfg_t adc_init_cfg = {.unit_id = ADC_UNIT_1};
-    ret = adc_oneshot_new_unit(&adc_init_cfg, &adc_handle);
+    esp_err_t ret = hwtest_audio_start(&config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create ADC: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to start production audio: %s", esp_err_to_name(ret));
         return ret;
     }
 
-    adc_oneshot_chan_cfg_t adc_chan_cfg = {
-        .bitwidth = ADC_BITWIDTH_12,
-        .atten = ADC_ATTEN_DB_12,
-    };
-    adc_oneshot_config_channel(adc_handle, MIC_ADC_CHANNEL, &adc_chan_cfg);
+    if (duration_sec == 0) {
+        while (audio_is_running()) {
+            (void)wait_for_audio(1000u);
+        }
+        /* An external stop ends this exclusive/manual test. Deinit only after
+         * observing that the workers are already stopped. */
+        ret = hwtest_audio_stop();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to clean up externally stopped audio: %s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+        ESP_LOGI(TAG, "=== LOOPBACK TEST STOPPED EXTERNALLY ===");
+        return ESP_OK;
+    }
 
-    /* Initialize I2S for speaker */
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 4;
-    chan_cfg.dma_frame_num = 256;
-
-    ret = i2s_new_channel(&chan_cfg, &tx_chan, NULL);
+    (void)wait_for_audio((uint64_t)duration_sec * 1000u);
+    audio_stats_t stats;
+    ret = audio_get_stats(&stats);
+    if (ret == ESP_OK) {
+        const uint64_t expected = (uint64_t)duration_sec * AUDIO_FRAMES_PER_SEC;
+        const uint32_t minimum = minimum_frames(expected, LOOPBACK_MIN_FRAME_PERCENT);
+        const uint32_t error_limit = maximum_errors(expected, MAX_ERROR_PERCENT);
+        if (stats.capture_frames_ok < minimum || stats.frames_encoded < minimum ||
+            stats.frames_decoded < minimum || stats.playback_frames < minimum) {
+            ESP_LOGE(TAG,
+                     "Too few loopback frames: capture=%lu encode=%lu decode=%lu playback=%lu "
+                     "minimum=%lu",
+                     (unsigned long)stats.capture_frames_ok, (unsigned long)stats.frames_encoded,
+                     (unsigned long)stats.frames_decoded, (unsigned long)stats.playback_frames,
+                     (unsigned long)minimum);
+            ret = ESP_FAIL;
+        } else if (stats.capture_peak_abs < LOOPBACK_MIN_PEAK_ABS) {
+            ESP_LOGE(TAG, "Loopback input peak too low: peak=%u minimum=%u; provide non-zero input",
+                     stats.capture_peak_abs, LOOPBACK_MIN_PEAK_ABS);
+            ret = ESP_FAIL;
+        } else if (stats.capture_errors > error_limit || stats.capture_timeouts > error_limit ||
+                   stats.encode_errors > error_limit || stats.decode_errors > error_limit ||
+                   stats.i2s_write_incomplete > error_limit) {
+            ESP_LOGE(TAG,
+                     "Too many loopback errors: capture=%lu timeout=%lu encode=%lu decode=%lu "
+                     "playback=%lu limit=%lu",
+                     (unsigned long)stats.capture_errors, (unsigned long)stats.capture_timeouts,
+                     (unsigned long)stats.encode_errors, (unsigned long)stats.decode_errors,
+                     (unsigned long)stats.i2s_write_incomplete, (unsigned long)error_limit);
+            ret = ESP_FAIL;
+        }
+    }
+    esp_err_t cleanup_ret = hwtest_audio_stop();
+    if (ret == ESP_OK && cleanup_ret != ESP_OK) {
+        ret = cleanup_ret;
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create I2S: %s", esp_err_to_name(ret));
-        adc_oneshot_del_unit(adc_handle);
+        ESP_LOGE(TAG, "=== LOOPBACK TEST FAILED: %s ===", esp_err_to_name(ret));
         return ret;
     }
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg =
-            I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg =
-            {
-                .mclk = I2S_GPIO_UNUSED,
-                .bclk = SPEAKER_BCLK_GPIO,
-                .ws = SPEAKER_WS_GPIO,
-                .dout = SPEAKER_DOUT_GPIO,
-                .din = I2S_GPIO_UNUSED,
-                .invert_flags = {.mclk_inv = false, .bclk_inv = false, .ws_inv = false},
-            },
-    };
-
-    i2s_channel_init_std_mode(tx_chan, &std_cfg);
-    i2s_channel_enable(tx_chan);
-
-    ESP_LOGI(TAG, "Loopback running - speak into mic!");
-
-    int64_t start_time = esp_timer_get_time();
-    int64_t end_time =
-        (duration_sec > 0) ? start_time + ((int64_t)duration_sec * 1000000) : INT64_MAX;
-
-    int16_t mono_buffer[64];
-    int16_t stereo_buffer[128]; /* Stereo output for I2S */
-    size_t bytes_written;
-
-    while (esp_timer_get_time() < end_time) {
-        /* Read samples from ADC */
-        for (int i = 0; i < 64; i++) {
-            int raw;
-            adc_oneshot_read(adc_handle, MIC_ADC_CHANNEL, &raw);
-            /* Convert 12-bit unsigned to 16-bit signed, centered - gain (8x) */
-            mono_buffer[i] = (int16_t)((raw - 2048) * 8);
-        }
-
-        /* Convert to stereo */
-        for (int i = 0; i < 64; i++) {
-            stereo_buffer[i * 2] = mono_buffer[i];     /* Left */
-            stereo_buffer[i * 2 + 1] = mono_buffer[i]; /* Right */
-        }
-
-        /* Write to speaker */
-        i2s_channel_write(tx_chan, stereo_buffer, sizeof(stereo_buffer), &bytes_written,
-                          portMAX_DELAY);
-    }
-
-    /* Cleanup */
-    i2s_channel_disable(tx_chan);
-    i2s_del_channel(tx_chan);
-    adc_oneshot_del_unit(adc_handle);
 
     ESP_LOGI(TAG, "=== LOOPBACK TEST DONE ===");
-
     return ESP_OK;
 }

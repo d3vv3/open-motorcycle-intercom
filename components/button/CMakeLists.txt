@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "button.c"
+    SRCS "button.c" "button_gesture.c"
     INCLUDE_DIRS "include"
-    REQUIRES driver esp_timer
+    REQUIRES board esp_driver_gpio esp_timer
 )

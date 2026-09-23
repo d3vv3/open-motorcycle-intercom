@@ -14,13 +14,20 @@ jobs:
     name: ESP-IDF firmware
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.5
+      image: espressif/idf@sha256:8ac794c57fd4cac246cb8d2ada4002fa26337ac7df683047b5b83743dbedb6b7
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4.2.2
 
-      - name: Build ESP32-S3 firmware
+      - name: Select ESP32-S31 preview target
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          cd "$GITHUB_WORKSPACE"
+          idf.py --preview set-target esp32s31
+
+      - name: Build ESP32-S31 firmware
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
@@ -32,10 +39,10 @@ jobs:
           . "$IDF_PATH/export.sh"
           idf.py -C "$GITHUB_WORKSPACE" size
 
-      - name: Upload ESP32-S3 artifacts
+      - name: Upload ESP32-S31 artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: esp32s3-firmware
+          name: esp32s31-firmware
           path: |
             build/omi.bin
             build/omi.elf
@@ -77,6 +84,39 @@ jobs:
       - name: Run audio PCM resampler tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/audio_pcm_resampler_test && /tmp/audio_pcm_resampler_test
 
+      - name: Run audio rate converter tests
+        run: cc -std=c11 -Wall -Wextra -Werror -Wno-sign-compare -pedantic -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/audio_rate_converter_test && /tmp/audio_rate_converter_test
+
+      - name: Run audio music scheduling tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio tests/c/audio_music_schedule_test.c -o /tmp/audio_music_schedule_test && /tmp/audio_music_schedule_test
+
+      - name: Run voice cleanup tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/voice_cleanup_test && /tmp/voice_cleanup_test
+
+      - name: Run WS sync math tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Inrf_mesh/include tests/c/ws_sync_math_test.c -o /tmp/ws_sync_math_test && /tmp/ws_sync_math_test
+
+      - name: Run audio reblock tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio -Icomponents/audio/include components/audio/audio_reblock.c tests/c/audio_reblock_test.c -o /tmp/audio_reblock_test && /tmp/audio_reblock_test
+
+      - name: Run audio capture FIFO tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio components/audio/audio_capture_fifo.c tests/c/audio_capture_fifo_test.c -o /tmp/audio_capture_fifo_test && /tmp/audio_capture_fifo_test
+
+      - name: Run audio sample FIFO and playback policy tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio components/audio/audio_sample_fifo.c components/audio/audio_route.c tests/c/audio_sample_fifo_test.c -o /tmp/audio_sample_fifo_test && /tmp/audio_sample_fifo_test
+
+      - name: Run Bluetooth audio route tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include -Icomponents/audio components/audio/audio_route.c tests/c/audio_route_test.c -o /tmp/audio_route_test && /tmp/audio_route_test
+
+      - name: Run phone call state reducer tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/phone_audio/include components/phone_audio/phone_audio_call_state.c tests/c/phone_audio_call_state_test.c -o /tmp/phone_audio_call_state_test && /tmp/phone_audio_call_state_test
+
+      - name: Run button gesture tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/button_gesture_test && /tmp/button_gesture_test
+
+      - name: Run BOOT media toggle guard tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Imain main/media_toggle_guard.c tests/c/media_toggle_guard_test.c -o /tmp/media_toggle_guard_test && /tmp/media_toggle_guard_test
+
       - name: Run integrated audio playout recovery tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/audio_playout_recovery_test && /tmp/audio_playout_recovery_test
 
@@ -102,13 +142,21 @@ jobs:
           FLAGS="-std=c11 -Wall -Wextra -Werror -pedantic"
           cc $FLAGS $SAN -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/san_mesh_core && /tmp/san_mesh_core
           cc $FLAGS $SAN -I. tests/c/mesh_tx_metrics_test.c -o /tmp/san_mesh_tx_metrics && /tmp/san_mesh_tx_metrics
+          cc $FLAGS $SAN -Inrf_mesh/include tests/c/ws_sync_math_test.c -o /tmp/san_ws_sync_math && /tmp/san_ws_sync_math
           cc $FLAGS $SAN -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/san_audio_bundle && /tmp/san_audio_bundle
           cc $FLAGS $SAN -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/san_audio_tx_cache && /tmp/san_audio_tx_cache
           cc $FLAGS $SAN -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/san_bridge_frame && /tmp/san_bridge_frame
           cc $FLAGS $SAN -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/san_audio_rx_tracker && /tmp/san_audio_rx_tracker
           cc $FLAGS $SAN -I. shared/mesh_membership.c tests/c/mesh_membership_test.c -o /tmp/san_mesh_membership && /tmp/san_mesh_membership
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/san_packet_store && /tmp/san_packet_store
-          cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
+           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
+           cc $FLAGS $SAN -Wno-sign-compare -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/san_audio_rate_converter && /tmp/san_audio_rate_converter
+            cc $FLAGS $SAN -Icomponents/audio -Icomponents/audio/include components/audio/audio_reblock.c tests/c/audio_reblock_test.c -o /tmp/san_reblock && /tmp/san_reblock
+           cc $FLAGS $SAN -Icomponents/audio components/audio/audio_capture_fifo.c tests/c/audio_capture_fifo_test.c -o /tmp/san_audio_capture_fifo && /tmp/san_audio_capture_fifo
+           cc $FLAGS $SAN -Icomponents/audio components/audio/audio_sample_fifo.c components/audio/audio_route.c tests/c/audio_sample_fifo_test.c -o /tmp/san_audio_sample_fifo && /tmp/san_audio_sample_fifo
+            cc $FLAGS $SAN -Icomponents/phone_audio/include components/phone_audio/phone_audio_call_state.c tests/c/phone_audio_call_state_test.c -o /tmp/san_phone_audio_call_state && /tmp/san_phone_audio_call_state
+           cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
+           cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
           cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
 

@@ -2,9 +2,9 @@
  * @file ws_sync.h
  * @brief I2S Word-Select (WS) Sync Capture
  *
- * Captures the ESP32's I2S WS signal (16 kHz) on nRF GPIO P0.02 (XIAO D0)
- * using GPIOTE + PPI + TIMER1 for playout-clock diagnostics. RF TDMA timing
- * remains on its fixed 20 ms packet cadence.
+ * Captures the ESP32-S31's physical 48 kHz I2S WS signal on nRF GPIO P0.02
+ * (XIAO D0) using GPIOTE + PPI + TIMER1 for clock diagnostics. This is not the
+ * 16 kHz Opus mesh audio rate. RF TDMA timing remains on a fixed 20 ms cadence.
  */
 
 #ifndef OMI_WS_SYNC_H

@@ -3,8 +3,7 @@
  * @brief OMI Audio Subsystem Interface
  *
  * This component handles:
- * - Microphone capture (ADC continuous mode, MAX9814 analog mic)
- * - Speaker output (I2S TX to the PCM5102A DAC)
+ * - Microphone capture and speaker output through the onboard ES8311 codec
  * - Opus encode/decode
  * - VOX detection
  * - Packet-store and adaptive PCM playout
@@ -15,9 +14,12 @@
 #define OMI_AUDIO_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
+
+#include "omi_board_pins.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,21 +28,27 @@ extern "C" {
 /*
  * I2S GPIO Pin Definitions
  *
- * The I2S bus only drives the speaker DAC; the microphone is sampled by the
- * ADC (see audio_adc_config_t).
- *   - BCLK (bit clock):  GPIO 4
- *   - WS (word select):  GPIO 5
- *   - DOUT (data out):   GPIO 7 - to the PCM5102A DAC
+ *   - MCLK: GPIO 52
+ *   - BCLK (bit clock):  GPIO 53
+ *   - DIN (codec microphone data): GPIO 54
+ *   - WS (word select):  GPIO 55
+ *   - DOUT (codec playback data): GPIO 56
  */
-#define AUDIO_I2S_BCLK_GPIO 4 /**< I2S bit clock GPIO */
-#define AUDIO_I2S_WS_GPIO   5 /**< I2S word select (LRCLK) GPIO */
-/* FIXME(api): DIN is unused; capture moved to the ADC. Remove this constant
- * and audio_i2s_pins_t.din_gpio together on the next config change. */
-#define AUDIO_I2S_DIN_GPIO  6 /**< Unused I2S data-in GPIO */
-#define AUDIO_I2S_DOUT_GPIO 7 /**< I2S data out (to speaker) GPIO */
+#define AUDIO_I2S_BCLK_GPIO OMI_BOARD_GPIO_AUDIO_I2S_BCLK /**< I2S bit clock GPIO */
+#define AUDIO_I2S_WS_GPIO   OMI_BOARD_GPIO_AUDIO_I2S_WS   /**< I2S word select (LRCLK) GPIO */
+#define AUDIO_I2S_MCLK_GPIO OMI_BOARD_GPIO_AUDIO_I2S_MCLK /**< Codec master clock GPIO */
+#define AUDIO_I2S_DIN_GPIO  OMI_BOARD_GPIO_AUDIO_I2S_DIN  /**< Codec data-in GPIO */
+#define AUDIO_I2S_DOUT_GPIO OMI_BOARD_GPIO_AUDIO_I2S_DOUT /**< I2S data out to codec */
 
 /** Matches the mesh grant limit while keeping audio independent of mesh headers. */
 #define AUDIO_MAX_RX_SOURCES 3
+
+/** Maximum input frames considered by one Bluetooth enqueue call. */
+#define AUDIO_ROUTE_MAX_ENQUEUE_FRAMES 1024u
+/** Maximum decoded Bluetooth music frames submitted by one callback chunk. */
+#define AUDIO_BLUETOOTH_PLAYBACK_MAX_FRAMES AUDIO_ROUTE_MAX_ENQUEUE_FRAMES
+/** Maximum samples returned by one non-blocking Bluetooth microphone read. */
+#define AUDIO_ROUTE_MAX_MIC_READ_SAMPLES 320u
 
 /**
  * @brief I2S GPIO pin configuration
@@ -48,7 +56,8 @@ extern "C" {
 typedef struct {
     int bclk_gpio; /**< Bit clock GPIO */
     int ws_gpio;   /**< Word select (LRCLK) GPIO */
-    int din_gpio;  /**< Unused; the microphone is sampled by the ADC */
+    int mclk_gpio; /**< Codec master clock GPIO */
+    int din_gpio;  /**< Codec data-in GPIO (microphone capture) */
     int dout_gpio; /**< Data out GPIO (speaker) */
 } audio_i2s_pins_t;
 
@@ -57,27 +66,9 @@ typedef struct {
  */
 #define AUDIO_I2S_PINS_DEFAULT()                                                                   \
     {                                                                                              \
-        .bclk_gpio = AUDIO_I2S_BCLK_GPIO, .ws_gpio = AUDIO_I2S_WS_GPIO,                            \
-        .din_gpio = AUDIO_I2S_DIN_GPIO, .dout_gpio = AUDIO_I2S_DOUT_GPIO,                          \
-    }
-
-/**
- * @brief ADC configuration for analog microphone
- */
-typedef struct {
-    int adc_channel; /**< ADC channel (default: ADC_CHANNEL_0 = GPIO1) */
-    int adc_unit;    /**< ADC unit (default: ADC_UNIT_1) */
-    int adc_atten;   /**< Attenuation (default: ADC_ATTEN_DB_12) */
-} audio_adc_config_t;
-
-/**
- * @brief Default ADC configuration
- */
-#define AUDIO_ADC_CONFIG_DEFAULT()                                                                 \
-    {                                                                                              \
-        .adc_channel = 0,   /* ADC1_CHANNEL_0 = GPIO1 */                                           \
-            .adc_unit = 1,  /* ADC_UNIT_1 */                                                       \
-            .adc_atten = 3, /* ADC_ATTEN_DB_12 - full 3.3V range for MAX9814 active mic */         \
+        .mclk_gpio = AUDIO_I2S_MCLK_GPIO, .bclk_gpio = AUDIO_I2S_BCLK_GPIO,                        \
+            .ws_gpio = AUDIO_I2S_WS_GPIO, .din_gpio = AUDIO_I2S_DIN_GPIO,                          \
+            .dout_gpio = AUDIO_I2S_DOUT_GPIO,                                                      \
     }
 
 /**
@@ -128,6 +119,12 @@ typedef void (*audio_activity_cb_t)(bool active);
  */
 typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us);
 
+/** Bluetooth playback route. The call route has priority over every other output. */
+typedef enum {
+    AUDIO_BLUETOOTH_MUSIC = 0,
+    AUDIO_BLUETOOTH_CALL = 1,
+} audio_bluetooth_playback_t;
+
 /**
  * @brief Audio configuration parameters
  */
@@ -138,7 +135,6 @@ typedef struct {
     uint16_t frame_size_ms;        /**< Frame size in ms (default: 20) */
     uint32_t opus_bitrate;         /**< Opus bitrate in bps (default: 12000) */
     audio_i2s_pins_t i2s_pins;     /**< I2S GPIO pin configuration */
-    audio_adc_config_t adc_config; /**< ADC configuration for mic input */
     audio_vox_config_t vox_config; /**< VOX detection configuration */
     bool enable_hpf;               /**< Enable high-pass filter */
     float hpf_cutoff_hz;           /**< HPF cutoff frequency (default: 80 Hz) */
@@ -153,7 +149,7 @@ typedef struct {
     {                                                                                              \
         .sample_rate = 16000, .channels = 1, .bits_per_sample = 16, .frame_size_ms = 20,           \
         .opus_bitrate = 12000, .i2s_pins = AUDIO_I2S_PINS_DEFAULT(),                               \
-        .adc_config = AUDIO_ADC_CONFIG_DEFAULT(), .vox_config = AUDIO_VOX_CONFIG_DEFAULT(),        \
+        .vox_config = AUDIO_VOX_CONFIG_DEFAULT(),                                                  \
         .enable_hpf = true, .hpf_cutoff_hz = 80.0f, .force_tx_always = false,                      \
         .mode = AUDIO_MODE_LOOPBACK,                                                               \
     }
@@ -206,11 +202,7 @@ typedef struct {
     uint8_t rx_q_depth_avg;          /**< Average observed RX queue depth */
     uint8_t rx_q_depth_max;          /**< Maximum observed RX queue depth */
     uint32_t task_loops;             /**< Audio task loop count (health indicator) */
-    uint32_t adc_overruns;           /**< ADC buffer overrun count */
     uint32_t tx_dtx_suppressed;      /**< Silence frames dropped before transmit (DTX) */
-    uint32_t capture_frames_ok;      /**< Complete ADC capture frames */
-    uint32_t capture_short_reads;    /**< Partial ADC capture frames */
-    uint32_t capture_timeouts;       /**< ADC notification/read timeouts */
     uint32_t encode_errors;          /**< Opus encode failures */
     uint32_t decode_errors;          /**< Opus decode and PLC failures */
     uint32_t rx_queue_overflows;     /**< Frames rejected because the playback queue was full */
@@ -231,6 +223,42 @@ typedef struct {
     uint32_t playback_frames;              /**< Complete I2S playback writes */
     uint8_t active_rx_sources;             /**< Remote source slots currently assigned */
     bool vox_active;                       /**< Current VOX state */
+    uint32_t capture_frames_ok;            /**< Complete codec capture frames */
+    uint32_t capture_short_reads;         /**< Partial codec capture frames */
+    uint32_t capture_timeouts;             /**< Codec capture reads that reached their timeout */
+    uint32_t capture_errors;               /**< Codec capture hard errors */
+    uint32_t adc_overruns;                 /**< Legacy capture overrun counter */
+    uint16_t capture_peak_abs;              /**< Maximum absolute conditioned PCM amplitude since audio start/reset */
+    uint32_t bluetooth_music_overflows;     /**< Rejected music input frames (queue or call cap) */
+    uint32_t bluetooth_music_underruns;     /**< Music render frames short of queued PCM */
+    uint32_t bluetooth_music_conversion_errors; /**< Converter/FIFO failures after raw dequeue */
+    uint32_t bluetooth_music_converter_failures;
+    uint32_t bluetooth_music_output_fifo_overflows;
+    uint32_t bluetooth_music_conversion_us_avg;
+    uint32_t bluetooth_music_conversion_us_max;
+    uint32_t playout_work_us_avg;
+    uint32_t playout_work_us_max;
+    uint32_t playout_work_count;
+    uint32_t capture_read_us_avg, capture_read_us_max, capture_read_count;
+    uint32_t capture_convert_us_avg, capture_convert_us_max, capture_convert_count;
+    uint32_t capture_aec_us_avg, capture_aec_us_max, capture_aec_count;
+    uint32_t capture_loop_us_avg, capture_loop_us_max, capture_loop_count;
+    uint32_t playout_write_us_avg, playout_write_us_max, playout_write_count;
+    uint32_t bluetooth_call_overflows;      /**< Rejected call input frames (queue or call cap) */
+    uint32_t bluetooth_call_underruns;      /**< Call render frames short of queued PCM */
+    uint32_t bluetooth_mic_overflows;       /**< Conditioned microphone input samples rejected */
+    uint32_t bluetooth_mic_underruns;       /**< Microphone reads short of available samples */
+    uint32_t bluetooth_music_enqueue_route_lock_misses; /**< Music enqueue lock misses */
+    uint32_t bluetooth_call_enqueue_route_lock_misses;  /**< Call enqueue lock misses */
+    uint32_t bluetooth_playout_route_lock_misses;       /**< Playout lock misses */
+    uint32_t bluetooth_mic_capture_write_route_lock_misses; /**< Capture-write lock misses */
+    uint32_t bluetooth_mic_read_route_lock_misses;         /**< Mic-read lock misses */
+    bool aec_available;                                    /**< ESP-SR AEC initialized */
+    bool aec_active;                                       /**< ESP-SR AEC processing */
+    uint16_t aec_chunk_size;                               /**< ESP-SR processing chunk */
+    uint32_t aec_chunks_processed;                         /**< AEC chunks processed */
+    uint32_t aec_startup_delay_frames;                     /**< Frames emitted as startup silence */
+    uint32_t aec_startup_fallback_frames;                 /**< Deprecated compatibility alias */
 } audio_stats_t;
 
 /**
@@ -245,6 +273,15 @@ esp_err_t audio_init(void);
  * @return ESP_OK on success
  */
 esp_err_t audio_init_with_config(const audio_config_t *config);
+
+/**
+ * @brief Initialize and start audio as one lifecycle operation
+ * @param config Audio configuration (NULL for defaults)
+ * @return ESP_OK when audio is running. If this call initialized a new instance
+ * and then failed, that new instance is fully unwound. If an instance already
+ * exists, the call returns ESP_ERR_INVALID_STATE and leaves it unchanged.
+ */
+esp_err_t audio_init_and_start_with_config(const audio_config_t *config);
 
 /**
  * @brief Deinitialize the audio subsystem
@@ -266,6 +303,12 @@ esp_err_t audio_start(void);
  * @return ESP_OK on success
  */
 esp_err_t audio_stop(void);
+
+/**
+ * @brief Check whether the audio worker tasks are currently running
+ * @return true when audio is running
+ */
+bool audio_is_running(void);
 
 /**
  * @brief Check if VOX is currently active (speech detected)
@@ -330,6 +373,9 @@ audio_mode_t audio_get_mode(void);
  */
 esp_err_t audio_get_stats(audio_stats_t *stats);
 
+/** Emit the parser-compatible audio statistics snapshot. */
+void audio_log_stats(void);
+
 /**
  * @brief Record TX pipeline latency from capture to transport enqueue.
  *
@@ -340,6 +386,30 @@ esp_err_t audio_get_stats(audio_stats_t *stats);
  * @return ESP_OK on success
  */
 esp_err_t audio_record_tx_pipeline_latency_us(uint32_t latency_us);
+
+/** Configure a Bluetooth playback route. Supported music rates are 16/32/44.1/48 kHz,
+ * mono or stereo; call supports 8/16 kHz mono. Configuration resets queued PCM. */
+esp_err_t audio_bluetooth_playback_configure(audio_bluetooth_playback_t route,
+                                             uint32_t sample_rate, uint8_t channels);
+/** Set playback route activity. An active call suppresses all lower-priority output. */
+esp_err_t audio_bluetooth_playback_set_active(audio_bluetooth_playback_t route, bool active);
+/** Copy interleaved signed-16 PCM into a bounded route queue. Music enqueue may wait at most one
+ * FreeRTOS tick for the route lock; call enqueue remains nonblocking. The return value is the
+ * number of complete input frames accepted; at most AUDIO_ROUTE_MAX_ENQUEUE_FRAMES are considered
+ * per call, and excess frames are dropped and counted. */
+size_t audio_bluetooth_playback_enqueue(audio_bluetooth_playback_t route,
+                                        const int16_t *interleaved, size_t frames);
+
+/** Configure the HFP microphone egress (8 or 16 kHz mono). Configuration resets queued PCM. */
+esp_err_t audio_bluetooth_mic_configure(uint32_t sample_rate);
+/** Enable or disable conditioned microphone egress. */
+esp_err_t audio_bluetooth_mic_set_active(bool active);
+/** Read up to requested signed-16 samples without blocking. At most
+ * AUDIO_ROUTE_MAX_MIC_READ_SAMPLES are returned per call; the caller can repeat. A short read is
+ * expected to be padded by the caller; zero is returned when the route is inactive or unavailable. */
+size_t audio_bluetooth_mic_read(int16_t *samples, size_t requested_samples);
+/** Return queued 16 kHz-domain microphone samples without consuming them. */
+size_t audio_bluetooth_mic_available_samples(void);
 
 /* ============================================================================
  * Notification Sounds
@@ -352,8 +422,9 @@ typedef enum {
     AUDIO_NOTIFY_STARTUP,       /**< Startup: 3-tone ascending arpeggio */
     AUDIO_NOTIFY_PEER_JOIN,     /**< Peer joined: low-high ascending beeps */
     AUDIO_NOTIFY_PEER_LEAVE,    /**< Peer left: high-low descending beeps */
-    AUDIO_NOTIFY_MESH_ENABLED,  /**< Mesh enabled: single beep */
-    AUDIO_NOTIFY_MESH_DISABLED, /**< Mesh disabled: single beep */
+    AUDIO_NOTIFY_MESH_ENABLED,  /**< Mesh enabled: rising two-note beep */
+    AUDIO_NOTIFY_MESH_DISABLED, /**< Mesh disabled: falling two-note beep */
+    AUDIO_NOTIFY_BLUETOOTH_PAIRING, /**< Bluetooth pairing: three high beeps */
 } audio_notify_t;
 
 /**

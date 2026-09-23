@@ -3,13 +3,14 @@
  * @brief I2S WS Sync Capture diagnostics
  *
  * Uses GPIOTE + PPI + TIMER1 in counter mode to count WS rising edges
- * from the ESP32's I2S output (16 kHz).  Each TDMA frame (~20 ms) we
- * snapshot the count and compare to the expected 320 edges.
+ * from the ESP32-S31's physical 48 kHz I2S WS output. Each 20 ms TDMA frame
+ * should contain 960 rising edges; this is separate from 16 kHz Opus mesh audio.
  *
  * Hardware wiring: ESP32 GPIO5 (I2S WS / LCK) → nRF XIAO D0 (P0.02)
  */
 
 #include "ws_sync.h"
+#include "ws_sync_math.h"
 
 #include <hal/nrf_gpio.h>
 #include <hal/nrf_gpiote.h>
@@ -28,12 +29,11 @@ LOG_MODULE_REGISTER(ws_sync, LOG_LEVEL_INF);
  * Configuration
  * ============================================================================ */
 
-/* GPIO pin receiving ESP32 I2S WS signal (XIAO D0 = P0.02) */
+/* GPIO pin receiving the S31 GPIO47 WS mirror of GPIO55 (XIAO D0 = P0.02) */
 #define WS_PIN  2
 #define WS_PORT 0 /* NRF_P0 */
 
 /* Expected WS edges per 20 ms TDMA frame (16 kHz × 0.020 s) */
-#define EXPECTED_EDGES_PER_FRAME 320
 
 /* GPIOTE and PPI channels are allocated to avoid colliding with other nrfx users. */
 static uint8_t s_gpiote_channel;
@@ -222,27 +222,29 @@ bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count, int32_t *correc
 
     uint32_t elapsed_frames = frame_counter - s_last_frame_counter;
     s_last_frame_counter = frame_counter;
-    if (elapsed_frames == 0 || elapsed_frames > 50) {
+    if (elapsed_frames == 0 || elapsed_frames > WS_SYNC_MAX_ELAPSED_FRAMES) {
         s_diag.rejected_count++;
         *correction_us = 0;
         return false;
     }
 
-    /* If WS signal is absent (delta == 0), don't try to correct */
-    if (delta == 0) {
+    int32_t error_us;
+    int32_t correction;
+    ws_sync_math_result_t result = ws_sync_calculate_correction(
+        delta, elapsed_frames, &error_us, &correction);
+    if (result == WS_SYNC_MATH_NO_SIGNAL) {
         s_diag.no_signal_count++;
         *correction_us = 0;
         return false;
     }
 
-    uint32_t expected_edges = elapsed_frames * EXPECTED_EDGES_PER_FRAME;
-    if (delta < (expected_edges * 3U) / 4U || delta > (expected_edges * 5U) / 4U) {
+    if (result != WS_SYNC_MATH_VALID) {
         s_diag.rejected_count++;
         *correction_us = 0;
         return false;
     }
 
-    /* delta should be ~320 per 20ms frame.
+    /* delta should be ~960 per 20ms frame.
      * If delta > 320: ESP clock ran more edges than expected → ESP is
      *   faster → nRF needs to speed up (negative correction = shrink frame).
      * If delta < 320: ESP is slower → nRF needs to slow down (positive
@@ -252,18 +254,6 @@ bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count, int32_t *correc
      *   error_us = (EXPECTED - delta) * 62.5
      * We use fixed-point: (EXPECTED - delta) * 625 / 10
      */
-    int32_t edge_error = (int32_t)expected_edges - (int32_t)delta;
-    int32_t error_us = (edge_error * 625) / 10;
-
-    /* Apply 25% of the observed phase error to avoid single-sample swings. */
-    int32_t correction = error_us / 4;
-
-    /* Clamp to avoid wild swings */
-    if (correction > 500) {
-        correction = 500;
-    } else if (correction < -500) {
-        correction = -500;
-    }
 
     s_diag.last_correction_us = correction;
     s_diag.cumulative_drift_us =

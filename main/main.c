@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
@@ -25,8 +26,10 @@
 #include "e2e_diag.h"
 #include "mesh.h"
 #include "mesh_intent.h"
+#include "media_toggle_guard.h"
 #include "nvs_flash.h"
 #include "power.h"
+#include "phone_audio.h"
 #include "rtt_probe.h"
 #include "transport_espnow.h"
 #include "transport_nrf.h"
@@ -45,6 +48,9 @@ static const char *TAG = "omi";
 #define RTT_LOG_INTERVAL_MS 10000
 
 _Atomic bool g_mesh_active = false;
+static atomic_bool s_short_press_pending = ATOMIC_VAR_INIT(false);
+static atomic_bool s_pairing_pending = ATOMIC_VAR_INIT(false);
+static media_toggle_guard_t s_media_toggle_guard;
 
 /*
  * Runtime transport selection: nRF52840 (ESB via SPI bridge) or ESP-NOW (WiFi).
@@ -213,11 +219,21 @@ static void enable_mesh_from_button(void)
 }
 
 /**
- * @brief Callback for button long press - toggles mesh on/off
+ * @brief Handle release-classified BOOT gestures.
  */
-static void button_long_press_callback(int gpio)
+static void button_gesture_callback(button_gesture_t gesture, int gpio)
 {
-    ESP_LOGI(TAG, "Button long press detected on GPIO %d - toggling mesh", gpio);
+    if (gesture == BUTTON_GESTURE_BLUETOOTH_PAIRING) {
+        atomic_store_explicit(&s_pairing_pending, true, memory_order_release);
+        return;
+    }
+    if (gesture == BUTTON_GESTURE_SHORT_PRESS) {
+        atomic_store_explicit(&s_short_press_pending, true, memory_order_release);
+        return;
+    }
+    if (gesture != BUTTON_GESTURE_MESH_TOGGLE) return;
+
+    ESP_LOGI(TAG, "BOOT mesh gesture detected on GPIO %d - toggling mesh", gpio);
 
     bool requested_enabled = !mesh_intent_enabled();
     esp_err_t ret = mesh_intent_persist(requested_enabled);
@@ -233,6 +249,80 @@ static void button_long_press_callback(int gpio)
     } else {
         disable_mesh_from_button();
     }
+}
+
+static void process_pairing_request(void)
+{
+    esp_err_t ret = phone_audio_set_discoverable(true);
+    if (ret == ESP_OK) {
+        (void)audio_play_notification(AUDIO_NOTIFY_BLUETOOTH_PAIRING);
+        ESP_LOGI(TAG, "BOOT gesture opened Bluetooth pairing window for 120 seconds");
+    } else {
+        ESP_LOGW(TAG, "BOOT pairing gesture unavailable: %s", esp_err_to_name(ret));
+    }
+}
+
+static void process_media_toggle(bool request_pending, int64_t now_ms)
+{
+    phone_audio_state_t phone_state;
+    if (phone_audio_get_state(&phone_state) != ESP_OK) {
+        media_toggle_guard_reset(&s_media_toggle_guard);
+        return;
+    }
+
+    bool valid = phone_state.call.phase == PHONE_AUDIO_CALL_PHASE_IDLE &&
+                 phone_state.a2dp_connected && phone_state.avrcp_connected;
+    now_ms = get_time_ms();
+    media_toggle_decision_t decision = media_toggle_guard_step(
+        &s_media_toggle_guard, request_pending, valid, phone_state.media_streaming,
+        phone_state.media_transition_ms, now_ms);
+    if (decision == MEDIA_TOGGLE_DROPPED) {
+        ESP_LOGW(TAG, "BOOT media toggle dropped: A2DP state transition was not observed");
+    } else if (decision == MEDIA_TOGGLE_DISPATCH) {
+        bool sent_streaming = phone_state.media_streaming;
+        esp_err_t ret = sent_streaming ? phone_audio_pause() : phone_audio_play();
+        bool arm_guard = ret != ESP_ERR_NO_MEM;
+        media_toggle_guard_command_result(&s_media_toggle_guard, arm_guard,
+                                          sent_streaming, get_time_ms());
+        ESP_LOGI(TAG, "BOOT short press: %s media (%s)",
+                 sent_streaming ? "pause" : "play", esp_err_to_name(ret));
+    }
+}
+
+static void process_short_press(int64_t now_ms)
+{
+    phone_audio_state_t phone_state;
+    esp_err_t ret = phone_audio_get_state(&phone_state);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BOOT short press state unavailable: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    switch (phone_state.call.phase) {
+        case PHONE_AUDIO_CALL_PHASE_INCOMING:
+            media_toggle_guard_reset(&s_media_toggle_guard);
+            ret = phone_audio_answer_call();
+            ESP_LOGI(TAG, "BOOT short press: answer call (%s)", esp_err_to_name(ret));
+            return;
+        case PHONE_AUDIO_CALL_PHASE_OUTGOING_DIALING:
+        case PHONE_AUDIO_CALL_PHASE_OUTGOING_ALERTING:
+        case PHONE_AUDIO_CALL_PHASE_ACTIVE:
+        case PHONE_AUDIO_CALL_PHASE_HELD:
+            media_toggle_guard_reset(&s_media_toggle_guard);
+            ret = phone_audio_reject_call();
+            ESP_LOGI(TAG, "BOOT short press: end call (%s)", esp_err_to_name(ret));
+            return;
+        case PHONE_AUDIO_CALL_PHASE_IDLE:
+            break;
+    }
+
+    if (phone_audio_get_call_state(&phone_state.call) != ESP_OK ||
+        phone_state.call.phase != PHONE_AUDIO_CALL_PHASE_IDLE) {
+        media_toggle_guard_reset(&s_media_toggle_guard);
+        ESP_LOGI(TAG, "BOOT short press: media action skipped because call is no longer idle");
+        return;
+    }
+    process_media_toggle(true, now_ms);
 }
 
 /* ============================================================================
@@ -397,11 +487,23 @@ static esp_err_t initialize_application(int64_t boot_time)
     audio_register_tx_callback(audio_tx_callback);
     audio_register_activity_callback(audio_activity_callback);
 
+    /* Reserve Classic Bluetooth controller memory before Wi-Fi pools and audio stacks. */
+    ESP_LOGI(TAG, "Before phone_audio_init: internal free/largest=%lu/%lu bytes, PSRAM free=%lu bytes",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    esp_err_t phone_ret = phone_audio_init();
+    if (phone_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Phone audio unavailable; continuing without Bluetooth: %s",
+                 esp_err_to_name(phone_ret));
+    }
+
     /* Now initialize ESP-NOW mesh if needed (after audio) */
     if (s_active_transport == TRANSPORT_ESP_NOW) {
         ret = transport_espnow_init();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initialize mesh: %s", esp_err_to_name(ret));
+            if (phone_ret == ESP_OK) (void)phone_audio_deinit();
             return ret;
         }
 
@@ -409,14 +511,12 @@ static esp_err_t initialize_application(int64_t boot_time)
             ret = mesh_start();
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to restore persisted mesh intent: %s", esp_err_to_name(ret));
+                if (phone_ret == ESP_OK) (void)phone_audio_deinit();
                 return ret;
             }
             atomic_store(&g_mesh_active, true);
         }
     }
-
-    /* Register button callback for mesh toggle */
-    button_register_long_press_callback(button_long_press_callback);
 
     /* Start audio pipeline */
     ESP_LOGI(TAG, "");
@@ -432,8 +532,10 @@ static esp_err_t initialize_application(int64_t boot_time)
     ret = audio_start();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start audio: %s", esp_err_to_name(ret));
+        if (phone_ret == ESP_OK) (void)phone_audio_deinit();
         return ret;
     }
+    button_register_gesture_callback(button_gesture_callback);
 
     /* The persisted user policy is reconciled with the selected transport. */
     if (s_active_transport == TRANSPORT_NRF52840) {
@@ -454,6 +556,7 @@ static void run_runtime_health_loop(int64_t boot_time)
     /* Main loop - log system health periodically */
     int64_t last_health_check = get_time_ms();
     int64_t last_quick_stats = get_time_ms();
+    int64_t last_audio_stats = get_time_ms();
 
 #if REDUCED_LOGGING_MODE
     const int64_t quick_stats_interval_ms = 20000;
@@ -467,6 +570,27 @@ static void run_runtime_health_loop(int64_t boot_time)
         vTaskDelay(pdMS_TO_TICKS(1000));
 
         int64_t now_ms = get_time_ms();
+
+        bool short_press = atomic_exchange_explicit(&s_short_press_pending, false,
+                                                    memory_order_acq_rel);
+        if (short_press) process_short_press(now_ms);
+        else process_media_toggle(false, now_ms);
+
+        /* When both intents are pending, call/media handling takes priority. */
+        if (atomic_exchange_explicit(&s_pairing_pending, false, memory_order_acq_rel)) {
+            process_pairing_request();
+        }
+
+        now_ms = get_time_ms();
+
+        if (audio_is_running() && (now_ms - last_audio_stats) >= 10000) {
+            audio_log_stats();
+            phone_audio_state_t phone_state;
+            if (phone_audio_get_state(&phone_state) == ESP_OK && phone_state.initialized) {
+                phone_audio_log_stats();
+            }
+            last_audio_stats = now_ms;
+        }
 
         if (g_mesh_active && mesh_is_initialized() &&
             (now_ms - last_quick_stats) >= quick_stats_interval_ms) {
@@ -512,6 +636,7 @@ void app_main(void)
     /* Cleanup (unreachable in normal operation) */
     mesh_stop();
     mesh_deinit();
+    phone_audio_deinit();
     audio_stop();
     audio_deinit();
     return;
