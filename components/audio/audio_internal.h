@@ -39,11 +39,14 @@
 #include "audio_rate_converter.h"
 #include "audio_sample_fifo.h"
 #include "opus.h"
+#if defined(AUDIO_S31_LC3_WIRE)
+#include "esp_lc3_codec.h"
+#endif
 #include "voice_cleanup.h"
 #include "vox.h"
 
 #define AUDIO_CAPTURE_TASK_STACK_SIZE 28672
-#define AUDIO_PLAYOUT_TASK_STACK_SIZE 8192
+#define AUDIO_PLAYOUT_TASK_STACK_SIZE 24576
 #define AUDIO_CAPTURE_TASK_PRIORITY   7
 #define AUDIO_PLAYOUT_TASK_PRIORITY   8
 #define AUDIO_TASK_CORE               1
@@ -78,7 +81,6 @@
 #define NOTIFICATION_QUEUE_SIZE   4
 #define NOTIFICATION_BEEP_SAMPLES 1600
 #define NOTIFICATION_GAP_SAMPLES  400
-#define NOTIFICATION_AMPLITUDE    0.3f
 
 typedef struct {
     float x1, x2;
@@ -95,6 +97,9 @@ typedef struct {
     bool decoder_reset_pending;
     bool decoded_active;
     OpusDecoder *decoder;
+#if defined(AUDIO_S31_LC3_WIRE)
+    esp_lc3_codec_t *lc3_decoder;
+#endif
     audio_packet_store_t packet_store;
     audio_pcm_resampler_t resampler;
 } audio_rx_source_t;
@@ -115,6 +120,8 @@ typedef struct {
     uint8_t tone_index;
     uint16_t segment_sample;
     bool in_gap;
+    uint32_t phase;
+    uint32_t phase_step;
 } audio_notification_state_t;
 
 /*
@@ -181,6 +188,9 @@ typedef struct {
     /* Codecs and DSP */
     OpusEncoder *opus_encoder;
     OpusDecoder *loopback_decoder;
+#if defined(AUDIO_S31_LC3_WIRE)
+    esp_lc3_codec_t *lc3_encoder;
+#endif
     audio_hpf_state_t hpf;
     vox_state_t vox;
     voice_cleanup_state_t voice_cleanup;
@@ -277,7 +287,7 @@ void audio_rx_reset_codecs_and_resamplers(void);
 void audio_rx_service_reset_request(void);
 
 /* audio_notify.c */
-size_t audio_notify_mix_frame(size_t base_present_samples);
+size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consumed);
 
 /* audio_route.c */
 bool audio_route_init(void);

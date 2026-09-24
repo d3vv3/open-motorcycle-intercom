@@ -18,13 +18,9 @@ static const char *TAG = "omi";
 
 void transport_espnow_send_audio(const uint8_t *data, uint16_t len, bool active)
 {
-    if (mesh_get_state() != MESH_STATE_ACTIVE) {
-        return;
-    }
-
     uint8_t audio_flags = active ? MESH_AUDIO_FLAG_ACTIVE : 0;
     esp_err_t ret = mesh_send_audio(data, len, audio_flags);
-    if (ret != ESP_OK) {
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGD(TAG, "Failed to queue audio for TX: %s", esp_err_to_name(ret));
     }
 }

@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_wifi.h"
@@ -241,15 +242,21 @@ esp_err_t init_esp_now_transport(void)
 }
 void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
+    /* Type is byte 1 of the wire header; shorter packets cannot be classified. */
+    bool audio = len >= 2 && data != NULL && data[1] == MESH_PKT_AUDIO;
+    if (audio) STATS_INC(rx_audio_raw);
+    else if (len < 2) STATS_INC(rx_short);
     taskENTER_CRITICAL(&s_transport_mux);
     if (!s_rx_enabled) {
         taskEXIT_CRITICAL(&s_transport_mux);
+        if (audio) STATS_INC(rx_audio_disabled);
         return;
     }
     s_rx_callbacks_active++;
     taskEXIT_CRITICAL(&s_transport_mux);
 
     if (len < sizeof(mesh_header_t)) {
+        if (audio) STATS_INC(rx_audio_bad_header);
         goto done;
     }
 
@@ -260,11 +267,13 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     rx.timestamp_us = esp_timer_get_time();
 
     if (rx.header.version != MESH_PROTOCOL_VERSION) {
+        if (audio) STATS_INC(rx_audio_bad_header);
         goto done;
     }
 
     uint16_t payload_len = rx.header.payload_len;
     if (payload_len > sizeof(rx.payload) || payload_len > (uint16_t)(len - sizeof(mesh_header_t))) {
+        if (audio) STATS_INC(rx_audio_bad_header);
         goto done;
     }
     if (payload_len > 0) {
@@ -275,6 +284,9 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
 
     if (xQueueSend(s_rx_queue, &rx, 0) != pdTRUE) {
         STATS_INC(rx_queue_overflows);
+        if (audio) STATS_INC(rx_audio_queue_full);
+    } else if (audio) {
+        STATS_INC(rx_audio_queued);
     }
 
 done:
@@ -286,6 +298,7 @@ done:
 void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t status)
 {
     (void)send_info;
+    int64_t completed_us = esp_timer_get_time();
 
     taskENTER_CRITICAL(&s_transport_mux);
     if (!s_send_callback_enabled) {
@@ -299,6 +312,7 @@ void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t
         return;
     }
     tx_inflight_t completion = s_tx_inflight;
+    uint32_t elapsed_us = mesh_timing_us(completed_us - completion.starts_us);
 
     if (status != ESP_NOW_SEND_SUCCESS && completion.type == MESH_PKT_STATUS) {
         taskENTER_CRITICAL(&s_speaker_mux);
@@ -308,6 +322,12 @@ void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t
     }
 
     taskENTER_CRITICAL(&s_stats_mux);
+    mesh_timing_stat_t *timing = completion.audio_origin ? &s_stats.origin_complete :
+                                                         &s_stats.control_complete;
+    if (timing->count < UINT32_MAX) timing->count++;
+    timing->us_sum = UINT64_MAX - timing->us_sum < elapsed_us ? UINT64_MAX :
+                     timing->us_sum + elapsed_us;
+    if (elapsed_us > timing->us_max) timing->us_max = elapsed_us;
     if (status == ESP_NOW_SEND_SUCCESS) {
         s_stats.packets_tx++;
         if (completion.audio_origin) {
@@ -315,6 +335,7 @@ void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t
         }
     } else {
         s_stats.packets_dropped++;
+        if (completion.audio_origin) s_stats.tx_radio_fail++;
     }
     taskEXIT_CRITICAL(&s_stats_mux);
 
@@ -324,7 +345,28 @@ void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t
     taskEXIT_CRITICAL(&s_transport_mux);
     xSemaphoreGive(s_tx_done_semaphore);
 }
-esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
+
+/* Called with transport mux held, then takes stats mux in the established order. */
+static void record_audio_busy_locked(int64_t now_us)
+{
+    if (!s_tx_inflight.active) return;
+    uint32_t age = mesh_timing_us(now_us - s_tx_inflight.starts_us);
+    taskENTER_CRITICAL(&s_stats_mux);
+    if (s_tx_inflight.audio_origin) s_stats.tx_busy_audio_count++;
+    else s_stats.tx_busy_control_count++;
+    if (age > s_stats.tx_busy_age_us_max) s_stats.tx_busy_age_us_max = age;
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
+void mesh_note_audio_tx_busy(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_transport_mux);
+    record_audio_busy_locked(now_us);
+    taskEXIT_CRITICAL(&s_transport_mux);
+}
+
+esp_err_t mesh_send_control_packet(mesh_pkt_type_t type, const void *payload, uint16_t len)
 {
     return enqueue_control_packet(type, payload, len, s_broadcast_mac);
 }
@@ -370,9 +412,13 @@ esp_err_t tracked_esp_now_send(const tracked_esp_now_send_request_t *request)
         return ESP_ERR_INVALID_ARG;
     }
 
+    int64_t reservation_us = esp_timer_get_time();
     taskENTER_CRITICAL(&s_transport_mux);
     if (s_tx_inflight.active || (s_stopping && request->type != MESH_PKT_LEAVE)) {
+        bool busy = s_tx_inflight.active && request->audio_origin;
+        if (busy) record_audio_busy_locked(reservation_us);
         taskEXIT_CRITICAL(&s_transport_mux);
+        if (busy) STATS_INC(tx_busy_count);
         return ESP_ERR_INVALID_STATE;
     }
     mesh_header_t *header = (mesh_header_t *)request->data;
@@ -386,10 +432,55 @@ esp_err_t tracked_esp_now_send(const tracked_esp_now_send_request_t *request)
         .relay_bitmap = request->relay_bitmap,
         .audio_origin = request->audio_origin,
         .active = true,
+        .starts_us = reservation_us,
     };
     taskEXIT_CRITICAL(&s_transport_mux);
 
-    esp_err_t ret = esp_now_send(request->dest_mac, request->data, request->len);
+    /* Last software admission check: preparation/reservation may outlive the slot. */
+    int64_t admission_us = esp_timer_get_time();
+    esp_err_t ret;
+    bool snapshot_heap = false;
+    uint32_t error_epoch = 0;
+    uint64_t snapshot_id = 0;
+    uint64_t failure_ms = 0;
+    if (mesh_tx_slot_deadline_passed(request->deadline_us, admission_us)) {
+        STATS_INC(tx_deadline_reject);
+        ret = ESP_ERR_TIMEOUT;
+        goto cleanup;
+    }
+
+    int64_t send_start_us = request->audio_origin ? admission_us : 0;
+    ret = esp_now_send(request->dest_mac, request->data, request->len);
+    int64_t send_end_us = esp_timer_get_time();
+    if (request->audio_origin) {
+        mesh_timing_record(&s_stats.tx_esp_now_send, send_end_us - send_start_us);
+    }
+    if (ret != ESP_OK) {
+        failure_ms = (uint64_t)(send_end_us / 1000);
+        taskENTER_CRITICAL(&s_stats_mux);
+        snapshot_heap = (s_stats.send_err_nomem == 0 && s_stats.send_err_other == 0) ||
+                         s_stats.send_last_error != (int32_t)ret;
+        if (snapshot_heap) {
+            error_epoch = s_stats.epoch_id;
+            snapshot_id = ++s_stats.send_heap_snapshot_id;
+            s_stats.send_heap_snapshot_uptime_ms = failure_ms;
+            s_stats.send_heap_snapshot_error = (int32_t)ret;
+            s_stats.send_heap_snapshot_valid = false;
+        }
+        if (ret == ESP_ERR_ESPNOW_NO_MEM || ret == ESP_ERR_NO_MEM) {
+            if (s_stats.send_err_nomem != UINT32_MAX) s_stats.send_err_nomem++;
+        } else {
+            if (s_stats.send_err_other != UINT32_MAX) s_stats.send_err_other++;
+        }
+        s_stats.send_last_error = (int32_t)ret;
+        s_stats.send_last_error_uptime_ms = failure_ms;
+        taskEXIT_CRITICAL(&s_stats_mux);
+    }
+    if (request->audio_origin) {
+        if (ret == ESP_OK) STATS_INC(tx_submit_ok);
+        else STATS_INC(tx_submit_err);
+    }
+cleanup:
     if (ret != ESP_OK) {
         taskENTER_CRITICAL(&s_transport_mux);
         s_tx_inflight.active = false;
@@ -397,6 +488,20 @@ esp_err_t tracked_esp_now_send(const tracked_esp_now_send_request_t *request)
             (*request->sequence)--;
         }
         taskEXIT_CRITICAL(&s_transport_mux);
+    }
+    if (snapshot_heap) {
+        const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+        uint32_t free_bytes = heap_caps_get_free_size(caps);
+        uint32_t largest = heap_caps_get_largest_free_block(caps);
+        uint32_t minimum = heap_caps_get_minimum_free_size(caps);
+        taskENTER_CRITICAL(&s_stats_mux);
+        if (s_stats.epoch_id == error_epoch && s_stats.send_heap_snapshot_id == snapshot_id) {
+            s_stats.send_error_internal_free = free_bytes;
+            s_stats.send_error_internal_largest = largest;
+            s_stats.send_error_internal_min = minimum;
+            s_stats.send_heap_snapshot_valid = true;
+        }
+        taskEXIT_CRITICAL(&s_stats_mux);
     }
     return ret;
 }
@@ -465,6 +570,7 @@ void force_cleanup_esp_now_transport(void)
     taskENTER_CRITICAL(&s_transport_mux);
     tx_inflight_t abandoned = s_tx_inflight;
     s_tx_inflight = (tx_inflight_t){0};
+    if (abandoned.active && abandoned.audio_origin) STATS_INC(tx_abandoned);
     s_esp_now_ready = false;
     taskEXIT_CRITICAL(&s_transport_mux);
 
@@ -567,7 +673,7 @@ esp_err_t send_keepalive(void)
         .reserved = 0,
     };
 
-    return send_packet(MESH_PKT_KEEPALIVE, &payload, sizeof(payload));
+    return mesh_send_control_packet(MESH_PKT_KEEPALIVE, &payload, sizeof(payload));
 }
 
 esp_err_t send_slot_map(void)
@@ -595,7 +701,7 @@ esp_err_t send_slot_map(void)
     memcpy(payload.active_speaker_ids, sm_ids, sizeof(payload.active_speaker_ids));
     memcpy(payload.relay_masks, sm_masks, sizeof(payload.relay_masks));
 
-    return send_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
+    return mesh_send_control_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
 }
 
 esp_err_t send_status(void)
@@ -623,7 +729,7 @@ esp_err_t send_status(void)
         }
     }
 
-    esp_err_t ret = send_packet(MESH_PKT_STATUS, &payload, sizeof(payload));
+    esp_err_t ret = mesh_send_control_packet(MESH_PKT_STATUS, &payload, sizeof(payload));
     if (ret != ESP_OK) {
         taskENTER_CRITICAL(&s_speaker_mux);
         s_heard_bitmap |= heard_bitmap;

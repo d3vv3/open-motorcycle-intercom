@@ -34,9 +34,12 @@
 #define MESH_KEEPALIVE_INTERVAL_MS      500  /* KEEPALIVE cadence */
 #define MESH_PROTOCOL_VERSION           0x02
 #define MESH_MAX_OPUS_BYTES             64
+#define MESH_LC3_FRAME_BYTES            48
 #define MESH_E2E_SEQUENCE_BYTES         2
 #define MESH_MAX_AUDIO_PAYLOAD          (MESH_MAX_OPUS_BYTES + MESH_E2E_SEQUENCE_BYTES)
 #define MESH_AUDIO_V2_CODEC_OPUS        0x01
+#define MESH_AUDIO_CODEC_OPUS            0x01
+#define MESH_AUDIO_CODEC_LC3             0x02
 #define MESH_AUDIO_V2_FRAME_MS          20
 #define MESH_AUDIO_V2_FIXED_HEADER_SIZE 8
 #define MESH_AUDIO_V2_MAX_FRAME_BYTES   64
@@ -117,7 +120,7 @@ typedef struct __attribute__((packed)) {
  * ============================================================================ */
 
 typedef struct __attribute__((packed)) {
-    uint8_t codec;                        /* Codec ID (0x01 = Opus) */
+    uint8_t codec;                        /* Legacy codec ID */
     uint8_t frame_ms;                     /* Frame duration (20) */
     uint8_t stream_id;                    /* Stream identifier */
     uint8_t audio_flags;                  /* Audio activity flags */
@@ -180,6 +183,8 @@ MESH_STATIC_ASSERT(sizeof(mesh_header_t) == 8, "mesh_header_t wire size changed"
 MESH_STATIC_ASSERT(offsetof(mesh_header_t, payload_len) == 6,
                    "mesh_header_t payload_len offset changed");
 MESH_STATIC_ASSERT(sizeof(mesh_audio_payload_t) == 70, "mesh_audio_payload_t wire size changed");
+MESH_STATIC_ASSERT(sizeof(mesh_audio_payload_t) == 4 + MESH_MAX_AUDIO_PAYLOAD,
+                   "legacy audio payload wire size changed");
 MESH_STATIC_ASSERT(sizeof(mesh_join_payload_t) == 2, "mesh_join_payload_t wire size changed");
 MESH_STATIC_ASSERT(sizeof(mesh_join_ack_payload_t) == 3,
                    "mesh_join_ack_payload_t wire size changed");
@@ -200,7 +205,22 @@ MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_BUNDLE_SIZE == 200, "audio v2 bundle limit 
 MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_PACKET_SIZE == 208, "audio v2 mesh packet limit changed");
 MESH_STATIC_ASSERT(sizeof(mesh_header_t) + MESH_AUDIO_V2_MAX_BUNDLE_SIZE ==
                        MESH_AUDIO_V2_MAX_PACKET_SIZE,
-                   "audio v2 packet size no longer matches mesh envelope");
+                    "audio v2 packet size no longer matches mesh envelope");
+
+static inline int mesh_audio_wire_payload_valid(uint8_t codec, uint8_t frame_ms,
+                                                uint16_t data_len, uint8_t local_codec)
+{
+    if (frame_ms != MESH_FRAME_MS || codec != local_codec) {
+        return 0;
+    }
+    if (codec == MESH_AUDIO_CODEC_LC3) {
+        return data_len == MESH_LC3_FRAME_BYTES;
+    }
+    if (codec == MESH_AUDIO_CODEC_OPUS) {
+        return data_len > 0 && data_len <= MESH_MAX_OPUS_BYTES;
+    }
+    return 0;
+}
 
 #undef MESH_STATIC_ASSERT
 

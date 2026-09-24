@@ -35,7 +35,91 @@ _PIPE_GAUGE_KEYS = {
     "asrc_recovery",
     "bundle_max_bytes",
     "tx_duration_max_us",
+    "uptime_ms",
+    "node_id",
+    "role",
+    "tx_depth",
+    "tx_inflight",
+    "jitter_depth",
+    "rx_depth",
+    "control_queue_depth",
+    "rx_store_depth",
+    "rx_store_depth_valid",
+    "rx_loop_gap_us_max",
+    "rx_dequeue_age_us_max",
+    "rx_handle_us_max",
+    "rx_audio_callback_us_max",
+    "jitter_deliver_age_us_max",
+    "jitter_expired_age_us_max",
+    "tx_frame_dispatch_late_us_max",
+    "tx_slot_service_late_us_max",
+    "tx_queue_age_us_max",
+    "tx_esp_now_send_us_max",
+    "tx_depth_high_water",
+    "origin_complete_us_max",
+    "control_complete_us_max",
+    "tx_busy_age_us_max",
+    "notify_mix_us_max",
+    "notify_frame_gap_us_max",
+    "notify_work_us_max",
+    "notify_write_us_max",
+    "notify_write_gap_us_max",
+    "send_last_error",
+    "send_last_error_uptime_ms",
+    "send_heap_snapshot_uptime_ms",
+    "send_heap_snapshot_error",
+    "send_heap_snapshot_valid",
+    "internal_8bit_free",
+    "internal_8bit_largest",
+    "internal_8bit_min",
+    "send_error_internal_free",
+    "send_error_internal_largest",
+    "send_error_internal_min",
+    "music_mutex_wait_us_max",
+    "music_route_read_us_max",
+    "music_convert_us_max",
+    "music_mix_us_max",
+    "music_rate_hz",
+    "music_channels",
+    "music_format_valid",
 }
+
+# CPU snapshots are interval measurements, except task runtime_us (cumulative).
+# Keep these stage-local: fields such as new and reset can be counters elsewhere.
+_PIPE_CPU_GAUGE_KEYS = {
+    "uptime_ms",
+    "valid",
+    "total_us",
+    "interval_us",
+    "snapshot_us",
+    "collect_us",
+    "task_count",
+    "task_count_hint",
+    "capacity",
+    "matched",
+    "new",
+    "gone",
+    "reset",
+    "coverage_permille",
+    "snapshot_fail",
+    "accounted_us",
+    "accounted_permille",
+    "chip_permille",
+    "idle0_valid",
+    "idle0_us",
+    "idle0_permille",
+    "idle1_valid",
+    "idle1_us",
+    "idle1_permille",
+    "priority",
+    "affinity",
+    "delta_us",
+    "cpu_permille",
+    "cumulative",  # Accepted from older firmware, but no longer emitted.
+}
+
+# Span timing measures wall time, not FreeRTOS task CPU time.
+_PIPE_CPU_SPAN_GAUGE_KEYS = {"wall_us_max"}
 
 _PIPE_SIGNED_KEYS = {
     "correction_applied_us",
@@ -45,6 +129,7 @@ _PIPE_SIGNED_KEYS = {
     "sync_frame_diff",
     "sync_phase_us",
     "asrc_ppm",
+    "affinity",
 }
 
 _IDENTITY_KEYS = {
@@ -58,6 +143,9 @@ _IDENTITY_KEYS = {
     "dst_node",
     "peer",
     "peer_node",
+    "epoch_id",
+    "node_mac",
+    "part",
 }
 
 _PIPE_TX_COUNTERS = ("sent", "tx", "tx_ok", "rf_tx_ok", "spi_out_ok")
@@ -246,4 +334,11 @@ def parse_pipeline_logfmt(line: str) -> dict[str, int | str] | None:
             record[key] = value
     if record.get("v") != 1 or "dev" not in record or "stage" not in record:
         return None
+    if record.get("stage") == "cpu" and record.get("part") == "task":
+        if any(
+            not isinstance(record.get(key), str)
+            or re.fullmatch(r"0x[0-9a-fA-F]+", record[key]) is None
+            for key in ("task_id", "task_handle")
+        ):
+            return None
     return record

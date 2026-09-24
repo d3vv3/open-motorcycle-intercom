@@ -11,6 +11,8 @@ import serial
 from serial.tools import list_ports
 
 from benchtool.parsers import (
+    _PIPE_CPU_GAUGE_KEYS,
+    _PIPE_CPU_SPAN_GAUGE_KEYS,
     _IDENTITY_KEYS,
     _SIMPLE_PARSERS,
     ESP_AUDIO_DECODED_RE,
@@ -147,16 +149,32 @@ class PortReader(threading.Thread):
         pipe = parse_pipeline_logfmt(line)
         if pipe is not None:
             name = _pipe_key(pipe)
+            if pipe["stage"] == "cpu" and pipe.get("part") == "task":
+                name += f":task_id={pipe['task_id']}:task_handle={pipe['task_handle']}"
             values = {k: v for k, v in pipe.items() if isinstance(v, int)}
             if name not in s.first_pipe:
                 s.first_pipe[name] = values.copy()
             s.last_pipe[name] = values
             s.pipe_samples[name] = s.pipe_samples.get(name, 0) + 1
-            s.pipe_history.setdefault(name, []).append(values.copy())
+            # Retain CPU gauges in first/last, not in cumulative counter history.
+            if pipe["stage"] == "cpu":
+                history_values = {
+                    key: value for key, value in values.items()
+                    if key not in _PIPE_CPU_GAUGE_KEYS
+                }
+            elif pipe["stage"] == "cpu_span":
+                history_values = {
+                    key: value for key, value in values.items()
+                    if key not in _PIPE_CPU_SPAN_GAUGE_KEYS
+                }
+            else:
+                history_values = values.copy()
+            s.pipe_history.setdefault(name, []).append(history_values)
             s.pipe_identity[name] = {
                 key: value
                 for key, value in pipe.items()
-                if key in _IDENTITY_KEYS or key in {"dev", "stage"}
+                if key in _IDENTITY_KEYS or key in {"dev", "stage", "node_id", "role"}
+                or (pipe["stage"] == "cpu" and key in {"task_id", "task_handle", "name_hint"})
             }
 
         # Simple first/last int-dict parsers

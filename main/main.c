@@ -23,6 +23,7 @@
 #include "app_state.h"
 #include "audio.h"
 #include "button.h"
+#include "cpu_profile.h"
 #include "e2e_diag.h"
 #include "mesh.h"
 #include "mesh_intent.h"
@@ -414,6 +415,12 @@ static void select_transport(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Detecting mesh transport...");
 
+#if defined(APP_S31_LC3_WIRE)
+    s_active_transport = TRANSPORT_ESP_NOW;
+    ESP_LOGW(TAG, "S31 LC3 wire build: forcing ESP-NOW; skipping nRF probe (nRF bundle is Opus-only)");
+    return;
+#endif
+
     /* Try the nRF SPI bridge first. */
     esp_err_t ret = uart_bridge_init();
     /* Probe for nRF52840 (send ping and wait up to 2s, with retries) */
@@ -441,6 +448,7 @@ static esp_err_t initialize_application(int64_t boot_time)
     ESP_LOGI(TAG, "Boot time: %" PRId64 " ms", boot_time);
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
+    cpu_profile_init();
 
     /* Initialize NVS */
     ESP_ERROR_CHECK(init_nvs());
@@ -585,6 +593,10 @@ static void run_runtime_health_loop(int64_t boot_time)
 
         if (audio_is_running() && (now_ms - last_audio_stats) >= 10000) {
             audio_log_stats();
+            cpu_profile_log();
+            if (s_active_transport == TRANSPORT_ESP_NOW && mesh_is_initialized()) {
+                mesh_log_pipeline_stats();
+            }
             phone_audio_state_t phone_state;
             if (phone_audio_get_state(&phone_state) == ESP_OK && phone_state.initialized) {
                 phone_audio_log_stats();

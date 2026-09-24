@@ -27,6 +27,14 @@ static void add_music_render_time(uint32_t elapsed)
     }
 }
 
+static void add_music_timing(audio_music_timing_t *stat, uint64_t elapsed)
+{
+    uint32_t us = elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
+    if (stat->count != UINT32_MAX) stat->count++;
+    stat->us_sum = UINT64_MAX - stat->us_sum < us ? UINT64_MAX : stat->us_sum + us;
+    if (us > stat->us_max) stat->us_max = us;
+}
+
 static bool s_music_fifo_failure_logged;
 
 bool audio_route_init(void)
@@ -115,11 +123,17 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
     int64_t render_start_us = esp_timer_get_time();
     size_t music_samples = 0u;
     size_t chunks_processed = 0u;
+    size_t iterations = 0u;
+    size_t input_frames = 0u, output_frames = 0u;
+    uint64_t route_us = 0u, convert_us = 0u, mutex_us = 0u;
+    uint8_t channels = 0u;
     uint32_t generation = atomic_load_explicit(&g_audio.music_playback_generation,
                                                memory_order_acquire);
     bool active = false;
     uint32_t input_rate = 0u;
+    int64_t route_start = esp_timer_get_time();
     if (!audio_route_lock_acquire(pdMS_TO_TICKS(AUDIO_ROUTE_LOCK_WAIT_MS))) {
+        route_us += esp_timer_get_time() - route_start;
         AUDIO_STATS_LOCK();
         add_route_stat(&g_audio.stats.bluetooth_playout_route_lock_misses, 1u);
         AUDIO_STATS_UNLOCK();
@@ -132,12 +146,18 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
     audio_route_stream_t *music = &g_audio.bluetooth_music;
     active = music->active && music->configured;
     input_rate = music->sample_rate;
+    channels = music->channels;
     audio_route_lock_release();
+    route_us += esp_timer_get_time() - route_start;
 
-    if (active && xSemaphoreTake(g_audio.music_playback_mutex, portMAX_DELAY) == pdTRUE) {
+    int64_t mutex_start = esp_timer_get_time();
+    bool have_mutex = active && xSemaphoreTake(g_audio.music_playback_mutex, portMAX_DELAY) == pdTRUE;
+    if (active) mutex_us = esp_timer_get_time() - mutex_start;
+    if (have_mutex) {
         if (generation == atomic_load_explicit(&g_audio.music_playback_generation,
                                                memory_order_acquire)) {
             size_t available = 0u;
+            route_start = esp_timer_get_time();
             if (audio_route_lock_acquire(pdMS_TO_TICKS(AUDIO_ROUTE_LOCK_WAIT_MS))) {
                 if (g_audio.bluetooth_music.active && g_audio.bluetooth_music.configured &&
                     !(g_audio.bluetooth_call.active && g_audio.bluetooth_call.configured)) {
@@ -145,6 +165,7 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
                 }
                 audio_route_lock_release();
             }
+            route_us += esp_timer_get_time() - route_start;
             size_t output_needed = g_audio.music_fifo.depth < AUDIO_HW_FRAME_SAMPLES
                 ? AUDIO_HW_FRAME_SAMPLES - g_audio.music_fifo.depth : 0u;
             size_t input_limit = audio_music_input_chunk_limit(input_rate,
@@ -161,29 +182,40 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
                         fifo_short, available - input_consumed);
                 }
                 if (scheduled_remaining == 0u) break;
+                iterations++;
                 int16_t *input = g_audio.music_input;
                 size_t input_count = scheduled_remaining;
                 if (input_count > AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES)
                     input_count = AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES;
-                if (!audio_route_lock_acquire(pdMS_TO_TICKS(AUDIO_ROUTE_LOCK_WAIT_MS))) break;
+                route_start = esp_timer_get_time();
+                if (!audio_route_lock_acquire(pdMS_TO_TICKS(AUDIO_ROUTE_LOCK_WAIT_MS))) {
+                    route_us += esp_timer_get_time() - route_start;
+                    break;
+                }
                 bool stream_active = g_audio.bluetooth_music.active &&
                     g_audio.bluetooth_music.configured &&
                     !(g_audio.bluetooth_call.active && g_audio.bluetooth_call.configured);
                 if (!stream_active || generation != atomic_load_explicit(
                         &g_audio.music_playback_generation, memory_order_acquire)) {
                     audio_route_lock_release();
+                    route_us += esp_timer_get_time() - route_start;
                     break;
                 }
                 input_count = audio_route_stream_read_raw(&g_audio.bluetooth_music,
                                                            input, input_count);
                 audio_route_lock_release();
+                route_us += esp_timer_get_time() - route_start;
                 if (input_count == 0u) break;
                 input_consumed += input_count;
+                input_frames += input_count;
                 size_t output_count = 0u;
+                int64_t convert_start = esp_timer_get_time();
                 int convert_result = g_audio.music_playback_converter == NULL ? -1 :
                     audio_rate_converter_process(g_audio.music_playback_converter,
                         input, input_count, g_audio.music_converted,
                         AUDIO_PLAYBACK_CONVERTED_CAPACITY, &output_count);
+                convert_us += esp_timer_get_time() - convert_start;
+                output_frames += output_count;
                 if (convert_result != 0) {
                     AUDIO_STATS_LOCK();
                     add_route_stat(&g_audio.stats.bluetooth_music_converter_failures, 1u);
@@ -220,7 +252,9 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
         }
         xSemaphoreGive(g_audio.music_playback_mutex);
     }
+    route_start = esp_timer_get_time();
     if (!audio_route_lock_acquire(pdMS_TO_TICKS(AUDIO_ROUTE_LOCK_WAIT_MS))) {
+        route_us += esp_timer_get_time() - route_start;
         AUDIO_STATS_LOCK();
         add_route_stat(&g_audio.stats.bluetooth_playout_route_lock_misses, 1u);
         AUDIO_STATS_UNLOCK();
@@ -229,6 +263,7 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
     bool still_active = g_audio.bluetooth_music.active && g_audio.bluetooth_music.configured &&
         !(g_audio.bluetooth_call.active && g_audio.bluetooth_call.configured);
     audio_route_lock_release();
+    route_us += esp_timer_get_time() - route_start;
     if (!still_active || generation != atomic_load_explicit(&g_audio.music_playback_generation,
                                                             memory_order_acquire)) {
         music_samples = 0u;
@@ -237,17 +272,31 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
         g_audio.stats.bluetooth_music_underruns++;
         AUDIO_STATS_UNLOCK();
     }
+    int64_t mix_start = esp_timer_get_time();
     for (size_t i = 0u; i < AUDIO_HW_FRAME_SAMPLES; ++i) {
         g_audio.hw_output[i] = audio_route_mix_sample(
             false, i < voice_present_samples, i < music_samples, g_audio.hw_output[i],
             i < music_samples ? g_audio.music_converted[i] : 0, 0);
     }
+    uint64_t mix_us = esp_timer_get_time() - mix_start;
     if (active) {
         int64_t elapsed_us = esp_timer_get_time() - render_start_us;
         uint32_t elapsed = elapsed_us > UINT32_MAX ? UINT32_MAX :
             (uint32_t)(elapsed_us > 0 ? elapsed_us : 0);
         AUDIO_STATS_LOCK();
         add_music_render_time(elapsed);
+        add_music_timing(&g_audio.stats.music_mutex_wait, mutex_us);
+        add_music_timing(&g_audio.stats.music_route_read, route_us);
+        add_music_timing(&g_audio.stats.music_mix, mix_us);
+        add_music_timing(&g_audio.stats.music_convert, convert_us);
+        add_route_stat(&g_audio.stats.music_chunks_count, chunks_processed);
+        add_route_stat(&g_audio.stats.music_iterations_count, iterations);
+        g_audio.stats.music_input_frames += input_frames;
+        g_audio.stats.music_output_frames += output_frames;
+        if (elapsed > 20000u && g_audio.stats.music_render_over20ms_count != UINT32_MAX)
+            g_audio.stats.music_render_over20ms_count++;
+        g_audio.stats.music_rate_hz = input_rate;
+        g_audio.stats.music_channels = channels;
         AUDIO_STATS_UNLOCK();
     }
 }

@@ -10,12 +10,125 @@
 #include "esp_timer.h"
 
 #include "audio_internal.h"
+#include "cpu_profile.h"
 
 static const char *TAG = "audio";
+static uint32_t successful_remote_decodes;
+
+#if defined(AUDIO_S31_LC3_SELFTEST)
+static bool run_lc3_startup_selftest(void)
+{
+    static int16_t zero_pcm[AUDIO_FRAME_SAMPLES] = {0};
+    static int16_t patterned_pcm[AUDIO_FRAME_SAMPLES];
+    static uint8_t packet[48];
+    static int16_t decoded[AUDIO_FRAME_SAMPLES];
+
+    for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
+        patterned_pcm[i] = ((i / 8u) & 1u) != 0u ? -10000 : 10000;
+    }
+    const int16_t *tests[] = {zero_pcm, patterned_pcm};
+    const char *names[] = {"zero", "patterned"};
+    for (size_t test = 0; test < 2u; ++test) {
+        ESP_LOGI(TAG, "LC3 self-test %s encode/decode start", names[test]);
+        int64_t encode_start = esp_timer_get_time();
+        int encoded_bytes = esp_lc3_codec_encode20(g_audio.lc3_encoder, tests[test], packet);
+        int64_t encode_us = esp_timer_get_time() - encode_start;
+        int output_samples = -1;
+        int64_t decode_us = 0;
+        if (encoded_bytes == (int)sizeof(packet)) {
+            int64_t decode_start = esp_timer_get_time();
+            output_samples = esp_lc3_codec_decode20(g_audio.rx_sources[0].lc3_decoder,
+                                                    packet, false, decoded);
+            decode_us = esp_timer_get_time() - decode_start;
+        }
+        int32_t peak = 0;
+        if (output_samples == AUDIO_FRAME_SAMPLES) {
+            for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
+                int32_t sample = decoded[i];
+                int32_t magnitude = sample < 0 ? -sample : sample;
+                if (magnitude > peak) peak = magnitude;
+            }
+        }
+        ESP_LOGI(TAG, "LC3 self-test %s encode/decode done: samples=%d bytes=%d"
+                      " encode_us=%" PRId64 " decode_us=%" PRId64 " peak=%" PRId32,
+                 names[test], output_samples, encoded_bytes, encode_us, decode_us, peak);
+        if (encoded_bytes != (int)sizeof(packet) || output_samples != AUDIO_FRAME_SAMPLES ||
+            (test == 1u && peak == 0)) {
+            ESP_LOGE(TAG, "LC3 self-test %s failed", names[test]);
+            return false;
+        }
+    }
+
+    /* Captured 48B peer diagnostic samples only; these are never transmitted. */
+    static const uint8_t peer_packets[][48] = {
+        {
+            0x06, 0x00, 0x1a, 0x9e, 0x0c, 0x0e, 0xfa, 0xe3,
+            0x6a, 0xb3, 0x2d, 0x83, 0x65, 0xf7, 0xe9, 0xfe,
+            0x0e, 0x2e, 0x7b, 0xe5, 0x33, 0x51, 0x10, 0x79,
+            0x00, 0x00, 0x10, 0x33, 0x22, 0x29, 0x21, 0xad,
+            0xf1, 0x84, 0x20, 0x9a, 0xe1, 0xc5, 0x56, 0xba,
+            0x4f, 0xd9, 0xd3, 0x59, 0x33, 0x53, 0x1e, 0x37,
+        },
+        {
+            0x2c, 0xbc, 0x25, 0x88, 0x90, 0x21, 0x67, 0xe3,
+            0xf0, 0xed, 0xd6, 0x35, 0xad, 0xc8, 0x68, 0x4f,
+            0x0e, 0x66, 0x2a, 0xeb, 0x33, 0x51, 0x1a, 0x65,
+            0x00, 0x00, 0x16, 0x77, 0xa5, 0xbe, 0xcd, 0x15,
+            0x9e, 0xf7, 0x8d, 0x6c, 0xfd, 0x7b, 0x57, 0xfe,
+            0xa8, 0x67, 0x21, 0xaa, 0x8b, 0x57, 0x26, 0x4b,
+        },
+    };
+    const char *peer_names[] = {"peer-old", "peer-new"};
+    for (size_t test = 0; test < 2u; ++test) {
+        int reset = esp_lc3_codec_reset(g_audio.rx_sources[0].lc3_decoder);
+        if (reset != 0) {
+            ESP_LOGE(TAG, "LC3 self-test %s decoder reset failed: %d", peer_names[test], reset);
+            return false;
+        }
+        ESP_LOGI(TAG, "LC3 self-test %s decode start", peer_names[test]);
+        int64_t decode_start = esp_timer_get_time();
+        int output_samples = esp_lc3_codec_decode20(g_audio.rx_sources[0].lc3_decoder,
+                                                    peer_packets[test], false, decoded);
+        int64_t decode_us = esp_timer_get_time() - decode_start;
+        int32_t peak = 0;
+        if (output_samples == AUDIO_FRAME_SAMPLES) {
+            for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
+                int32_t sample = decoded[i];
+                int32_t magnitude = sample < 0 ? -sample : sample;
+                if (magnitude > peak) peak = magnitude;
+            }
+        }
+        ESP_LOGI(TAG, "LC3 self-test %s decode done: samples=%d decode_us=%" PRId64
+                      " peak=%" PRId32,
+                 peer_names[test], output_samples, decode_us, peak);
+        if (output_samples != AUDIO_FRAME_SAMPLES) {
+            ESP_LOGE(TAG, "LC3 self-test %s failed", peer_names[test]);
+            return false;
+        }
+    }
+
+    int decoder_reset = esp_lc3_codec_reset(g_audio.rx_sources[0].lc3_decoder);
+    int encoder_reset = esp_lc3_codec_reset(g_audio.lc3_encoder);
+    if (decoder_reset != 0 || encoder_reset != 0) {
+        ESP_LOGE(TAG, "LC3 self-test reset failed: decoder=%d encoder=%d",
+                 decoder_reset, encoder_reset);
+        return false;
+    }
+    ESP_LOGI(TAG, "LC3 startup self-tests passed; encoder and decoder reset");
+    return true;
+}
+#endif
 
 static void add_timing_us(uint64_t *sum, uint64_t value)
 {
     *sum = UINT64_MAX - *sum < value ? UINT64_MAX : *sum + value;
+}
+
+static void record_timing(uint32_t *count, uint64_t *sum, uint32_t *maximum, uint32_t us)
+{
+    if (*count != UINT32_MAX) (*count)++;
+    add_timing_us(sum, us);
+    if (us > *maximum) *maximum = us;
 }
 
 typedef struct {
@@ -39,6 +152,8 @@ void audio_playout_reset_far_reference(void)
  */
 static void advance_far_reference_after_write(void)
 {
+#if AUDIO_ENABLE_AEC_NS && AUDIO_ENABLE_ESP_SR_AEC
+    /* No reference conversion is needed when AEC is compiled out. */
     for (size_t offset = 0u; offset < AUDIO_HW_FRAME_SAMPLES;
          offset += AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES) {
         size_t converted = 0u;
@@ -66,6 +181,7 @@ static void advance_far_reference_after_write(void)
            sizeof(g_audio.far_ref_shadows[g_audio.far_ref_shadow_head]));
     g_audio.far_ref_shadow_head = (g_audio.far_ref_shadow_head + 1u) % I2S_DMA_BUFFER_COUNT;
     portEXIT_CRITICAL(&g_audio_far_ref_lock);
+#endif
 }
 
 static void record_decode_result(int samples, int64_t decode_time_us, int64_t *decode_time_sum)
@@ -135,10 +251,12 @@ static bool refresh_source_assignment(audio_rx_source_t *source, uint64_t now_ms
 {
     bool assigned;
     bool reset_decoder = false;
+    bool was_pending = false;
 
     xSemaphoreTake(g_audio.rx_sources_mutex, portMAX_DELAY);
     assigned = source->assigned;
     if (source->decoder_reset_pending) {
+        was_pending = true;
         source->decoder_reset_pending = false;
         reset_decoder = true;
     }
@@ -155,9 +273,23 @@ static bool refresh_source_assignment(audio_rx_source_t *source, uint64_t now_ms
     xSemaphoreGive(g_audio.rx_sources_mutex);
 
     if (reset_decoder) {
-        opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+        bool reset_ok = true;
+#if defined(AUDIO_S31_LC3_WIRE)
+        if (g_audio.config.mode == AUDIO_MODE_MESH) {
+            reset_ok = esp_lc3_codec_reset(source->lc3_decoder) == 0;
+        } else
+#endif
+        {
+            opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
+        }
         audio_pcm_resampler_reset(&source->resampler);
         source->decoded_active = false;
+        if (!reset_ok && was_pending) {
+            xSemaphoreTake(g_audio.rx_sources_mutex, portMAX_DELAY);
+            if (source->assigned) source->decoder_reset_pending = true;
+            xSemaphoreGive(g_audio.rx_sources_mutex);
+            return false;
+        }
     }
     return assigned;
 }
@@ -167,16 +299,7 @@ static bool pop_due_events(audio_rx_source_t *source, uint64_t now_ms,
                            audio_playout_event_t *events, size_t *event_count,
                            uint16_t *packet_depth, size_t *upstream_samples)
 {
-    size_t pcm_depth = audio_pcm_resampler_depth(&source->resampler);
-    size_t target_room = pcm_depth < AUDIO_PCM_RESAMPLER_TARGET_SAMPLES
-                             ? AUDIO_PCM_RESAMPLER_TARGET_SAMPLES - pcm_depth
-                             : 0u;
-    size_t event_limit = target_room / AUDIO_FRAME_SAMPLES;
-    size_t available_events =
-        audio_pcm_resampler_available(&source->resampler) / AUDIO_FRAME_SAMPLES;
-    if (event_limit > available_events) {
-        event_limit = available_events;
-    }
+    size_t event_limit = audio_pcm_resampler_admission_blocks(&source->resampler);
     if (event_limit > AUDIO_PACKET_STORE_CAPACITY) {
         event_limit = AUDIO_PACKET_STORE_CAPACITY;
     }
@@ -186,12 +309,21 @@ static bool pop_due_events(audio_rx_source_t *source, uint64_t now_ms,
     xSemaphoreTake(g_audio.rx_sources_mutex, portMAX_DELAY);
     if (source->assigned) {
         size_t count;
+        uint32_t popped = 0u;
         for (count = 0; count < event_limit; ++count) {
             audio_playout_event_t *event = &events[count];
             event->result = audio_packet_store_pop(&source->packet_store, now_ms, &event->packet);
             if (event->result == AUDIO_PACKET_STORE_POP_NOT_DUE) {
                 break;
             }
+            if (event->result == AUDIO_PACKET_STORE_POP_PACKET) {
+                popped++;
+            }
+        }
+        if (popped != 0u) {
+            AUDIO_STATS_LOCK();
+            g_audio.stats.rx_store_pop += popped;
+            AUDIO_STATS_UNLOCK();
         }
         *event_count = count;
         size_t remaining_depth = audio_packet_store_depth(&source->packet_store);
@@ -216,21 +348,67 @@ static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout
 
     int16_t decoded[AUDIO_FRAME_SAMPLES];
     int64_t decode_start = esp_timer_get_time();
+#if defined(AUDIO_S31_LC3_WIRE)
+    bool lc3_wire = g_audio.config.mode == AUDIO_MODE_MESH;
+    int samples;
+#if defined(AUDIO_S31_LC3_SKIP_RX)
+    if (lc3_wire) {
+        memset(decoded, 0, sizeof(decoded));
+        samples = AUDIO_FRAME_SAMPLES;
+    } else {
+        samples = packet_event
+                      ? opus_decode(source->decoder, event->packet.data,
+                                    (opus_int32)event->packet.length, decoded,
+                                    AUDIO_FRAME_SAMPLES, 0)
+                      : opus_decode(source->decoder, NULL, 0, decoded,
+                                    AUDIO_FRAME_SAMPLES, 0);
+    }
+#else
+    samples = lc3_wire
+                      ? esp_lc3_codec_decode20(source->lc3_decoder,
+                                               packet_event ? event->packet.data : NULL,
+                                               !packet_event, decoded)
+                      : (packet_event
+                             ? opus_decode(source->decoder, event->packet.data,
+                                           (opus_int32)event->packet.length, decoded,
+                                           AUDIO_FRAME_SAMPLES, 0)
+                             : opus_decode(source->decoder, NULL, 0, decoded,
+                                           AUDIO_FRAME_SAMPLES, 0));
+#endif
+#else
     int samples =
         packet_event
             ? opus_decode(source->decoder, event->packet.data, (opus_int32)event->packet.length,
                           decoded, AUDIO_FRAME_SAMPLES, 0)
             : opus_decode(source->decoder, NULL, 0, decoded, AUDIO_FRAME_SAMPLES, 0);
+#endif
     int64_t decode_time = esp_timer_get_time() - decode_start;
 
     if (packet_event) {
         record_rx_pipe_latency(&event->packet, decode_start);
+#if defined(AUDIO_S31_LC3_SKIP_RX)
+        if (!lc3_wire) {
+            record_decode_result(samples, decode_time, decode_time_sum);
+        }
+#else
         record_decode_result(samples, decode_time, decode_time_sum);
+#endif
+#if !defined(AUDIO_S31_LC3_SKIP_RX)
+        if (samples == AUDIO_FRAME_SAMPLES && successful_remote_decodes < 100u) {
+            successful_remote_decodes++;
+            if (successful_remote_decodes == 1u || successful_remote_decodes == 100u) {
+                ESP_LOGI(TAG, "Remote audio decode count=%" PRIu32
+                         " playout stack high water: %u bytes",
+                         successful_remote_decodes,
+                         (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            }
+        }
+#endif
     } else if (samples != AUDIO_FRAME_SAMPLES) {
         AUDIO_STATS_LOCK();
         g_audio.stats.decode_errors++;
         AUDIO_STATS_UNLOCK();
-        ESP_LOGW(TAG, "Opus PLC failed: %d", samples);
+        ESP_LOGW(TAG, "Audio PLC failed: %d", samples);
     } else if (event->result == AUDIO_PACKET_STORE_POP_MISSING) {
         AUDIO_STATS_LOCK();
         g_audio.stats.seq_gap_frames++;
@@ -368,12 +546,33 @@ static bool render_loopback(int64_t *decode_time_sum)
 void audio_log_stats(void)
 {
     audio_stats_t stats = audio_stats_snapshot();
+    /* Fall back to the previous playout sample when either nonblocking lock is busy. */
+    uint32_t rx_store_depth = stats.jitter_buffer_depth;
+    bool rx_store_depth_valid = false;
+    SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();
+    if (lifecycle_mutex != NULL && xSemaphoreTake(lifecycle_mutex, 0) == pdTRUE) {
+        if (g_audio.rx_sources_mutex != NULL &&
+            xSemaphoreTake(g_audio.rx_sources_mutex, 0) == pdTRUE) {
+            rx_store_depth = 0u;
+            for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
+                rx_store_depth += (uint32_t)audio_packet_store_depth(
+                    &g_audio.rx_sources[i].packet_store);
+            }
+            rx_store_depth_valid = true;
+            xSemaphoreGive(g_audio.rx_sources_mutex);
+        }
+        xSemaphoreGive(lifecycle_mutex);
+    }
+    uint64_t uptime_ms = (uint64_t)esp_timer_get_time() / 1000u;
     audio_rate_converter_timing_t music_cvt = {0};
     bool music_active = false;
     bool music_snapshot_valid = false;
-    if (audio_route_lock_acquire(0)) {
+    bool music_format_valid = audio_route_lock_acquire(0);
+    if (music_format_valid) {
         music_active = g_audio.bluetooth_music.active && g_audio.bluetooth_music.configured &&
             !(g_audio.bluetooth_call.active && g_audio.bluetooth_call.configured);
+        stats.music_rate_hz = music_active ? g_audio.bluetooth_music.sample_rate : 0u;
+        stats.music_channels = music_active ? g_audio.bluetooth_music.channels : 0u;
         /* Route users pin the lifecycle; playback takes this mutex before the route lock. */
         if (g_audio.music_playback_mutex != NULL &&
             xSemaphoreTake(g_audio.music_playback_mutex, 0) == pdTRUE) {
@@ -384,6 +583,9 @@ void audio_log_stats(void)
             xSemaphoreGive(g_audio.music_playback_mutex);
         }
         audio_route_lock_release();
+    } else {
+        stats.music_rate_hz = 0u;
+        stats.music_channels = 0u;
     }
     ESP_LOGI(TAG, "Audio loops capture=%lu playout=%lu encoded=%lu decoded=%lu", stats.task_loops,
              stats.playout_task_loops, stats.frames_encoded, stats.frames_decoded);
@@ -467,38 +669,106 @@ void audio_log_stats(void)
                    music_cvt.source_rate_hz, music_cvt.destination_rate_hz,
                    music_cvt.last_vendor_result);
      }
-     ESP_LOGI(TAG,
-              "PIPE v=1 dev=esp stage=audio capture_ok=%lu capture_short=%lu "
-              "capture_timeout=%lu capture_err=%lu encode_ok=%lu encode_err=%lu dtx_drop=%lu "
-              "rx_q_drop=%lu rx_lock_drop=%lu rx_src_drop=%lu rx_src_evict=%lu "
-             "jitter_drop=%lu decode_ok=%lu "
-             "decode_err=%lu plc=%lu hold=%lu catchup=%lu conceal=%lu seq_gap=%lu "
-             "seq_reset=%lu seq_stale=%lu glitch=%lu play_ok=%lu i2s_err=%lu notify_drop=%lu "
-             "rx_sources=%u packet_dup=%lu packet_late=%lu packet_future=%lu pcm_overflow=%lu "
-             "pcm_underrun=%lu asrc_ppm=%ld asrc_abs_max_ppm=%lu asrc_recovery=%u "
-              "playout_loops=%lu bt_music_overflow=%lu bt_music_underrun=%lu "
-              "bt_music_lock=%lu bt_call_overflow=%lu bt_call_underrun=%lu bt_call_lock=%lu "
-              "bt_playout_lock=%lu bt_mic_overflow=%lu bt_mic_underrun=%lu "
-              "bt_mic_write_lock=%lu bt_mic_read_lock=%lu",
-              stats.capture_frames_ok, stats.capture_short_reads, stats.capture_timeouts,
-              stats.capture_errors, stats.frames_encoded, stats.encode_errors,
-              stats.tx_dtx_suppressed,
-             stats.rx_queue_overflows, stats.rx_lock_drops, stats.rx_source_rejections,
-             stats.rx_source_evictions, stats.jitter_trim_frames, stats.frames_decoded,
-             stats.decode_errors, stats.plc_frames, stats.hold_frames, stats.catchup_frames,
-             stats.conceal_loss_frames, stats.seq_gap_frames, stats.seq_resets,
-             stats.seq_stale_drops, stats.glitches_detected, stats.playback_frames,
-             stats.i2s_write_incomplete, stats.notification_queue_overflows,
-             stats.active_rx_sources, stats.packet_duplicate_drops, stats.packet_late_drops,
-             stats.packet_future_drops, stats.pcm_fifo_overflows, stats.pcm_underruns,
-             (long)stats.asrc_correction_ppm, stats.asrc_correction_abs_max_ppm,
-              stats.asrc_recovery_active ? 1u : 0u, stats.playout_task_loops,
-               stats.bluetooth_music_overflows, stats.bluetooth_music_underruns,
-               stats.bluetooth_music_enqueue_route_lock_misses, stats.bluetooth_call_overflows,
-              stats.bluetooth_call_underruns, stats.bluetooth_call_enqueue_route_lock_misses,
-              stats.bluetooth_playout_route_lock_misses, stats.bluetooth_mic_overflows,
-              stats.bluetooth_mic_underruns, stats.bluetooth_mic_capture_write_route_lock_misses,
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=audio part=tx epoch_id=0x%08" PRIx32
+             " uptime_ms=%" PRIu64 " tx_handoff=%" PRIu32 " tx_no_cb=%" PRIu32
+             " capture_fifo_discard_samples=%" PRIu32
+             " capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu"
+             " encode_ok=%lu encode_err=%lu dtx_drop=%lu",
+             stats.pipeline_epoch, uptime_ms, stats.tx_handoff, stats.tx_no_cb,
+             stats.capture_fifo_discard_samples, stats.capture_frames_ok,
+             stats.capture_short_reads, stats.capture_timeouts, stats.capture_errors,
+             stats.frames_encoded, stats.encode_errors, stats.tx_dtx_suppressed);
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=audio part=rx epoch_id=0x%08" PRIx32
+             " uptime_ms=%" PRIu64 " rx_offer=%" PRIu32 " rx_store_ok=%" PRIu32
+             " rx_store_reject=%" PRIu32 " rx_invalid=%" PRIu32
+             " rx_inactive=%" PRIu32 " rx_store_pop=%" PRIu32
+             " rx_store_purge=%" PRIu32 " rx_store_depth=%" PRIu32
+             " rx_store_depth_valid=%u rx_q_drop=%lu rx_lock_drop=%lu"
+             " rx_src_drop=%lu rx_src_evict=%lu jitter_drop=%lu"
+             " seq_reset=%lu seq_stale=%lu rx_sources=%u"
+             " packet_dup=%lu packet_late=%lu packet_future=%lu",
+             stats.pipeline_epoch, uptime_ms, stats.rx_offer, stats.rx_store_ok,
+             stats.rx_store_reject, stats.rx_invalid, stats.rx_inactive,
+             stats.rx_store_pop, stats.rx_store_purge, rx_store_depth,
+             rx_store_depth_valid ? 1u : 0u, stats.rx_queue_overflows,
+             stats.rx_lock_drops, stats.rx_source_rejections, stats.rx_source_evictions,
+             stats.jitter_trim_frames, stats.seq_resets, stats.seq_stale_drops,
+             stats.active_rx_sources, stats.packet_duplicate_drops,
+             stats.packet_late_drops, stats.packet_future_drops);
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=audio part=playout epoch_id=0x%08" PRIx32
+             " uptime_ms=%" PRIu64 " decode_ok=%lu decode_err=%lu plc=%lu"
+             " hold=%lu catchup=%lu conceal=%lu seq_gap=%lu glitch=%lu"
+             " play_ok=%lu i2s_err=%lu notify_drop=%lu pcm_overflow=%lu"
+             " pcm_underrun=%lu asrc_ppm=%ld asrc_abs_max_ppm=%lu"
+             " asrc_recovery=%u playout_loops=%lu",
+             stats.pipeline_epoch, uptime_ms, stats.frames_decoded, stats.decode_errors,
+             stats.plc_frames, stats.hold_frames, stats.catchup_frames,
+             stats.conceal_loss_frames, stats.seq_gap_frames, stats.glitches_detected,
+             stats.playback_frames, stats.i2s_write_incomplete,
+             stats.notification_queue_overflows, stats.pcm_fifo_overflows,
+             stats.pcm_underruns, (long)stats.asrc_correction_ppm,
+             stats.asrc_correction_abs_max_ppm, stats.asrc_recovery_active ? 1u : 0u,
+             stats.playout_task_loops);
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=audio part=bt epoch_id=0x%08" PRIx32
+             " uptime_ms=%" PRIu64 " bt_music_overflow=%lu bt_music_underrun=%lu"
+             " bt_music_lock=%lu bt_call_overflow=%lu bt_call_underrun=%lu"
+             " bt_call_lock=%lu bt_playout_lock=%lu bt_mic_overflow=%lu"
+             " bt_mic_underrun=%lu bt_mic_write_lock=%lu bt_mic_read_lock=%lu",
+             stats.pipeline_epoch, uptime_ms, stats.bluetooth_music_overflows,
+             stats.bluetooth_music_underruns,
+             stats.bluetooth_music_enqueue_route_lock_misses,
+             stats.bluetooth_call_overflows, stats.bluetooth_call_underruns,
+             stats.bluetooth_call_enqueue_route_lock_misses,
+             stats.bluetooth_playout_route_lock_misses, stats.bluetooth_mic_overflows,
+             stats.bluetooth_mic_underruns,
+             stats.bluetooth_mic_capture_write_route_lock_misses,
               stats.bluetooth_mic_read_route_lock_misses);
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=audio_timing part=notify epoch_id=0x%08" PRIx32
+             " uptime_ms=%" PRIu64 " notify_started_count=%" PRIu32
+             " notify_completed_count=%" PRIu32 " notify_mix_count=%" PRIu32
+             " notify_mix_us_sum=%" PRIu64 " notify_mix_us_max=%" PRIu32
+             " notify_frame_gap_count=%" PRIu32 " notify_frame_gap_us_sum=%" PRIu64
+             " notify_frame_gap_us_max=%" PRIu32
+             " notify_frame_gap_over25ms_count=%" PRIu32
+             " notify_work_count=%" PRIu32 " notify_work_us_sum=%" PRIu64
+             " notify_work_us_max=%" PRIu32 " notify_write_count=%" PRIu32
+             " notify_write_us_sum=%" PRIu64 " notify_write_us_max=%" PRIu32
+             " notify_write_gap_count=%" PRIu32 " notify_write_gap_us_sum=%" PRIu64
+             " notify_write_gap_us_max=%" PRIu32,
+             stats.pipeline_epoch, uptime_ms, stats.notify_started_count,
+             stats.notify_completed_count, stats.notify_mix_count, stats.notify_mix_us_sum,
+             stats.notify_mix_us_max, stats.notify_frame_gap_count,
+             stats.notify_frame_gap_us_sum, stats.notify_frame_gap_us_max,
+             stats.notify_frame_gap_over25ms_count, stats.notify_work_count,
+             stats.notify_work_us_sum, stats.notify_work_us_max, stats.notify_write_count,
+             stats.notify_write_us_sum, stats.notify_write_us_max, stats.notify_write_gap_count,
+              stats.notify_write_gap_us_sum, stats.notify_write_gap_us_max);
+    ESP_LOGI(TAG,
+             "PIPE v=1 dev=esp stage=audio_timing part=music epoch_id=0x%08" PRIx32
+             " uptime_ms=%" PRIu64 " music_mutex_wait_count=%" PRIu32
+             " music_mutex_wait_us_sum=%" PRIu64 " music_mutex_wait_us_max=%" PRIu32
+             " music_route_read_count=%" PRIu32 " music_route_read_us_sum=%" PRIu64
+             " music_route_read_us_max=%" PRIu32 " music_convert_count=%" PRIu32
+             " music_convert_us_sum=%" PRIu64 " music_convert_us_max=%" PRIu32
+             " music_mix_count=%" PRIu32 " music_mix_us_sum=%" PRIu64
+             " music_mix_us_max=%" PRIu32 " music_render_over20ms_count=%" PRIu32
+             " music_iterations_count=%" PRIu32 " music_chunks_count=%" PRIu32 " music_input_frames=%" PRIu64
+             " music_output_frames=%" PRIu64 " music_rate_hz=%" PRIu32
+             " music_channels=%u music_format_valid=%u",
+             stats.pipeline_epoch, uptime_ms,
+             stats.music_mutex_wait.count, stats.music_mutex_wait.us_sum,
+             stats.music_mutex_wait.us_max, stats.music_route_read.count,
+             stats.music_route_read.us_sum, stats.music_route_read.us_max,
+             stats.music_convert.count, stats.music_convert.us_sum, stats.music_convert.us_max,
+             stats.music_mix.count, stats.music_mix.us_sum, stats.music_mix.us_max,
+             stats.music_render_over20ms_count, stats.music_iterations_count, stats.music_chunks_count,
+             stats.music_input_frames, stats.music_output_frames, stats.music_rate_hz,
+             stats.music_channels, music_format_valid ? 1u : 0u);
 }
 
 static void playout_task_finish(void)
@@ -518,9 +788,11 @@ static void playout_task_finish(void)
     vTaskDelete(NULL);
 }
 
-static void write_playout_frame(void)
+static void write_playout_frame(bool notify_frame, bool notify_continues,
+                                int64_t *previous_notify_write_start_us)
 {
     if (!atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
+        *previous_notify_write_start_us = 0;
         return;
     }
     int64_t write_start_us = esp_timer_get_time();
@@ -538,7 +810,19 @@ static void write_playout_frame(void)
                                                         g_audio.stats.playout_write_count);
     if (write_us > g_audio.stats.playout_write_us_max)
         g_audio.stats.playout_write_us_max = write_us;
+    if (notify_frame) {
+        record_timing(&g_audio.stats.notify_write_count, &g_audio.stats.notify_write_us_sum,
+                      &g_audio.stats.notify_write_us_max, write_us);
+        if (*previous_notify_write_start_us != 0 &&
+            write_start_us >= *previous_notify_write_start_us) {
+            uint32_t gap_us = (uint32_t)(write_start_us - *previous_notify_write_start_us);
+            record_timing(&g_audio.stats.notify_write_gap_count,
+                          &g_audio.stats.notify_write_gap_us_sum,
+                          &g_audio.stats.notify_write_gap_us_max, gap_us);
+        }
+    }
     AUDIO_STATS_UNLOCK();
+    *previous_notify_write_start_us = notify_continues ? write_start_us : 0;
     if (ret != ESP_CODEC_DEV_OK) {
         AUDIO_STATS_LOCK();
         g_audio.stats.i2s_write_incomplete++;
@@ -549,7 +833,9 @@ static void write_playout_frame(void)
         (void)audio_rate_converter_reset(g_audio.far_reference_converter);
         ESP_LOGW(TAG, "Codec playback write failed: %d", ret);
     } else {
+        int64_t far_span = cpu_profile_span_begin();
         advance_far_reference_after_write();
+        cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_FAR_REFERENCE, far_span);
         AUDIO_STATS_LOCK();
         g_audio.stats.playback_frames++;
         AUDIO_STATS_UNLOCK();
@@ -558,10 +844,46 @@ static void write_playout_frame(void)
 
 void audio_playout_task(void *arg)
 {
+#if defined(AUDIO_S31_LC3_SPLIT_CORES)
+    ESP_LOGI(TAG, "LC3 split cores=1 playout entry mode=%d actual_core=%d affinity_core=%d",
+             (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
+#endif
     (void)arg;
+    successful_remote_decodes = 0u;
+#if defined(AUDIO_S31_LC3_WIRE)
+    if (g_audio.config.mode == AUDIO_MODE_MESH) {
+#if defined(AUDIO_S31_LC3_SKIP_RX)
+        ESP_LOGW(TAG, "Diagnostic mode: LC3 decoder is bypassed; remote audio is silent");
+#endif
+        for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
+            if (esp_lc3_codec_reset(g_audio.rx_sources[i].lc3_decoder) != 0) {
+                ESP_LOGE(TAG, "LC3 decoder reset failed for source %zu", i);
+                atomic_store_explicit(&g_audio.playout_ready, false, memory_order_release);
+                xSemaphoreGive(g_audio.playout_started);
+                playout_task_finish();
+                return;
+            }
+        }
+#if defined(AUDIO_S31_LC3_SELFTEST)
+        bool selftest_ok = run_lc3_startup_selftest();
+#if defined(AUDIO_S31_LC3_SPLIT_CORES)
+        ESP_LOGI(TAG, "LC3 split cores=1 playout after selftest mode=%d actual_core=%d affinity_core=%d",
+                 (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
+#endif
+        if (!selftest_ok) {
+            atomic_store_explicit(&g_audio.playout_ready, false, memory_order_release);
+            xSemaphoreGive(g_audio.playout_started);
+            playout_task_finish();
+            return;
+        }
+#endif
+    }
+#endif
     int64_t decode_time_sum = 0;
     uint32_t frame_loops = 0;
     bool stack_logged = false;
+    int64_t previous_notify_work_start_us = 0;
+    int64_t previous_notify_write_start_us = 0;
 
     opus_decoder_ctl(g_audio.loopback_decoder, OPUS_RESET_STATE);
     audio_rx_reset_codecs_and_resamplers();
@@ -578,6 +900,7 @@ void audio_playout_task(void *arg)
 
     while (atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
         int64_t work_start_us = esp_timer_get_time();
+        bool notify_frame = g_audio.notification.active;
         audio_rx_service_reset_request();
         AUDIO_STATS_LOCK();
         g_audio.stats.playout_task_loops++;
@@ -603,11 +926,25 @@ void audio_playout_task(void *arg)
             if (g_audio.config.mode == AUDIO_MODE_LOOPBACK) {
                 base_present = render_loopback(&decode_time_sum);
             } else {
+                int64_t remote_span = cpu_profile_span_begin();
                 base_present = render_remote_sources((uint64_t)(esp_timer_get_time() / 1000),
                                                      &decode_time_sum);
+                cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_REMOTE, remote_span);
             }
             base_present_samples = base_present ? AUDIO_FRAME_SAMPLES : 0u;
-            size_t notification_samples = audio_notify_mix_frame(base_present_samples);
+            bool request_consumed;
+            int64_t mix_start_us = esp_timer_get_time();
+            size_t notification_samples = audio_notify_mix_frame(base_present_samples,
+                                                                  &request_consumed);
+            uint32_t mix_us = (uint32_t)(esp_timer_get_time() - mix_start_us);
+            notify_frame = notify_frame || request_consumed || notification_samples != 0u ||
+                           g_audio.notification.active;
+            if (notify_frame) {
+                AUDIO_STATS_LOCK();
+                record_timing(&g_audio.stats.notify_mix_count, &g_audio.stats.notify_mix_us_sum,
+                              &g_audio.stats.notify_mix_us_max, mix_us);
+                AUDIO_STATS_UNLOCK();
+            }
             if (base_present_samples == 0u) base_present_samples = notification_samples;
         }
         bool call_active = audio_route_render_call_frame();
@@ -616,9 +953,14 @@ void audio_playout_task(void *arg)
             memset(g_audio.pcm_output, 0, sizeof(g_audio.pcm_output));
         }
         size_t converted = 0u;
-        if (audio_rate_converter_process(g_audio.voice_playback_converter, g_audio.pcm_output,
-                                         AUDIO_FRAME_SAMPLES, g_audio.voice_converted,
-                                          AUDIO_PLAYBACK_CONVERTED_CAPACITY, &converted) != 0 ||
+        int64_t voice_convert_span = cpu_profile_span_begin();
+        int convert_result = audio_rate_converter_process(g_audio.voice_playback_converter,
+                                                          g_audio.pcm_output, AUDIO_FRAME_SAMPLES,
+                                                          g_audio.voice_converted,
+                                                          AUDIO_PLAYBACK_CONVERTED_CAPACITY,
+                                                          &converted);
+        cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_VOICE_CONVERT, voice_convert_span);
+        if (convert_result != 0 ||
             audio_sample_fifo_write(&g_audio.voice_fifo, g_audio.voice_converted,
                                     converted) != converted) {
             audio_sample_fifo_reset(&g_audio.voice_fifo);
@@ -669,8 +1011,24 @@ void audio_playout_task(void *arg)
         }
         if (work_us > g_audio.stats.playout_work_us_max)
             g_audio.stats.playout_work_us_max = work_us;
+        if (notify_frame) {
+            record_timing(&g_audio.stats.notify_work_count, &g_audio.stats.notify_work_us_sum,
+                          &g_audio.stats.notify_work_us_max, work_us);
+            if (previous_notify_work_start_us != 0 &&
+                work_start_us >= previous_notify_work_start_us) {
+                uint32_t gap_us = (uint32_t)(work_start_us - previous_notify_work_start_us);
+                record_timing(&g_audio.stats.notify_frame_gap_count,
+                              &g_audio.stats.notify_frame_gap_us_sum,
+                              &g_audio.stats.notify_frame_gap_us_max, gap_us);
+                if (gap_us > 25000u &&
+                    g_audio.stats.notify_frame_gap_over25ms_count != UINT32_MAX)
+                    g_audio.stats.notify_frame_gap_over25ms_count++;
+            }
+        }
         AUDIO_STATS_UNLOCK();
-        write_playout_frame();
+        bool notify_continues = notify_frame && g_audio.notification.active;
+        previous_notify_work_start_us = notify_continues ? work_start_us : 0;
+        write_playout_frame(notify_frame, notify_continues, &previous_notify_write_start_us);
 
     }
 

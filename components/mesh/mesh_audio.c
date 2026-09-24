@@ -9,6 +9,42 @@
 #include "mesh_internal.h"
 #include "power.h"
 
+#ifdef MESH_S31_PAIR_UNICAST
+static bool pair_unicast_dest(uint8_t remote_mac[6])
+{
+    if (s_peer_mutex == NULL || xSemaphoreTake(s_peer_mutex, 0) != pdTRUE) return false;
+
+    bool eligible = false;
+    if (s_state == MESH_STATE_ACTIVE &&
+        (s_role == MESH_ROLE_COORDINATOR || s_role == MESH_ROLE_PARTICIPANT) &&
+        s_node_id != 0 && s_node_id <= MESH_MAX_NODES) {
+        /* Match mesh_get_node_count() under the same peer-table lock. */
+        uint8_t total = s_peer_count;
+        if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_PARTICIPANT && s_node_id != 0) {
+            total++;
+        }
+        if (total == 2) {
+            unsigned remotes = 0;
+            bool valid_remote = false;
+            for (int i = 0; i < MESH_MAX_NODES; i++) {
+                const mesh_peer_info_t *peer = &s_peers[i].info;
+                if (!peer->active ||
+                    memcmp(peer->mac_addr, s_local_mac, sizeof(peer->mac_addr)) == 0) continue;
+                remotes++;
+                if (remotes == 1) {
+                    valid_remote = peer->node_id != 0 && peer->node_id <= MESH_MAX_NODES;
+                    memcpy(remote_mac, peer->mac_addr, sizeof(peer->mac_addr));
+                }
+            }
+            eligible = remotes == 1 && valid_remote;
+        }
+    }
+    xSemaphoreGive(s_peer_mutex);
+
+    return eligible && esp_now_is_peer_exist(remote_mac);
+}
+#endif
+
 bool relay_queue_empty(void)
 {
     return s_relay_head == s_relay_tail;
@@ -26,6 +62,7 @@ bool enqueue_relay_packet(const uint8_t *data, uint16_t len, uint8_t ttl, uint8_
 
     uint8_t next_head = (uint8_t)((s_relay_head + 1) % RELAY_RING_SIZE);
     if (next_head == s_relay_tail) {
+        STATS_INC(relay_overwrite);
         s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
     }
 
@@ -129,7 +166,7 @@ void send_speaker_release_for(uint8_t speaker_id)
         .speaker_ids = {speaker_id, 0},
     };
 
-    (void)send_packet(MESH_PKT_SPEAKER_RELEASE, &payload, sizeof(payload));
+    (void)mesh_send_control_packet(MESH_PKT_SPEAKER_RELEASE, &payload, sizeof(payload));
 }
 
 void update_speaker_grants(void)
@@ -197,7 +234,7 @@ void update_speaker_grants(void)
         }
     }
 
-    (void)send_packet(MESH_PKT_SPEAKER_GRANT, &payload, sizeof(payload));
+    (void)mesh_send_control_packet(MESH_PKT_SPEAKER_GRANT, &payload, sizeof(payload));
 }
 void clear_transient_mesh_state(void)
 {
@@ -213,31 +250,43 @@ void clear_transient_mesh_state(void)
     taskEXIT_CRITICAL(&s_speaker_mux);
 
     xSemaphoreTake(s_jitter_mutex, portMAX_DELAY);
-    memset(s_jitter_buffer, 0, sizeof(s_jitter_buffer));
-    s_jitter_read_idx = 0;
-    s_jitter_write_idx = 0;
+    uint32_t purged = s_jitter_buffer.count;
+    STATS_ADD(jitter_purge, purged);
+    STATS_SET(jitter_depth, 0);
+    mesh_jitter_reset(&s_jitter_buffer);
     xSemaphoreGive(s_jitter_mutex);
+    STATS_ADD(tx_purge, uxQueueMessagesWaiting(s_tx_queue));
     xQueueReset(s_tx_queue);
     reset_control_queue();
 }
 void handle_audio_packet(const mesh_rx_item_t *rx)
 {
+    STATS_INC(rx_audio_seen);
     if (rx->header.payload_len < 4) {
+        STATS_INC(rx_audio_invalid);
         return;
     }
 
     const mesh_audio_payload_t *audio = (const mesh_audio_payload_t *)rx->payload;
     uint16_t opus_len = rx->header.payload_len - 4;
 
-    if (opus_len > MESH_MAX_OPUS_BYTES) {
+#ifdef MESH_S31_LC3_WIRE
+    const uint8_t local_codec = MESH_AUDIO_CODEC_LC3;
+#else
+    const uint8_t local_codec = MESH_AUDIO_CODEC_OPUS;
+#endif
+    if (!mesh_audio_wire_payload_valid(audio->codec, audio->frame_ms, opus_len, local_codec)) {
+        STATS_INC(rx_audio_invalid);
         return;
     }
 
     if (rx->header.src_id == s_node_id) {
+        STATS_INC(rx_audio_self);
         return;
     }
 
     if (!mesh_core_dedupe_accept(&s_dedupe, rx->header.type, rx->header.src_id, rx->header.seq)) {
+        STATS_INC(rx_audio_dup);
         return;
     }
 
@@ -293,13 +342,14 @@ void handle_audio_packet(const mesh_rx_item_t *rx)
 
     STATS_INC(audio_frames_rx);
 }
-esp_err_t send_audio_in_slot(void)
+mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
 {
     mesh_tx_item_t tx_item;
 
     if (!wait_for_tx_idle(0)) {
-        STATS_INC(slot_misses);
-        return ESP_ERR_INVALID_STATE;
+        mesh_note_audio_tx_busy();
+        STATS_INC(tx_busy_count);
+        return MESH_TX_SLOT_BUSY;
     }
 
     if (xQueuePeek(s_tx_queue, &tx_item, 0) != pdTRUE) {
@@ -315,6 +365,7 @@ esp_err_t send_audio_in_slot(void)
                 .relay_bitmap = 0,
                 .sequence = NULL,
                 .audio_origin = false,
+                .deadline_us = deadline_us,
             });
 
             if (relay_ret == ESP_OK) {
@@ -322,13 +373,11 @@ esp_err_t send_audio_in_slot(void)
                 s_relay_bitmap |= mesh_core_node_bit(relay_header->src_id);
                 taskEXIT_CRITICAL(&s_speaker_mux);
                 s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
-            } else {
-                STATS_INC(slot_misses);
             }
-            return relay_ret;
+            return relay_ret == ESP_OK ? MESH_TX_SLOT_SUBMITTED : MESH_TX_SLOT_ERROR;
         }
 
-        return ESP_OK;
+        return MESH_TX_SLOT_EMPTY;
     }
 
     uint8_t buffer[sizeof(mesh_header_t) + sizeof(mesh_audio_payload_t)];
@@ -352,14 +401,24 @@ esp_err_t send_audio_in_slot(void)
         }
     }
 
-    audio->codec = 0x01; /* Opus */
+#ifdef MESH_S31_LC3_WIRE
+    audio->codec = MESH_AUDIO_CODEC_LC3;
+#else
+    audio->codec = MESH_AUDIO_CODEC_OPUS;
+#endif
     audio->frame_ms = MESH_FRAME_MS;
     audio->stream_id = s_node_id;
     audio->audio_flags = tx_item.audio_flags;
     memcpy(audio->data, tx_item.data, tx_item.len);
 
+    const uint8_t *dest_mac = s_broadcast_mac;
+#ifdef MESH_S31_PAIR_UNICAST
+    uint8_t remote_mac[6];
+    if (pair_unicast_dest(remote_mac)) dest_mac = remote_mac;
+#endif
+    int64_t send_start_us = esp_timer_get_time();
     esp_err_t ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){
-        .dest_mac = s_broadcast_mac,
+        .dest_mac = dest_mac,
         .data = buffer,
         .len = sizeof(mesh_header_t) + 4 + tx_item.len,
         .type = MESH_PKT_AUDIO,
@@ -367,49 +426,32 @@ esp_err_t send_audio_in_slot(void)
         .relay_bitmap = 0,
         .sequence = &s_audio_tx_seq,
         .audio_origin = true,
+        .deadline_us = deadline_us,
     });
 
     if (ret == ESP_OK) {
+        if (dest_mac == s_broadcast_mac) STATS_INC(tx_broadcast_submit_ok);
+        else STATS_INC(tx_unicast_submit_ok);
+        mesh_timing_record(&s_stats.tx_queue_age, send_start_us - tx_item.timestamp_us);
         (void)xQueueReceive(s_tx_queue, &tx_item, 0);
         note_audio_activity(s_node_id, tx_item.audio_flags);
         if (s_role == MESH_ROLE_COORDINATOR) {
             update_speaker_grants();
         }
-    } else {
-        STATS_INC(slot_misses);
     }
 
-    return ret;
+    return ret == ESP_OK ? MESH_TX_SLOT_SUBMITTED : MESH_TX_SLOT_ERROR;
 }
 void jitter_buffer_insert(const uint8_t *data, uint16_t len, uint8_t src_id, uint8_t seq,
                           uint8_t audio_flags, int64_t timestamp_us)
 {
     xSemaphoreTake(s_jitter_mutex, portMAX_DELAY);
-
-    jitter_entry_t *entry = &s_jitter_buffer[s_jitter_write_idx];
-
-    if (entry->valid) {
+    int64_t now_us = esp_timer_get_time();
+    if (mesh_jitter_push(&s_jitter_buffer, data, len, src_id, seq, audio_flags,
+                         timestamp_us, now_us)) {
         STATS_INC(jitter_overruns);
     }
-
-    memcpy(entry->data, data, len);
-    entry->len = len;
-    entry->src_id = src_id;
-    entry->seq = seq;
-    entry->audio_flags = audio_flags;
-    entry->timestamp_us = timestamp_us;
-    entry->enqueued_us = esp_timer_get_time();
-    entry->valid = true;
-
-    s_jitter_write_idx = (s_jitter_write_idx + 1) % MESH_JITTER_BUFFER_DEPTH;
-
-    uint8_t depth = 0;
-    for (int i = 0; i < MESH_JITTER_BUFFER_DEPTH; i++) {
-        if (s_jitter_buffer[i].valid)
-            depth++;
-    }
-    STATS_SET(jitter_depth, depth);
-
+    STATS_SET(jitter_depth, s_jitter_buffer.count);
     xSemaphoreGive(s_jitter_mutex);
 }
 
@@ -417,33 +459,26 @@ bool jitter_buffer_pop(uint8_t *data, uint16_t *len, uint8_t *src_id, uint8_t *a
                        int64_t *timestamp_us)
 {
     xSemaphoreTake(s_jitter_mutex, portMAX_DELAY);
-
-    jitter_entry_t *entry = &s_jitter_buffer[s_jitter_read_idx];
-
-    if (!entry->valid) {
-        xSemaphoreGive(s_jitter_mutex);
-        STATS_INC(jitter_underruns);
-        return false;
+    int64_t now_us = esp_timer_get_time();
+    mesh_jitter_entry_t entry;
+    mesh_jitter_pop_result_t result = mesh_jitter_pop(&s_jitter_buffer, now_us, &entry);
+    taskENTER_CRITICAL(&s_stats_mux);
+    s_stats.audio_frames_late += result.expired;
+    s_stats.jitter_expired_with_pending_count += result.expired_with_pending;
+    if (result.expired_age_us_max > s_stats.jitter_expired_age_us_max)
+        s_stats.jitter_expired_age_us_max = result.expired_age_us_max;
+    if (result.delivered) s_stats.jitter_pop++;
+    else s_stats.jitter_underruns++;
+    s_stats.jitter_depth = s_jitter_buffer.count;
+    taskEXIT_CRITICAL(&s_stats_mux);
+    if (result.delivered) {
+        memcpy(data, entry.data, entry.len);
+        *len = entry.len;
+        *src_id = entry.src_id;
+        *audio_flags = entry.audio_flags;
+        *timestamp_us = entry.timestamp_us;
+        mesh_timing_record(&s_stats.jitter_deliver_age, now_us - entry.enqueued_us);
     }
-
-    int64_t age_us = esp_timer_get_time() - entry->enqueued_us;
-    if (age_us > (MESH_FRAME_US * 3)) {
-        STATS_INC(audio_frames_late);
-        entry->valid = false;
-        s_jitter_read_idx = (s_jitter_read_idx + 1) % MESH_JITTER_BUFFER_DEPTH;
-        xSemaphoreGive(s_jitter_mutex);
-        return false;
-    }
-
-    memcpy(data, entry->data, entry->len);
-    *len = entry->len;
-    *src_id = entry->src_id;
-    *audio_flags = entry->audio_flags;
-    *timestamp_us = entry->timestamp_us;
-
-    entry->valid = false;
-    s_jitter_read_idx = (s_jitter_read_idx + 1) % MESH_JITTER_BUFFER_DEPTH;
-
     xSemaphoreGive(s_jitter_mutex);
-    return true;
+    return result.delivered;
 }

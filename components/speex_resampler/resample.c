@@ -63,8 +63,21 @@
 
 #ifdef OUTSIDE_SPEEX
 #include <stdlib.h>
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+#if defined(ESP_PLATFORM) && defined(CONFIG_IDF_TARGET_ESP32S31) && CONFIG_IDF_TARGET_ESP32S31 && defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+#include "esp_heap_caps.h"
+/* CPU-only state, filter and history buffers use PSRAM to preserve internal RAM for radio. */
+static void *speex_alloc(int size) {return heap_caps_calloc(size, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);}
+static void *speex_realloc(void *ptr, int size)
+{
+   return heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+#else
 static void *speex_alloc(int size) {return calloc(size,1);}
 static void *speex_realloc(void *ptr, int size) {return realloc(ptr, size);}
+#endif
 static void speex_free(void *ptr) {free(ptr);}
 #ifndef EXPORT
 #define EXPORT

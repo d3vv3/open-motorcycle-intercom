@@ -87,6 +87,12 @@ typedef struct {
  * @brief Mesh statistics
  */
 typedef struct {
+    uint32_t count;
+    uint64_t us_sum;
+    uint32_t us_max;
+} mesh_timing_stat_t;
+
+typedef struct {
     /* Packet counters */
     uint32_t packets_tx;         /**< Total packets transmitted */
     uint32_t packets_rx;         /**< Total packets received */
@@ -100,7 +106,7 @@ typedef struct {
     uint32_t audio_frames_lost; /**< Audio frames never received */
 
     /* TDMA timing */
-    uint32_t slot_misses;   /**< Missed TX slot opportunities */
+    uint32_t slot_misses;   /**< Valid slots ending without a submission (one per slot). */
     uint32_t sync_received; /**< SYNC packets received */
     uint32_t sync_errors;   /**< SYNC timing errors */
     int32_t clock_drift_us; /**< Estimated clock drift */
@@ -124,6 +130,76 @@ typedef struct {
     uint8_t control_queue_high_watermark; /**< Maximum queued control packet count */
     uint32_t contention_tx;               /**< Unassigned JOIN contention transmissions */
     uint32_t contention_deferred;         /**< JOIN attempts deferred by contention pacing */
+    /* Cumulative ESP-NOW audio pipeline counters (frames, except gauges). */
+    uint32_t epoch_id;
+    uint32_t tx_offer;
+    uint32_t tx_enqueue;
+    uint32_t tx_reject_state;
+    uint32_t tx_reject_invalid;
+    uint32_t tx_queue_full;
+    uint32_t tx_purge;
+    uint32_t tx_submit_ok;
+    uint32_t tx_submit_err;
+    uint32_t tx_unicast_submit_ok;   /**< Accepted origin submissions to a single peer. */
+    uint32_t tx_broadcast_submit_ok; /**< Accepted origin submissions to broadcast. */
+    uint32_t tx_radio_fail;
+    uint32_t tx_abandoned;
+    uint32_t relay_overwrite;
+    uint32_t rx_short;
+    uint32_t rx_audio_raw;
+    uint32_t rx_audio_bad_header;
+    uint32_t rx_audio_disabled;
+    uint32_t rx_audio_queue_full;
+    uint32_t rx_audio_queued;
+    uint32_t rx_audio_purge;
+    uint32_t rx_audio_seen;
+    uint32_t rx_audio_invalid;
+    uint32_t rx_audio_self;
+    uint32_t rx_audio_dup;
+    uint32_t jitter_pop;
+    uint32_t jitter_purge;
+    uint32_t rx_deliver;
+    /* Timing aggregates, reset with epoch_id. Maxima are snapshot gauges. */
+    mesh_timing_stat_t rx_loop_gap;
+    uint32_t rx_loop_gap_over_5ms_count;
+    uint32_t rx_loop_gap_over_20ms_count;
+    uint32_t rx_loop_gap_over_60ms_count;
+    mesh_timing_stat_t rx_dequeue_age;
+    mesh_timing_stat_t rx_handle;
+    mesh_timing_stat_t rx_audio_callback;
+    uint32_t rx_audio_callback_over_20ms_count;
+    mesh_timing_stat_t jitter_deliver_age;
+    uint32_t jitter_expired_age_us_max;
+    uint32_t jitter_expired_with_pending_count;
+    mesh_timing_stat_t tx_frame_dispatch_late;
+    mesh_timing_stat_t tx_slot_service_late;
+    uint32_t tx_slot_late_count;
+    uint32_t tx_slot_early_count;
+    uint32_t tx_slot_invalid_count;
+    uint32_t tx_busy_count;
+    uint32_t tx_retry_armed;     /**< Successfully armed 200 us retry timers. */
+    uint32_t tx_retry_recovered; /**< Actual packet submissions after a retry. */
+    uint32_t tx_retry_exhausted; /**< Retried slots expired, busy, or unable to arm timer. */
+    uint32_t tx_deadline_reject;  /**< Slot submissions rejected before the ESP-NOW API call. */
+    mesh_timing_stat_t tx_queue_age;
+    mesh_timing_stat_t tx_esp_now_send;
+    uint32_t send_err_nomem;       /**< Non-OK results from actual esp_now_send calls. */
+    uint32_t send_err_other;
+    int32_t send_last_error;       /**< Zero until the first actual send error. */
+    uint64_t send_last_error_uptime_ms;
+    uint64_t send_heap_snapshot_id; /**< Reservation token; reset with the stats epoch. */
+    uint64_t send_heap_snapshot_uptime_ms;
+    int32_t send_heap_snapshot_error;
+    bool send_heap_snapshot_valid;
+    uint32_t send_error_internal_free;
+    uint32_t send_error_internal_largest;
+    uint32_t send_error_internal_min;
+    uint32_t tx_depth_high_water;
+    mesh_timing_stat_t origin_complete;
+    mesh_timing_stat_t control_complete;
+    uint32_t tx_busy_audio_count;   /**< Audio slot blocked by audio-origin TX. */
+    uint32_t tx_busy_control_count; /**< Audio slot blocked by control/relay TX. */
+    uint32_t tx_busy_age_us_max;
 } mesh_stats_t;
 
 /**
@@ -283,6 +359,9 @@ esp_err_t mesh_get_stats(mesh_stats_t *stats);
  * @return ESP_OK on success
  */
 esp_err_t mesh_reset_stats(void);
+
+/** @brief Emit cumulative ESP-NOW pipeline counters (call at low rate from a task). */
+void mesh_log_pipeline_stats(void);
 
 /**
  * @brief Get current TDMA frame counter

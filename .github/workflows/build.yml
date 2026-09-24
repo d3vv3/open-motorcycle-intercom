@@ -33,6 +33,13 @@ jobs:
           . "$IDF_PATH/export.sh"
           idf.py -C "$GITHUB_WORKSPACE" build
 
+      - name: Verify mesh control packet symbol
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          riscv32-esp-elf-nm -g --defined-only "$GITHUB_WORKSPACE/build/omi.elf" \
+            | grep -E '[[:space:]]T[[:space:]]mesh_send_control_packet$' > /dev/null
+
       - name: Report build size
         shell: bash
         run: |
@@ -75,6 +82,12 @@ jobs:
       - name: Run mesh TX metrics tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_tx_metrics_test.c -o /tmp/mesh_tx_metrics_test && /tmp/mesh_tx_metrics_test
 
+      - name: Run CPU profile metrics tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/cpu_profile_metrics_test.c -o /tmp/cpu_profile_metrics_test && /tmp/cpu_profile_metrics_test
+
+      - name: Run mesh TX slot tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_tx_slot_test.c -o /tmp/mesh_tx_slot_test && /tmp/mesh_tx_slot_test
+
       - name: Run audio bundle tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/audio_bundle_test && /tmp/audio_bundle_test
 
@@ -84,8 +97,24 @@ jobs:
       - name: Run audio PCM resampler tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/audio_pcm_resampler_test && /tmp/audio_pcm_resampler_test
 
+      - name: Run audio notification tone tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include tests/c/audio_notification_tone_test.c -lm -o /tmp/audio_notification_tone_test && /tmp/audio_notification_tone_test
+
       - name: Run audio rate converter tests
         run: cc -std=c11 -Wall -Wextra -Werror -Wno-sign-compare -pedantic -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/audio_rate_converter_test && /tmp/audio_rate_converter_test
+
+      - name: Run Speex resampler tests in interpolated and direct modes
+        run: |
+          set -e
+          for mode in interpolated direct; do
+            extra=()
+            if [ "$mode" = direct ]; then extra=(-DRESAMPLE_FULL_SINC_TABLE); fi
+            cc -std=c11 -O2 -Wall -Wextra -Werror -Wno-sign-compare \
+              -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex "${extra[@]}" \
+              -Icomponents/speex_resampler components/speex_resampler/resample.c \
+              tests/c/speex_resampler_test.c -lm -o "/tmp/speex_resampler_$mode"
+            "/tmp/speex_resampler_$mode"
+          done
 
       - name: Run audio music scheduling tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio tests/c/audio_music_schedule_test.c -o /tmp/audio_music_schedule_test && /tmp/audio_music_schedule_test
@@ -142,6 +171,7 @@ jobs:
           FLAGS="-std=c11 -Wall -Wextra -Werror -pedantic"
           cc $FLAGS $SAN -I. shared/mesh_core.c tests/c/mesh_core_test.c -o /tmp/san_mesh_core && /tmp/san_mesh_core
           cc $FLAGS $SAN -I. tests/c/mesh_tx_metrics_test.c -o /tmp/san_mesh_tx_metrics && /tmp/san_mesh_tx_metrics
+          cc $FLAGS $SAN -I. tests/c/mesh_tx_slot_test.c -o /tmp/san_mesh_tx_slot && /tmp/san_mesh_tx_slot
           cc $FLAGS $SAN -Inrf_mesh/include tests/c/ws_sync_math_test.c -o /tmp/san_ws_sync_math && /tmp/san_ws_sync_math
           cc $FLAGS $SAN -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/san_audio_bundle && /tmp/san_audio_bundle
           cc $FLAGS $SAN -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/san_audio_tx_cache && /tmp/san_audio_tx_cache
@@ -158,7 +188,13 @@ jobs:
            cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
-          cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
+           cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
+
+      - name: Run mesh jitter buffer tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_jitter_buffer_test.c -o /tmp/mesh_jitter_buffer_test && /tmp/mesh_jitter_buffer_test
+
+      - name: Run mesh wire tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_wire_test.c -o /tmp/mesh_wire_test && /tmp/mesh_wire_test
 
   nrf-zephyr:
     name: nRF52840 Zephyr firmware

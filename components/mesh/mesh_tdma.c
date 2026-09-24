@@ -51,6 +51,8 @@ void service_frame_boundary(const frame_event_t *event)
         xSemaphoreGive(s_frame_timer_mutex);
         return;
     }
+    mesh_timing_record(&s_stats.tx_frame_dispatch_late,
+                       esp_timer_get_time() - event->timestamp_us);
 
     esp_err_t timer_ret = arm_frame_timer_at_generation_locked(event->timestamp_us + MESH_FRAME_US,
                                                                event->generation);
@@ -88,17 +90,33 @@ void service_frame_boundary(const frame_event_t *event)
     }
 
     if (s_slot_index >= 0 && s_state == MESH_STATE_ACTIVE) {
+        taskENTER_CRITICAL(&s_transport_mux);
+        bool stopping = s_stopping;
+        taskEXIT_CRITICAL(&s_transport_mux);
+        taskENTER_CRITICAL(&s_tdma_mux);
+        uint32_t old_slot_generation = s_slot_generation;
+        uint32_t generation = s_tdma_generation;
+        int64_t old_deadline_us = s_slot_deadline_us;
+        taskEXIT_CRITICAL(&s_tdma_mux);
+        if (!stopping && mesh_tx_slot_rollover(&s_mesh.slot_state, old_slot_generation,
+                                               generation, old_deadline_us, esp_timer_get_time())) {
+            STATS_INC(slot_misses);
+            if (s_mesh.slot_state.retried) STATS_INC(tx_retry_exhausted);
+        }
+
         int64_t slot_offset_us = (int64_t)s_slot_index * MESH_SLOT_US;
         taskENTER_CRITICAL(&s_tdma_mux);
         s_slot_start_us = frame_start_us + slot_offset_us;
         s_slot_deadline_us = frame_start_us + slot_offset_us + MESH_SLOT_US - MESH_GUARD_US;
         s_slot_generation = event->generation;
         taskEXIT_CRITICAL(&s_tdma_mux);
+        s_mesh.slot_state = (mesh_tx_slot_state_t){.assigned_index = s_slot_index};
 
         int64_t slot_delay_us = s_slot_start_us - esp_timer_get_time();
         if (slot_delay_us <= 0) {
             xSemaphoreGive(s_slot_semaphore);
         } else if (esp_timer_start_once(s_slot_timer, slot_delay_us) != ESP_OK) {
+            s_mesh.slot_state.completed = true;
             STATS_INC(slot_misses);
         }
     }
@@ -120,22 +138,62 @@ void control_timer_callback(void *arg)
 
 void service_tx_slot(void)
 {
+    xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool stopping = s_stopping;
+    taskEXIT_CRITICAL(&s_transport_mux);
     taskENTER_CRITICAL(&s_tdma_mux);
     int64_t slot_start_us = s_slot_start_us;
     int64_t deadline_us = s_slot_deadline_us;
-    bool valid = s_slot_generation == s_tdma_generation;
+    uint32_t slot_generation = s_slot_generation;
+    uint32_t generation = s_tdma_generation;
     taskEXIT_CRITICAL(&s_tdma_mux);
 
     int64_t now_us = esp_timer_get_time();
-    if (!valid || s_state != MESH_STATE_ACTIVE || s_slot_index < 0 || now_us < slot_start_us ||
-        now_us > deadline_us) {
-        STATS_INC(slot_misses);
+    mesh_tx_slot_check_t check = mesh_tx_slot_check(&s_mesh.slot_state,
+        s_state == MESH_STATE_ACTIVE, stopping, s_slot_index, slot_generation, generation,
+        slot_start_us, deadline_us, now_us);
+    if (slot_generation == generation && s_state == MESH_STATE_ACTIVE && s_slot_index >= 0) {
+        mesh_timing_record(&s_stats.tx_slot_service_late, now_us - slot_start_us);
+    }
+    if (check != MESH_TX_SLOT_ATTEMPT) {
+        if (check == MESH_TX_SLOT_INVALID) STATS_INC(tx_slot_invalid_count);
+        else if (check == MESH_TX_SLOT_EARLY) STATS_INC(tx_slot_early_count);
+        else if (check == MESH_TX_SLOT_EXPIRED) {
+            STATS_INC(tx_slot_late_count);
+            STATS_INC(slot_misses);
+            if (s_mesh.slot_state.retried) STATS_INC(tx_retry_exhausted);
+        }
+        xSemaphoreGive(s_frame_timer_mutex);
         return;
     }
 
     power_radio_slot_start();
-    send_audio_in_slot();
+    mesh_tx_slot_send_result_t result = send_audio_in_slot(deadline_us);
     power_radio_slot_end();
+
+    taskENTER_CRITICAL(&s_transport_mux);
+    stopping = s_stopping;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    if (!stopping) {
+        mesh_tx_slot_outcome_t outcome = mesh_tx_slot_finish(&s_mesh.slot_state, result,
+            esp_timer_get_time(), deadline_us, MESH_GUARD_US);
+        if (outcome == MESH_TX_SLOT_RETRY) {
+            if (esp_timer_start_once(s_slot_timer, MESH_TX_SLOT_RETRY_US) == ESP_OK) {
+                STATS_INC(tx_retry_armed);
+            } else {
+                s_mesh.slot_state.completed = true;
+                STATS_INC(slot_misses);
+                STATS_INC(tx_retry_exhausted);
+            }
+        } else if (outcome == MESH_TX_SLOT_RECOVERED) {
+            STATS_INC(tx_retry_recovered);
+        } else if (outcome == MESH_TX_SLOT_MISSED || outcome == MESH_TX_SLOT_EXHAUSTED) {
+            STATS_INC(slot_misses);
+            if (outcome == MESH_TX_SLOT_EXHAUSTED) STATS_INC(tx_retry_exhausted);
+        }
+    }
+    xSemaphoreGive(s_frame_timer_mutex);
 }
 
 void service_control_window(void)

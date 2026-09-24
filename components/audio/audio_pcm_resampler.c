@@ -125,6 +125,22 @@ size_t audio_pcm_resampler_depth(const audio_pcm_resampler_t *resampler)
     return resampler == NULL ? 0u : resampler->depth;
 }
 
+size_t audio_pcm_resampler_admission_blocks(const audio_pcm_resampler_t *resampler)
+{
+    if (resampler == NULL || resampler->depth >= AUDIO_PCM_RESAMPLER_TARGET_SAMPLES) {
+        return 0u;
+    }
+
+    const size_t room = AUDIO_PCM_RESAMPLER_TARGET_SAMPLES - resampler->depth;
+    const size_t block = AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES;
+    size_t blocks = room / block;
+    if (!resampler->started && room % block != 0u) {
+        ++blocks;
+    }
+    const size_t available = audio_pcm_resampler_available(resampler) / block;
+    return blocks < available ? blocks : available;
+}
+
 audio_pcm_resampler_telemetry_t audio_pcm_resampler_push(audio_pcm_resampler_t *resampler,
                                                          const int16_t *samples,
                                                          size_t sample_count, bool active)

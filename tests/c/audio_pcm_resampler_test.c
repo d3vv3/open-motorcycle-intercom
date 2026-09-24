@@ -313,6 +313,71 @@ static void test_underrun_and_restart(void)
     assert(output[AUDIO_PCM_RESAMPLER_RESTART_FADE_SAMPLES] == 10000);
 }
 
+static void test_partial_residual_admission_restarts(void)
+{
+    audio_pcm_resampler_t state;
+    audio_pcm_resampler_telemetry_t status;
+    int16_t block[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES];
+    int16_t full_ring[AUDIO_PCM_RESAMPLER_RING_SAMPLES];
+    int16_t output[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES];
+    size_t admission;
+    size_t i;
+
+    fill_constant(block, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES, 1000);
+    audio_pcm_resampler_reset(&state);
+    assert(audio_pcm_resampler_admission_blocks(&state) == 4u);
+    for (i = 0u; i < 4u; ++i) {
+        assert(!audio_pcm_resampler_push(&state, block, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES,
+                                         true).rejected_push);
+    }
+    assert(state.depth == AUDIO_PCM_RESAMPLER_TARGET_SAMPLES);
+    assert(audio_pcm_resampler_admission_blocks(&state) == 0u);
+
+    /* One extra sample survives the drain, as can happen with fractional consumption. */
+    assert(!audio_pcm_resampler_push(&state, block, 1u, true).rejected_push);
+    for (i = 0u; i < 8u; ++i) {
+        status = audio_pcm_resampler_render(&state, output, 0u);
+        if (status.underrun) break;
+    }
+    assert(i < 8u);
+    assert(!state.started);
+    assert(state.depth > 0u && state.depth < AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES);
+    assert((AUDIO_PCM_RESAMPLER_TARGET_SAMPLES - state.depth) /
+               AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES == 3u);
+    assert(audio_pcm_resampler_admission_blocks(&state) == 4u);
+
+    admission = audio_pcm_resampler_admission_blocks(&state);
+    for (i = 0u; i < admission; ++i) {
+        assert(!audio_pcm_resampler_push(&state, block, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES,
+                                         true).rejected_push);
+    }
+    assert(state.depth >= AUDIO_PCM_RESAMPLER_START_SAMPLES);
+    assert(state.depth < AUDIO_PCM_RESAMPLER_START_SAMPLES + AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES);
+    status = audio_pcm_resampler_render(&state, output, 0u);
+    assert(status.started && !status.underrun && status.audible_active);
+    assert(status.consumed_count > 0u);
+    assert(output[AUDIO_PCM_RESAMPLER_RESTART_FADE_SAMPLES] == 1000);
+
+    audio_pcm_resampler_reset(&state);
+    fill_constant(full_ring, AUDIO_PCM_RESAMPLER_RING_SAMPLES, 1000);
+    assert(!audio_pcm_resampler_push(&state, full_ring, AUDIO_PCM_RESAMPLER_RING_SAMPLES -
+                                    AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES + 1u, true).rejected_push);
+    assert(audio_pcm_resampler_available(&state) < AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES);
+    assert(audio_pcm_resampler_admission_blocks(&state) == 0u);
+
+    audio_pcm_resampler_reset(&state);
+    for (i = 0u; i < 4u; ++i) {
+        assert(!audio_pcm_resampler_push(&state, block, AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES,
+                                         true).rejected_push);
+    }
+    status = audio_pcm_resampler_render(&state, output, 0u);
+    assert(status.started && state.depth == AUDIO_PCM_RESAMPLER_TARGET_SAMPLES -
+                                             AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES);
+    assert(audio_pcm_resampler_admission_blocks(&state) == 1u);
+    assert(!audio_pcm_resampler_push(&state, block, 1u, true).rejected_push);
+    assert(audio_pcm_resampler_admission_blocks(&state) == 0u);
+}
+
 static void test_activity_follows_pcm_timeline(void)
 {
     audio_pcm_resampler_t state;
@@ -501,6 +566,7 @@ int main(void)
     test_ring_wrap_and_overflow();
     test_int16_limits();
     test_underrun_and_restart();
+    test_partial_residual_admission_restarts();
     test_activity_follows_pcm_timeline();
     test_two_producer_gaps_are_bridged();
     test_upstream_burst_recovery();

@@ -170,6 +170,34 @@ typedef struct {
  * @brief Audio statistics
  */
 typedef struct {
+    uint32_t count;
+    uint64_t us_sum;
+    uint32_t us_max;
+} audio_music_timing_t;
+
+typedef struct {
+    uint32_t pipeline_epoch;   /**< New random stats epoch on successful init */
+    audio_music_timing_t music_mutex_wait;
+    audio_music_timing_t music_route_read; /**< Route-lock wait plus locked reads. */
+    audio_music_timing_t music_convert;    /**< Entire rate-converter process calls. */
+    audio_music_timing_t music_mix;
+    uint32_t music_render_over20ms_count;
+    uint32_t music_iterations_count;
+    uint32_t music_chunks_count;
+    uint64_t music_input_frames;
+    uint64_t music_output_frames;
+    uint32_t music_rate_hz; /**< Last active music format, zero if inactive. */
+    uint8_t music_channels;
+    uint32_t tx_handoff;       /**< Encoded frames passed to the TX callback */
+    uint32_t tx_no_cb;         /**< Transmittable encoded frames without a callback */
+    uint32_t rx_offer;         /**< Calls to audio_put_rx_frame */
+    uint32_t rx_store_ok;      /**< Packets accepted by the remote store */
+    uint32_t rx_store_reject;  /**< Calls not accepted by the remote store */
+    uint32_t rx_invalid;       /**< Invalid frame, source ID, or caller */
+    uint32_t rx_inactive;      /**< Audio unavailable or not accepting remote audio */
+    uint32_t rx_store_pop;     /**< Actual remote packets removed for playout */
+    uint32_t rx_store_purge;   /**< Queued remote packets removed without playout */
+    uint32_t capture_fifo_discard_samples; /**< 16 kHz samples lost on FIFO reset/push failure */
     uint32_t frames_encoded;     /**< Total frames encoded */
     uint32_t frames_decoded;     /**< Total frames decoded */
     uint32_t frames_dropped;     /**< Frames rejected by bounded audio buffers */
@@ -220,6 +248,22 @@ typedef struct {
     bool asrc_recovery_active;             /**< ASRC is draining compressed packet backlog */
     uint32_t playout_task_loops;           /**< I2S-paced playout loop count */
     uint32_t notification_queue_overflows; /**< Notification requests dropped while queue is full */
+    uint32_t notify_started_count, notify_completed_count;
+    uint32_t notify_mix_count;
+    uint64_t notify_mix_us_sum;
+    uint32_t notify_mix_us_max;
+    uint32_t notify_frame_gap_count, notify_frame_gap_over25ms_count;
+    uint64_t notify_frame_gap_us_sum;
+    uint32_t notify_frame_gap_us_max;
+    uint32_t notify_work_count;
+    uint64_t notify_work_us_sum;
+    uint32_t notify_work_us_max;
+    uint32_t notify_write_count;
+    uint64_t notify_write_us_sum;
+    uint32_t notify_write_us_max;
+    uint32_t notify_write_gap_count;
+    uint64_t notify_write_gap_us_sum;
+    uint32_t notify_write_gap_us_max;
     uint32_t playback_frames;              /**< Complete I2S playback writes */
     uint8_t active_rx_sources;             /**< Remote source slots currently assigned */
     bool vox_active;                       /**< Current VOX state */

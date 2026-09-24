@@ -19,6 +19,8 @@ from benchtool.stats import (
     _nrf_starvation_delta,
     _nrf_starvation_total,
     compute_correlated_delivery,
+    compute_esp_discard_health,
+    compute_esp_stage_rows,
     compute_hop_pct,
 )
 
@@ -121,6 +123,9 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
             }
             for name in sorted(s.first_pipe)
         },
+        "esp_stage_rows": compute_esp_stage_rows(s),
+        "health": _overall_health(s),
+        "esp_discard_health": compute_esp_discard_health(s),
     }
     for name in _SNAPSHOT_NAMES:
         d.update(_snapshot_json(s, name))
@@ -154,6 +159,28 @@ def _build_port_json(s: PortStats) -> dict[str, Any]:
     return d
 
 
+def _overall_health(s: PortStats) -> str:
+    """Augment legacy checks with measured stage-local discards."""
+    legacy = _health_line(s)
+    assessment = compute_esp_discard_health(s)
+    warnings = assessment["warnings"]
+    unavailable = assessment["unavailable"]
+    if warnings:
+        details = ", ".join(warnings)
+        if legacy.startswith("WARN ("):
+            legacy = legacy[:-1] + ", " + details + ")"
+        elif legacy.startswith("OK ("):
+            legacy = f"WARN ({details})"
+        else:
+            legacy += f"; ESP discards: {details}"
+    if unavailable:
+        note = "ESP discard telemetry unavailable: " + ", ".join(unavailable)
+        if legacy.startswith("OK ("):
+            return f"UNKNOWN ({note}; no measured discards observed)"
+        return f"{legacy}; {note}"
+    return legacy
+
+
 def write_summary_json(
     path: str,
     started_at: float,
@@ -173,6 +200,10 @@ def write_summary_json(
         "actual_duration_s": round(ended_at - started_at, 3),
         "ports": [_build_port_json(s) for s in all_stats],
         "correlated_delivery": compute_correlated_delivery(all_stats),
+        "espnow_air_loss": {
+            "status": "unknown",
+            "reason": "Aggregate receive counters lack per-sender identity; local radio completion is not remote receipt",
+        },
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
@@ -497,6 +528,7 @@ def _e2e_lines(s: PortStats) -> list[str]:
 def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     """Generate human-readable report lines for one port."""
     out = _header_lines(s)
+    out.extend(_esp_stage_lines(s))
     out.extend(_mesh_lines(s))
     out.extend(_bridge_lines(s))
     out.extend(_playback_lines(s, duration))
@@ -506,8 +538,37 @@ def _report_lines_for_port(s: PortStats, duration: int) -> list[str]:
     out.extend(_e2e_lines(s))
     if s.last_crc_warn is not None:
         out.append(f"  Last ESP bridge CRC warn counter: {s.last_crc_warn}")
-    out.append(f"  Health: {_health_line(s)}")
+    out.append(f"  Health: {_overall_health(s)}")
     out.append("")
+    return out
+
+
+def _esp_stage_lines(s: PortStats) -> list[str]:
+    rows = compute_esp_stage_rows(s)
+    if not rows:
+        return []
+    out = ["  ESP-NOW/LC3 stage intervals (20 ms per encoded/decoded frame; local observations; BT overflows count rejected PCM frames for music/call and rejected samples for mic):"]
+    for row in rows:
+        ident = row["identity"]
+        label = (f"{ident['stage']}/{ident.get('part', 'all')} "
+                 f"epoch={ident.get('epoch_id', 'unknown')} "
+                 f"mac={ident.get('node_mac', 'unknown')} "
+                 f"node={ident.get('node_id', 'unknown')} role={ident.get('role', 'unknown')}")
+        if row["status"] != "measured":
+            out.append(f"    {label}: unavailable ({row['samples']} samples; need two monotonic same-epoch samples with uptime and a full-window counter)")
+            continue
+        out.append(f"    {label}: {row['elapsed_ms']}ms, {row['samples']} samples")
+        for category, counters in row["counters"].items():
+            if counters:
+                values = " ".join(f"{name}={value}" for name, value in counters.items())
+                out.append(f"      {category}: {values}")
+        if row["rates_per_s"]:
+            out.append("      frames/s: " + " ".join(
+                f"{name}={rate if rate is not None else 'n/a'}" for name, rate in row["rates_per_s"].items()))
+        if row["gauges"]:
+            out.append("      latest gauges: " + " ".join(
+                f"{name}={value}" for name, value in row["gauges"].items()))
+    out.append("    Air loss unknown: local radio completion is not remote receipt; sequence gaps and concealment are diagnostics, not proven radio drops. capture_fifo_discard_samples counts samples, not frames. rx_store_reject aggregates rejection reasons; queue diagnostics can overlap audio queue drops. Do not add categories into end-to-end loss.")
     return out
 
 
@@ -550,6 +611,8 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
     printed = False
 
     for s in all_stats:
+        if compute_esp_stage_rows(s):
+            print(f"  {s.port} Health: {_overall_health(s)}")
         glitch_d = s.delta("glitch")
         hop = compute_hop_pct(s)
 
@@ -610,8 +673,24 @@ def print_quick_summary(all_stats: list[PortStats], duration: int) -> None:
                 print(f"  {s.port} (nRF): {' | '.join(parts)}")
                 printed = True
 
+        for row in compute_esp_stage_rows(s):
+            ident = row["identity"]
+            label = f"{s.port} {ident['stage']}/{ident.get('part', 'all')} epoch={ident.get('epoch_id', 'unknown')}"
+            if row["status"] == "measured":
+                rates = row["rates_per_s"]
+                selected = ("encode_ok", "tx_radio_ok", "rx_audio_accept", "rx_deliver", "rx_store_ok", "decode_ok")
+                shown = " ".join(f"{k}={rates[k]}/s" if rates[k] is not None else f"{k}=n/a" for k in selected if k in rates)
+                drops = " ".join(f"{k}={v}" for k, v in row["counters"]["discards"].items() if v)
+                print(f"  {label}: {shown or 'no frame counters'} ({row['elapsed_ms']}ms)"
+                      + (f" discards: {drops}" if drops else ""))
+            else:
+                print(f"  {label}: unavailable ({row['samples']} samples)")
+            printed = True
+
     if not printed:
         print("  (no metrics captured)")
     correlation = compute_correlated_delivery(all_stats)
     print(f"  Correlated delivery: {correlation['status']}")
+    if any(compute_esp_stage_rows(s) for s in all_stats):
+        print("  ESP-NOW air loss: unknown (no per-sender receive correlation)")
     print()

@@ -9,6 +9,7 @@ idf_component_register(
     INCLUDE_DIRS "." "../shared"
     REQUIRES 
         audio
+        cpu_profile
         phone_audio
         mesh
         uart_bridge
@@ -19,3 +20,7 @@ idf_component_register(
         heap
         nvs_flash
 )
+
+if(S31_LC3_WIRE AND IDF_TARGET STREQUAL "esp32s31")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE APP_S31_LC3_WIRE=1)
+endif()

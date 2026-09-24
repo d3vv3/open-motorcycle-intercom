@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "esp_random.h"
 
 #include "audio_internal.h"
 
@@ -345,8 +346,10 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         return ret;
     }
 
+    uint32_t pipeline_epoch = esp_random();
     AUDIO_STATS_LOCK();
     memset(&g_audio.stats, 0, sizeof(g_audio.stats));
+    g_audio.stats.pipeline_epoch = pipeline_epoch;
     g_audio.tx_pipe_sum_us = 0u;
     g_audio.tx_pipe_count = 0u;
     g_audio.rx_pipe_sum_us = 0u;
@@ -393,6 +396,9 @@ static void audio_unwind_locked(void)
     audio_join_workers_locked();
     audio_hw_codec_stop();
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
+    AUDIO_STATS_LOCK();
+    g_audio.stats.capture_fifo_discard_samples += (uint32_t)g_audio.capture_fifo.depth;
+    AUDIO_STATS_UNLOCK();
     audio_capture_fifo_reset(&g_audio.capture_fifo);
     audio_rx_reset_source_metadata();
     audio_hw_opus_deinit();
@@ -496,6 +502,9 @@ static esp_err_t audio_stop_locked(void)
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
     (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
     (void)audio_rate_converter_reset(g_audio.far_reference_converter);
+    AUDIO_STATS_LOCK();
+    g_audio.stats.capture_fifo_discard_samples += (uint32_t)g_audio.capture_fifo.depth;
+    AUDIO_STATS_UNLOCK();
     audio_capture_fifo_reset(&g_audio.capture_fifo);
     audio_rx_reset_source_metadata();
     xQueueReset(g_audio.loopback_queue);
@@ -591,6 +600,9 @@ static esp_err_t audio_start_locked(void)
     audio_playout_reset_far_reference();
     if (g_audio.music_playback_converter != NULL &&
         audio_rate_converter_reset(g_audio.music_playback_converter) != 0) return ESP_FAIL;
+    AUDIO_STATS_LOCK();
+    g_audio.stats.capture_fifo_discard_samples += (uint32_t)g_audio.capture_fifo.depth;
+    AUDIO_STATS_UNLOCK();
     audio_capture_fifo_reset(&g_audio.capture_fifo);
     xQueueReset(g_audio.loopback_queue);
     AUDIO_STATS_LOCK();
@@ -610,11 +622,38 @@ static esp_err_t audio_start_locked(void)
         audio_route_lock_release();
     }
 
+    uint32_t capture_stack = AUDIO_CAPTURE_TASK_STACK_SIZE;
+    uint32_t playout_stack = AUDIO_PLAYOUT_TASK_STACK_SIZE;
+#if defined(AUDIO_S31_LC3_SINGLE_OWNER)
+    if (g_audio.config.mode == AUDIO_MODE_MESH) {
+        capture_stack = 12288u;
+        playout_stack = 12288u;
+    }
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    ESP_LOGI(TAG, "LC3 owner mode=%d capture_stack=%u playout_stack=%u internal free=%u largest=%u",
+             (int)g_audio.config.mode, (unsigned)capture_stack, (unsigned)playout_stack,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps));
+#endif
+    BaseType_t playout_core = AUDIO_TASK_CORE;
+#if defined(AUDIO_S31_LC3_SPLIT_CORES)
+    if (g_audio.config.mode == AUDIO_MODE_MESH) {
+        playout_core = 0;
+    }
+    ESP_LOGI(TAG, "LC3 split cores=1 mode=%d requested playout_core=%d capture_core=%d caller_core=%d",
+             (int)g_audio.config.mode, (int)playout_core, (int)AUDIO_TASK_CORE,
+             (int)xPortGetCoreID());
+#endif
     log_audio_worker_memory("audio_playout task");
     BaseType_t created = xTaskCreatePinnedToCore(
-        audio_playout_task, "audio_playout", AUDIO_PLAYOUT_TASK_STACK_SIZE, NULL,
-        AUDIO_PLAYOUT_TASK_PRIORITY, &g_audio.playout_task, AUDIO_TASK_CORE);
+        audio_playout_task, "audio_playout", playout_stack, NULL,
+        AUDIO_PLAYOUT_TASK_PRIORITY, &g_audio.playout_task, playout_core);
+#if defined(AUDIO_S31_LC3_SPLIT_CORES)
+    ESP_LOGI(TAG, "LC3 split cores=1 playout create result=%d", (int)created);
+#endif
     if (created != pdPASS) {
+        ESP_LOGE(TAG, "audio_playout task create failed: requested stack=%u bytes",
+                 (unsigned)playout_stack);
         g_audio.playout_task = NULL;
         atomic_store_explicit(&g_audio.running, false, memory_order_release);
         audio_hw_codec_stop();
@@ -623,15 +662,21 @@ static esp_err_t audio_start_locked(void)
     xSemaphoreTake(g_audio.playout_started, portMAX_DELAY);
     if (!atomic_load_explicit(&g_audio.playout_ready, memory_order_acquire)) {
         xSemaphoreTake(g_audio.playout_done, portMAX_DELAY);
+        atomic_store_explicit(&g_audio.running, false, memory_order_release);
         audio_hw_codec_stop();
         return ESP_FAIL;
     }
 
     log_audio_worker_memory("audio_capture task");
     created = xTaskCreatePinnedToCore(
-        audio_capture_task, "audio_capture", AUDIO_CAPTURE_TASK_STACK_SIZE, NULL,
+        audio_capture_task, "audio_capture", capture_stack, NULL,
         AUDIO_CAPTURE_TASK_PRIORITY, &g_audio.capture_task, AUDIO_TASK_CORE);
+#if defined(AUDIO_S31_LC3_SPLIT_CORES)
+    ESP_LOGI(TAG, "LC3 split cores=1 capture create result=%d", (int)created);
+#endif
     if (created != pdPASS) {
+        ESP_LOGE(TAG, "audio_capture task create failed: requested stack=%u bytes",
+                 (unsigned)capture_stack);
         g_audio.capture_task = NULL;
         audio_join_workers_locked();
         audio_hw_codec_stop();

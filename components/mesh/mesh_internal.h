@@ -20,6 +20,10 @@
 
 #include "mesh.h"
 #include "mesh_core.h"
+#include "mesh_jitter_buffer.h"
+#include "mesh_tx_slot.h"
+
+_Static_assert(MESH_JITTER_BUFFER_DEPTH == MESH_JITTER_CAPACITY, "jitter capacity mismatch");
 
 #define MESH_TASK_STACK_SIZE 4096
 #define MESH_TASK_PRIORITY   6
@@ -60,17 +64,6 @@ typedef struct {
 } mesh_rx_item_t;
 
 typedef struct {
-    uint8_t data[MESH_MAX_OPUS_BYTES];
-    uint16_t len;
-    uint8_t src_id;
-    uint8_t seq;
-    uint8_t audio_flags;
-    int64_t timestamp_us; /* Original ESP-NOW receive timestamp. */
-    int64_t enqueued_us;  /* Local insertion time used for jitter expiry. */
-    bool valid;
-} jitter_entry_t;
-
-typedef struct {
     mesh_peer_info_t info;
     mesh_core_seq8_t rx_seq;
     uint32_t packets_received;
@@ -93,6 +86,7 @@ typedef struct {
     uint8_t relay_bitmap;
     bool audio_origin;
     bool active;
+    int64_t starts_us;
 } tx_inflight_t;
 
 typedef struct {
@@ -104,6 +98,7 @@ typedef struct {
     uint8_t relay_bitmap;
     uint8_t *sequence;
     bool audio_origin;
+    int64_t deadline_us; /* Zero for non-slot traffic. */
 } tracked_esp_now_send_request_t;
 
 typedef enum {
@@ -162,6 +157,7 @@ typedef struct {
     uint32_t frame_timer_generation;
     int64_t expected_frame_us;
     uint32_t slot_generation;
+    mesh_tx_slot_state_t slot_state; /* Protected by frame_timer_mutex. */
     uint32_t control_generation;
     SemaphoreHandle_t frame_timer_mutex;
     SemaphoreHandle_t slot_semaphore;
@@ -195,9 +191,7 @@ typedef struct {
     relay_entry_t relay_ring[RELAY_RING_SIZE];
     uint8_t relay_head;
     uint8_t relay_tail;
-    jitter_entry_t jitter_buffer[MESH_JITTER_BUFFER_DEPTH];
-    uint8_t jitter_read_idx;
-    uint8_t jitter_write_idx;
+    mesh_jitter_buffer_t jitter_buffer;
     SemaphoreHandle_t jitter_mutex;
 
     mesh_audio_cb_t audio_cb;
@@ -277,8 +271,6 @@ extern const uint8_t s_broadcast_mac[6];
 #define s_relay_head                 s_mesh.relay_head
 #define s_relay_tail                 s_mesh.relay_tail
 #define s_jitter_buffer              s_mesh.jitter_buffer
-#define s_jitter_read_idx            s_mesh.jitter_read_idx
-#define s_jitter_write_idx           s_mesh.jitter_write_idx
 #define s_jitter_mutex               s_mesh.jitter_mutex
 #define s_audio_cb                   s_mesh.audio_cb
 #define s_state_cb                   s_mesh.state_cb
@@ -301,6 +293,23 @@ extern const uint8_t s_broadcast_mac[6];
         taskEXIT_CRITICAL(&s_stats_mux);                                                           \
     } while (0)
 
+static inline uint32_t mesh_timing_us(int64_t elapsed_us)
+{
+    return elapsed_us <= 0 ? 0 :
+           (uint64_t)elapsed_us > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_us;
+}
+
+/* Caller obtains timestamps outside the stats critical section. */
+static inline void mesh_timing_record(mesh_timing_stat_t *stat, int64_t elapsed_us)
+{
+    uint32_t us = mesh_timing_us(elapsed_us);
+    taskENTER_CRITICAL(&s_stats_mux);
+    if (stat->count < UINT32_MAX) stat->count++;
+    stat->us_sum = UINT64_MAX - stat->us_sum < us ? UINT64_MAX : stat->us_sum + us;
+    if (us > stat->us_max) stat->us_max = us;
+    taskEXIT_CRITICAL(&s_stats_mux);
+}
+
 bool relay_queue_empty(void);
 bool enqueue_relay_packet(const uint8_t *data, uint16_t len, uint8_t ttl, uint8_t flags);
 void clear_speaker_state(void);
@@ -314,11 +323,13 @@ uint8_t compute_relay_mask(uint8_t speaker_id);
 void send_speaker_release_for(uint8_t speaker_id);
 void update_speaker_grants(void);
 void clear_transient_mesh_state(void);
+uint32_t drain_rx_queue_for_reset(void);
 void jitter_buffer_insert(const uint8_t *data, uint16_t len, uint8_t src_id, uint8_t seq,
                           uint8_t audio_flags, int64_t timestamp_us);
 bool jitter_buffer_pop(uint8_t *data, uint16_t *len, uint8_t *src_id, uint8_t *audio_flags,
-                       int64_t *timestamp_us);
-esp_err_t send_audio_in_slot(void);
+                        int64_t *timestamp_us);
+void mesh_note_audio_tx_busy(void);
+mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us);
 
 esp_err_t init_esp_now_transport(void);
 void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len);
@@ -328,7 +339,7 @@ esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len
 bool dequeue_control_packet(control_tx_item_t *item);
 void reset_control_queue(void);
 void mesh_transport_restore_status_bitmaps(const control_tx_item_t *item);
-esp_err_t send_packet(mesh_pkt_type_t type, const void *payload, uint16_t len);
+esp_err_t mesh_send_control_packet(mesh_pkt_type_t type, const void *payload, uint16_t len);
 esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint16_t len,
                                 const uint8_t *dest_mac);
 esp_err_t tracked_esp_now_send(const tracked_esp_now_send_request_t *request);

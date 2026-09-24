@@ -16,6 +16,7 @@ from benchmark import (
     compute_hop_pct,
     parse_pipeline_logfmt,
 )
+from benchtool.report import _overall_health
 
 
 class PipelineLogTest(unittest.TestCase):
@@ -303,6 +304,525 @@ class PipelineLogTest(unittest.TestCase):
         self.assertNotIn("asrc_recovery", pipeline["delta"])
         self.assertEqual(pipeline["last"]["asrc_ppm"], 250)
         self.assertEqual(pipeline["last"]["asrc_recovery"], 1)
+
+    def test_cpu_summary_snapshots_are_gauges_and_do_not_change_other_stages(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=cpu part=summary epoch_id=0x01 node_mac=aa:bb"
+        for uptime, valid, total, interval, new, reset, failed, idle0, idle1 in (
+            (1000, 1, 5000000000, 1000000, 2, 1, 0, 1, 1),
+            (2000, 0, 6000000000, 0, 0, 0, 1, 0, 0),
+        ):
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} valid={valid} total_us={total} "
+                f"interval_us={interval} task_count=20 "
+                "task_count_hint=24 capacity=32 "
+                f"matched=18 new={new} gone=1 reset={reset} coverage_permille=900 "
+                f"snapshot_fail={failed}"
+            )
+            reader._parse_line(
+                f"{meta.replace('part=summary', 'part=idle')} uptime_ms={uptime} "
+                f"valid={valid} interval_us={interval} accounted_us=800000 "
+                f"accounted_permille=800 chip_permille=400 idle0_valid={idle0} "
+                "idle0_us=100000 idle0_permille=100 "
+                f"idle1_valid={idle1} idle1_us=200000 idle1_permille=200"
+            )
+            reader._parse_line(
+                f"{meta.replace('part=summary', 'part=overhead')} uptime_ms={uptime} "
+                f"snapshot_us={70 + valid} collect_us={90 + valid}"
+            )
+        reader._parse_line("PIPE v=1 dev=esp stage=other new=3 reset=4")
+        reader._parse_line("PIPE v=1 dev=esp stage=other new=5 reset=6")
+        pipeline = _build_port_json(stats)["pipeline"]
+        cpu = pipeline["esp:cpu:na:node_mac=aa:bb:epoch_id=0x01:part=summary"]
+        idle = pipeline["esp:cpu:na:node_mac=aa:bb:epoch_id=0x01:part=idle"]
+        overhead = pipeline["esp:cpu:na:node_mac=aa:bb:epoch_id=0x01:part=overhead"]
+        self.assertEqual(cpu["first"]["total_us"], 5000000000)
+        self.assertEqual(cpu["last"]["snapshot_fail"], 1)
+        self.assertEqual(cpu["last"]["capacity"], 32)
+        self.assertEqual(cpu["last"]["task_count_hint"], 24)
+        self.assertNotIn("accounted_us", cpu["last"])
+        self.assertEqual(idle["first"]["idle0_valid"], 1)
+        self.assertEqual(idle["first"]["idle1_valid"], 1)
+        self.assertEqual(idle["last"]["idle0_valid"], 0)
+        self.assertEqual(idle["last"]["idle1_valid"], 0)
+        self.assertEqual(idle["last"]["idle1_permille"], 200)
+        self.assertEqual(idle["last"]["accounted_us"], 800000)
+        self.assertEqual(overhead["first"]["snapshot_us"], 71)
+        self.assertEqual(overhead["last"]["snapshot_us"], 70)
+        for row in (cpu, idle, overhead):
+            self.assertEqual(row["delta"], {})
+            self.assertEqual(row["reset_epochs"], {})
+        reader._parse_line(
+            "PIPE v=1 dev=esp stage=cpu part=idle epoch_id=0x02 node_mac=aa:bb "
+            "uptime_ms=100 valid=0 interval_us=0 idle0_valid=0 idle1_valid=0"
+        )
+        reader._parse_line(
+            "PIPE v=1 dev=esp stage=cpu part=task epoch_id=0x01 node_mac=aa:bb "
+            "task_id=0x01 task_handle=0x1234 runtime_us=5000000000"
+        )
+        rows = _build_port_json(stats)["pipeline"]
+        self.assertEqual(rows["esp:cpu:na:node_mac=aa:bb:epoch_id=0x02:part=idle"]["delta"], {})
+        task_key = ("esp:cpu:na:node_mac=aa:bb:epoch_id=0x01:part=task:"
+                    "task_id=0x01:task_handle=0x1234")
+        self.assertEqual(rows[task_key]["last"]["runtime_us"], 5000000000)
+        idle_key = "esp:cpu:na:node_mac=aa:bb:epoch_id=0x01:part=idle"
+        self.assertEqual(stats.pipe_samples[idle_key], 2)
+        self.assertEqual(pipeline["esp:other:na"]["delta"], {"new": 2, "reset": 2})
+
+    def test_cpu_span_parts_have_cumulative_wall_sums_and_snapshot_maxima(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        base = "PIPE v=1 dev=esp stage=cpu_span node_mac=aa:bb"
+        parts = ("cap_convert", "cap_hpf", "cap_cleanup", "play_remote",
+                 "play_voice_convert", "play_far_reference")
+        for part in parts:
+            for epoch, count, total, maximum in (
+                ("0x01", 10, 5000000000, 900),
+                ("0x01", 14, 5000000500, 700),
+                ("0x02", 1, 6000000000, 100),
+                ("0x02", 3, 6000000200, 80),
+            ):
+                reader._parse_line(
+                    f"{base} part={part} epoch_id={epoch} uptime_ms={count * 1000} "
+                    f"count={count} wall_us_sum={total} wall_us_max={maximum}"
+                )
+        pipeline = _build_port_json(stats)["pipeline"]
+        self.assertEqual(len(pipeline), len(parts) * 2)
+        for part in parts:
+            for epoch, delta_count, delta_sum, last_max in (
+                ("0x01", 4, 500, 700), ("0x02", 2, 200, 80)
+            ):
+                row = pipeline[f"esp:cpu_span:na:node_mac=aa:bb:epoch_id={epoch}:part={part}"]
+                self.assertEqual(row["delta"], {"count": delta_count, "wall_us_sum": delta_sum})
+                self.assertEqual(row["last"]["wall_us_max"], last_max)
+                self.assertNotIn("wall_us_max", row["reset_epochs"])
+
+    def test_cpu_tasks_use_epoch_mac_id_and_handle_not_name_hint(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        def task(epoch, mac, task_id, handle, hint, runtime, delta, affinity=-1):
+            return (
+                f"PIPE v=1 dev=esp stage=cpu part=task epoch_id={epoch} node_mac={mac} "
+                f"task_id={task_id} task_handle={handle} name_hint={hint} "
+                f"priority=7 affinity={affinity} runtime_us={runtime} "
+                f"delta_us={delta} interval_us=1000000 cpu_permille={delta // 1000}"
+            )
+
+        cases = (
+            ("0x01", "aa:bb", "0x00000001", "0x1234", "audio", 5000000000, 200000),
+            ("0x01", "aa:bb", "0x00000001", "0x1234", "renamed", 5000300000, 300000),
+            ("0x01", "aa:bb", "0x00000002", "0x1234", "audio", 100000, 100000),
+            ("0x01", "aa:bb", "0x00000001", "0x5678", "audio", 200000, 200000),
+            ("0x02", "aa:bb", "0x00000001", "0x1234", "audio", 300000, 300000),
+            ("0x01", "cc:dd", "0x00000001", "0x1234", "audio", 400000, 400000),
+        )
+        for args in cases:
+            reader._parse_line(task(*args))
+        pipeline = _build_port_json(stats)["pipeline"]
+        self.assertEqual(len(pipeline), 5)
+        key = "esp:cpu:na:node_mac=aa:bb:epoch_id=0x01:part=task:task_id=0x00000001:task_handle=0x1234"
+        self.assertEqual(stats.pipe_samples[key], 2)
+        self.assertEqual(stats.pipe_identity[key]["name_hint"], "renamed")
+        self.assertEqual(stats.pipe_identity[key]["task_id"], "0x00000001")
+        self.assertEqual(stats.pipe_identity[key]["task_handle"], "0x1234")
+        self.assertEqual(pipeline[key]["delta"], {"runtime_us": 300000})
+        self.assertEqual(pipeline[key]["last"]["affinity"], -1)
+        self.assertEqual(pipeline[key]["last"]["cpu_permille"], 300)
+        self.assertNotIn("cumulative", pipeline[key]["last"])
+        for row in pipeline.values():
+            self.assertEqual(row["reset_epochs"], {})
+
+    def test_cpu_sparse_top_tasks_do_not_imply_zero_utilization(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=cpu part=task epoch_id=0x1 node_mac=aa:bb"
+        for task_id, runtime, affinity in (("0x01", 5000000000, 2147483647),
+                                           ("0x02", 9000000000, -1),
+                                           ("0x01", 5000000050, 2147483647)):
+            reader._parse_line(
+                f"{meta} task_id={task_id} task_handle=0x1234 name_hint=unknown "
+                f"runtime_us={runtime} affinity={affinity} delta_us=50 cpu_permille=5"
+            )
+        pipeline = _build_port_json(stats)["pipeline"]
+        missing = next(row for key, row in pipeline.items() if "task_id=0x02" in key)
+        self.assertEqual(missing["delta"], {})
+        self.assertEqual(missing["last"]["affinity"], -1)
+        self.assertEqual(next(row for key, row in pipeline.items() if "task_id=0x01" in key)["delta"],
+                         {"runtime_us": 50})
+
+    def test_cpu_task_requires_both_hex_identity_fields(self):
+        for fields in ("task_id=0x1", "task_handle=0x1", "task_id=1 task_handle=0x2"):
+            self.assertIsNone(parse_pipeline_logfmt(
+                f"PIPE v=1 dev=esp stage=cpu part=task {fields} runtime_us=10"
+            ))
+
+    def test_espnow_split_parts_are_independent_measured_intervals(self):
+        stats = PortStats(port="sender")
+        reader = PortReader("sender", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=espnow epoch_id=0x1234 node_mac=aa:bb:cc:dd:ee:ff node_id=1 role=coordinator"
+        for uptime, sent, received in ((1000, 10, 3), (3000, 30, 8)):
+            reader._parse_line(f"{meta} uptime_ms={uptime} part=tx tx_offer={sent} tx_radio_ok={sent} tx_submit_err={sent // 10} tx_queue_full=1 tx_depth={sent // 10} tx_inflight=1")
+            reader._parse_line(f"{meta} uptime_ms={uptime} part=rx rx_audio_accept={received} rx_deliver={received} seq_gap={received} jitter_depth=2")
+        rows = _build_port_json(stats)["esp_stage_rows"]
+        self.assertEqual(len(rows), 2)
+        tx = next(row for row in rows if row["identity"]["part"] == "tx")
+        rx = next(row for row in rows if row["identity"]["part"] == "rx")
+        self.assertEqual(tx["samples"], 2)
+        self.assertEqual(tx["elapsed_ms"], 2000)
+        self.assertEqual(tx["rates_per_s"]["tx_radio_ok"], 10.0)
+        self.assertEqual(tx["counters"]["attempts_filters"]["tx_submit_err"], 2)
+        self.assertNotIn("tx_submit_err", tx["counters"]["discards"])
+        self.assertEqual(rx["counters"]["frames"]["rx_audio_accept"], 5)
+        self.assertEqual(rx["counters"]["diagnostics"]["seq_gap"], 5)
+        for row in rows:
+            self.assertNotIn("uptime_ms", _build_port_json(stats)["pipeline"][row["series"]]["delta"])
+            self.assertNotIn("node_id", _build_port_json(stats)["pipeline"][row["series"]]["delta"])
+            self.assertNotIn("tx_depth", _build_port_json(stats)["pipeline"][row["series"]]["delta"])
+        self.assertIn("Air loss unknown", "\n".join(_report_lines_for_port(stats, 60)))
+
+    def test_espnow_timing_counters_delta_but_maxima_remain_gauges(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = ("PIPE v=1 dev=esp stage=espnow_timing epoch_id=0x1234 "
+                "node_mac=aa:bb:cc:dd:ee:ff node_id=1 role=coordinator")
+        for uptime, count, total, maximum, depth in (
+            (1000, 10, 500, 80, 3), (2000, 20, 1400, 110, 4)
+        ):
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} part=rx rx_dequeue_age_count={count} "
+                f"rx_dequeue_age_us_sum={total} rx_dequeue_age_us_max={maximum} "
+                f"jitter_expired_age_us_max={maximum} "
+                f"jitter_expired_with_pending_count={count}"
+            )
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} part=tx tx_esp_now_send_count={count} "
+                f"tx_esp_now_send_us_sum={total} tx_esp_now_send_us_max={maximum} "
+                f"tx_slot_late_count={count} tx_depth_high_water={depth}"
+            )
+        pipeline = _build_port_json(stats)["pipeline"]
+        rx = next(row for key, row in pipeline.items() if key.endswith(":part=rx"))
+        tx = next(row for key, row in pipeline.items() if key.endswith(":part=tx"))
+        self.assertEqual(rx["delta"]["rx_dequeue_age_count"], 10)
+        self.assertEqual(rx["delta"]["rx_dequeue_age_us_sum"], 900)
+        self.assertEqual(rx["delta"]["jitter_expired_with_pending_count"], 10)
+        self.assertEqual(tx["delta"]["tx_esp_now_send_count"], 10)
+        self.assertEqual(tx["delta"]["tx_slot_late_count"], 10)
+        for row, maxima in ((rx, ("rx_dequeue_age_us_max", "jitter_expired_age_us_max")),
+                            (tx, ("tx_esp_now_send_us_max", "tx_depth_high_water"))):
+            for key in maxima:
+                self.assertNotIn(key, row["delta"])
+                self.assertNotIn(key, row["reset_epochs"])
+        self.assertEqual(tx["last"]["tx_depth_high_water"], 4)
+
+    def test_espnow_radio_timing_maxima_are_gauges(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=espnow_timing epoch_id=0x1234 part=radio"
+        for uptime, count, total, maximum in ((1000, 2, 500, 300),
+                                               (2000, 5, 1800, 700)):
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} origin_complete_count={count} "
+                f"origin_complete_us_sum={total} origin_complete_us_max={maximum} "
+                f"control_complete_count={count} control_complete_us_sum={total} "
+                f"control_complete_us_max={maximum} tx_busy_audio_count={count} "
+                f"tx_busy_control_count={count} tx_busy_age_us_max={maximum}"
+            )
+        row = next(value for key, value in _build_port_json(stats)["pipeline"].items()
+                   if key.endswith(":part=radio"))
+        for key in ("origin_complete_us_max", "control_complete_us_max",
+                    "tx_busy_age_us_max"):
+            self.assertEqual(row["last"][key], 700)
+            self.assertNotIn(key, row["delta"])
+            self.assertNotIn(key, row["reset_epochs"])
+        for key in ("origin_complete_count", "control_complete_count",
+                    "tx_busy_audio_count", "tx_busy_control_count"):
+            self.assertEqual(row["delta"][key], 3)
+        self.assertEqual(row["delta"]["origin_complete_us_sum"], 1300)
+
+    def test_notification_timing_counts_and_sums_delta_but_maxima_are_gauges(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=audio_timing part=notify epoch_id=0x1234"
+        for uptime, count, total, maximum in (
+            (1000, 1, 100, 25), (2000, 3, 400, 80)
+        ):
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} notify_started_count={count} "
+                f"notify_completed_count={count} notify_mix_count={count} "
+                f"notify_mix_us_sum={total} notify_mix_us_max={maximum} "
+                f"notify_frame_gap_count={count} notify_frame_gap_us_sum={total} "
+                f"notify_frame_gap_us_max={maximum} notify_frame_gap_over25ms_count={count} "
+                f"notify_work_count={count} notify_work_us_sum={total} "
+                f"notify_work_us_max={maximum} notify_write_count={count} "
+                f"notify_write_us_sum={total} notify_write_us_max={maximum} "
+                f"notify_write_gap_count={count} notify_write_gap_us_sum={total} "
+                f"notify_write_gap_us_max={maximum}"
+            )
+        pipeline = next(
+            value for key, value in _build_port_json(stats)["pipeline"].items()
+            if key.startswith("esp:audio_timing:") and key.endswith(":part=notify")
+        )
+        for key in (
+            "notify_started_count", "notify_completed_count", "notify_mix_count",
+            "notify_frame_gap_count", "notify_frame_gap_over25ms_count",
+            "notify_work_count", "notify_write_count", "notify_write_gap_count",
+        ):
+            self.assertEqual(pipeline["delta"][key], 2)
+        for key in (
+            "notify_mix_us_sum", "notify_frame_gap_us_sum", "notify_work_us_sum",
+            "notify_write_us_sum", "notify_write_gap_us_sum",
+        ):
+            self.assertEqual(pipeline["delta"][key], 300)
+        for key in (
+            "notify_mix_us_max", "notify_frame_gap_us_max", "notify_work_us_max",
+            "notify_write_us_max", "notify_write_gap_us_max",
+        ):
+            self.assertEqual(pipeline["last"][key], 80)
+            self.assertNotIn(key, pipeline["delta"])
+            self.assertNotIn(key, pipeline["reset_epochs"])
+
+    def test_send_errors_distinguish_counters_from_heap_and_last_error_gauges(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=espnow_timing part=errors epoch_id=0x1234"
+        for uptime, no_mem, other, last, free, snapshot_time, snapshot_error in (
+            (1000, 1, 0, 257, 30000, 990, 257),
+            (2000, 2, 0, 257, 28000, 990, 257),
+            (3000, 3, 1, 12345, 25000, 2990, 12345),
+        ):
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} send_err_nomem={no_mem} "
+                f"send_err_other={other} send_last_error={last} "
+                f"send_last_error_uptime_ms={uptime - 10} "
+                f"send_heap_snapshot_uptime_ms={snapshot_time} "
+                f"send_heap_snapshot_error={snapshot_error} send_heap_snapshot_valid=1 "
+                f"internal_8bit_free={free} "
+                f"internal_8bit_largest={free // 2} internal_8bit_min={free - 1000} "
+                f"send_error_internal_free={30000 if uptime == 2000 else free} "
+                f"send_error_internal_largest={(30000 if uptime == 2000 else free) // 2} "
+                f"send_error_internal_min={(30000 if uptime == 2000 else free) - 1000}"
+            )
+            if uptime == 2000:
+                same_code = next(
+                    value for key, value in _build_port_json(stats)["pipeline"].items()
+                    if key.endswith(":part=errors")
+                )["last"]
+                self.assertEqual(same_code["send_last_error_uptime_ms"], 1990)
+                self.assertEqual(same_code["send_heap_snapshot_uptime_ms"], 990)
+                self.assertEqual(same_code["send_error_internal_free"], 30000)
+        row = next(value for key, value in _build_port_json(stats)["pipeline"].items()
+                   if key.endswith(":part=errors"))
+        self.assertEqual(row["delta"]["send_err_nomem"], 2)
+        self.assertEqual(row["delta"]["send_err_other"], 1)
+        self.assertEqual(row["last"]["send_heap_snapshot_uptime_ms"], 2990)
+        for key in ("send_last_error", "send_last_error_uptime_ms",
+                    "send_heap_snapshot_uptime_ms", "send_heap_snapshot_error",
+                    "send_heap_snapshot_valid", "internal_8bit_free",
+                    "internal_8bit_largest", "internal_8bit_min", "send_error_internal_free",
+                    "send_error_internal_largest", "send_error_internal_min"):
+            self.assertNotIn(key, row["delta"])
+            self.assertNotIn(key, row["reset_epochs"])
+
+    def test_music_timing_maxima_and_format_are_gauges(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=audio_timing part=music epoch_id=0x1234"
+        for uptime, count, total, maximum, rate in (
+            (1000, 2, 100, 80, 44100), (2000, 5, 450, 150, 48000)
+        ):
+            reader._parse_line(
+                f"{meta} uptime_ms={uptime} " + " ".join(
+                    f"music_{part}_count={count} music_{part}_us_sum={total} "
+                    f"music_{part}_us_max={maximum}"
+                    for part in ("mutex_wait", "route_read", "convert", "mix")
+                ) + f" music_render_over20ms_count={count} music_chunks_count={count} "
+                f"music_iterations_count={count} music_input_frames={total} "
+                f"music_output_frames={total} music_rate_hz={rate} music_channels=2 "
+                "music_format_valid=1"
+            )
+        row = next(value for key, value in _build_port_json(stats)["pipeline"].items()
+                   if key.endswith(":part=music"))
+        self.assertEqual(row["delta"]["music_convert_us_sum"], 350)
+        self.assertEqual(row["delta"]["music_chunks_count"], 3)
+        for key in ("music_mutex_wait_us_max", "music_route_read_us_max",
+                    "music_convert_us_max", "music_mix_us_max", "music_rate_hz",
+                    "music_channels", "music_format_valid"):
+            self.assertNotIn(key, row["delta"])
+            self.assertNotIn(key, row["reset_epochs"])
+
+    def test_esp_epochs_are_separate_even_if_new_boot_counters_increase(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        for epoch, uptime, count in (("0x00000001", 100, 10), ("0x00000001", 1100, 20),
+                                      ("0x00000002", 50, 100), ("0x00000002", 1050, 104)):
+            reader._parse_line(f"PIPE v=1 dev=esp stage=audio epoch_id={epoch} uptime_ms={uptime} encode_ok={count} rx_store_depth=3 rx_store_depth_valid=1")
+        rows = _build_port_json(stats)["esp_stage_rows"]
+        self.assertEqual([r["counters"]["frames"]["encode_ok"] for r in rows], [10, 4])
+        self.assertEqual([r["elapsed_ms"] for r in rows], [1000, 1000])
+        for row in rows:
+            self.assertEqual(row["gauges"]["rx_store_depth_valid"], 1)
+            self.assertNotIn("rx_store_depth_valid", _build_port_json(stats)["pipeline"][row["series"]]["delta"])
+
+    def test_esp_single_sample_missing_stage_and_reset_are_unavailable(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        reader._parse_line("PIPE v=1 dev=esp stage=audio epoch_id=0x42 uptime_ms=100 encode_ok=5")
+        meta = "PIPE v=1 dev=esp stage=espnow epoch_id=0x43 part=tx"
+        reader._parse_line(f"{meta} uptime_ms=100 tx_radio_ok=10")
+        reader._parse_line(f"{meta} uptime_ms=200 tx_radio_ok=2")
+        rows = _build_port_json(stats)["esp_stage_rows"]
+        self.assertEqual([row["status"] for row in rows], ["unavailable", "unavailable"])
+        self.assertTrue(all(all(rate is None for rate in row["rates_per_s"].values()) for row in rows))
+
+    def test_gauge_only_stage_window_is_unavailable(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=espnow epoch_id=0x43 part=rx"
+        reader._parse_line(f"{meta} uptime_ms=100 jitter_depth=2")
+        reader._parse_line(f"{meta} uptime_ms=200 jitter_depth=3")
+        row = _build_port_json(stats)["esp_stage_rows"][0]
+        self.assertEqual(row["status"], "unavailable")
+        self.assertEqual(row["gauges"]["jitter_depth"], 3)
+        self.assertFalse(any(row["counters"].values()))
+
+    def test_sparse_frame_counters_never_use_wider_stage_uptime(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=audio part=tx epoch_id=0x42"
+        reader._parse_line(f"{meta} uptime_ms=1000 capture_ok=10 encode_ok=10")
+        reader._parse_line(f"{meta} uptime_ms=2000 capture_ok=20 encode_ok=20 tx_handoff=20")
+        reader._parse_line(f"{meta} uptime_ms=3000 capture_ok=30 tx_handoff=25")
+        row = _build_port_json(stats)["esp_stage_rows"][0]
+        self.assertEqual(row["status"], "measured")
+        self.assertEqual(row["elapsed_ms"], 2000)
+        self.assertEqual(row["rates_per_s"]["capture_ok"], 10.0)
+        self.assertIsNone(row["rates_per_s"]["encode_ok"])
+        self.assertIsNone(row["rates_per_s"]["tx_handoff"])
+        self.assertNotIn("encode_ok", row["counters"]["frames"])
+        self.assertNotIn("tx_handoff", row["counters"]["frames"])
+        self.assertIn("encode_ok=n/a", "\n".join(_report_lines_for_port(stats, 60)))
+
+    def test_missing_middle_and_reset_counters_do_not_hide_valid_rates(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=audio part=playout epoch_id=0x42"
+        reader._parse_line(f"{meta} uptime_ms=1000 decode_ok=10 play_ok=100 plc=4")
+        reader._parse_line(f"{meta} uptime_ms=2000 decode_ok=20 play_ok=110")
+        reader._parse_line(f"{meta} uptime_ms=3000 decode_ok=30 play_ok=2 plc=7")
+        row = _build_port_json(stats)["esp_stage_rows"][0]
+        self.assertEqual(row["rates_per_s"]["decode_ok"], 10.0)
+        self.assertIsNone(row["rates_per_s"]["play_ok"])
+        self.assertNotIn("plc", row["counters"]["diagnostics"])
+
+    def test_audio_parts_and_espnow_rx_drop_classification(self):
+        stats = PortStats(port="one")
+        reader = PortReader("one", 115200, None, "unused", stats)
+        audio = "PIPE v=1 dev=esp stage=audio epoch_id=0x42"
+        mesh = "PIPE v=1 dev=esp stage=espnow epoch_id=0x99 part=rx"
+        for uptime, value in ((1000, 2), (2000, 5)):
+            reader._parse_line(f"{audio} part=tx uptime_ms={uptime} capture_fifo_discard_samples={value} encode_ok={value}")
+            reader._parse_line(f"{audio} part=rx uptime_ms={uptime} rx_store_reject={value} rx_src_evict={value} rx_store_ok={value}")
+            reader._parse_line(f"{audio} part=playout uptime_ms={uptime} decode_ok={value}")
+            reader._parse_line(f"{audio} part=bt uptime_ms={uptime} bt_music_overflow={value}")
+            reader._parse_line(f"{mesh} uptime_ms={uptime} rx_audio_purge={value} jitter_late={value} control_queue_drops={value} rx_queue_overflows={value} rx_audio_queue_full={value}")
+        rows = _build_port_json(stats)["esp_stage_rows"]
+        self.assertEqual(len(rows), 5)
+        audio_rx = next(r for r in rows if r["identity"].get("part") == "rx" and r["identity"]["stage"] == "audio")
+        mesh_rx = next(r for r in rows if r["identity"]["stage"] == "espnow")
+        self.assertEqual(audio_rx["counters"]["discards"]["rx_store_reject"], 3)
+        self.assertEqual(audio_rx["counters"]["diagnostics"]["rx_src_evict"], 3)
+        self.assertNotIn("rx_src_evict", audio_rx["counters"]["discards"])
+        self.assertEqual(mesh_rx["counters"]["discards"]["rx_audio_purge"], 3)
+        self.assertEqual(mesh_rx["counters"]["discards"]["jitter_late"], 3)
+        for key in ("control_queue_drops", "rx_queue_overflows"):
+            self.assertEqual(mesh_rx["counters"]["diagnostics"][key], 3)
+            self.assertNotIn(key, mesh_rx["counters"]["discards"])
+        tx = next(r for r in rows if r["identity"].get("part") == "tx")
+        self.assertEqual(tx["counters"]["diagnostics"]["capture_fifo_discard_samples"], 3)
+        self.assertNotIn("capture_fifo_discard_samples", tx["counters"]["discards"])
+        report = "\n".join(_report_lines_for_port(stats, 60))
+        self.assertIn("counts samples, not frames", report)
+        self.assertIn("queue diagnostics can overlap", report)
+
+    def test_measured_esp_discards_warn_in_overall_health_without_adding_overlap(self):
+        stats = PortStats(port="one", open_ok=True, lines=4)
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=espnow epoch_id=0x23"
+        for uptime, queue, late in ((1000, 5, 10), (2000, 12, 29)):
+            reader._parse_line(f"{meta} part=tx uptime_ms={uptime} tx_queue_full={queue} tx_submit_err={queue}")
+            reader._parse_line(f"{meta} part=rx uptime_ms={uptime} jitter_late={late} rx_audio_accept={late}")
+        health = _overall_health(stats)
+        self.assertIn("WARN", health)
+        self.assertIn("tx_queue_full+7", health)
+        self.assertIn("jitter_late+19", health)
+        self.assertNotIn("tx_submit_err", health)
+        self.assertIn(f"Health: {health}", "\n".join(_report_lines_for_port(stats, 10)))
+        self.assertEqual(_build_port_json(stats)["health"], health)
+        self.assertEqual(len(_build_port_json(stats)["esp_discard_health"]["warnings"]), 2)
+
+    def test_retry_only_and_unavailable_esp_discards_do_not_claim_health(self):
+        retry = PortStats(port="retry", open_ok=True, lines=2)
+        reader = PortReader("retry", 115200, None, "unused", retry)
+        for uptime, attempts in ((1000, 2), (2000, 9)):
+            reader._parse_line(f"PIPE v=1 dev=esp stage=espnow epoch_id=0x24 part=tx uptime_ms={uptime} tx_submit_err={attempts} tx_queue_full=4")
+        self.assertEqual(_build_port_json(retry)["esp_discard_health"]["warnings"], [])
+        self.assertNotIn("WARN", _overall_health(retry))
+        self.assertNotIn("tx_submit_err", _overall_health(retry))
+
+        single = PortStats(port="single", open_ok=True, lines=1)
+        PortReader("single", 115200, None, "unused", single)._parse_line(
+            "PIPE v=1 dev=esp stage=espnow epoch_id=0x25 part=rx uptime_ms=100 jitter_late=999"
+        )
+        self.assertEqual(_build_port_json(single)["esp_discard_health"]["warnings"], [])
+        self.assertIn("UNKNOWN", _overall_health(single))
+        self.assertIn("telemetry unavailable", _overall_health(single))
+
+    def test_missing_split_part_is_unknown_with_zero_measured_discards(self):
+        stats = PortStats(port="one", open_ok=True, lines=4)
+        reader = PortReader("one", 115200, None, "unused", stats)
+        for uptime in (1000, 2000):
+            reader._parse_line(f"PIPE v=1 dev=esp stage=audio part=tx epoch_id=0x12 uptime_ms={uptime} tx_no_cb=0")
+            reader._parse_line(f"PIPE v=1 dev=esp stage=espnow part=tx epoch_id=0x34 node_mac=aa:bb uptime_ms={uptime} tx_queue_full=0")
+        health = _overall_health(stats)
+        self.assertTrue(health.startswith("UNKNOWN ("))
+        unavailable = _build_port_json(stats)["esp_discard_health"]["unavailable"]
+        self.assertIn("audio/rx epoch=0x12 (missing part)", unavailable)
+        self.assertIn("audio/bt epoch=0x12 (missing part)", unavailable)
+        self.assertIn("espnow/rx epoch=0x34 mac=aa:bb (missing part)", unavailable)
+        self.assertNotIn("espnow/rx epoch=0x12", str(unavailable))
+
+    def test_bt_overflow_warns_in_pcm_units_but_underrun_does_not(self):
+        stats = PortStats(port="one", open_ok=True, lines=2)
+        reader = PortReader("one", 115200, None, "unused", stats)
+        meta = "PIPE v=1 dev=esp stage=audio part=bt epoch_id=0x55"
+        reader._parse_line(f"{meta} uptime_ms=1000 bt_music_overflow=10 bt_call_overflow=1 bt_mic_overflow=20 bt_music_underrun=1")
+        reader._parse_line(f"{meta} uptime_ms=2000 bt_music_overflow=14 bt_call_overflow=1 bt_mic_overflow=23 bt_music_underrun=9")
+        health = _overall_health(stats)
+        self.assertIn("WARN (", health)
+        self.assertIn("bt_music_overflow+4", health)
+        self.assertIn("bt_mic_overflow+3", health)
+        self.assertNotIn("bt_music_underrun", health)
+        self.assertIn("rejected PCM frames", "\n".join(_report_lines_for_port(stats, 1)))
+
+    def test_incomplete_esp_telemetry_preserves_legacy_warn_and_fail(self):
+        stats = PortStats(port="one", open_ok=True, lines=2)
+        reader = PortReader("one", 115200, None, "unused", stats)
+        reader._parse_line("[MESH] r=1 id=2 sl=1 tx=10(err=0) rx=5 drop=1 fwd=2 | spi_in=10 overwr=0 starve=0 drain=8 q=0")
+        reader._parse_line("[MESH] r=1 id=2 sl=1 tx=12(err=0) rx=7 drop=2 fwd=3 | spi_in=12 overwr=0 starve=0 drain=11 q=0")
+        reader._parse_line("PIPE v=1 dev=esp stage=espnow part=tx epoch_id=0x01 uptime_ms=100 tx_queue_full=0")
+        self.assertIn("WARN (mesh_drop+1)", _overall_health(stats))
+        self.assertIn("telemetry unavailable", _overall_health(stats))
+        stats.open_ok = False
+        self.assertTrue(_overall_health(stats).startswith("FAIL (port could not be opened)"))
+
+    def test_legacy_unsplit_audio_does_not_require_split_parts(self):
+        stats = PortStats(port="one", open_ok=True, lines=2)
+        reader = PortReader("one", 115200, None, "unused", stats)
+        for uptime in (1000, 2000):
+            reader._parse_line(f"PIPE v=1 dev=esp stage=audio epoch_id=0x11 uptime_ms={uptime} rx_store_reject=0")
+        self.assertEqual(_build_port_json(stats)["esp_discard_health"]["unavailable"], [])
+        self.assertTrue(_overall_health(stats).startswith("OK ("))
 
     def test_records_first_last_and_cumulative_delta(self):
         stats = PortStats(port="test")

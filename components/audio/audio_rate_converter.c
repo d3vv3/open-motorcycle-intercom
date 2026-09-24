@@ -5,6 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && CONFIG_IDF_TARGET_ESP32S31 && defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+#include "esp_heap_caps.h"
+#define RATE_CVT_SCRATCH_PSRAM 1
+#endif
+#endif
+
 #ifdef AUDIO_RATE_CONVERTER_HOST_TEST
 #include "audio_rate_converter_vendor_mock.h"
 #else
@@ -33,6 +41,16 @@ struct audio_rate_converter {
 #ifndef AUDIO_RATE_CONVERTER_HOST_TEST
 static const char *TAG = "audio_rate_cvt";
 #endif
+
+static void *scratch_calloc(size_t count, size_t size)
+{
+#ifdef RATE_CVT_SCRATCH_PSRAM
+    /* CPU-only scratch preserves internal RAM for radio; never falls back internally. */
+    return heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    return calloc(count, size);
+#endif
+}
 
 static int64_t timer_get_time(void)
 {
@@ -109,8 +127,8 @@ int audio_rate_converter_create(audio_rate_converter_t **converter,
                                        (size_t)omi_speex_resampler_get_output_latency(
                                            created->resampler));
     }
-    created->input_scratch = calloc(AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES, sizeof(int16_t));
-    created->output_scratch = calloc(output_capacity, sizeof(int16_t));
+    created->input_scratch = scratch_calloc(AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES, sizeof(int16_t));
+    created->output_scratch = scratch_calloc(output_capacity, sizeof(int16_t));
     if (created->input_scratch == NULL || created->output_scratch == NULL) {
         audio_rate_converter_close(&created);
         return -1;

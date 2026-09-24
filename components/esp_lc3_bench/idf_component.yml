@@ -1,0 +1,5 @@
+dependencies:
+  espressif/esp_audio_codec:
+    version: "=2.6.2"
+    rules:
+      - if: target == "esp32s31"

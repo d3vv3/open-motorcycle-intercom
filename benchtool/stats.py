@@ -221,10 +221,107 @@ def compute_hop_pct(s: PortStats) -> dict[str, float | None]:
 
 def _pipe_key(record: dict[str, int | str]) -> str:
     key = f"{record['dev']}:{record['stage']}:{record.get('node', 'na')}"
-    for field_name in ("session", "src_node", "dst_node", "peer", "peer_node"):
+    for field_name in (
+        "session", "src_node", "dst_node", "peer", "peer_node",
+        "node_mac", "epoch_id", "part",
+    ):
         if field_name in record:
             key += f":{field_name}={record[field_name]}"
     return key
+
+
+_ESP_STAGE_FIELDS = {
+    "audio": {
+        "frames": ("capture_ok", "encode_ok", "tx_handoff", "rx_store_ok", "rx_store_pop", "decode_ok", "play_ok"),
+        "discards": ("tx_no_cb", "rx_store_reject", "rx_store_purge", "rx_q_drop", "rx_lock_drop", "rx_src_drop", "jitter_drop", "pcm_overflow", "bt_music_overflow", "bt_call_overflow", "bt_mic_overflow"),
+        "attempts_filters": ("capture_short", "capture_timeout", "capture_err", "encode_err", "rx_invalid", "rx_inactive", "decode_err", "packet_dup", "packet_late", "packet_future", "notify_drop", "i2s_err", "dtx_drop"),
+        "diagnostics": ("capture_fifo_discard_samples", "rx_src_evict", "seq_gap", "seq_reset", "seq_stale", "conceal", "plc", "glitch", "pcm_underrun", "bt_music_underrun", "bt_call_underrun", "bt_mic_underrun", "bt_music_lock", "bt_call_lock", "bt_playout_lock", "bt_mic_write_lock", "bt_mic_read_lock"),
+        "gauges": ("rx_store_depth", "rx_store_depth_valid", "rx_sources"),
+    },
+    "espnow": {
+        "frames": ("tx_offer", "tx_enqueue", "tx_submit_ok", "tx_radio_ok", "rx_audio_raw", "rx_audio_queued", "rx_audio_seen", "rx_audio_accept", "jitter_pop", "rx_deliver"),
+        "discards": ("tx_queue_full", "tx_purge", "tx_radio_fail", "tx_abandoned", "relay_overwrite", "rx_audio_queue_full", "rx_audio_purge", "jitter_overwrite", "jitter_late", "jitter_purge"),
+        "attempts_filters": ("tx_reject_state", "tx_reject_invalid", "tx_submit_err", "rx_short", "rx_audio_bad_header", "rx_audio_disabled", "rx_audio_invalid", "rx_audio_self", "rx_audio_dup"),
+        "diagnostics": ("seq_gap", "slot_misses", "control_queue_drops", "rx_queue_overflows"),
+        "gauges": ("tx_depth", "tx_inflight", "jitter_depth", "rx_depth", "control_queue_depth"),
+    },
+}
+
+
+def compute_esp_stage_rows(s: PortStats) -> list[dict[str, Any]]:
+    """Measured, stage-local intervals; never join audio and mesh epoch tokens."""
+    rows: list[dict[str, Any]] = []
+    for key, identity in sorted(s.pipe_identity.items()):
+        if identity.get("dev") != "esp" or identity.get("stage") not in _ESP_STAGE_FIELDS:
+            continue
+        history = s.pipe_history[key]
+        fields = _ESP_STAGE_FIELDS[str(identity["stage"])]
+        uptime = [sample.get("uptime_ms") for sample in history]
+        elapsed = uptime[-1] - uptime[0] if len(uptime) >= 2 and all(isinstance(x, int) for x in uptime) else 0
+        valid = ("epoch_id" in identity and elapsed > 0 and
+                 all(b > a for a, b in zip(uptime, uptime[1:])))
+        # Count only counters covering the full row window. Sparse or reset series
+        # cannot be divided by this row's elapsed time.
+        counters: dict[str, dict[str, int]] = {}
+        rates: dict[str, float | None] = {}
+        discard_unavailable: list[str] = []
+        for category, names in fields.items():
+            if category == "gauges":
+                continue
+            counters[category] = {}
+            for name in names:
+                present = any(name in sample for sample in history)
+                values = [sample[name] for sample in history if name in sample]
+                covered = (valid and len(values) == len(history) and
+                           all(b >= a for a, b in zip(values, values[1:])))
+                if covered:
+                    counters[category][name] = values[-1] - values[0]
+                elif category == "discards" and present:
+                    discard_unavailable.append(name)
+                if category == "frames" and present:
+                    rates[name] = round((values[-1] - values[0]) * 1000 / elapsed, 2) if covered else None
+        measured = valid and any(counters.values())
+        rows.append({
+            "series": key,
+            "identity": identity,
+            "samples": len(history),
+            "status": "measured" if measured else "unavailable",
+            "elapsed_ms": elapsed if valid else None,
+            "counters": counters,
+            "discard_counters_unavailable": discard_unavailable,
+            "rates_per_s": rates,
+            "gauges": {name: history[-1][name] for name in fields["gauges"] if name in history[-1]},
+        })
+    return rows
+
+
+def compute_esp_discard_health(s: PortStats) -> dict[str, Any]:
+    """Report confirmed local discard growth separately, never as a sum or RF loss."""
+    warnings: list[str] = []
+    unavailable: list[str] = []
+    rows = compute_esp_stage_rows(s)
+    split_groups: dict[tuple[str, str, str | int | None], set[str]] = {}
+    for row in rows:
+        identity = row["identity"]
+        if "epoch_id" in identity and "part" in identity:
+            group = (str(identity["stage"]), str(identity["epoch_id"]), identity.get("node_mac"))
+            split_groups.setdefault(group, set()).add(str(identity["part"]))
+    for (stage, epoch, mac), parts in sorted(split_groups.items(), key=lambda item: str(item[0])):
+        expected = {"audio": {"tx", "rx", "playout", "bt"}, "espnow": {"tx", "rx"}}[stage]
+        for part in sorted(expected - parts):
+            unavailable.append(f"{stage}/{part} epoch={epoch}" + (f" mac={mac}" if mac else "") + " (missing part)")
+    for row in rows:
+        identity = row["identity"]
+        label = f"{identity['stage']}/{identity.get('part', 'all')} epoch={identity.get('epoch_id', 'unknown')}"
+        if (row["status"] != "measured" or not row["counters"]["discards"] or
+                row["discard_counters_unavailable"]):
+            unavailable.append(label)
+        if row["status"] != "measured":
+            continue
+        for name, count in row["counters"]["discards"].items():
+            if count > 0:
+                warnings.append(f"{label} {name}+{count}")
+    return {"warnings": warnings, "unavailable": unavailable}
 
 
 def _endpoint(record: dict, direction: str) -> tuple[Any, Any] | None:

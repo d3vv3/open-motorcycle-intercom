@@ -49,6 +49,12 @@ void audio_pcm_resampler_reset(audio_pcm_resampler_t *resampler);
 size_t audio_pcm_resampler_available(const audio_pcm_resampler_t *resampler);
 size_t audio_pcm_resampler_depth(const audio_pcm_resampler_t *resampler);
 
+/** Whole PCM blocks to admit toward the target, limited by ring capacity.
+ *  An unstarted resampler may admit one block past the target to cross its
+ *  start threshold when a partial block remains after underrun.
+ */
+size_t audio_pcm_resampler_admission_blocks(const audio_pcm_resampler_t *resampler);
+
 audio_pcm_resampler_telemetry_t audio_pcm_resampler_push(audio_pcm_resampler_t *resampler,
                                                          const int16_t *samples,
                                                          size_t sample_count, bool active);

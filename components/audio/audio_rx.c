@@ -13,8 +13,10 @@
 /* Caller holds rx_sources_mutex. Decoder and resampler resets remain playout-owned. */
 void audio_rx_reset_source_metadata_locked(void)
 {
+    uint32_t purged = 0u;
     for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
         audio_rx_source_t *source = &g_audio.rx_sources[i];
+        purged += (uint32_t)audio_packet_store_depth(&source->packet_store);
         source->assigned = false;
         source->source_id = 0;
         source->last_enqueue_ms = 0;
@@ -22,6 +24,9 @@ void audio_rx_reset_source_metadata_locked(void)
         source->decoder_reset_pending = true;
         audio_packet_store_reset(&source->packet_store);
     }
+    AUDIO_STATS_LOCK();
+    g_audio.stats.rx_store_purge += purged;
+    AUDIO_STATS_UNLOCK();
 }
 
 void audio_rx_reset_source_metadata(void)
@@ -81,6 +86,7 @@ static audio_rx_source_t *admit_source_locked(const audio_frame_t *frame, uint8_
     }
     audio_rx_source_t *source = &g_audio.rx_sources[decision.slot_index];
     if (decision.action != AUDIO_RX_SELECT_MATCH) {
+        uint32_t purged = (uint32_t)audio_packet_store_depth(&source->packet_store);
         if (decision.action == AUDIO_RX_SELECT_EVICT) {
             source->assigned = false;
             source->last_active_ms = 0;
@@ -92,6 +98,9 @@ static audio_rx_source_t *admit_source_locked(const audio_frame_t *frame, uint8_
         source->source_id = source_id;
         source->decoder_reset_pending = true;
         audio_packet_store_reset(&source->packet_store);
+        AUDIO_STATS_LOCK();
+        g_audio.stats.rx_store_purge += purged;
+        AUDIO_STATS_UNLOCK();
     }
     if (frame->active) {
         source->last_active_ms = now_ms;
@@ -124,10 +133,18 @@ static audio_packet_store_push_result_t push_packet_locked(audio_rx_source_t *so
     return result;
 }
 
-static esp_err_t record_push_result(audio_packet_store_push_result_t result, bool reanchored)
+static esp_err_t record_push_result(audio_packet_store_push_result_t result, bool reanchored,
+                                    uint32_t purged)
 {
     esp_err_t ret = ESP_OK;
     AUDIO_STATS_LOCK();
+    g_audio.stats.rx_offer++;
+    g_audio.stats.rx_store_purge += purged;
+    if (result == AUDIO_PACKET_STORE_PUSH_OK) {
+        g_audio.stats.rx_store_ok++;
+    } else {
+        g_audio.stats.rx_store_reject++;
+    }
     if (reanchored) {
         g_audio.stats.packet_future_drops++;
         g_audio.stats.seq_resets++;
@@ -164,43 +181,58 @@ static esp_err_t record_push_result(audio_packet_store_push_result_t result, boo
     return ret;
 }
 
+static esp_err_t record_rx_reject(esp_err_t error, uint32_t *reason)
+{
+    AUDIO_STATS_LOCK();
+    g_audio.stats.rx_offer++;
+    g_audio.stats.rx_store_reject++;
+    (*reason)++;
+    AUDIO_STATS_UNLOCK();
+    return error;
+}
+
 esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
 {
     if (frame == NULL) {
-        return ESP_ERR_INVALID_ARG;
+        return record_rx_reject(ESP_ERR_INVALID_ARG, &g_audio.stats.rx_invalid);
     }
     if (frame->len == 0 || frame->len > AUDIO_PACKET_MAX_SIZE) {
-        return ESP_ERR_INVALID_SIZE;
+        return record_rx_reject(ESP_ERR_INVALID_SIZE, &g_audio.stats.rx_invalid);
     }
     SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();
     if (lifecycle_mutex == NULL) {
-        return ESP_ERR_INVALID_STATE;
+        return record_rx_reject(ESP_ERR_INVALID_STATE, &g_audio.stats.rx_inactive);
     }
     if (audio_called_from_worker()) {
-        return ESP_ERR_INVALID_STATE;
+        return record_rx_reject(ESP_ERR_INVALID_STATE, &g_audio.stats.rx_invalid);
     }
 
     audio_packet_t packet = packet_from_frame(frame);
 
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     if (g_audio.deinitializing || g_audio.rx_sources_mutex == NULL) {
+        esp_err_t ret = record_rx_reject(ESP_ERR_INVALID_STATE, &g_audio.stats.rx_inactive);
         xSemaphoreGive(lifecycle_mutex);
-        return ESP_ERR_INVALID_STATE;
+        return ret;
     }
     if (xSemaphoreTake(g_audio.rx_sources_mutex, pdMS_TO_TICKS(RX_ENQUEUE_LOCK_WAIT_MS)) !=
         pdTRUE) {
         AUDIO_STATS_LOCK();
         g_audio.stats.frames_dropped++;
         g_audio.stats.rx_lock_drops++;
+        g_audio.stats.rx_offer++;
+        g_audio.stats.rx_store_reject++;
         AUDIO_STATS_UNLOCK();
         xSemaphoreGive(lifecycle_mutex);
         return ESP_ERR_TIMEOUT;
     }
     if (!g_audio.initialized || !atomic_load_explicit(&g_audio.running, memory_order_acquire) ||
         source_id == 0 || g_audio.config.mode != AUDIO_MODE_MESH) {
+        esp_err_t ret = record_rx_reject(ESP_ERR_INVALID_STATE, source_id == 0
+                                    ? &g_audio.stats.rx_invalid : &g_audio.stats.rx_inactive);
         xSemaphoreGive(g_audio.rx_sources_mutex);
         xSemaphoreGive(lifecycle_mutex);
-        return ESP_ERR_INVALID_STATE;
+        return ret;
     }
 
     int64_t now_us = esp_timer_get_time();
@@ -211,6 +243,8 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         AUDIO_STATS_LOCK();
         g_audio.stats.frames_dropped++;
         g_audio.stats.rx_source_rejections++;
+        g_audio.stats.rx_offer++;
+        g_audio.stats.rx_store_reject++;
         AUDIO_STATS_UNLOCK();
         xSemaphoreGive(lifecycle_mutex);
         return ESP_ERR_NO_MEM;
@@ -219,11 +253,15 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         packet.received_us = (uint64_t)now_us;
     }
     bool reanchored = false;
+    size_t old_depth = audio_packet_store_depth(&source->packet_store);
     audio_packet_store_push_result_t result =
         push_packet_locked(source, &packet, now_ms, &reanchored);
+    size_t new_depth = audio_packet_store_depth(&source->packet_store);
+    size_t expected_depth = old_depth + (result == AUDIO_PACKET_STORE_PUSH_OK ? 1u : 0u);
+    uint32_t purged = expected_depth > new_depth ? (uint32_t)(expected_depth - new_depth) : 0u;
+    esp_err_t ret = record_push_result(result, reanchored, purged);
     xSemaphoreGive(g_audio.rx_sources_mutex);
 
-    esp_err_t ret = record_push_result(result, reanchored);
     xSemaphoreGive(lifecycle_mutex);
     return ret;
 }

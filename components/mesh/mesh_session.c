@@ -157,7 +157,10 @@ static void mesh_task_drain_active_rx_and_deliver_audio(void)
     mesh_rx_item_t rx;
     int processed = 0;
     while (xQueueReceive(s_rx_queue, &rx, 0) == pdTRUE) {
+        int64_t handle_start_us = esp_timer_get_time();
+        mesh_timing_record(&s_stats.rx_dequeue_age, handle_start_us - rx.timestamp_us);
         handle_packet(&rx);
+        mesh_timing_record(&s_stats.rx_handle, esp_timer_get_time() - handle_start_us);
         processed++;
         if (processed >= 32) {
             break;
@@ -176,7 +179,12 @@ static void mesh_task_drain_active_rx_and_deliver_audio(void)
         int64_t timestamp_us;
 
         while (jitter_buffer_pop(audio_data, &audio_len, &src_id, &audio_flags, &timestamp_us)) {
+            STATS_INC(rx_deliver);
+            int64_t cb_start_us = esp_timer_get_time();
             s_audio_cb(audio_data, audio_len, src_id, audio_flags, timestamp_us);
+            int64_t cb_us = esp_timer_get_time() - cb_start_us;
+            mesh_timing_record(&s_stats.rx_audio_callback, cb_us);
+            if (cb_us > 20000) STATS_INC(rx_audio_callback_over_20ms_count);
         }
     }
 }
@@ -223,6 +231,7 @@ void mesh_task(void *arg)
         .prev_state = s_state,
     };
     s_contention_next_tx_us = task.scan_start + (esp_random() % (CONTENTION_JITTER_MS + 1)) * 1000;
+    int64_t last_active_loop_us = 0;
 
     while (1) {
         taskENTER_CRITICAL(&s_transport_mux);
@@ -234,6 +243,18 @@ void mesh_task(void *arg)
 
         int64_t now = esp_timer_get_time();
         mesh_task_update_state_tracking(&task, now);
+        if (s_state == MESH_STATE_ACTIVE) {
+            if (last_active_loop_us != 0) {
+                int64_t gap_us = now - last_active_loop_us;
+                mesh_timing_record(&s_stats.rx_loop_gap, gap_us);
+                if (gap_us > 5000) STATS_INC(rx_loop_gap_over_5ms_count);
+                if (gap_us > 20000) STATS_INC(rx_loop_gap_over_20ms_count);
+                if (gap_us > 60000) STATS_INC(rx_loop_gap_over_60ms_count);
+            }
+            last_active_loop_us = now;
+        } else {
+            last_active_loop_us = 0;
+        }
 
         switch (s_state) {
         case MESH_STATE_SCANNING:
@@ -248,6 +269,7 @@ void mesh_task(void *arg)
             mesh_task_drain_active_rx_and_deliver_audio();
             mesh_task_run_active_maintenance(&task, now);
             mesh_task_dispatch_timer_event();
+            if (s_state != MESH_STATE_ACTIVE) last_active_loop_us = 0;
             break;
 
         default:
@@ -776,6 +798,8 @@ void check_peer_timeouts(void)
         esp_timer_stop(s_frame_timer);
         esp_timer_stop(s_control_timer);
         drain_slot_signal();
+        /* RX callbacks remain enabled here; the existing reset can race a new enqueue. */
+        drain_rx_queue_for_reset();
         xQueueReset(s_rx_queue);
         clear_transient_mesh_state();
         xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
@@ -801,13 +825,9 @@ void demote_to_participant(const uint8_t *coordinator_mac, uint8_t coordinator_i
     drain_slot_signal();
     clear_transient_mesh_state();
 
-    mesh_rx_item_t rx;
-    int cleared = 0;
-    while (xQueueReceive(s_rx_queue, &rx, 0) == pdTRUE) {
-        cleared++;
-    }
+    uint32_t cleared = drain_rx_queue_for_reset();
     if (cleared > 0) {
-        ESP_LOGI(TAG, "Cleared %d packets from RX queue during demotion", cleared);
+        ESP_LOGI(TAG, "Cleared %lu packets from RX queue during demotion", (unsigned long)cleared);
     }
 
     s_role = MESH_ROLE_PARTICIPANT;

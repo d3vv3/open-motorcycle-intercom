@@ -5,8 +5,12 @@
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 
 #include "audio_internal.h"
+#if defined(AUDIO_S31_LC3_WIRE)
+#include "esp_lc3_codec.h"
+#endif
 
 static const char *TAG = "audio";
 
@@ -276,11 +280,31 @@ esp_err_t audio_hw_opus_init(const audio_config_t *config)
 {
     const size_t decoder_count = AUDIO_MAX_RX_SOURCES + 1u;
     const int decoder_size = opus_decoder_get_size(config->channels);
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    const int encoder_complexity = 0;
+#else
+    const int encoder_complexity = 5;
+#endif
     int error = OPUS_OK;
 
     audio_hw_opus_deinit();
+#if defined(AUDIO_S31_LC3_WIRE)
+    g_audio.lc3_encoder = esp_lc3_codec_open(true);
+    if (g_audio.lc3_encoder == NULL) {
+        audio_hw_opus_deinit();
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
+        g_audio.rx_sources[i].lc3_decoder = esp_lc3_codec_open(false);
+        if (g_audio.rx_sources[i].lc3_decoder == NULL) {
+            audio_hw_opus_deinit();
+            return ESP_FAIL;
+        }
+    }
+#endif
     if (decoder_size <= 0) {
         ESP_LOGE(TAG, "Invalid Opus decoder size for %u channels", config->channels);
+        audio_hw_opus_deinit();
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -288,14 +312,22 @@ esp_err_t audio_hw_opus_init(const audio_config_t *config)
         opus_encoder_create(config->sample_rate, config->channels, OPUS_APPLICATION_VOIP, &error);
     if (error != OPUS_OK || g_audio.opus_encoder == NULL) {
         ESP_LOGE(TAG, "Failed to create Opus encoder: %s", opus_strerror(error));
+        audio_hw_opus_deinit();
         return ESP_FAIL;
     }
     opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_BITRATE(config->opus_bitrate));
     opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_INBAND_FEC(1));
     opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_PACKET_LOSS_PERC(OPUS_EXPECTED_LOSS_PERC));
-    opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_COMPLEXITY(5));
+#if CONFIG_IDF_TARGET_ESP32S31
+    opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_MAX_BANDWIDTH(OPUS_BANDWIDTH_NARROWBAND));
+#endif
+    opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_COMPLEXITY(encoder_complexity));
     opus_encoder_ctl(g_audio.opus_encoder, OPUS_SET_DTX(1));
+    ESP_LOGI(TAG, "Opus encoder complexity=%d state=%p allocated=%u bytes memory=%s",
+             encoder_complexity, (void *)g_audio.opus_encoder,
+             (unsigned)heap_caps_get_allocated_size(g_audio.opus_encoder),
+             esp_ptr_external_ram(g_audio.opus_encoder) ? "PSRAM" : "internal");
 
     g_audio.loopback_decoder = heap_caps_malloc((size_t)decoder_size,
                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -346,5 +378,11 @@ void audio_hw_opus_deinit(void)
     free_opus_decoder(&g_audio.loopback_decoder);
     for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
         free_opus_decoder(&g_audio.rx_sources[i].decoder);
+#if defined(AUDIO_S31_LC3_WIRE)
+        esp_lc3_codec_close(&g_audio.rx_sources[i].lc3_decoder);
+#endif
     }
+#if defined(AUDIO_S31_LC3_WIRE)
+    esp_lc3_codec_close(&g_audio.lc3_encoder);
+#endif
 }

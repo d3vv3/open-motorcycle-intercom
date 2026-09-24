@@ -3,9 +3,8 @@
  * @brief Notification tone synthesis mixed into the playout frame.
  */
 
-#include <math.h>
-
 #include "audio_internal.h"
+#include "audio_notification_tone.h"
 
 static uint8_t notification_tone_count(audio_notify_t type)
 {
@@ -20,13 +19,11 @@ static uint8_t notification_tone_count(audio_notify_t type)
     return 1;
 }
 
-static float notification_frequency(audio_notify_t type, uint8_t tone_index)
+static uint32_t notification_frequency_millihz(audio_notify_t type, uint8_t tone_index)
 {
-    static const float startup[] = {261.63f, 329.63f, 392.00f};
-    static const float join[] = {440.0f, 880.0f};
-    static const float leave[] = {880.0f, 440.0f};
-    static const float mesh_enabled[] = {440.0f, 880.0f};
-    static const float mesh_disabled[] = {880.0f, 440.0f};
+    static const uint32_t startup[] = {261630u, 329630u, 392000u};
+    static const uint32_t join[] = {440000u, 880000u};
+    static const uint32_t leave[] = {880000u, 440000u};
     switch (type) {
     case AUDIO_NOTIFY_STARTUP:
         return startup[tone_index];
@@ -35,20 +32,29 @@ static float notification_frequency(audio_notify_t type, uint8_t tone_index)
     case AUDIO_NOTIFY_PEER_LEAVE:
         return leave[tone_index];
     case AUDIO_NOTIFY_MESH_ENABLED:
-        return mesh_enabled[tone_index];
+        return join[tone_index];
     case AUDIO_NOTIFY_MESH_DISABLED:
-        return mesh_disabled[tone_index];
+        return leave[tone_index];
     case AUDIO_NOTIFY_BLUETOOTH_PAIRING:
-        return 988.0f;
+        return 988000u;
     default:
-        return 0.0f;
+        return 0u;
     }
 }
 
-size_t audio_notify_mix_frame(size_t base_present_samples)
+static void notification_start_tone(audio_notification_state_t *note)
+{
+    note->phase = 0u;
+    note->phase_step = audio_notification_phase_step(
+        notification_frequency_millihz(note->type, note->tone_index),
+        g_audio.config.sample_rate);
+}
+
+size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consumed)
 {
     audio_notification_state_t *note = &g_audio.notification;
     size_t contributed = 0u;
+    *request_consumed = false;
     for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
         if (!note->active) {
             audio_notification_request_t request;
@@ -56,16 +62,21 @@ size_t audio_notify_mix_frame(size_t base_present_samples)
                 return contributed;
             }
             note->active = true;
+            *request_consumed = true;
+            AUDIO_STATS_LOCK();
+            if (g_audio.stats.notify_started_count != UINT32_MAX)
+                g_audio.stats.notify_started_count++;
+            AUDIO_STATS_UNLOCK();
             note->type = (audio_notify_t)request.type;
             note->tone_index = 0;
             note->segment_sample = 0;
             note->in_gap = false;
+            notification_start_tone(note);
         }
         int32_t tone = 0;
         if (!note->in_gap) {
-            float phase = 2.0f * M_PI * notification_frequency(note->type, note->tone_index) *
-                          note->segment_sample / g_audio.config.sample_rate;
-            tone = (int32_t)(NOTIFICATION_AMPLITUDE * 32767.0f * sinf(phase));
+            tone = audio_notification_tone_sample(note->phase);
+            note->phase += note->phase_step;
             contributed++;
             g_audio.pcm_output[i] = audio_route_mix_sample(false, i < base_present_samples, true,
                                                             g_audio.pcm_output[i],
@@ -82,10 +93,15 @@ size_t audio_notify_mix_frame(size_t base_present_samples)
         if (note->in_gap) {
             note->in_gap = false;
             note->tone_index++;
+            notification_start_tone(note);
         } else if (note->tone_index + 1u < notification_tone_count(note->type)) {
             note->in_gap = true;
         } else {
             note->active = false;
+            AUDIO_STATS_LOCK();
+            if (g_audio.stats.notify_completed_count != UINT32_MAX)
+                g_audio.stats.notify_completed_count++;
+            AUDIO_STATS_UNLOCK();
         }
         /* Start each tone or gap on a frame boundary so contribution remains a prefix. */
         return contributed;
