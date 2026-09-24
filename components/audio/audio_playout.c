@@ -15,6 +15,14 @@
 static const char *TAG = "audio";
 static uint32_t successful_remote_decodes;
 
+typedef struct {
+    uint32_t attempted;
+    uint32_t successful;
+    uint32_t failed;
+    uint32_t nonzero_frames;
+    int32_t peak_abs;
+} audio_output_window_t;
+
 #if defined(AUDIO_S31_LC3_SELFTEST)
 static bool run_lc3_startup_selftest(void)
 {
@@ -789,12 +797,22 @@ static void playout_task_finish(void)
 }
 
 static void write_playout_frame(bool notify_frame, bool notify_continues,
-                                int64_t *previous_notify_write_start_us)
+                                int64_t *previous_notify_write_start_us,
+                                audio_output_window_t *output_window)
 {
     if (!atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
         *previous_notify_write_start_us = 0;
         return;
     }
+    int32_t frame_peak = 0;
+    for (size_t i = 0; i < AUDIO_HW_FRAME_SAMPLES; ++i) {
+        int32_t sample = g_audio.hw_output[i];
+        int32_t magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > frame_peak) frame_peak = magnitude;
+    }
+    output_window->attempted++;
+    if (frame_peak != 0) output_window->nonzero_frames++;
+    if (frame_peak > output_window->peak_abs) output_window->peak_abs = frame_peak;
     int64_t write_start_us = esp_timer_get_time();
     int ret = esp_codec_dev_write(g_audio.play_dev, (uint8_t *)g_audio.hw_output,
                                   sizeof(g_audio.hw_output));
@@ -824,6 +842,7 @@ static void write_playout_frame(bool notify_frame, bool notify_continues,
     AUDIO_STATS_UNLOCK();
     *previous_notify_write_start_us = notify_continues ? write_start_us : 0;
     if (ret != ESP_CODEC_DEV_OK) {
+        output_window->failed++;
         AUDIO_STATS_LOCK();
         g_audio.stats.i2s_write_incomplete++;
         g_audio.stats.glitches_detected++;
@@ -833,6 +852,7 @@ static void write_playout_frame(bool notify_frame, bool notify_continues,
         (void)audio_rate_converter_reset(g_audio.far_reference_converter);
         ESP_LOGW(TAG, "Codec playback write failed: %d", ret);
     } else {
+        output_window->successful++;
         int64_t far_span = cpu_profile_span_begin();
         advance_far_reference_after_write();
         cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_FAR_REFERENCE, far_span);
@@ -884,6 +904,7 @@ void audio_playout_task(void *arg)
     bool stack_logged = false;
     int64_t previous_notify_work_start_us = 0;
     int64_t previous_notify_write_start_us = 0;
+    audio_output_window_t output_window = {0};
 
     opus_decoder_ctl(g_audio.loopback_decoder, OPUS_RESET_STATE);
     audio_rx_reset_codecs_and_resamplers();
@@ -897,6 +918,7 @@ void audio_playout_task(void *arg)
     atomic_store_explicit(&g_audio.playout_ready, true, memory_order_release);
     xSemaphoreGive(g_audio.playout_started);
     ESP_LOGI(TAG, "Playout task started on core %d", xPortGetCoreID());
+    int64_t output_window_start_us = esp_timer_get_time();
 
     while (atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
         int64_t work_start_us = esp_timer_get_time();
@@ -1028,7 +1050,20 @@ void audio_playout_task(void *arg)
         AUDIO_STATS_UNLOCK();
         bool notify_continues = notify_frame && g_audio.notification.active;
         previous_notify_work_start_us = notify_continues ? work_start_us : 0;
-        write_playout_frame(notify_frame, notify_continues, &previous_notify_write_start_us);
+        write_playout_frame(notify_frame, notify_continues, &previous_notify_write_start_us,
+                            &output_window);
+        int64_t output_now_us = esp_timer_get_time();
+        if (output_window.attempted >= 500u ||
+            output_now_us - output_window_start_us >= 10000000LL) {
+            ESP_LOGI(TAG, "AUDIO_OUT window_attempted=%" PRIu32 " successful=%" PRIu32
+                          " failed=%" PRIu32 " attempted_nonzero_frames=%" PRIu32
+                          " attempted_peak_abs=%" PRId32,
+                     output_window.attempted, output_window.successful, output_window.failed,
+                     output_window.nonzero_frames, output_window.peak_abs);
+            audio_hw_log_output_state();
+            output_window = (audio_output_window_t){0};
+            output_window_start_us = esp_timer_get_time();
+        }
 
     }
 

@@ -134,20 +134,8 @@ static inline void pulse_ack_line(void)
 static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
 {
     switch (type) {
-    case UART_PKT_AUDIO: {
-        static int32_t last_log = 0;
-        static uint32_t audio_pkt_count = 0;
-        audio_pkt_count++;
-        int32_t now = k_uptime_get();
-        if (now - last_log > 5000) {
-            LOG_INF("Audio: %u pkts received (last len=%d)", audio_pkt_count, len);
-            last_log = now;
-        }
-        if (len >= 1) {
-            return mesh_protocol_send_audio(payload + 1, (uint8_t)(len - 1), payload[0]);
-        }
-        return -EINVAL;
-    }
+    case UART_PKT_AUDIO:
+        return -ENOTSUP;
 
     case UART_PKT_AUDIO_V2:
         return mesh_protocol_send_audio_v2(payload, len);
@@ -222,7 +210,11 @@ static void parse_rx(const uint8_t *buf, size_t len)
         }
     }
 
-    if (frame.type == UART_PKT_AUDIO || frame.type == UART_PKT_AUDIO_V2) {
+    if (frame.type == UART_PKT_AUDIO) {
+        s_audio_ingress_reject++;
+        return;
+    }
+    if (frame.type == UART_PKT_AUDIO_V2) {
         bool duplicate = s_last_audio_seq_valid && (seq == s_last_audio_seq);
         if (duplicate) {
             s_audio_ingress_duplicate++;
@@ -333,43 +325,6 @@ int uart_bridge_init(void)
     return 0;
 }
 
-int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len)
-{
-    if (!s_initialized || data == NULL || len == 0) {
-        return -EINVAL;
-    }
-
-    if (len > SPI_MAX_PAYLOAD - 1) { /* -1 for src_id */
-        return -EMSGSIZE;
-    }
-
-    k_mutex_lock(&s_tx_lock, K_FOREVER);
-    uint8_t cur_head = s_audio_head;
-    uint8_t next_head = (cur_head + 1) % TX_AUDIO_QUEUE_SIZE;
-    if (next_head == s_audio_tail) {
-        /* Full: drop oldest to keep low latency */
-        s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
-        s_audio_q_overwrite++;
-        if ((s_audio_q_overwrite % 200) == 0) {
-            LOG_WRN("Audio SPI TX queue overwrite count=%u", s_audio_q_overwrite);
-        }
-    }
-
-    struct tx_entry *e = &s_audio_q[cur_head];
-    memset(e->buf, 0, BRIDGE_SPI_MAX_XFER);
-    uint8_t payload[SPI_MAX_PAYLOAD] = {0};
-    payload[0] = src_id;
-    memcpy(&payload[1], data, len);
-    e->len = build_packet(e->buf, UART_PKT_AUDIO, payload, (uint8_t)(len + 1));
-    e->type = UART_PKT_AUDIO;
-
-    s_audio_head = next_head;
-    k_mutex_unlock(&s_tx_lock);
-
-    LOG_DBG("Queued audio packet: src=%d, len=%d", src_id, len);
-    return 0;
-}
-
 int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len)
 {
     audio_bundle_view_t bundle;
@@ -441,6 +396,8 @@ int uart_bridge_send_status(uint8_t state, uint8_t role, uint8_t peer_count, uin
         .slot_index = slot_index,
         .coordinator_id = coordinator_id,
         .marker = BRIDGE_STATUS_V2_MARKER,
+        .audio_codec = MESH_AUDIO_V2_CODEC_LC3,
+        .audio_frame_ms = MESH_FRAME_MS,
     };
     uint16_t pkt_len =
         build_packet(pkt, UART_PKT_STATUS, (const uint8_t *)&payload, sizeof(payload));

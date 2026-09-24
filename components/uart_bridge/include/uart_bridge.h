@@ -55,6 +55,8 @@ typedef struct {
     bool is_coordinator;
     bool has_mesh_state;
     uint8_t protocol_version;
+    uint8_t audio_codec;    /* 0 if not advertised by a v3 status */
+    uint8_t audio_frame_ms; /* 0 if not advertised by a v3 status */
     uint32_t generation;
     int64_t received_at_us;
     bool continuity_lost;
@@ -133,7 +135,7 @@ esp_err_t uart_bridge_get_status(uart_bridge_status_t *status);
 bool uart_bridge_is_connected(void);
 
 /**
- * @brief Check whether a fresh status reports a mesh-ready nRF52840
+ * @brief Check whether a fresh status reports an LC3-capable mesh-ready nRF52840
  */
 bool uart_bridge_is_mesh_ready(void);
 

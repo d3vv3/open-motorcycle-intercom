@@ -26,20 +26,23 @@
  * ============================================================================ */
 
 #define MESH_MAX_NODES                  8
-#define MESH_FRAME_MS                   20   /* TDMA frame duration (aligned with Opus) */
+#define MESH_FRAME_MS                   20   /* TDMA frame duration */
 #define MESH_SLOT_MS                    2    /* TDMA slot duration */
 #define MESH_GUARD_US                   500  /* Guard time between slots */
 #define MESH_SYNC_INTERVAL_FRAMES       10   /* SYNC broadcast cadence */
 #define MESH_NODE_TIMEOUT_MS            3000 /* Drop peer after this silence */
 #define MESH_KEEPALIVE_INTERVAL_MS      500  /* KEEPALIVE cadence */
-#define MESH_PROTOCOL_VERSION           0x02
+#define MESH_PROTOCOL_VERSION           0x03
 #define MESH_MAX_OPUS_BYTES             64
 #define MESH_LC3_FRAME_BYTES            48
 #define MESH_E2E_SEQUENCE_BYTES         2
 #define MESH_MAX_AUDIO_PAYLOAD          (MESH_MAX_OPUS_BYTES + MESH_E2E_SEQUENCE_BYTES)
 #define MESH_AUDIO_V2_CODEC_OPUS        0x01
+#define MESH_AUDIO_V2_CODEC_LC3         0x02
 #define MESH_AUDIO_CODEC_OPUS            0x01
 #define MESH_AUDIO_CODEC_LC3             0x02
+#define MESH_CAP_OPUS                    0x01
+#define MESH_CAP_LC3                     0x02
 #define MESH_AUDIO_V2_FRAME_MS          20
 #define MESH_AUDIO_V2_FIXED_HEADER_SIZE 8
 #define MESH_AUDIO_V2_MAX_FRAME_BYTES   64
@@ -94,7 +97,7 @@ typedef enum {
     MESH_PKT_SPEAKER_RELEASE = 0x0A, /* Relay grant release */
     MESH_PKT_JOIN_V2 = 0x0B,         /* Identity-bearing JOIN (nRF/ESB) */
     MESH_PKT_JOIN_ACK_V2 = 0x0C,     /* Identity-targeted JOIN_ACK (nRF/ESB) */
-    MESH_PKT_AUDIO_V2 = 0x0D,        /* Redundant Opus audio bundle */
+    MESH_PKT_AUDIO_V2 = 0x0D,        /* Redundant LC3 audio bundle */
 } mesh_pkt_type_t;
 
 /* ============================================================================

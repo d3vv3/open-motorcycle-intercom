@@ -269,6 +269,7 @@ void audio_hw_codec_deinit(void);
 esp_err_t audio_hw_codec_start(const audio_config_t *config);
 void audio_hw_codec_stop(void);
 void audio_hw_i2c_deinit(void);
+void audio_hw_log_output_state(void);
 esp_err_t audio_hw_opus_init(const audio_config_t *config);
 void audio_hw_opus_deinit(void);
 

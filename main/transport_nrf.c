@@ -53,6 +53,16 @@ static uint8_t s_notification_tail = 0;
 static uint32_t s_membership_generation = 0;
 static _Atomic bool s_enable_notification_pending = false;
 
+static bool nrf_lc3_ready(void)
+{
+    uart_bridge_status_t status;
+    return uart_bridge_get_status(&status) == ESP_OK &&
+           status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
+           status.audio_codec == MESH_AUDIO_CODEC_LC3 &&
+           status.audio_frame_ms == MESH_AUDIO_V2_FRAME_MS &&
+           status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
+}
+
 uint8_t transport_nrf_node_id(void)
 {
     uart_bridge_status_t status;
@@ -137,15 +147,15 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, in
 {
     e2e_pipe_counters_t *pipe = e2e_diag_counters();
     uint16_t seq = e2e_diag_next_tx_seq();
-    if (len > MESH_MAX_OPUS_BYTES) {
+    if (data == NULL || len != MESH_LC3_FRAME_BYTES) {
         pipe->spi_oversize++;
         audio_tx_cache_reset(&s_previous_audio);
-        ESP_LOGW(TAG, "Audio frame too large for E2E wrapper: %u", len);
+        ESP_LOGW(TAG, "Rejecting non-LC3 audio frame: %u bytes (expected %u)", len,
+                 MESH_LC3_FRAME_BYTES);
         return;
     }
 
-    /* Single-predecessor redundancy: prev1 recovers isolated losses, and
-     * Opus PLC covers the rare two-in-a-row loss. prev2 measured near-zero
+    /* Single-predecessor redundancy: prev1 recovers isolated losses. prev2 measured near-zero
      * additional recovery for ~1/3 of the airtime budget. */
     uint16_t previous1_len = 0;
     const uint8_t *previous1_data = audio_tx_cache_previous(&s_previous_audio, seq, &previous1_len);
@@ -162,6 +172,7 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, in
         .current_seq = seq,
         .stream_id = transport_nrf_node_id(),
         .flags = active ? AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE : 0,
+        .codec = MESH_AUDIO_V2_CODEC_LC3,
     };
     if (attach_previous1) {
         bundle.flags |= AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT | AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
@@ -171,7 +182,7 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, in
     audio_tx_cache_store(&s_previous_audio, data, len, active, seq, mesh_intent_enabled());
 
     xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
-    if (mesh_intent_enabled() && uart_bridge_is_mesh_ready()) {
+    if (mesh_intent_enabled() && nrf_lc3_ready()) {
         pipe->spi_attempts++;
         esp_err_t ret = bundle_encoded ? uart_bridge_send_audio_v2(bundle_buf, (uint16_t)bundle_len)
                                        : ESP_ERR_INVALID_SIZE;
@@ -213,7 +224,7 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, in
 static esp_err_t submit_audio_frame(const audio_frame_t *frame, uint8_t src_id, bool *admitted)
 {
     xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
-    bool ready = mesh_intent_enabled() && uart_bridge_is_mesh_ready();
+    bool ready = mesh_intent_enabled() && nrf_lc3_ready();
     if (admitted != NULL) {
         *admitted = ready;
     }
@@ -267,7 +278,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 {
     e2e_pipe_counters_t *pipe = e2e_diag_counters();
 
-    if (!mesh_intent_enabled() || !uart_bridge_is_mesh_ready()) {
+    if (!mesh_intent_enabled() || !nrf_lc3_ready()) {
         pipe->spi_rx_invalid++;
         return;
     }
@@ -296,7 +307,10 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 
     audio_bundle_view_t bundle = {0};
     pipe->bundle_rx++;
-    if (!audio_bundle_parse(data, len, &bundle) ||
+    if (!audio_bundle_parse(data, len, &bundle) || bundle.codec != MESH_AUDIO_V2_CODEC_LC3 ||
+        bundle.current_len != MESH_LC3_FRAME_BYTES ||
+        (bundle.previous1_len != 0 && bundle.previous1_len != MESH_LC3_FRAME_BYTES) ||
+        (bundle.previous2_len != 0 && bundle.previous2_len != MESH_LC3_FRAME_BYTES) ||
         (bundle.stream_id != 0 && bundle.stream_id != src_id)) {
         pipe->bundle_bad++;
         pipe->spi_rx_invalid++;
@@ -370,7 +384,10 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 
 static void bridge_status_callback(const uart_bridge_status_t *status)
 {
-    bool ready = status->mesh_state == BRIDGE_MESH_STATE_ACTIVE && status->node_id != 0;
+    bool ready = status->protocol_version == BRIDGE_PROTOCOL_VERSION &&
+                 status->audio_codec == MESH_AUDIO_CODEC_LC3 &&
+                 status->audio_frame_ms == MESH_AUDIO_V2_FRAME_MS &&
+                 status->mesh_state == BRIDGE_MESH_STATE_ACTIVE && status->node_id != 0;
     bool user_enabled;
     bool logged_join = false;
     bool logged_leave = false;
@@ -470,7 +487,10 @@ static void reconcile_mesh_state(int64_t now_ms)
         return;
     }
 
-    bool ready = status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
+    bool ready = status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
+                 status.audio_codec == MESH_AUDIO_CODEC_LC3 &&
+                 status.audio_frame_ms == MESH_AUDIO_V2_FRAME_MS &&
+                 status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
     if (!s_status_observed || status.mesh_state != s_last_mesh_state) {
         s_status_observed = true;
         s_last_mesh_state = status.mesh_state;

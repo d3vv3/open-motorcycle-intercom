@@ -199,6 +199,9 @@ static void process_join(const mesh_header_t *hdr, const uint8_t *payload)
         return;
     }
     const mesh_join_v2_payload_t *join = (const mesh_join_v2_payload_t *)payload;
+    if ((join->capabilities & MESH_CAP_LC3) == 0u) {
+        return;
+    }
     uint8_t assigned_id = 0;
     int8_t assigned_slot = -1;
     for (int i = 0; i < MESH_MAX_NODES; i++) {

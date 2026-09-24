@@ -76,10 +76,8 @@ typedef struct {
 } mesh_peer_info_t;
 
 /**
- * @brief Queue a legacy RTT probe for transmission in the next slot
- * @param data RTT probe payload
- * @param len Payload length
- * @return 0 on success
+ * @brief Raw audio is unsupported; use mesh_protocol_send_audio_v2() for LC3 bundles.
+ * @return -ENOTSUP
  */
 int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags);
 

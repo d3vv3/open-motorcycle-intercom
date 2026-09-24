@@ -30,7 +30,19 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
         if (len == sizeof(bridge_status_payload_t)) {
             bridge_status_payload_t status;
             memcpy(&status, payload, sizeof(status));
-            bridge_status_apply_v2(&status);
+            if (status.version == BRIDGE_PROTOCOL_VERSION) {
+                bridge_status_apply_v2(&status);
+            } else {
+                ESP_LOGW(TAG, "Ignoring 10-byte bridge status with version %u", status.version);
+            }
+        } else if (len == BRIDGE_STATUS_V2_LENGTH) {
+            bridge_status_payload_t status = {0};
+            memcpy(&status, payload, BRIDGE_STATUS_V2_LENGTH);
+            if (status.version == BRIDGE_PROTOCOL_VERSION_V2) {
+                bridge_status_apply_v2(&status);
+            } else {
+                ESP_LOGW(TAG, "Ignoring 8-byte bridge status with version %u", status.version);
+            }
         } else if (len == 3) {
             bridge_status_apply_legacy(payload);
         } else {

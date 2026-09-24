@@ -24,6 +24,7 @@ typedef struct {
     uint16_t current_seq;
     uint8_t stream_id;
     uint8_t flags;
+    uint8_t codec;
 } audio_bundle_view_t;
 
 bool audio_bundle_encode(const audio_bundle_view_t *bundle, uint8_t *output, size_t output_capacity,

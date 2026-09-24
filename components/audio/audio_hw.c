@@ -6,13 +6,106 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
+#include <stdio.h>
 
 #include "audio_internal.h"
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+#include "soc/gpio_struct.h"
+#endif
 #if defined(AUDIO_S31_LC3_WIRE)
 #include "esp_lc3_codec.h"
 #endif
 
 static const char *TAG = "audio";
+static bool periodic_readback_enabled = true;
+
+static void audio_hw_codec_snapshot(const char *phase)
+{
+    static const uint8_t regs[] = {0x00, 0x01, 0x02, 0x09, 0x0D, 0x0E, 0x12, 0x31, 0x32, 0x37};
+    char dump[128];
+    size_t used = 0;
+
+    for (size_t i = 0; i < sizeof(regs); ++i) {
+        int value = 0;
+        int ret = g_audio.ctrl_if->read_reg(g_audio.ctrl_if, regs[i], 1, &value, 1);
+        if (ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "ES8311 %s read reg %02X failed: %d", phase, regs[i], ret);
+        }
+        int written = snprintf(dump + used, sizeof(dump) - used, "%s%02X=%s",
+                               i ? " " : "", regs[i], ret == ESP_CODEC_DEV_OK ? "" : "ERR");
+        used += (size_t)written;
+        if (ret == ESP_CODEC_DEV_OK) {
+            written = snprintf(dump + used, sizeof(dump) - used, "%02X", value & 0xFF);
+            used += (size_t)written;
+        }
+    }
+    ESP_LOGI(TAG, "ES8311 %s: %s", phase, dump);
+}
+
+void audio_hw_log_output_state(void)
+{
+    static const uint8_t regs[] = {0x00, 0x0E, 0x12, 0x31, 0x32};
+    if (periodic_readback_enabled) {
+        char dump[64];
+        size_t used = 0;
+
+        for (size_t i = 0; i < sizeof(regs); ++i) {
+            int value = 0;
+            int ret = g_audio.ctrl_if->read_reg(g_audio.ctrl_if, regs[i], 1, &value, 1);
+            if (ret != ESP_CODEC_DEV_OK) {
+                periodic_readback_enabled = false;
+                ESP_LOGW(TAG, "AUDIO_OUT ES8311 read reg %02X failed: %d; readback disabled until codec init",
+                         regs[i], ret);
+                break;
+            }
+            int written = snprintf(dump + used, sizeof(dump) - used, "%s%02X=%02X",
+                                   i ? " " : "", regs[i], value & 0xFF);
+            used += (size_t)written;
+        }
+        ESP_LOGI(TAG, "AUDIO_OUT ES8311 %s%s", used ? dump : "(none)",
+                 periodic_readback_enabled ? "" : " (readback disabled)");
+    } else {
+        ESP_LOGI(TAG, "AUDIO_OUT ES8311 readback disabled");
+    }
+
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    const uint32_t bit = 1u << (OMI_BOARD_GPIO_AUDIO_AMP_EN - 32);
+    ESP_LOGI(TAG, "AUDIO_OUT PA GPIO%d output_latch=%u output_enable=%u (not pad voltage)",
+             OMI_BOARD_GPIO_AUDIO_AMP_EN, (unsigned)((GPIO.out1.val & bit) != 0u),
+             (unsigned)((GPIO.enable1.val & bit) != 0u));
+#endif
+}
+
+static esp_err_t audio_hw_codec_reset(void)
+{
+    const int amp_pin = OMI_BOARD_GPIO_AUDIO_AMP_EN;
+    int ret = g_audio.gpio_if->set(amp_pin, false);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "Failed to preload amplifier enable low: %d", ret);
+        return ESP_FAIL;
+    }
+    ret = g_audio.gpio_if->setup(amp_pin, AUDIO_GPIO_DIR_OUT, AUDIO_GPIO_MODE_FLOAT);
+    if (ret != ESP_CODEC_DEV_OK) {
+        ESP_LOGE(TAG, "Failed to configure amplifier enable output: %d", ret);
+        return ESP_FAIL;
+    }
+
+    audio_hw_codec_snapshot("before reset");
+    /* MCU reset leaves the ES8311 powered; use the reset prefix from esp-bsp/components/es8311/es8311.c. */
+    const int reset_values[] = {0x1F, 0x00, 0x80};
+    for (size_t i = 0; i < sizeof(reset_values) / sizeof(reset_values[0]); ++i) {
+        int value = reset_values[i];
+        ret = g_audio.ctrl_if->write_reg(g_audio.ctrl_if, 0x00, 1, &value, 1);
+        if (ret != ESP_CODEC_DEV_OK) {
+            ESP_LOGE(TAG, "ES8311 reset write %02X failed: %d", value, ret);
+            return ESP_FAIL;
+        }
+        if (i == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    return ESP_OK;
+}
 
 esp_err_t audio_hw_i2s_init(const audio_config_t *config)
 {
@@ -91,6 +184,7 @@ void audio_hw_i2s_deinit(void)
 
 esp_err_t audio_hw_codec_init(const audio_config_t *config)
 {
+    periodic_readback_enabled = true;
     i2c_master_bus_config_t i2c_cfg = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = OMI_BOARD_GPIO_AUDIO_I2C_SDA,
@@ -116,6 +210,10 @@ esp_err_t audio_hw_codec_init(const audio_config_t *config)
     g_audio.gpio_if = audio_codec_new_gpio();
     if (g_audio.gpio_if == NULL) {
         ret = ESP_ERR_NO_MEM;
+        goto fail;
+    }
+    ret = audio_hw_codec_reset();
+    if (ret != ESP_OK) {
         goto fail;
     }
     audio_codec_i2s_cfg_t tx_data_cfg = {
@@ -212,6 +310,7 @@ esp_err_t audio_hw_codec_start(const audio_config_t *config)
         audio_hw_codec_stop();
         return ret;
     }
+    audio_hw_codec_snapshot("after start");
     return ESP_OK;
 }
 

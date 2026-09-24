@@ -175,8 +175,11 @@ void bridge_tx_prepare_dma(void)
 
         portENTER_CRITICAL(&g_bridge_status_lock);
         bool mesh_ready = bridge_status_is_fresh_locked(dequeue_us) &&
-                          g_bridge.status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
-                          g_bridge.status.node_id != 0;
+                           g_bridge.status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
+                           g_bridge.status.node_id != 0 &&
+                           g_bridge.status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
+                           g_bridge.status.audio_codec == MESH_AUDIO_CODEC_LC3 &&
+                           g_bridge.status.audio_frame_ms == MESH_AUDIO_V2_FRAME_MS;
         portEXIT_CRITICAL(&g_bridge_status_lock);
         if (!mesh_ready) {
             g_bridge.audio_tx_stale_drop++;

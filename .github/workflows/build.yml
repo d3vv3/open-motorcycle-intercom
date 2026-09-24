@@ -158,6 +158,9 @@ jobs:
       - name: Run bridge frame codec tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/bridge_frame_test && /tmp/bridge_frame_test
 
+      - name: Run bridge audio capability tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/bridge_audio_capability_test.c -o /tmp/bridge_audio_capability_test && /tmp/bridge_audio_capability_test
+
       - name: Run audio RX tracker tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/audio_rx_tracker_test && /tmp/audio_rx_tracker_test
 

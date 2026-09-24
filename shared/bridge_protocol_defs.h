@@ -4,9 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BRIDGE_PROTOCOL_VERSION   2
-#define BRIDGE_STATUS_V2_MARKER   0xA5
-#define BRIDGE_PEER_COUNT_UNKNOWN 0xFF
+#include "mesh_protocol_defs.h"
+
+#define BRIDGE_PROTOCOL_VERSION    3
+#define BRIDGE_PROTOCOL_VERSION_V2 2
+#define BRIDGE_STATUS_V2_MARKER    0xA5
+#define BRIDGE_STATUS_V2_LENGTH    8
+#define BRIDGE_PEER_COUNT_UNKNOWN  0xFF
 
 #define BRIDGE_PKT_AUDIO      0x01
 #define BRIDGE_PKT_STATUS     0x02
@@ -59,11 +63,24 @@ typedef struct __attribute__((packed)) {
     int8_t slot_index;
     uint8_t coordinator_id;
     uint8_t marker;
+    uint8_t audio_codec;
+    uint8_t audio_frame_ms;
 } bridge_status_payload_t;
+
+static inline int bridge_audio_supports_lc3(uint8_t version, uint8_t codec, uint8_t frame_ms)
+{
+    return version == BRIDGE_PROTOCOL_VERSION && codec == MESH_AUDIO_V2_CODEC_LC3 &&
+           frame_ms == MESH_FRAME_MS;
+}
 
 _Static_assert(sizeof(bridge_command_payload_t) == 2, "bridge command wire size changed");
 _Static_assert(sizeof(bridge_command_ack_payload_t) == 3, "bridge ACK wire size changed");
-_Static_assert(sizeof(bridge_status_payload_t) == 8, "bridge status wire size changed");
+_Static_assert(sizeof(bridge_status_payload_t) == 10, "bridge status wire size changed");
+_Static_assert(offsetof(bridge_status_payload_t, marker) == 7, "bridge status marker offset changed");
+_Static_assert(offsetof(bridge_status_payload_t, audio_codec) == BRIDGE_STATUS_V2_LENGTH,
+               "bridge status codec offset changed");
+_Static_assert(offsetof(bridge_status_payload_t, audio_frame_ms) == 9,
+               "bridge status frame duration offset changed");
 _Static_assert(offsetof(bridge_status_payload_t, role) == 0, "legacy status role prefix changed");
 _Static_assert(offsetof(bridge_status_payload_t, peer_count) == 1,
                "legacy status peer prefix changed");

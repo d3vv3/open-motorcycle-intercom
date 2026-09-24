@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 enum {
     FIRST_SEQUENCE = 96,
@@ -26,7 +27,7 @@ static audio_packet_t make_packet(uint16_t sequence, bool active)
     audio_packet_t packet = {0};
 
     packet.data[0] = (uint8_t)sequence;
-    packet.length = 1u;
+    packet.length = MESH_LC3_FRAME_BYTES;
     packet.sequence = sequence;
     packet.mode = AUDIO_PACKET_MODE_SEQUENCED;
     packet.active = active;
@@ -39,7 +40,7 @@ static void decode_and_push(audio_pcm_resampler_t *resampler,
     int16_t pcm[AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES];
     size_t index;
 
-    assert(packet->length == 1u);
+    assert(packet->length == MESH_LC3_FRAME_BYTES);
     assert(packet->data[0] == (uint8_t)packet->sequence);
     for (index = 0u; index < AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES; ++index) {
         pcm[index] = (int16_t)(1000 + packet->sequence);
@@ -100,9 +101,9 @@ static void prime_playout(audio_packet_store_t *store,
 
 static void push_redundant_bundle_oldest_first(audio_packet_store_t *store)
 {
-    const uint8_t previous2[] = {FIRST_LOST_SEQUENCE};
-    const uint8_t previous1[] = {FIRST_LOST_SEQUENCE + 1u};
-    const uint8_t current[] = {BUNDLE_SEQUENCE};
+    uint8_t previous2[MESH_LC3_FRAME_BYTES] = {FIRST_LOST_SEQUENCE};
+    uint8_t previous1[MESH_LC3_FRAME_BYTES] = {FIRST_LOST_SEQUENCE + 1u};
+    uint8_t current[MESH_LC3_FRAME_BYTES] = {BUNDLE_SEQUENCE};
     uint8_t wire[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
     size_t wire_length;
     audio_bundle_view_t parsed;
@@ -115,6 +116,7 @@ static void push_redundant_bundle_oldest_first(audio_packet_store_t *store)
         .current_len = sizeof(current),
         .current_seq = BUNDLE_SEQUENCE,
         .stream_id = 1u,
+        .codec = MESH_AUDIO_V2_CODEC_LC3,
         .flags = AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
                  AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE |
                  AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT |
@@ -125,15 +127,17 @@ static void push_redundant_bundle_oldest_first(audio_packet_store_t *store)
 
     assert(audio_bundle_encode(&bundle, wire, sizeof(wire), &wire_length));
     assert(audio_bundle_parse(wire, wire_length, &parsed));
+    assert(parsed.codec == MESH_AUDIO_V2_CODEC_LC3);
+    assert(parsed.current_len == MESH_LC3_FRAME_BYTES);
     packets[0] = make_packet((uint16_t)(parsed.current_seq - 2u),
                              (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0u);
-    packets[0].data[0] = parsed.previous2_data[0];
+    memcpy(packets[0].data, parsed.previous2_data, MESH_LC3_FRAME_BYTES);
     packets[1] = make_packet((uint16_t)(parsed.current_seq - 1u),
                              (parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0u);
-    packets[1].data[0] = parsed.previous1_data[0];
+    memcpy(packets[1].data, parsed.previous1_data, MESH_LC3_FRAME_BYTES);
     packets[2] = make_packet(parsed.current_seq,
                              (parsed.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE) != 0u);
-    packets[2].data[0] = parsed.current_data[0];
+    memcpy(packets[2].data, parsed.current_data, MESH_LC3_FRAME_BYTES);
 
     for (index = 0u; index < 3u; ++index) {
         assert(packets[index].sequence == FIRST_LOST_SEQUENCE + index);

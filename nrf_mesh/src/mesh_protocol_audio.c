@@ -10,7 +10,6 @@
 #include "esb_radio.h"
 #include "mesh_protocol_internal.h"
 #include "mesh_tx_metrics.h"
-#include "rtt_probe_defs.h"
 #include "tdma.h"
 #include "uart_bridge.h"
 
@@ -106,13 +105,6 @@ void mesh_protocol_audio_init(void)
 void mesh_protocol_audio_cancel_work(void)
 {
     k_work_cancel(&s_audio_ingress_work);
-}
-
-static bool is_rtt_probe_payload(const uint8_t *data, uint8_t len)
-{
-    return len == RTT_PKT_LEN && data[1] == RTT_MAGIC0 && data[2] == RTT_MAGIC1 &&
-           data[3] == RTT_MAGIC2 && data[4] == RTT_MAGIC3 &&
-           (data[5] == RTT_TYPE_REQ || data[5] == RTT_TYPE_RSP);
 }
 
 void mesh_protocol_audio_reset_rf_e2e_tracker(uint8_t node_id)
@@ -339,7 +331,8 @@ void mesh_protocol_audio_update_speaker_grants(void)
 
 static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, uint8_t flags)
 {
-    if (ttl == 0 || len < sizeof(mesh_header_t) || len > MESH_PACKET_OUTER_MAX) {
+    if (ttl == 0 || len < sizeof(mesh_header_t) || len > MESH_PACKET_OUTER_MAX ||
+        data[1] != MESH_PKT_AUDIO_V2) {
         return false;
     }
 
@@ -444,47 +437,14 @@ bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int
 {
     const mesh_header_t *hdr = (const mesh_header_t *)data;
     const uint8_t *payload = data + sizeof(mesh_header_t);
-    if (hdr->type != MESH_PKT_AUDIO && hdr->type != MESH_PKT_AUDIO_V2) {
+    if (hdr->type == MESH_PKT_AUDIO) {
+        s_stat_rf_rx_malformed++;
+        return true;
+    }
+    if (hdr->type != MESH_PKT_AUDIO_V2) {
         return false;
     }
-    if (hdr->type == MESH_PKT_AUDIO) {
-        if (s_state != MESH_STATE_ACTIVE || hdr->payload_len <= 4) {
-            if (s_state != MESH_STATE_ACTIVE)
-                s_stat_rf_rx_inactive_drop++;
-            else
-                s_stat_rf_rx_malformed++;
-            return true;
-        }
-        const mesh_audio_payload_t *audio = (const mesh_audio_payload_t *)payload;
-        uint8_t audio_len = hdr->payload_len - 4;
-        uint8_t bridge_buf[MESH_MAX_AUDIO_PAYLOAD + 1];
-        if (hdr->src_id == s_node_id) {
-            s_stat_rf_rx_self_drop++;
-            return true;
-        }
-        if (audio_len > MESH_MAX_AUDIO_PAYLOAD) {
-            s_stat_rf_rx_malformed++;
-            return true;
-        }
-        if (!mesh_core_dedupe_accept(&s_dedupe, hdr->type, hdr->src_id, hdr->seq)) {
-            s_stat_rf_rx_duplicate_drop++;
-            return true;
-        }
-        bool is_diagnostic = is_rtt_probe_payload(audio->data, audio_len);
-        if (!is_diagnostic) {
-            s_stat_rf_rx_malformed++;
-            return true;
-        }
-        mesh_protocol_update_peer_last_seen(hdr->src_id, rssi);
-        bridge_buf[0] = audio->audio_flags;
-        memcpy(&bridge_buf[1], audio->data, audio_len);
-        s_stat_rf_rx_audio_ok++;
-        if (uart_bridge_send_audio(hdr->src_id, bridge_buf, (uint8_t)(audio_len + 1)) == 0) {
-            s_stat_audio_fwd++;
-            s_stat_spi_out_ok++;
-        } else
-            s_stat_spi_out_drop++;
-    } else {
+    {
         audio_bundle_view_t bundle;
         if (s_state != MESH_STATE_ACTIVE) {
             s_stat_rf_rx_inactive_drop++;
@@ -674,19 +634,14 @@ static void transmit_relay_entry(void)
     const struct relay_entry *queued = &s_relay_ring[s_relay_tail];
     uint8_t packet_len = queued->len;
     int ret = -EINVAL;
-    bool is_v2 = packet_len > 1u && queued->data[1] == MESH_PKT_AUDIO_V2;
     bool prev1_forwarded = false;
     bool prev2_forwarded = false;
 
-    if (packet_len >= sizeof(mesh_header_t) && packet_len <= sizeof(packet)) {
+    if (packet_len >= sizeof(mesh_header_t) && packet_len <= sizeof(packet) &&
+        queued->data[1] == MESH_PKT_AUDIO_V2) {
         memcpy(packet, queued->data, packet_len);
-
-        if (!is_v2) {
-            ret = esb_radio_send(packet, packet_len);
-        } else {
-            ret = transmit_relay_audio_v2(packet, &packet_len, &prev1_forwarded, &prev2_forwarded);
-        }
-    } else if (is_v2) {
+        ret = transmit_relay_audio_v2(packet, &packet_len, &prev1_forwarded, &prev2_forwarded);
+    } else {
         s_stat_bundle_bad++;
     }
 
@@ -694,14 +649,12 @@ static void transmit_relay_entry(void)
         const mesh_header_t *sent_hdr = (const mesh_header_t *)packet;
         s_stat_tx_count++;
         s_relay_bitmap |= mesh_core_node_bit(sent_hdr->src_id);
-        if (is_v2) {
-            s_stat_bundle_tx++;
-            if (prev1_forwarded) {
-                s_stat_prev1_forwarded++;
-            }
-            if (prev2_forwarded) {
-                s_stat_prev2_forwarded++;
-            }
+        s_stat_bundle_tx++;
+        if (prev1_forwarded) {
+            s_stat_prev1_forwarded++;
+        }
+        if (prev2_forwarded) {
+            s_stat_prev2_forwarded++;
         }
     } else if (ret != -ETIME) {
         s_stat_tx_fail++;
@@ -808,26 +761,8 @@ static enum local_tx_outcome transmit_local_entry(const struct tx_audio_entry *e
                 count_e2e = true;
             }
         }
-    } else if (retain_prev1) {
-        return LOCAL_TX_FALLBACK_ORIGINAL;
     } else {
-        bool is_diagnostic = is_rtt_probe_payload(entry->data, entry->len);
-        mesh_audio_payload_t payload = {
-            .codec = MESH_AUDIO_V2_CODEC_OPUS,
-            .frame_ms = MESH_FRAME_MS,
-            .stream_id = s_node_id,
-            .audio_flags = entry->audio_flags,
-        };
-
-        memcpy(payload.data, entry->data, entry->len);
-        if (!is_diagnostic) {
-            note_audio_activity(s_node_id, entry->audio_flags);
-        }
-        s_stat_rf_audio_try++;
-        ret = mesh_protocol_tx_send_packet_ex(MESH_PKT_AUDIO, &payload, 4 + entry->len,
-                                              MESH_AUDIO_TTL_DEFAULT, tx_flags, s_node_id,
-                                              s_tx_seq++);
-        count_e2e = !is_diagnostic;
+        s_stat_bundle_bad++;
     }
 
     if (ret == 0) {
@@ -947,36 +882,20 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
                                  uint8_t packet_type)
 {
     audio_bundle_view_t bundle;
-    bool is_v2 = packet_type == MESH_PKT_AUDIO_V2;
-
     if (s_state != MESH_STATE_ACTIVE) {
         s_stat_ingress_inactive_drop++;
         return -EAGAIN;
     }
-    if ((!is_v2 && len > MESH_MAX_AUDIO_PAYLOAD) ||
-        (is_v2 && !audio_bundle_parse(data, len, &bundle))) {
-        if (is_v2) {
-            s_stat_bundle_bad++;
-        }
-        return -EMSGSIZE;
+    if (packet_type != MESH_PKT_AUDIO_V2 || !audio_bundle_parse(data, len, &bundle)) {
+        s_stat_bundle_bad++;
+        return -EINVAL;
     }
 
-    bool is_diagnostic = !is_v2 && is_rtt_probe_payload(data, len);
-    uint16_t e2e_seq = 0;
-    bool has_e2e_seq = false;
-    if (is_v2) {
-        audio_flags = bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE;
-        e2e_seq = bundle.current_seq;
-        has_e2e_seq = true;
-        s_stat_bundle_max_bytes = MAX(s_stat_bundle_max_bytes, len);
-    } else if (!is_diagnostic && len >= 2) {
-        e2e_seq = ((uint16_t)data[0] << 8) | data[1];
-        has_e2e_seq = true;
-    }
-
-    if (has_e2e_seq) {
+    audio_flags = bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE;
+    s_stat_bundle_max_bytes = MAX(s_stat_bundle_max_bytes, len);
+    {
         mesh_core_seq_result_t sequence =
-            mesh_core_seq16_accept(&s_e2e_spi_in_src[s_node_id], e2e_seq);
+            mesh_core_seq16_accept(&s_e2e_spi_in_src[s_node_id], bundle.current_seq);
         if (sequence.classification == MESH_CORE_SEQ_GAP) {
             s_e2e_spi_in_gap_evt++;
             s_e2e_spi_in_gap_fr += sequence.gap;
@@ -988,18 +907,16 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
 
     s_stat_spi_audio_in++;
     s_last_audio_in_time = k_uptime_get_32();
-    if (!is_diagnostic) {
-        note_audio_activity(s_node_id, audio_flags);
-        if (s_slot_index >= 0) {
-            int32_t tts_us = tdma_get_time_to_slot_us();
-            if (tts_us >= 0) {
-                uint32_t bucket = (uint32_t)tts_us / 2000U;
-                s_context.aphase_hist[MIN(bucket, 9U)]++;
-            }
+    note_audio_activity(s_node_id, audio_flags);
+    if (s_slot_index >= 0) {
+        int32_t tts_us = tdma_get_time_to_slot_us();
+        if (tts_us >= 0) {
+            uint32_t bucket = (uint32_t)tts_us / 2000U;
+            s_context.aphase_hist[MIN(bucket, 9U)]++;
         }
     }
 
-    if (!is_diagnostic && s_role == MESH_ROLE_COORDINATOR) {
+    if (s_role == MESH_ROLE_COORDINATOR) {
         mesh_protocol_audio_update_speaker_grants();
     }
 
@@ -1066,11 +983,10 @@ static int queue_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio_f
 
 int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_flags)
 {
-    if (data == NULL || len == 0 || len > MESH_MAX_AUDIO_PAYLOAD ||
-        !is_rtt_probe_payload(data, len)) {
-        return -EINVAL;
-    }
-    return queue_audio_ingress(data, len, audio_flags, MESH_PKT_AUDIO);
+    ARG_UNUSED(data);
+    ARG_UNUSED(len);
+    ARG_UNUSED(audio_flags);
+    return -ENOTSUP;
 }
 
 int mesh_protocol_send_audio_v2(const uint8_t *data, uint8_t len)

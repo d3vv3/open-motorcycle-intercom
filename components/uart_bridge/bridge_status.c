@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 
 #include "bridge_internal.h"
+#include "mesh_protocol_defs.h"
 
 static const char *TAG = "spi_bridge";
 
@@ -85,8 +86,7 @@ void bridge_status_log_telemetry(int64_t now_us)
 /**
  * @brief Store a validated status and notify the status callback.
  *
- * @return true when a change-relevant field differs from the previous
- *         status (only evaluated for v2 statuses).
+ * @return true when a change-relevant field differs from the previous status.
  */
 static bool commit_status(const uart_bridge_status_t *incoming, bool detect_change)
 {
@@ -129,10 +129,12 @@ static bool commit_status(const uart_bridge_status_t *incoming, bool detect_chan
 
 void bridge_status_apply_v2(const bridge_status_payload_t *payload)
 {
-    if (payload->version != BRIDGE_PROTOCOL_VERSION || payload->marker != BRIDGE_STATUS_V2_MARKER ||
+    if ((payload->version != BRIDGE_PROTOCOL_VERSION &&
+         payload->version != BRIDGE_PROTOCOL_VERSION_V2) ||
+        payload->marker != BRIDGE_STATUS_V2_MARKER ||
         payload->mesh_state > BRIDGE_MESH_STATE_ACTIVE) {
-        ESP_LOGW(TAG, "Ignoring invalid bridge v2 status (version=%u marker=0x%02X)",
-                 payload->version, payload->marker);
+        ESP_LOGW(TAG, "Ignoring invalid bridge status (version=%u marker=0x%02X)",
+                  payload->version, payload->marker);
         return;
     }
 
@@ -146,6 +148,8 @@ void bridge_status_apply_v2(const bridge_status_payload_t *payload)
         .is_coordinator = payload->role == 1,
         .has_mesh_state = true,
         .protocol_version = payload->version,
+        .audio_codec = payload->version == BRIDGE_PROTOCOL_VERSION ? payload->audio_codec : 0,
+        .audio_frame_ms = payload->version == BRIDGE_PROTOCOL_VERSION ? payload->audio_frame_ms : 0,
     };
 
     bool changed = commit_status(&incoming, true);
@@ -154,7 +158,10 @@ void bridge_status_apply_v2(const bridge_status_payload_t *payload)
                  payload->mesh_state, payload->role, payload->node_id, payload->slot_index,
                  payload->coordinator_id, payload->peer_count);
     }
-    if (payload->mesh_state != BRIDGE_MESH_STATE_ACTIVE || payload->node_id == 0) {
+    if (payload->mesh_state != BRIDGE_MESH_STATE_ACTIVE || payload->node_id == 0 ||
+        incoming.protocol_version != BRIDGE_PROTOCOL_VERSION ||
+        incoming.audio_codec != MESH_AUDIO_CODEC_LC3 ||
+        incoming.audio_frame_ms != MESH_AUDIO_V2_FRAME_MS) {
         bridge_tx_discard_pending_audio();
     }
 }
@@ -247,5 +254,8 @@ bool uart_bridge_is_mesh_ready(void)
     }
     portEXIT_CRITICAL(&g_bridge_status_lock);
 
-    return err == ESP_OK && status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
+    return err == ESP_OK && status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0 &&
+           status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
+           status.audio_codec == MESH_AUDIO_CODEC_LC3 &&
+           status.audio_frame_ms == MESH_AUDIO_V2_FRAME_MS;
 }

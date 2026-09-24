@@ -89,7 +89,7 @@ static esp_err_t init_nvs(void)
     return ret;
 }
 
-static void disable_esp_radios_for_nrf_transport(void)
+static void disable_esp_wifi_for_nrf_transport(void)
 {
 #if CONFIG_ESP_WIFI_ENABLED
     esp_err_t ret = esp_wifi_stop();
@@ -118,7 +118,7 @@ static void disable_esp_radios_for_nrf_transport(void)
 #endif
 
 #if CONFIG_BT_ENABLED
-    ESP_LOGW(TAG, "Bluetooth support is enabled in this build; no runtime BT stack is started");
+    ESP_LOGI(TAG, "Bluetooth remains available for phone audio");
 #else
     ESP_LOGI(TAG, "ESP Bluetooth disabled in build config");
 #endif
@@ -416,28 +416,37 @@ static void select_transport(void)
     ESP_LOGI(TAG, "Detecting mesh transport...");
 
 #if defined(APP_S31_LC3_WIRE)
-    s_active_transport = TRANSPORT_ESP_NOW;
-    ESP_LOGW(TAG, "S31 LC3 wire build: forcing ESP-NOW; skipping nRF probe (nRF bundle is Opus-only)");
-    return;
-#endif
-
     /* Try the nRF SPI bridge first. */
     esp_err_t ret = uart_bridge_init();
-    /* Probe for nRF52840 (send ping and wait up to 2s, with retries) */
-    if (ret == ESP_OK && uart_bridge_probe(2000)) {
-        /* nRF52840 detected: use ESB via SPI bridge. */
+    bool probed = ret == ESP_OK && uart_bridge_probe(2000);
+    uart_bridge_status_t status = {0};
+    bool fresh_status = probed && uart_bridge_get_status(&status) == ESP_OK;
+    if (fresh_status && bridge_audio_supports_lc3(status.protocol_version, status.audio_codec,
+                                                   status.audio_frame_ms)) {
         s_active_transport = TRANSPORT_NRF52840;
-        ESP_LOGI(TAG, "nRF52840 detected on SPI bridge - using ESB transport");
+        ESP_LOGI(TAG, "Using nRF ESB transport: bridge protocol=%u codec=LC3(%u) frame=%u ms",
+                 status.protocol_version, status.audio_codec, status.audio_frame_ms);
 
         transport_nrf_attach();
-        disable_esp_radios_for_nrf_transport();
+        disable_esp_wifi_for_nrf_transport();
     } else {
-        /* No nRF52840 - fallback to ESP-NOW */
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Using ESP-NOW: SPI bridge init failed: %s", esp_err_to_name(ret));
+        } else if (!fresh_status) {
+            ESP_LOGW(TAG, "Using ESP-NOW: no fresh nRF status after probe");
+        } else {
+            ESP_LOGW(TAG, "Using ESP-NOW: incompatible nRF bridge protocol=%u codec=%u frame=%u ms (need v%u LC3/20 ms)",
+                     status.protocol_version, status.audio_codec, status.audio_frame_ms,
+                     BRIDGE_PROTOCOL_VERSION);
+        }
         uart_bridge_deinit();
         transport_nrf_reset_tx_cache();
         s_active_transport = TRANSPORT_ESP_NOW;
-        ESP_LOGI(TAG, "nRF52840 not detected - using ESP-NOW transport");
     }
+#else
+    s_active_transport = TRANSPORT_ESP_NOW;
+    ESP_LOGI(TAG, "Using ESP-NOW: nRF LC3 transport requires S31_LC3_WIRE=ON");
+#endif
 }
 
 static esp_err_t initialize_application(int64_t boot_time)
@@ -614,7 +623,10 @@ static void run_runtime_health_loop(int64_t boot_time)
             static int64_t last_rtt_log_ms = 0;
 
             transport_nrf_tick(now_ms);
+#if !defined(APP_S31_LC3_WIRE)
+            /* LC3 nRF firmware does not ACK legacy BRIDGE_PKT_AUDIO RTT probes. */
             rtt_probe_tick(now_ms, g_mesh_active, uart_bridge_is_connected());
+#endif
 
             if ((now_ms - last_rtt_log_ms) >= RTT_LOG_INTERVAL_MS) {
                 rtt_probe_stats_t rtt = {0};

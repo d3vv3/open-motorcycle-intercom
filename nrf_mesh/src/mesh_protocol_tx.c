@@ -27,6 +27,11 @@ static int send_sync(mesh_protocol_context_t *context)
 int mesh_protocol_tx_send_packet_ex(mesh_pkt_type_t type, const void *payload, uint16_t len,
                                     uint8_t ttl, uint8_t flags, uint8_t src_id, uint8_t seq)
 {
+    audio_bundle_view_t bundle;
+    if (type == MESH_PKT_AUDIO ||
+        (type == MESH_PKT_AUDIO_V2 && !audio_bundle_parse(payload, len, &bundle))) {
+        return -EINVAL;
+    }
     if (len > MESH_PACKET_PAYLOAD_MAX) {
         return -EMSGSIZE;
     }
@@ -58,6 +63,9 @@ int mesh_protocol_tx_send_packet(mesh_protocol_context_t *context, mesh_pkt_type
 int mesh_protocol_tx_queue_control(mesh_protocol_context_t *context, mesh_pkt_type_t type,
                                    const void *payload, uint16_t len)
 {
+    if (type == MESH_PKT_AUDIO || type == MESH_PKT_AUDIO_V2) {
+        return -EINVAL;
+    }
     if (len > MESH_PACKET_PAYLOAD_MAX) {
         return -EMSGSIZE;
     }
@@ -88,7 +96,7 @@ int mesh_protocol_tx_queue_control(mesh_protocol_context_t *context, mesh_pkt_ty
 int mesh_protocol_tx_send_join_request(mesh_protocol_context_t *context)
 {
     mesh_join_v2_payload_t payload = {
-        .capabilities = 0x01, /* Has audio */
+        .capabilities = MESH_CAP_LC3,
         .reserved = 0,
     };
     memcpy(payload.requester_addr, context->local_addr, sizeof(payload.requester_addr));

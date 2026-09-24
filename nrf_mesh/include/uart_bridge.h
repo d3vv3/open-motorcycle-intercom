@@ -41,15 +41,6 @@
 int uart_bridge_init(void);
 
 /**
- * @brief Send a legacy RTT probe to ESP32
- * @param src_id Source node ID
- * @param data RTT probe data
- * @param len Data length
- * @return 0 on success
- */
-int uart_bridge_send_audio(uint8_t src_id, const uint8_t *data, uint8_t len);
-
-/**
  * @brief Send an intact V2 audio bundle to ESP32 with its source ID prefix
  */
 int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len);

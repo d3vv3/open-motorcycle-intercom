@@ -28,11 +28,10 @@ bool uart_bridge_probe(uint32_t timeout_ms)
         return false;
     }
 
-    if (uart_bridge_is_connected()) {
-        return true;
-    }
-
     const int MAX_PROBE_ATTEMPTS = 3;
+    uart_bridge_status_t initial_status;
+    uint32_t initial_generation =
+        uart_bridge_get_status(&initial_status) == ESP_OK ? initial_status.generation : 0;
 
     for (int attempt = 1; attempt <= MAX_PROBE_ATTEMPTS; attempt++) {
         ESP_LOGI(TAG, "Probing for nRF52840 (attempt %d/%d)...", attempt, MAX_PROBE_ATTEMPTS);
@@ -44,7 +43,9 @@ bool uart_bridge_probe(uint32_t timeout_ms)
 
         int64_t start_time = esp_timer_get_time();
         while ((esp_timer_get_time() - start_time) < ((int64_t)timeout_ms * 1000)) {
-            if (uart_bridge_is_connected()) {
+            uart_bridge_status_t status;
+            if (uart_bridge_get_status(&status) == ESP_OK &&
+                status.generation != initial_generation) {
                 ESP_LOGI(TAG, "nRF52840 probe response received!");
                 return true;
             }
