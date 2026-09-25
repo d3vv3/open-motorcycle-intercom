@@ -98,6 +98,7 @@ See the [wiring guide](docs/wiring.md) for the current assembled prototype.
 - [ ] Replace beeps with voice prompts for button operations
 - [ ] Power budgeting and optimization for 8-16 hours of active riding per charge
 - [ ] Testing on real motorcycle rides
+- [ ] E2EE
 
 ---
 

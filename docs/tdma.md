@@ -39,5 +39,4 @@ The current runtime does not enable WS-based TDMA clock correction.
 Two-board operation has been tested; eight-node operation still needs validation.
 Timing counters alone do not prove end-to-end audio latency or RF delivery.
 
-See [protocol.md](protocol.md) for packet and bridge formats and
-[inter_mcu.md](inter_mcu.md) for the exact SPI timing.
+See [protocol.md](protocol.md) for packet and bridge formats.

@@ -12,8 +12,7 @@ See the [project README](../README.md) for an overview and project progress.
 
 - [Architecture](architecture.md): component responsibilities and transport selection.
 - [Audio pipeline](audio.md): capture, codecs, playback, and Bluetooth audio routes.
-- [Mesh protocol](protocol.md): packet formats and mesh control messages.
-- [Inter-MCU contract](inter_mcu.md): the SPI bridge between the S31 and nRF52840.
+- [Mesh protocol](protocol.md): packet formats, mesh control messages, and SPI flow control.
 - [TDMA scheduling](tdma.md): voice slots, control windows, and timing constraints.
 - [Power and battery](power.md): power management and battery measurement status.
 
@@ -21,7 +20,6 @@ See the [project README](../README.md) for an overview and project progress.
 
 - [Pipeline telemetry](pipeline_telemetry.md): counters and tools for tracing audio delivery and drops.
 - [CPU profiling](s31-cpu-profiling.md): optional task profiling, timing measurements, and interpretation limits.
-- [Development plan](dev_plan.md): implementation status and outstanding work.
 
 ## Investigation History
 

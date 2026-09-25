@@ -128,12 +128,19 @@ Older 3-byte and 8-byte statuses remain readable but do not establish LC3 compat
 
 ### Two Different Acknowledgments
 
-- **Audio admission:** The nRF pulses GPIO ACK for 20 µs after accepting an audio packet or recognizing its admitted duplicate.
-  The S31 repeats unacknowledged SPI audio until ACK or a 50 ms timeout. This does not confirm radio delivery.
+- **Audio admission:** The nRF pulses GPIO ACK for 20 µs after admitting audio to bounded RAM ingress or recognizing its admitted duplicate.
+  The S31 retains and repeats unacknowledged SPI audio until ACK or a 50 ms timeout. ACK does not confirm RF delivery.
 - **Commands:** MESH_START and MESH_STOP carry a command byte and generation byte.
   A COMMAND_ACK event returns the command, matching generation, and signed result: zero for success, minus one for failure.
 
-See [the inter-MCU contract](inter_mcu.md) for lifecycle and queue handling.
+### SPI Flow Control
+
+- Both bridge directions send pending control before audio.
+- S31 queued outbound audio expires after 120 ms; transfer requires fresh status reporting an ACTIVE mesh and assigned node ID.
+- nRF outbound SPI audio drops the oldest entry when full; it has no age expiry.
+
+The nRF owns ESB, mesh membership, TDMA, relay, and synchronization. The S31
+owns codec/audio, phone routes, application policy, and SPI slave state.
 
 ## Security
 
