@@ -263,11 +263,32 @@ static int encode_frame(const int16_t *input, int64_t *encode_time_sum, uint32_t
     return encoded;
 }
 
+#if defined(AUDIO_S31_LC3_WIRE)
+static void skip_idle_lc3_frame(int64_t frame_start_us)
+{
+    AUDIO_STATS_LOCK();
+    if (g_audio.stats.vox_suppressed_frames != UINT32_MAX) {
+        g_audio.stats.vox_suppressed_frames++;
+    }
+    AUDIO_STATS_UNLOCK();
+    portENTER_CRITICAL(&g_audio_task_lock);
+    audio_tx_idle_cb_t callback = g_audio.tx_idle_callback;
+    portEXIT_CRITICAL(&g_audio_task_lock);
+    if (callback != NULL) {
+        callback(frame_start_us);
+    }
+}
+#endif
+
 static void deliver_encoded_frame(int encoded, bool tx_active, int64_t frame_start_us)
 {
 #if defined(AUDIO_S31_LC3_WIRE)
     bool lc3_wire = g_audio.config.mode == AUDIO_MODE_MESH;
-    bool comfort_update = lc3_wire ? true : encoded > OPUS_DTX_FRAME_MAX_BYTES;
+    if (lc3_wire && !tx_active) {
+        skip_idle_lc3_frame(frame_start_us);
+        return;
+    }
+    bool comfort_update = encoded > OPUS_DTX_FRAME_MAX_BYTES;
 #else
     bool comfort_update = encoded > OPUS_DTX_FRAME_MAX_BYTES;
 #endif
@@ -454,6 +475,9 @@ void audio_capture_task(void *arg)
     int64_t converter_retry_after_us = 0;
     uint32_t frame_loops = 0;
     bool stack_logged = false;
+#if defined(AUDIO_S31_LC3_WIRE)
+    bool last_tx_active = g_audio.config.force_tx_always;
+#endif
 
     audio_opus_stage_profile_reset();
 #if defined(AUDIO_LC3_BENCH)
@@ -516,12 +540,19 @@ void audio_capture_task(void *arg)
         if (!read_codec_frame(&consecutive_hard_errors, &last_error_log_us,
                               &converter_retry_after_us, &emit_silence)) {
             if (emit_silence && atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
-                uint32_t encoded_frames = 0;
-                int encoded = encode_frame(silence_frame, &encode_time_sum, &encoded_frames,
-                                           &encode_profile);
-                if (encoded > 0) {
-                    deliver_encoded_frame(encoded, true, frame_start_us);
-                    record_frame_latency(frame_start_us, &latency_sum, encoded_frames);
+#if defined(AUDIO_S31_LC3_WIRE)
+                if (g_audio.config.mode == AUDIO_MODE_MESH && !last_tx_active) {
+                    skip_idle_lc3_frame(frame_start_us);
+                } else
+#endif
+                {
+                    uint32_t encoded_frames = 0;
+                    int encoded = encode_frame(silence_frame, &encode_time_sum, &encoded_frames,
+                                               &encode_profile);
+                    if (encoded > 0) {
+                        deliver_encoded_frame(encoded, true, frame_start_us);
+                        record_frame_latency(frame_start_us, &latency_sum, encoded_frames);
+                    }
                 }
             }
             record_capture_timing(CAPTURE_LOOP_TIMING, esp_timer_get_time() - frame_start_us);
@@ -552,6 +583,14 @@ void audio_capture_task(void *arg)
 
         bool vox_active = detect_voice_activity();
         bool tx_active = vox_active || g_audio.config.force_tx_always;
+#if defined(AUDIO_S31_LC3_WIRE)
+        last_tx_active = tx_active;
+        if (g_audio.config.mode == AUDIO_MODE_MESH && !tx_active) {
+            skip_idle_lc3_frame(frame_start_us);
+            record_capture_timing(CAPTURE_LOOP_TIMING, esp_timer_get_time() - frame_start_us);
+            continue;
+        }
+#endif
         const int16_t *encode_input = tx_active ? g_audio.pcm_input : silence_frame;
         uint32_t encoded_frames = 0;
         int encoded = encode_frame(encode_input, &encode_time_sum, &encoded_frames,

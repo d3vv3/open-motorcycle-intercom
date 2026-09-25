@@ -5,6 +5,17 @@
 void audio_tx_cache_reset(audio_tx_cache_t *cache)
 {
     atomic_store_explicit(&cache->valid, false, memory_order_release);
+    atomic_store(&cache->quiet_slots, 0u);
+}
+
+void audio_tx_cache_skip_frame(audio_tx_cache_t *cache, uint16_t *next_seq)
+{
+    atomic_store_explicit(&cache->valid, false, memory_order_release);
+    uint8_t slots = atomic_load(&cache->quiet_slots);
+    if (slots < AUDIO_TX_QUIET_SEQUENCE_SLOTS) {
+        *next_seq = (uint16_t)(*next_seq + 1u);
+        atomic_store(&cache->quiet_slots, (uint8_t)(slots + 1u));
+    }
 }
 
 void audio_tx_cache_store(audio_tx_cache_t *cache, const uint8_t *data, uint16_t len, bool active,
@@ -18,6 +29,9 @@ void audio_tx_cache_store(audio_tx_cache_t *cache, const uint8_t *data, uint16_t
     cache->len = len;
     cache->seq = seq;
     cache->active = active;
+    if (active) {
+        atomic_store(&cache->quiet_slots, 0u);
+    }
     atomic_store_explicit(&cache->valid, eligible, memory_order_release);
 }
 

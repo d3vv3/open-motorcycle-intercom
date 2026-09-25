@@ -150,6 +150,53 @@ static void test_reset_clears(void)
     expect_no_attach(&cache, 701u);
 }
 
+static void test_idle_advances_and_invalidates_at_wrap(void)
+{
+    audio_tx_cache_t cache;
+    uint8_t frame[24] = {1u};
+    uint16_t next_seq = UINT16_MAX;
+
+    audio_tx_cache_reset(&cache);
+    audio_tx_cache_store(&cache, frame, sizeof(frame), true, 65534u, true);
+    audio_tx_cache_skip_frame(&cache, &next_seq);
+    assert(next_seq == 0u);
+    expect_no_attach(&cache, next_seq);
+    audio_tx_cache_skip_frame(&cache, &next_seq);
+    assert(next_seq == 1u);
+    expect_no_attach(&cache, next_seq);
+}
+
+static void test_quiet_cap_and_lifecycle_reset(void)
+{
+    audio_tx_cache_t cache;
+    uint8_t frame[24] = {1u};
+    uint16_t next_seq = 101u;
+    unsigned index;
+
+    audio_tx_cache_reset(&cache);
+    audio_tx_cache_store(&cache, frame, sizeof(frame), true, 100u, true);
+    for (index = 0u; index < 65537u; ++index) {
+        audio_tx_cache_skip_frame(&cache, &next_seq);
+    }
+    assert(next_seq == 101u + AUDIO_TX_QUIET_SEQUENCE_SLOTS);
+    expect_no_attach(&cache, next_seq);
+    audio_tx_cache_store(&cache, frame, sizeof(frame), true, next_seq++, true);
+    assert(next_seq == 102u + AUDIO_TX_QUIET_SEQUENCE_SLOTS);
+    audio_tx_cache_skip_frame(&cache, &next_seq);
+    assert(next_seq == 103u + AUDIO_TX_QUIET_SEQUENCE_SLOTS);
+    expect_no_attach(&cache, next_seq);
+
+    for (index = 1u; index < AUDIO_TX_QUIET_SEQUENCE_SLOTS; ++index) {
+        audio_tx_cache_skip_frame(&cache, &next_seq);
+    }
+    uint16_t held_seq = next_seq;
+    audio_tx_cache_skip_frame(&cache, &next_seq);
+    assert(next_seq == held_seq);
+    audio_tx_cache_reset(&cache);
+    audio_tx_cache_skip_frame(&cache, &next_seq);
+    assert(next_seq == (uint16_t)(held_seq + 1u));
+}
+
 int main(void)
 {
     test_consecutive_seq_attaches();
@@ -161,6 +208,8 @@ int main(void)
     test_max_len_frame_attaches();
     test_seq_wraparound_attaches();
     test_reset_clears();
+    test_idle_advances_and_invalidates_at_wrap();
+    test_quiet_cap_and_lifecycle_reset();
     printf("audio_tx_cache_test: all tests passed\n");
     return 0;
 }

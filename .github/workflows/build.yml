@@ -147,7 +147,7 @@ jobs:
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Imain main/media_toggle_guard.c tests/c/media_toggle_guard_test.c -o /tmp/media_toggle_guard_test && /tmp/media_toggle_guard_test
 
       - name: Run integrated audio playout recovery tests
-        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/audio_playout_recovery_test && /tmp/audio_playout_recovery_test
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Icomponents/audio/include shared/audio_bundle.c shared/audio_tx_cache.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/audio_playout_recovery_test && /tmp/audio_playout_recovery_test
 
       - name: Run RX source selection tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/audio_rx_source_select_test && /tmp/audio_rx_source_select_test
@@ -191,7 +191,7 @@ jobs:
            cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
-           cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
+           cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c shared/audio_tx_cache.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
 
       - name: Run mesh jitter buffer tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_jitter_buffer_test.c -o /tmp/mesh_jitter_buffer_test && /tmp/mesh_jitter_buffer_test

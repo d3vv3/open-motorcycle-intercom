@@ -243,6 +243,7 @@ typedef struct {
 
     /* Callbacks */
     audio_tx_cb_t tx_callback;
+    audio_tx_idle_cb_t tx_idle_callback;
     audio_activity_cb_t activity_callback;
 } audio_context_t;
 

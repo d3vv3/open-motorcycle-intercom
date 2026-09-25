@@ -11,10 +11,9 @@
  *
  * Thread-safety: on target, store + query run in the same task (the audio TX
  * callback), but reset is invoked from other task contexts (bridge event
- * callbacks, mesh user enable/disable, transport selection). The `valid`
- * flag is therefore _Atomic with release/acquire ordering, mirroring the
- * original main.c implementation. The frame payload itself is only written
- * by the TX task, so it needs no additional synchronization.
+ * callbacks, mesh user enable/disable, transport selection). `valid` and
+ * `quiet_slots` are therefore atomic. The frame payload itself is only
+ * written by the TX task, so it needs no additional synchronization.
  */
 
 #include <stdatomic.h>
@@ -23,12 +22,16 @@
 
 #include "mesh_protocol_defs.h"
 
+/* Match the RX packet store's empty-missing threshold (checked in the integrated test). */
+#define AUDIO_TX_QUIET_SEQUENCE_SLOTS 5u
+
 typedef struct {
     uint8_t data[MESH_AUDIO_V2_MAX_FRAME_BYTES];
     uint16_t len;
     uint16_t seq;
     bool active;
     _Atomic bool valid;
+    _Atomic uint8_t quiet_slots;
 } audio_tx_cache_t;
 
 /**
@@ -38,12 +41,17 @@ typedef struct {
  */
 void audio_tx_cache_reset(audio_tx_cache_t *cache);
 
+/** @brief Invalidate predecessor audio for every quiet frame; advance at most five
+ * sequence slots per quiet spell, then hold the next sequence until active audio. */
+void audio_tx_cache_skip_frame(audio_tx_cache_t *cache, uint16_t *next_seq);
+
 /**
  * @brief Cache a just-transmitted frame as the predecessor candidate.
  *
  * A zero-length or oversize frame (len > MESH_AUDIO_V2_MAX_FRAME_BYTES)
  * invalidates the cache instead of storing. Otherwise the frame is stored
- * and the cache is marked valid iff @p eligible is true.
+ * and the cache is marked valid iff @p eligible is true. Active frames reset
+ * the bounded quiet-slot count.
  *
  * @param cache    Cache instance.
  * @param data     Encoded frame payload.

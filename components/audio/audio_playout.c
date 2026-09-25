@@ -682,11 +682,12 @@ void audio_log_stats(void)
              " uptime_ms=%" PRIu64 " tx_handoff=%" PRIu32 " tx_no_cb=%" PRIu32
              " capture_fifo_discard_samples=%" PRIu32
              " capture_ok=%lu capture_short=%lu capture_timeout=%lu capture_err=%lu"
-             " encode_ok=%lu encode_err=%lu dtx_drop=%lu",
+             " encode_ok=%lu encode_err=%lu dtx_drop=%lu vox_skip=%" PRIu32,
              stats.pipeline_epoch, uptime_ms, stats.tx_handoff, stats.tx_no_cb,
              stats.capture_fifo_discard_samples, stats.capture_frames_ok,
              stats.capture_short_reads, stats.capture_timeouts, stats.capture_errors,
-             stats.frames_encoded, stats.encode_errors, stats.tx_dtx_suppressed);
+             stats.frames_encoded, stats.encode_errors, stats.tx_dtx_suppressed,
+             stats.vox_suppressed_frames);
     ESP_LOGI(TAG,
              "PIPE v=1 dev=esp stage=audio part=rx epoch_id=0x%08" PRIx32
              " uptime_ms=%" PRIu64 " rx_offer=%" PRIu32 " rx_store_ok=%" PRIu32

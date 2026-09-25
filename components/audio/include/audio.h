@@ -119,6 +119,11 @@ typedef void (*audio_activity_cb_t)(bool active);
  */
 typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us);
 
+/** Called from the capture task once per intentionally skipped mesh LC3 frame.
+ * No encoded data is available; transport may advance its frame sequence.
+ * timestamp_us is the capture frame's start time in microseconds. */
+typedef void (*audio_tx_idle_cb_t)(int64_t timestamp_us);
+
 /** Bluetooth playback route. The call route has priority over every other output. */
 typedef enum {
     AUDIO_BLUETOOTH_MUSIC = 0,
@@ -190,6 +195,7 @@ typedef struct {
     uint8_t music_channels;
     uint32_t tx_handoff;       /**< Encoded frames passed to the TX callback */
     uint32_t tx_no_cb;         /**< Transmittable encoded frames without a callback */
+    uint32_t vox_suppressed_frames; /**< Mesh LC3 frames suppressed for inactive VOX (not errors) */
     uint32_t rx_offer;         /**< Calls to audio_put_rx_frame */
     uint32_t rx_store_ok;      /**< Packets accepted by the remote store */
     uint32_t rx_store_reject;  /**< Calls not accepted by the remote store */
@@ -394,6 +400,10 @@ void audio_clear_rx_frames(void);
  * @return ESP_OK on success
  */
 esp_err_t audio_register_tx_callback(audio_tx_cb_t cb);
+
+/** Register the optional mesh LC3 idle-frame callback (NULL to disable).
+ * Like the TX callback, registration is protected by the audio task lock. */
+esp_err_t audio_register_tx_idle_callback(audio_tx_idle_cb_t cb);
 
 esp_err_t audio_register_activity_callback(audio_activity_cb_t cb);
 

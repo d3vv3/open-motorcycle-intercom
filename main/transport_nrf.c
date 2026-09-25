@@ -84,6 +84,12 @@ void transport_nrf_reset_tx_cache(void)
     audio_tx_cache_reset(&s_previous_audio);
 }
 
+void transport_nrf_skip_audio_frame(int64_t timestamp_us)
+{
+    (void)timestamp_us;
+    e2e_diag_skip_tx_frame(&s_previous_audio);
+}
+
 void transport_nrf_cancel_enable_notification(void)
 {
     atomic_store(&s_enable_notification_pending, false);

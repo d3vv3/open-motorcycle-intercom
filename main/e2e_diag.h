@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "audio_tx_cache.h"
+
 /**
  * @brief Stage counters for the SPI/bundle pipeline.
  *
@@ -48,6 +50,10 @@ e2e_pipe_counters_t *e2e_diag_counters(void);
 
 /** @brief Allocate the next TX sequence number and count the frame. */
 uint16_t e2e_diag_next_tx_seq(void);
+
+/** @brief Account for an idle slot without counting an encoded source frame;
+ * sequence advancement stops after the RX DTX inference threshold. */
+void e2e_diag_skip_tx_frame(audio_tx_cache_t *cache);
 
 /** @brief Record an accepted current frame for RX continuity tracking. */
 void e2e_diag_track_rx(uint8_t source_id, uint16_t seq);

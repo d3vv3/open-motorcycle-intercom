@@ -763,6 +763,14 @@ esp_err_t audio_register_tx_callback(audio_tx_cb_t callback)
     return ESP_OK;
 }
 
+esp_err_t audio_register_tx_idle_callback(audio_tx_idle_cb_t callback)
+{
+    portENTER_CRITICAL(&g_audio_task_lock);
+    g_audio.tx_idle_callback = callback;
+    portEXIT_CRITICAL(&g_audio_task_lock);
+    return ESP_OK;
+}
+
 esp_err_t audio_register_activity_callback(audio_activity_cb_t callback)
 {
     SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();

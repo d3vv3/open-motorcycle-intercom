@@ -1,6 +1,7 @@
 #include "audio_packet_store.h"
 #include "audio_pcm_resampler.h"
 #include "shared/audio_bundle.h"
+#include "shared/audio_tx_cache.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -21,6 +22,8 @@ _Static_assert(AUDIO_PCM_RESAMPLER_TARGET_SAMPLES ==
                "playout reserve must contain four frames");
 _Static_assert(AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES == 320u,
                "each render must produce one 20 ms PCM block");
+_Static_assert(AUDIO_TX_QUIET_SEQUENCE_SLOTS == AUDIO_PACKET_STORE_EMPTY_MISSING_LIMIT,
+               "TX quiet sequence cap must match RX DTX inference threshold");
 
 static audio_packet_t make_packet(uint16_t sequence, bool active)
 {
@@ -226,10 +229,113 @@ static void test_unrecovered_losses_use_two_plc_blocks(void)
            3u * AUDIO_PCM_RESAMPLER_BLOCK_SAMPLES);
 }
 
+static void send_frame(audio_packet_store_t *store, audio_tx_cache_t *cache,
+                       uint16_t *next_seq, uint64_t arrival_ms, bool expect_previous)
+{
+    uint8_t payload[MESH_LC3_FRAME_BYTES] = {0};
+    uint8_t wire[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
+    uint16_t previous_len = 0u;
+    uint16_t seq = (*next_seq)++;
+    const uint8_t *previous = audio_tx_cache_previous(cache, seq, &previous_len);
+    size_t wire_len = 0u;
+    audio_bundle_view_t parsed;
+    audio_packet_t packet;
+    audio_bundle_view_t bundle = {
+        .previous1_data = previous,
+        .previous1_len = previous_len,
+        .current_data = payload,
+        .current_len = sizeof(payload),
+        .current_seq = seq,
+        .stream_id = 7u,
+        .flags = AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE |
+                 (previous != NULL ? AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
+                                     AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE : 0u),
+        .codec = MESH_AUDIO_V2_CODEC_LC3,
+    };
+
+    assert((previous != NULL) == expect_previous);
+    payload[0] = (uint8_t)seq;
+    assert(audio_bundle_encode(&bundle, wire, sizeof(wire), &wire_len));
+    assert(audio_bundle_parse(wire, wire_len, &parsed));
+    assert(parsed.stream_id == 7u);
+    assert(parsed.current_seq == seq);
+    assert(((parsed.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT) != 0u) == expect_previous);
+    packet = make_packet(parsed.current_seq, true);
+    memcpy(packet.data, parsed.current_data, parsed.current_len);
+    assert(audio_packet_store_push(store, &packet, arrival_ms) == AUDIO_PACKET_STORE_PUSH_OK);
+    audio_tx_cache_store(cache, payload, sizeof(payload), true, seq, true);
+}
+
+static void test_vox_idle_resume(uint16_t first_seq, unsigned idle_frames)
+{
+    audio_packet_store_t store;
+    audio_tx_cache_t cache;
+    audio_packet_t packet = {0};
+    uint16_t next_seq = first_seq;
+    unsigned sequence_slots = idle_frames < AUDIO_TX_QUIET_SEQUENCE_SLOTS
+                                  ? idle_frames : AUDIO_TX_QUIET_SEQUENCE_SLOTS;
+    unsigned index;
+
+    audio_packet_store_reset(&store);
+    audio_tx_cache_reset(&cache);
+    for (index = 0u; index < 3u; ++index) {
+        send_frame(&store, &cache, &next_seq, 0u, index != 0u);
+    }
+    for (index = 0u; index < 3u; ++index) {
+        assert(audio_packet_store_pop(&store, index * 20u, &packet) ==
+               AUDIO_PACKET_STORE_POP_PACKET);
+        assert(packet.sequence == (uint16_t)(first_seq + index));
+    }
+    for (index = 0u; index < idle_frames; ++index) {
+        audio_tx_cache_skip_frame(&cache, &next_seq);
+    }
+    assert(next_seq == (uint16_t)(first_seq + 3u + sequence_slots));
+    /* Past the cap, another quiet callback must still leave the cache invalid. */
+    if (idle_frames > AUDIO_TX_QUIET_SEQUENCE_SLOTS) {
+        uint16_t previous_len = 1u;
+        assert(audio_tx_cache_previous(&cache, next_seq, &previous_len) == NULL);
+        assert(previous_len == 0u);
+    }
+    if (idle_frames < AUDIO_PACKET_STORE_EMPTY_MISSING_LIMIT) {
+        send_frame(&store, &cache, &next_seq, 80u, false);
+        for (index = 0u; index < idle_frames; ++index) {
+            assert(audio_packet_store_pop(&store, 100u + index * 20u, &packet) ==
+                   AUDIO_PACKET_STORE_POP_MISSING);
+        }
+        assert(!store.dtx_idle);
+        assert(audio_packet_store_pop(&store, 100u + idle_frames * 20u, &packet) ==
+               AUDIO_PACKET_STORE_POP_PACKET);
+    } else {
+        for (index = 0u; index < AUDIO_PACKET_STORE_EMPTY_MISSING_LIMIT; ++index) {
+            assert(audio_packet_store_pop(&store, 100u + index * 20u, &packet) ==
+                   AUDIO_PACKET_STORE_POP_MISSING);
+        }
+        assert(store.dtx_idle);
+        assert(audio_packet_store_pop(&store, 200u, &packet) ==
+               AUDIO_PACKET_STORE_POP_DTX_IDLE);
+        send_frame(&store, &cache, &next_seq, 210u, false);
+        assert(audio_packet_store_pop(&store, 220u, &packet) ==
+               AUDIO_PACKET_STORE_POP_PACKET);
+    }
+    assert(packet.sequence == (uint16_t)(first_seq + 3u + sequence_slots));
+    assert(packet.data[0] == (uint8_t)packet.sequence);
+    assert(packet.active);
+    assert(!store.dtx_idle);
+    assert(audio_packet_store_depth(&store) == 0u);
+    send_frame(&store, &cache, &next_seq, 260u, true);
+    assert(audio_packet_store_pop(&store, 260u, &packet) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(packet.sequence == (uint16_t)(first_seq + 4u + sequence_slots));
+}
+
 int main(void)
 {
     test_redundant_bundle_recovers_two_losses();
     test_unrecovered_losses_use_two_plc_blocks();
+    test_vox_idle_resume(100u, 2u);
+    test_vox_idle_resume(300u, AUDIO_TX_QUIET_SEQUENCE_SLOTS);
+    test_vox_idle_resume(300u, 6u);
+    test_vox_idle_resume(65533u, 2u);
+    test_vox_idle_resume(65533u, 65537u);
     puts("audio playout recovery tests passed");
     return 0;
 }

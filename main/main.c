@@ -43,7 +43,7 @@ static const char *TAG = "omi";
 
 /* Test knob: bypass VOX gating and always transmit microphone frames.
  * 0 = normal VOX behavior (DTX silence suppression active), 1 = force continuous TX. */
-#define FORCE_TX_ALWAYS_FOR_TEST 1
+#define FORCE_TX_ALWAYS_FOR_TEST 0
 
 /* RTT log cadence while using nRF transport */
 #define RTT_LOG_INTERVAL_MS 10000
@@ -148,6 +148,13 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
     default:
         /* No transport active */
         break;
+    }
+}
+
+static void audio_tx_idle_callback(int64_t timestamp_us)
+{
+    if (s_active_transport == TRANSPORT_NRF52840) {
+        transport_nrf_skip_audio_frame(timestamp_us);
     }
 }
 
@@ -502,6 +509,7 @@ static esp_err_t initialize_application(int64_t boot_time)
     }
 
     audio_register_tx_callback(audio_tx_callback);
+    audio_register_tx_idle_callback(audio_tx_idle_callback);
     audio_register_activity_callback(audio_activity_callback);
 
     /* Reserve Classic Bluetooth controller memory before Wi-Fi pools and audio stacks. */

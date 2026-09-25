@@ -33,6 +33,11 @@ uint16_t e2e_diag_next_tx_seq(void)
     return s_tx_seq++;
 }
 
+void e2e_diag_skip_tx_frame(audio_tx_cache_t *cache)
+{
+    audio_tx_cache_skip_frame(cache, &s_tx_seq);
+}
+
 void e2e_diag_track_rx(uint8_t source_id, uint16_t seq)
 {
     portENTER_CRITICAL(&s_rx_lock);
