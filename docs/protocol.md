@@ -1,295 +1,148 @@
-# OMI Protocol v2
+# Mesh and Bridge Protocol v3
 
-This document describes the implemented on-air mesh protocol and the
-ESP32-S3/nRF52840 bridge protocol. The current on-air version is `0x02`.
+The current LC3 firmware uses mesh version `0x03` and SPI bridge version `3`.
+The name `AUDIO_V2` identifies a packet format; it does not mean protocol version 2.
 
-## On-Air Envelope
+## Mesh Radio Header
 
 Every mesh packet starts with this packed 8-byte header:
 
-| Offset | Size | Field | Description |
-|---:|---:|---|---|
-| 0 | 1 | `version` | Must be `0x02` |
-| 1 | 1 | `type` | Packet type |
-| 2 | 1 | `src_id` | Source node ID; `0` means unassigned |
-| 3 | 1 | `seq` | Per-sender 8-bit packet sequence |
-| 4 | 1 | `ttl` | Remaining relay hops |
-| 5 | 1 | `flags` | Relay and speaker flags |
-| 6 | 2 | `payload_len` | Bytes after the header, little-endian |
+| Offset | Field | Bytes | Meaning |
+|---:|---|---:|---|
+| 0 | `version` | 1 | `0x03` |
+| 1 | `type` | 1 | Message ID below |
+| 2 | `src_id` | 1 | Source node; `0` for an unassigned joining node |
+| 3 | `seq` | 1 | Radio packet sequence |
+| 4 | `ttl` | 1 | Remaining hop limit |
+| 5 | `flags` | 1 | Relay request, relayed, and speaker-granted bits |
+| 6 | `payload_len` | 2 | Payload length, little-endian |
 
-Node IDs are `1` through `8`. The coordinator normally owns ID `1` and slot
-`0`; other assignments map node ID `n` to slot `n - 1`.
+Assigned node IDs are 1-8, with TDMA slot `node_id - 1`.
+Receivers reject mismatched protocol versions and invalid packet lengths.
 
-Header flags are:
-
-| Value | Name | Meaning |
+| ID | Message | Purpose |
 |---:|---|---|
-| `0x01` | `RELAY_REQUEST` | Packet may be considered for relay |
-| `0x02` | `RELAYED` | Packet has traversed a relay |
-| `0x04` | `SPEAKER_GRANTED` | Source has a current coordinator relay grant |
+| `0x01` | `AUDIO` | ESP-NOW audio; rejected by the current nRF audio path |
+| `0x02` / `0x03` | `JOIN` / `JOIN_ACK` | Membership request and assignment |
+| `0x04` | `LEAVE` | Departure |
+| `0x05` / `0x06` | `SYNC` / `SLOT_MAP` | Timing and slot assignments |
+| `0x07` / `0x08` | `STATUS` / `KEEPALIVE` | Node status and liveness |
+| `0x09` / `0x0A` | `SPEAKER_GRANT` / `SPEAKER_RELEASE` | Speaker-control IDs |
+| `0x0B` / `0x0C` | `JOIN_V2` / `JOIN_ACK_V2` | Extended membership IDs |
+| `0x0D` | `AUDIO_V2` | LC3 bundle used by nRF ESB |
 
-Receivers fail closed by rejecting packets with another protocol version.
-There is no version negotiation or optional-field negotiation.
+These are shared IDs; not every transport uses every message.
+The nRF coordinator requires the LC3 capability bit in `JOIN_V2` requests.
+ESP-NOW membership does not enforce the same capability check; use matching firmware on all nodes.
 
-## Packet Types
+## LC3 Audio Bundles
 
-| Value | Name | Purpose |
-|---:|---|---|
-| `0x01` | `AUDIO` | Legacy single-frame audio envelope |
-| `0x02` | `JOIN` | ESP-NOW join request |
-| `0x03` | `JOIN_ACK` | ESP-NOW join assignment |
-| `0x04` | `LEAVE` | Graceful departure |
-| `0x05` | `SYNC` | Coordinator timing |
-| `0x06` | `SLOT_MAP` | Membership and relay map |
-| `0x07` | `STATUS` | Peer health and relay observations |
-| `0x08` | `KEEPALIVE` | Presence during audio silence |
-| `0x09` | `SPEAKER_GRANT` | Active-speaker and relay assignment |
-| `0x0A` | `SPEAKER_RELEASE` | Active-speaker release |
-| `0x0B` | `JOIN_V2` | nRF/ESB identity-bearing join request |
-| `0x0C` | `JOIN_ACK_V2` | nRF/ESB identity-targeted assignment |
-| `0x0D` | `AUDIO_V2` | Redundant Opus bundle |
+Mesh voice is 16 kHz mono. Each 20 ms audio unit contains two 10 ms LC3 frames, 24 bytes each.
+The nRF forwards these encoded bytes; the S31 performs encoding and decoding.
 
-Normal nRF/ESB microphone audio must use `AUDIO_V2`. On that transport,
-legacy `AUDIO` is accepted only for the fixed-format RTT diagnostic. ESP-NOW
-still uses legacy `AUDIO` for normal audio.
-
-## Audio V2 Bundle
-
-The `AUDIO_V2` payload has an exact 8-byte fixed header followed by zero to two
-predecessor frames and the current Opus frame:
-
-| Offset | Size | Field | Description |
-|---:|---:|---|---|
-| 0 | 1 | `codec` | `0x01` for Opus |
-| 1 | 1 | `frame_ms` | Must be `20` |
-| 2 | 1 | `stream_id` | Logical source; `0` is allowed on receive |
-| 3 | 1 | `flags` | Bundle flags below |
-| 4 | 2 | `current_seq` | Current frame sequence, big-endian |
-| 6 | 1 | `current_len` | Current frame bytes, `1..64` |
-| 7 | 1 | `previous1_len` | Immediate predecessor bytes, `0..64` |
-| 8 | N | frame data | `previous2`, then `previous1`, then `current` |
-
-There is no `previous2_len` field. When `PREVIOUS2_PRESENT` is set, its length
-is inferred as:
+An `AUDIO_V2` payload begins with an 8-byte header:
 
 ```text
-payload_len - 8 - previous1_len - current_len
+codec | frame_ms | stream_id | flags | current_seq (2 bytes) | current_len | previous1_len
 ```
 
-Bundle flags are:
+All fields are one byte except `current_seq`, which is **big-endian**.
+The codec is `0x02` (LC3), duration is `20`, and every present audio unit must contain exactly 48 bytes.
+`stream_id` identifies the source, not a new speech segment. The S31 accepts zero or the matching source node ID.
 
-| Value | Name |
+Audio data follows in this order: oldest predecessor, immediate predecessor, current audio.
+The oldest predecessor's length is inferred from the remaining payload size.
+
+| Flag | Meaning |
 |---:|---|
-| `0x01` | `CURRENT_ACTIVE` |
-| `0x02` | `PREVIOUS1_PRESENT` |
-| `0x04` | `PREVIOUS1_ACTIVE` |
-| `0x08` | `PREVIOUS2_PRESENT` |
-| `0x10` | `PREVIOUS2_ACTIVE` |
+| `0x01` | Current audio active |
+| `0x02` / `0x04` | Immediate predecessor present / active |
+| `0x08` / `0x10` | Oldest predecessor present / active |
 
-Unknown flag bits, inconsistent presence/activity flags, empty current frames,
-and malformed lengths are rejected. `previous2` is valid only when
-`previous1` is also present.
+Other flag bits are rejected. The S31 currently attaches at most one predecessor; the format supports two.
 
-Each Opus frame is at most 64 bytes. The three-frame data area is at most 192
-bytes, the complete bundle is at most 200 bytes, and the complete on-air packet
-is at most 208 bytes including the mesh header.
+| Audio units | Bundle bytes | Bytes with mesh header |
+|---|---:|---:|
+| Current only | 56 | 64 |
+| Current + one predecessor | 104 | 112 |
+| Current + two predecessors | 152 | 160 |
 
-The ESP sender currently attaches only `previous1`, and only when the cached
-frame was active, eligible, and immediately precedes `current_seq`. Parsers and
-playout recovery support both predecessors. Relays preserve the bundle when it
-fits the remaining slot airtime and strip the oldest predecessor first when it
-does not.
+The 16-bit audio sequence is separate from the 8-bit radio packet sequence.
+During VOX silence, no LC3 audio is encoded or sent. There is no explicit end-of-speech packet.
+The sender clears cached predecessors and advances through at most five quiet sequence slots before holding the sequence.
+The receiver uses bounded concealment before treating an empty stream as idle.
 
-## Legacy Audio
+ESP-NOW uses its separate `AUDIO` payload format. The S31 LC3 build requires LC3 there too; it does not negotiate codecs.
 
-The legacy `AUDIO` payload is:
+## Control and Delivery
 
-| Offset | Size | Field | Description |
-|---:|---:|---|---|
-| 0 | 1 | `codec` | `0x01` for Opus |
-| 1 | 1 | `frame_ms` | `20` |
-| 2 | 1 | `stream_id` | Source stream |
-| 3 | 1 | `audio_flags` | Bit `0x01` means active audio |
-| 4 | N | data | Opus data, or the nRF RTT diagnostic payload |
+Coordinator SYNC is scheduled every 200 ms. The nRF queues STATUS and KEEPALIVE every second;
+ESP-NOW schedules keepalives every 500 ms. Peer timeout is 3 seconds.
+These control messages continue during VOX silence.
 
-## TDMA and RF Delivery
+The coordinator grants relay service to at most two active speakers.
+Audio starts with TTL 2; the implemented relay path permits one forwarding hop.
+See [TDMA scheduling](tdma.md) for slot ownership and deadlines.
 
-A frame is 20 ms. It contains eight fixed 2 ms voice slots followed by a 2 ms
-control window. Each voice or control window closes 500 us before its nominal
-end, providing the fixed guard interval. SYNC is sent every ten frames; that
-control window is reserved for the coordinator. Other control-window ownership
-rotates by frame and assigned slot.
+nRF ESB sends with RF acknowledgments disabled. Lost audio is handled through predecessors and receiver concealment, not RF retransmission.
+ESP-NOW completion callbacks have separate MAC-layer semantics; they do not prove application delivery.
 
-Audio is attempted only in the sender's voice slot. Late work is dropped. RF
-audio has no delivery ACK and no protocol retry. nRF ESB transmissions set the
-no-ACK flag; ESP-NOW completion callbacks account for local send completion but
-do not trigger audio retransmission. Loss is handled by V2 predecessor recovery
-and Opus packet-loss concealment.
+## S31/nRF SPI Bridge
 
-## Relaying
-
-Ordinary audio remains one hop. The coordinator may grant at most two active
-speakers and publishes a relay mask for each. A packet is relay-eligible only
-when it has `RELAY_REQUEST`, `SPEAKER_GRANTED`, a positive TTL, and the receiving
-node is selected in that speaker's relay mask. Relays deduplicate by packet type,
-source ID, and sequence. The default audio TTL is `2`; each relay decrements it
-and sets `RELAYED`.
-
-Relay arbitration is transport-specific:
-
-- ESP-NOW always sends queued local audio first and uses an otherwise idle local
-  slot for one relay.
-- nRF alternates local and relay traffic when both are pending. It may defer an
-  active local V2 frame and send its successor on the next local turn only when
-  that successor proves recovery by carrying the deferred frame as `previous1`.
-
-There is no cross-transport claim of identical relay scheduling.
-
-## Join Identity
-
-ESP-NOW obtains the sender's 6-byte MAC from receive metadata, so its payloads
-do not carry an address:
-
-| Packet | Size | Payload |
-|---|---:|---|
-| `JOIN` | 2 | `capabilities`, `reserved` |
-| `JOIN_ACK` | 3 | `assigned_id`, `slot_index`, `coordinator_id` |
-| `LEAVE` | 0 | Sender identity comes from receive metadata |
-
-The coordinator unicasts `JOIN_ACK` to the requester MAC. Repeated joins from a
-known MAC refresh that member and receive the same assignment.
-
-ESB receive delivery does not provide a transmitter identity. nRF therefore
-uses identity-bearing payloads:
-
-| Packet | Size | Payload |
-|---|---:|---|
-| `JOIN_V2` | 7 | `capabilities`, `reserved`, `requester_addr[5]` |
-| `JOIN_ACK_V2` | 8 | `assigned_id`, `slot_index`, `coordinator_id`, `target_addr[5]` |
-| `LEAVE` | 5 | `sender_addr[5]`; this is the current transmitted form |
-
-`JOIN_V2` is sent with source ID `0`. Its stable device-derived ESB address lets
-the coordinator deduplicate retries. `JOIN_ACK_V2` is broadcast, but only the
-requester whose local address matches `target_addr` accepts it. nRF ignores the
-legacy `JOIN` and `JOIN_ACK` forms.
-
-The nRF receiver also accepts a zero-length legacy `LEAVE` for compatibility.
-That form identifies the departing peer only by `SrcID`. New senders use the
-five-byte identity-bearing form.
-
-## Sync, Membership, and Status
-
-`SYNC` differs only in coordinator address width:
-
-| Offset | Size | Field |
-|---:|---:|---|
-| 0 | 4 | `frame_counter`, little-endian |
-| 4 | 2 | signed `drift_ppm`, little-endian |
-| 6 | 6 or 5 | ESP-NOW MAC or nRF ESB coordinator address |
-
-The address is also the coordinator-election tie-breaker: the lower
-lexicographic address wins. nRF coordinators currently send `drift_ppm = 0`;
-participants currently apply phase correction or reacquire timing from received
-SYNC timestamps. The advertised rate-correction term is inactive while
-`drift_ppm` remains zero.
-
-`SLOT_MAP` is always 14 bytes:
-
-| Offset | Size | Field |
-|---:|---:|---|
-| 0 | 1 | `slot_count` |
-| 1 | 8 | `slot_ids`; zero marks an unused slot |
-| 9 | 1 | `active_speaker_count` |
-| 10 | 2 | `active_speaker_ids` |
-| 12 | 2 | `relay_masks` |
-
-Current senders publish `slot_count = 8`. `SPEAKER_GRANT` is five bytes
-(`speaker_count`, two IDs, two masks); `SPEAKER_RELEASE` is three bytes
-(`speaker_count`, two IDs).
-
-`STATUS` is exactly 8 bytes:
-
-| Offset | Size | Field | Sentinel or meaning |
-|---:|---:|---|---|
-| 0 | 1 | `battery_pct` | `0..100`; `255` unknown |
-| 1 | 1 | signed `rssi_dbm` | `127` unknown |
-| 2 | 1 | `peer_count` | Active peers |
-| 3 | 1 | `fw_version` | Currently `0x02` |
-| 4 | 1 | signed `temperature_c` | `127` unknown |
-| 5 | 1 | `heard_bitmap` | Sources heard in the reporting interval |
-| 6 | 1 | `relay_bitmap` | Sources relayed in the reporting interval |
-| 7 | 1 | `active_speakers` | Current active/granted count |
-
-`KEEPALIVE` is two bytes: `battery_pct` and `reserved`.
-
-## Liveness and Coordinator Loss
-
-The ordinary peer timeout is 3000 ms without accepted traffic. Audio, join
-retries, keepalives, and status reports refresh the relevant peer records; SYNC
-refreshes coordinator presence. Silence therefore does not depend on audio
-traffic.
-
-The transports differ in coordinator handling:
-
-- ESP-NOW sends KEEPALIVE every 500 ms and STATUS every 1000 ms. Its general
-  3000 ms peer timeout also removes a missing coordinator and returns the node
-  to scanning.
-- nRF sends STATUS and KEEPALIVE together every 1000 ms. It excludes the
-  coordinator from the 3000 ms peer reaper and instead returns to scanning after
-  5000 ms without accepted coordinator SYNC.
-
-## ESP32-S3/nRF52840 Bridge
-
-The bridge is SPI only. The nRF52840 is master and the ESP32-S3 is slave. It
-runs at 4 MHz, mode 0, with manual active-low chip select. The master starts one
-full-duplex transaction every 2 ms. Every transaction clocks exactly 256 bytes;
-unused bytes are zero and an all-zero first byte is idle.
-
-One framed message may occupy the start of a transaction:
+The nRF is SPI master; the S31 is slave. Transfers are 256 bytes, mode 0, at 4 MHz.
+The polling loop has a nominal 2 ms interval, not a guaranteed transaction deadline.
+See [wiring](wiring.md) for connections. The `uart_bridge` name is historical; this link uses SPI.
 
 ```text
 0xAA | LEN | SEQ | TYPE | PAYLOAD... | CRC8 | zero padding...
 ```
 
-`LEN` is `2 + payload_length` and covers `SEQ`, `TYPE`, and payload. CRC8 covers
-`LEN` through the final payload byte, uses polynomial `0x07`, and starts at zero.
-The frame length before padding is `payload_length + 5`. The bridge constrains
-application payloads to 208 bytes even though the generic frame codec can
-represent up to 253.
+`LEN = payload_length + 2`. CRC8 covers `LEN` through the payload, using polynomial `0x07` and initial value zero.
+The 256-byte transfer allows at most 251 payload bytes. SPI sequence numbers are separate from radio and audio sequences.
 
-Bridge packet types are:
-
-| Value | Name | Direction |
+| ID | Message | Direction |
 |---:|---|---|
-| `0x01` | `AUDIO` | Bidirectional legacy RTT diagnostic |
-| `0x02` | `STATUS` | nRF to ESP |
-| `0x03` | `MESH_EVENT` | nRF to ESP |
-| `0x04` | `CONTROL` | ESP to nRF |
-| `0x05` | `LOG` | nRF to ESP |
-| `0x06` | `AUDIO_V2` | Bidirectional normal audio |
+| `0x01` | Legacy `AUDIO` | Rejected by current nRF firmware |
+| `0x02` | `STATUS` | nRF to S31 |
+| `0x03` | `MESH_EVENT` | nRF to S31 |
+| `0x04` | `CONTROL` | S31 to nRF |
+| `0x05` | `LOG` | nRF to S31 |
+| `0x06` | `AUDIO_V2` | Both directions |
 
-Audio payload direction is significant:
+S31-to-nRF audio carries the bundle directly. nRF-to-S31 audio prefixes the bundle with one source-ID byte.
+Receive timestamps are assigned locally; they are not included in this payload.
 
-- ESP to nRF `AUDIO_V2`: the intact V2 bundle.
-- nRF to ESP `AUDIO_V2`: `src_id` followed by the intact V2 bundle.
-- ESP to nRF legacy `AUDIO`: `audio_flags` followed by the RTT payload.
-- nRF to ESP legacy `AUDIO`: `src_id`, `audio_flags`, then the RTT payload.
+### Status and Compatibility
 
-ESP-to-nRF audio uses GPIO-ACK stop-and-wait across SPI: the ESP retains and
-re-presents one in-flight audio frame until nRF admission produces an ACK pulse
-or the 50 ms timeout expires. Control can pass while audio is waiting. This
-bridge reliability mechanism does not apply to RF transmission.
+The v3 STATUS payload is 10 bytes, in this order:
 
-The bridge status payload is eight bytes: `role`, `peer_count`, `node_id`,
-`version`, `mesh_state`, signed `slot_index`, `coordinator_id`, and marker
-`0xA5`. Bridge protocol version is `2`. START and STOP control payloads contain
-`command` and 8-bit `generation`; command ACK events contain `command`, matching
-`generation`, and signed result.
+```text
+role | peer_count | node_id | version | mesh_state | slot_index |
+coordinator_id | marker | audio_codec | audio_frame_ms
+```
 
-See [inter_mcu.md](inter_mcu.md) for ownership, queueing, status freshness, and
-failure behavior.
+Each field is one byte; `slot_index` is signed. The marker is `0xA5`.
+Startup selects nRF only after a fresh status advertises version 3, LC3, and 20 ms audio.
+Audio transfer additionally requires an ACTIVE mesh and an assigned node ID.
+Older 3-byte and 8-byte statuses remain readable but do not establish LC3 compatibility.
+
+### Two Different Acknowledgments
+
+- **Audio admission:** The nRF pulses GPIO ACK for 20 µs after accepting an audio packet or recognizing its admitted duplicate.
+  The S31 repeats unacknowledged SPI audio until ACK or a 50 ms timeout. This does not confirm radio delivery.
+- **Commands:** MESH_START and MESH_STOP carry a command byte and generation byte.
+  A COMMAND_ACK event returns the command, matching generation, and signed result: zero for success, minus one for failure.
+
+See [the inter-MCU contract](inter_mcu.md) for lifecycle and queue handling.
 
 ## Security
 
-On-air authentication and encryption are not implemented. Key management and
-secure firmware update are outside protocol v2 and remain deferred.
+CRC detects accidental corruption; it does not authenticate the sender.
+On-air authentication, encryption, key management, and secure firmware update are not implemented.
+
+## Source Definitions
+
+- [Mesh header and message IDs](../shared/mesh_protocol_defs.h)
+- [LC3 bundle encoder and parser](../shared/audio_bundle.c)
+- [Bridge messages and status layout](../shared/bridge_protocol_defs.h)
+- [SPI framing and CRC](../shared/bridge_frame.c)
