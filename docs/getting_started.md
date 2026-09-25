@@ -1,181 +1,143 @@
 # Getting Started
 
-This guide covers setting up a development environment for the Open Motorcycle Intercom (OMI) project.
+The tested setup uses two ESP32-S31 Function CoreBoard-1 / XIAO nRF52840 Sense pairs.
+The S31 handles audio and Bluetooth; the nRF provides the ESB mesh radio.
 
-[TOC]
+## Hardware and Tools
 
----
+For each pair, use:
 
-## Prerequisites
+- An ESP32-S31 Function CoreBoard-1 with 16 MB flash and 16 MB PSRAM.
+- A XIAO nRF52840 Sense and a passive 4 ohm, 3 W speaker.
+- Data-capable USB cables and the connections in [wiring.md](wiring.md).
 
-### Hardware
+The CoreBoard already contains the microphone, codec, and speaker amplifier.
+Do not add the external audio modules from the older ESP32-S3 prototype.
 
-This will get you started, together with **cables** and **soldering tools**:
+The commands below assume Linux, Docker access, and a cloned repository.
+Install `uv` for the benchmark and Python tests, and NCS 3.4.1 with its matching toolchain for the nRF build.
 
-| Item | Notes |
-|------|-------|
-| ESP32-S3-DevKitC-1-N8 or compatible | 8 MB flash; PSRAM is not required or enabled |
-| PCM5102A breakout | Recommended I2S audio output for a prototype |
-| MAX9814 breakout | Recommended analog microphone input for a prototype |
-| CTIA TRRS 3.5mm jack | For headset audio and microphone connections |
-| A TRRS/TRS microphone headset | For testing audio |
-| Powered headphones or an amplified speaker | A passive speaker needs a separate amplifier |
-| USB-C cable | For flashing and debugging |
-| A power source | 5V USB power supply or battery pack |
+## Build the S31 Firmware
 
-Check the [Wiring Guide](wiring.md) for prototype wiring and the differences in
-the Rev2 PCB schematic.
-
-### Software
-
-| Tool | Version | Notes |
-|------|---------|-------|
-| ESP-IDF | v5.5 (v5.5.2 recommended) | [Installation Guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.2/esp32s3/get-started/) |
-| nRF Connect SDK | v2.7.0 | Required to build the optional XIAO nRF52840 firmware |
-| Git | Any recent | Source control |
-
----
-
-## Build
+Run from the repository root. Use the pinned ESP-IDF preview image that supports S31:
 
 ```bash
-# Activate ESP-IDF environment. Adjust the path for your installation.
-source ~/esp/esp-idf/export.sh
+export IDF_IMAGE=espressif/idf@sha256:8ac794c57fd4cac246cb8d2ada4002fa26337ac7df683047b5b83743dbedb6b7
 
-# Clone the repository
-git clone https://github.com/d3vv3/open-motorcycle-intercom.git
-cd open-motorcycle-intercom
-
-# Set target to ESP32-S3
-idf.py set-target esp32s3
-
-# Build
-idf.py build
+docker run --rm --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp -e OMI_ESP_LC3_BENCH=1 \
+  -v "$PWD:/project" -w /project "$IDF_IMAGE" \
+  bash -lc '. "$IDF_PATH/export.sh" >/dev/null &&
+    idf.py --preview -B build-s31 \
+      -D SDKCONFIG=/project/build-s31/sdkconfig \
+      -D IDF_TARGET=esp32s31 \
+      -D ESP_LC3_BENCH=ON \
+      -D S31_LC3_WIRE=ON \
+      -D S31_LC3_SELFTEST=ON \
+      -D S31_LC3_SERIALIZE=ON \
+      -D S31_LC3_INTERNAL_BUFFERS=ON \
+      -D S31_LC3_SINGLE_OWNER=ON \
+      -D S31_LC3_SPLIT_CORES=OFF \
+      -D S31_LC3_SKIP_RX=OFF \
+      -D S31_MESH_COEX_PREFER_WIFI=OFF \
+      -D S31_MESH_PAIR_UNICAST=OFF \
+      -D S31_TASK_CPU_PROFILE=OFF build'
 ```
 
-First build takes several minutes. Subsequent builds are faster.
+Use a fresh `build-s31` directory for this configuration.
+Its separate `sdkconfig` uses the project's defaults instead of an existing root configuration.
+The environment variable and CMake options are both required for the LC3 dependency and codec path.
+Plain `idf.py build` does not enable this configuration by default.
 
-### Build the XIAO nRF52840 Firmware
+The pinned image contains ESP-IDF commit `9a97f6c54ec638111ce55cd36581b3c192f15207`.
+Do not substitute a moving SDK tag when comparing results.
 
-Use an nRF Connect SDK v2.7.0 workspace, then build from that workspace with the
-exact board target used by CI:
+## Build the nRF Firmware
+
+Open an NCS 3.4.1 toolchain terminal. From its SDK workspace, set the absolute path to this repository:
 
 ```bash
-west build -b xiao_ble/nrf52840 /path/to/open-motorcycle-intercom/nrf_mesh \
-  -d /path/to/open-motorcycle-intercom/build-nrf
+export OMI_APP_DIR=/absolute/path/to/omi
+
+west build --sysbuild -b xiao_ble/nrf52840 \
+  "$OMI_APP_DIR/nrf_mesh" -d "$OMI_APP_DIR/build-nrf341" \
+  -- -DCONFIG_BUILD_OUTPUT_UF2=y
 ```
 
-The output includes `build-nrf/zephyr/zephyr.hex` and
-`build-nrf/zephyr/zephyr.uf2`.
+The tested target is also used for our XIAO Sense boards.
+The application image is `build-nrf341/nrf_mesh/zephyr/zephyr.uf2`.
+Both ends need matching LC3 protocol-v3 firmware; an older Opus bridge is not compatible.
 
----
+## Flash the Boards
 
-## Flash and Monitor
+### XIAO nRF52840
+
+Power off the pair and disconnect the shared `3V3` supply wire before connecting XIAO USB.
+Follow the [USB power and flashing procedure](wiring.md#usb-flashing-or-nrf-serial-capture).
+
+Double-press XIAO RESET and copy the application UF2 to its bootloader drive.
+The board restarts after the copy. Use the application UF2, not a whole-chip erase or bootloader replacement.
+Repeat for the other nRF.
+
+### ESP32-S31
+
+Native USB JTAG/OpenOCD is the tested flashing path; serial flashing was unreliable on this setup.
+Connect the S31's native USB port and select its USB serial identity explicitly.
+Run from the repository root, using `IDF_IMAGE` from the build step:
 
 ```bash
-# Flash firmware
-idf.py -p /dev/ttyACM0 flash
+export S31_SERIAL=YOUR_S31_USB_SERIAL
 
-# Monitor serial output
-idf.py -p /dev/ttyACM0 monitor
-
-# Or combined
-idf.py -p /dev/ttyACM0 flash monitor
+docker run --rm --user 0:0 \
+  --device-cgroup-rule='c 189:* rwm' \
+  -v /dev/bus/usb:/dev/bus/usb \
+  -v "$PWD:/project:ro" -w /project \
+  -e S31_SERIAL "$IDF_IMAGE" \
+  bash -lc '. "$IDF_PATH/export.sh" >/dev/null &&
+    openocd -f board/esp32s31-builtin.cfg \
+      -c "adapter serial $S31_SERIAL" \
+      -c "program_esp_bins /project/build-s31 flasher_args.json verify reset exit"'
 ```
 
-Identify the actual port on your system and replace `/dev/ttyACM0` as needed
-(`/dev/ttyUSB0`, `/dev/cu.usbmodem*`, and similar names are also common).
+This uses the generated image list and offsets for the bootloader, partition table, and application.
+An app-only update is not sufficient for initial board setup. Check the programming and verification results before continuing.
+Repeat with the other S31's serial identity.
 
-**Exit monitor:** `Ctrl+]`
+## First Checks
 
-### Boot Checks
+1. Let each nRF boot, then reset its S31 so the SPI probe can find it.
+2. Confirm nRF ESB selection, bridge protocol 3, LC3, and 20 ms audio in the S31 logs.
+3. On each fresh S31, hold BOOT for 2 to under 6 seconds, then release it to enable mesh.
+4. Confirm that the two nodes join the same mesh and report a peer.
+5. Speak near each microphone and listen at the opposite speaker.
+6. Use the [button gestures](buttons.md) to pair a phone and test music alongside mesh voice.
 
-Boot output changes as firmware evolves, so do not depend on exact timestamps or
-heap values. A healthy boot reports the OMI banner, ESP-IDF version, NVS, power,
-button, audio, and transport initialization. During `Detecting mesh transport...`,
-the ESP32 probes the nRF52840 over the SPI bridge. A successful SPI probe selects
-the nRF/ESB transport and disables ESP Wi-Fi/ESP-NOW; otherwise the current
-firmware reports `nRF52840 not detected - using ESP-NOW transport` and continues
-with the fallback transport.
+Mesh starts disabled on fresh boards. The setting persists across restarts; the same gesture toggles it on existing installations.
 
-Fresh NVS defaults mesh intent to disabled. Hold the ESP Boot button for two
-seconds to enable mesh operation. The firmware stores this setting for later
-boots.
+With VOX enabled, silence stops LC3 encoding and audio transmission after the hangover period.
+Capture and control traffic continue; quiet audio counters alone are not a fault.
+There is no pre-roll buffer, so the start of quiet speech can be clipped.
 
----
+An absent or incompatible nRF bridge causes ESP-NOW fallback at startup.
+Check the selected transport before comparing results. With nRF selected, S31 Wi-Fi is off and Bluetooth remains enabled.
 
-## Project Structure
+Two-pair music and voice operation has been tested. Larger groups and sustained calls still need validation.
+For normal one-cable operation, follow the power transition in [wiring.md](wiring.md) before reconnecting the shared supply.
 
-```
-open-motorcycle-intercom/
-├── CMakeLists.txt          # Root project file
-├── sdkconfig.defaults      # Default SDK configuration
-├── partitions.csv          # Flash partition table
-│
-├── main/
-│   ├── CMakeLists.txt
-│   └── main.c              # Application entry point
-│
-├-- components/
-|   ├-- audio/              # Audio capture, Opus (DTX), VOX, jitter buffer, playback
-|   ├-- mesh/               # ESP-NOW transport, TDMA, relay/routing
-|   ├-- uart_bridge/        # SPI bridge to the nRF52840 radio MCU
-|   ├-- power/              # Power state machine
-|   ├-- button/             # Boot-button UI handler
-|   └-- hwtest/             # Hardware bring-up / test utilities
-|
-├-- nrf_mesh/               # nRF52840 (Zephyr) radio firmware: ESB, TDMA, mesh
-├-- shared/                 # Shared wire formats and transport-neutral mesh code
-├-- tests/
-|   ├-- c/                  # Host-side C unit and compile tests
-|   └-- python/             # Telemetry-parsing tests for benchmark.py
-|
-└-- docs/                   # Documentation
-```
+## Capture Logs and Run Tests
 
----
-
-## Common Commands
-
-| Command | Purpose |
-|---------|---------|
-| `idf.py build` | Build the project |
-| `idf.py flash` | Flash to device |
-| `idf.py monitor` | Open serial monitor |
-| `idf.py flash monitor` | Flash and monitor |
-| `idf.py menuconfig` | Configure SDK options |
-| `idf.py fullclean` | Clean all build artifacts |
-| `idf.py size-components` | Show size by component |
-
----
-
-## Troubleshooting
-
-### Permission Denied on Serial Port (Linux)
+From the repository root, select the actual serial ports:
 
 ```bash
-sudo usermod -a -G dialout $USER
-# Log out and back in
+uv run benchmark.py --duration 120 --baud 115200 \
+  --ports /dev/ttyACM0 /dev/ttyACM1 --out-dir logs/benchmark
+
+uv run --frozen pytest
 ```
 
-### Device Not Found
+Prefer stable `/dev/serial/by-id/` paths. Capture both S31s together; nRF USB consoles are optional additional inputs.
+Disconnect the shared supply before adding nRF USB power. The current nRF console uses CDC interface `if02`.
 
-- Use a data cable (not charge-only)
-- Try a different USB port
-- Check `dmesg | tail -20` for connection events
-
----
-
-## LSP Support
-
-After building, symlink `compile_commands.json` for clangd:
-
-```bash
-ln -sf build/compile_commands.json .
-```
-
----
-
-## Next Steps
-
-See the [Development Plan](dev_plan.md) for the roadmap and exit criteria.
+Each run produces `raw/`, `report.txt`, and `summary.json`.
+See [pipeline telemetry](pipeline_telemetry.md) for counter interpretation and [CPU profiling](s31-cpu-profiling.md) for optional diagnostics.
+Standalone C checks and firmware build jobs are listed in [the CI workflow](../.github/workflows/build.yml).
