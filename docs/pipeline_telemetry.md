@@ -1,70 +1,82 @@
 # Audio Pipeline Telemetry
 
-Firmware emits cumulative pipeline counters through the normal ESP-IDF and
-Zephyr logging systems. The message body starts with `PIPE` and uses a stable
-key-value schema:
+Firmware emits `PIPE` records through ESP-IDF and Zephyr logs. These examples omit other fields:
 
 ```text
-PIPE v=1 dev=esp stage=transport node=2 source=1000 gate_drop=0 spi_ok=998
-PIPE v=1 dev=nrf stage=mesh node=3 ingress_ok=998 rf_tx_ok=995 rf_tx_fail=3
+PIPE v=1 dev=esp stage=audio part=tx epoch_id=0x1234 uptime_ms=20000 capture_ok=1000 encode_ok=100 vox_skip=900 tx_handoff=100
+PIPE v=1 dev=esp stage=espnow part=tx epoch_id=0x5678 uptime_ms=20000 node_mac=aa:bb:cc:dd:ee:ff tx_offer=100 tx_queue_full=2
+PIPE v=1 dev=esp stage=transport node=2 source=100 spi_ok=98
+PIPE v=1 dev=nrf stage=mesh node=2 ingress_ok=98 rf_tx_ok=96
 ```
 
-Required fields are `v`, `dev`, and `stage`. All metric values are unsigned
-cumulative integers. Counter names ending in `_drop`, `_fail`, `_err`, or
-`_timeout` identify a loss reason. Queue depths and maximum durations are gauges;
-do not calculate deltas for those fields.
-
-`benchmark.py` accepts records with ESP-IDF prefixes, Zephyr prefixes, or no
-prefix. It groups records by device, stage, node, and any explicit session/link
-identity. Reports include first/last values, reset-aware deltas, and per-counter
-`reset_epochs`; a counter decrease starts a new epoch instead of producing a
-negative delta.
+The parser requires `v=1`, `dev`, and `stage`. Most event counts are cumulative.
+Queue depths, maxima, current settings, and identity fields are not event counts.
 
 ## Stages
 
 | Device | Stage | Boundary |
 |---|---|---|
-| ESP | `audio` | ADC capture through Opus and I2S playback |
-| ESP | `transport` | Audio callback through bridge RX and playback queue |
-| ESP | `spi` | ESP bridge queue, framing, parser, and ACK handling |
-| nRF | `spi` | SPI ingress admission and nRF-to-ESP transactions |
-| nRF | `mesh` | Ingress queue, TDMA ring, RF audio, and SPI egress |
-| nRF | `tdma` | Timer due, work coalescing, and late execution |
-| nRF | `rf` | ESB driver completion, timeout, FIFO, and RX restart |
+| S31 | `audio` | Separate `tx`, `rx`, `playout`, and `bt` parts for capture, codecs, queues, and playback |
+| S31 | `audio_timing` | Music and notification processing time |
+| S31 | `transport` | nRF audio handoff, SPI admission, redundancy, and playback queue |
+| S31 | `spi` | SPI queue, framing, parser, and ACK handling |
+| S31 | `espnow` | Separate `tx` and `rx` parts for ESP-NOW admission, completion, and receive handling |
+| S31 | `espnow_timing` | Slot timing, queue age, radio completion, send errors, and internal heap |
+| nRF | `spi` | SPI ingress and nRF-to-S31 transactions |
+| nRF | `mesh` | Ingress, TDMA, ESB audio, relay, and SPI egress |
+| nRF | `tdma` | Due work, coalescing, and late execution |
+| nRF | `rf` | ESB completion, timeout, FIFO, and RX restart |
 
-## Finding The First Loss
+The capture boundary is PCM read from the audio codec, not a direct ADC measurement.
+The tested mesh configuration uses LC3; local codec loopback still uses Opus.
+Only inspect stages relevant to the selected transport.
 
-Compare deltas from one talk interval. Start at the sender and stop at the first
-boundary where accepted output is lower than input after subtracting explicit
-drops.
+## Useful Counters
 
-1. `esp:transport source` counts frames offered by the codec callback.
-2. `esp:transport spi_ok` counts frames admitted to the ESP SPI queue.
-3. `nrf:spi ingress_ok` counts unique frames durably admitted by nRF. The GPIO
-   ACK is now sent only at this boundary or for a known duplicate.
-4. `nrf:mesh ingress_ok` counts frames moved into the owner-context TDMA ring.
-5. `nrf:mesh rf_tx_ok` counts successful local ESB completion. ESB broadcasts
-   have no receiver ACK, so this does not prove over-the-air delivery.
-6. Receiver `nrf:mesh rf_rx_ok` counts accepted RF audio.
-7. Receiver `nrf:mesh spi_out_ok` counts frames admitted to its outbound SPI
-   queue.
-8. `esp:transport play_q_ok` counts frames admitted to ESP playback.
-9. `esp:audio play_ok` counts complete I2S writes.
+- **Capture and encoding:** `capture_ok`, `encode_ok`, and `tx_handoff` track successive audio boundaries.
+- **VOX silence:** `vox_skip` counts intentionally suppressed LC3 frames, not failures.
+  Capture can continue at 50 frames/s while encoding and audio transmission stay at zero.
+- **Local discards:** Examples include `tx_queue_full`, `jitter_late`, and `rx_store_reject`.
+  Some counters overlap; do not add every drop or gap counter into one loss total.
+- **Reception and playback:** `rx_store_pop`, `decode_ok`, `conceal`, and `play_ok` distinguish received audio from concealment and output writes.
+- **Radio completion:** nRF `rf_tx_ok` and ESP-NOW `tx_radio_ok` describe local completion, not remote application delivery.
 
-Use `spi_gap` and the nRF E2E gap fields to estimate missing frame counts. These
-are stage-local loss estimates, not end-to-end delivery percentages.
+Control traffic and required relaying can continue while the local microphone is silent.
+Retries and duplicate rejection also need separate interpretation from lost audio.
 
-Delivery is reported only when separate TX and RX records have matching explicit
-`session`, sender, receiver, and stage semantics. A single port's unrelated TX
-and RX counters are never treated as correlated delivery. Missing identity yields
-`insufficient correlated data`; reset epochs or RX greater than TX yield
-`inconsistent correlated data` and suppress the percentage. This avoids a false
-delivery claim but cannot infer correlation for legacy logs that lack link
-identity.
+## Compare Intervals Carefully
 
-## Commands
+Use changes between samples, not lifetime totals, to assess a test window.
 
-```bash
-uv run benchmark.py --duration 120
-uv run pytest
+- Audio records carry `epoch_id`, `uptime_ms`, and `part`; they do not carry a MAC address. Keep serial-port identity attached.
+- ESP-NOW records also carry `node_mac`. Keep different stages, parts, and epochs separate.
+- S31 nRF-transport and nRF records lack those epoch and uptime fields. Use capture timestamps and boot boundaries.
+  Node IDs alone are not stable device identities.
+
+Derived ESP rates require at least two samples with increasing uptime in one epoch.
+Each counter must cover the full interval without decreasing. Missing or reset counters are unavailable, not zero.
+Generic counter summaries handle decreases as resets, but cannot establish continuity across an unobserved reboot.
+
+Sender and receiver windows must refer to the same traffic and time period.
+Aggregate counters alone do not establish an exact end-to-end delivery percentage.
+
+## Capture and Reports
+
+From the repository root, substitute your serial ports in this example:
+
+```sh
+uv run benchmark.py --duration 120 --baud 115200 \
+  --ports /dev/ttyACM0 /dev/ttyACM1 --out-dir logs/benchmark
 ```
+
+Prefer stable `/dev/serial/by-id/` paths when available. Each run writes `raw/`, `summary.json`, and `report.txt`.
+
+The report adds `WARN` for measured ESP discard increases and marks missing interval coverage as unavailable.
+Missing ESP coverage can change otherwise-OK health to `UNKNOWN`; existing warnings or failures remain.
+Health is a diagnostic summary, not proof of clean audio or successful radio delivery.
+
+Optional `cpu` records report task runtime; `cpu_span` records measure elapsed wall time, including waits and preemption.
+See [CPU profiling](s31-cpu-profiling.md) for interpretation and overhead.
+
+Counters and successful I2S writes do not prove audible output, acoustic latency, coexistence quality, or battery life.
+See [audio.md](audio.md) for the pipeline and its limits.
