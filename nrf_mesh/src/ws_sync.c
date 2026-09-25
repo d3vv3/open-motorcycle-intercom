@@ -2,11 +2,11 @@
  * @file ws_sync.c
  * @brief I2S WS Sync Capture diagnostics
  *
- * Uses GPIOTE + PPI + TIMER1 in counter mode to count WS rising edges
+ * Uses GPIOTE + GPPI + TIMER1 in counter mode to count WS rising edges
  * from the ESP32-S31's physical 48 kHz I2S WS output. Each 20 ms TDMA frame
  * should contain 960 rising edges; this is separate from 16 kHz Opus mesh audio.
  *
- * Hardware wiring: ESP32 GPIO5 (I2S WS / LCK) → nRF XIAO D0 (P0.02)
+ * Hardware wiring: ESP32 GPIO5 (I2S WS / LCK) -> nRF XIAO D0 (P0.02)
  */
 
 #include "ws_sync.h"
@@ -16,8 +16,9 @@
 #include <hal/nrf_gpiote.h>
 #include <hal/nrf_timer.h>
 #include <nrfx_gpiote.h>
-#include <nrfx_ppi.h>
+#include <helpers/nrfx_gppi.h>
 #include <nrfx_timer.h>
+#include <gpiote_nrfx.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -33,15 +34,14 @@ LOG_MODULE_REGISTER(ws_sync, LOG_LEVEL_INF);
 #define WS_PIN  2
 #define WS_PORT 0 /* NRF_P0 */
 
-/* Expected WS edges per 20 ms TDMA frame (16 kHz × 0.020 s) */
+/* Expected WS edges per 20 ms TDMA frame (48 kHz * 0.020 s = 960) */
 
-/* GPIOTE and PPI channels are allocated to avoid colliding with other nrfx users. */
+/* GPIOTE channel and GPPI connection are allocated to avoid other nrfx users. */
 static uint8_t s_gpiote_channel;
-/* PPI channel — ESB uses 15-17, we take 0 */
-static nrf_ppi_channel_t s_ppi_channel;
+static nrfx_gppi_handle_t s_gppi_handle;
 
-/* TIMER1 instance for counting (TIMER0 reserved by ESB) */
-static const nrfx_timer_t s_timer = NRFX_TIMER_INSTANCE(1);
+/* TIMER1 instance for counting (ESB owns TIMER2). */
+static nrfx_timer_t s_timer = NRFX_TIMER_INSTANCE(NRF_TIMER1);
 
 /* ============================================================================
  * State
@@ -55,39 +55,6 @@ static uint32_t s_last_frame_counter;
 static ws_sync_diag_t s_diag;
 
 /* ============================================================================
- * Dummy handler — TIMER1 interrupt not used, but nrfx requires one
- * ============================================================================ */
-static void timer_dummy_handler(nrf_timer_event_t event, void *ctx)
-{
-    ARG_UNUSED(event);
-    ARG_UNUSED(ctx);
-}
-
-#if NRFX_API_VER_AT_LEAST(3, 2, 0)
-static const nrfx_gpiote_t s_gpiote = NRFX_GPIOTE_INSTANCE(0);
-
-static nrfx_err_t gpiote_channel_alloc(uint8_t *channel)
-{
-    return nrfx_gpiote_channel_alloc(&s_gpiote, channel);
-}
-
-static nrfx_err_t gpiote_channel_free(uint8_t channel)
-{
-    return nrfx_gpiote_channel_free(&s_gpiote, channel);
-}
-#else
-static nrfx_err_t gpiote_channel_alloc(uint8_t *channel)
-{
-    return nrfx_gpiote_channel_alloc(channel);
-}
-
-static nrfx_err_t gpiote_channel_free(uint8_t channel)
-{
-    return nrfx_gpiote_channel_free(channel);
-}
-#endif
-
-/* ============================================================================
  * Public API
  * ============================================================================ */
 
@@ -97,24 +64,25 @@ int ws_sync_init(void)
         return 0;
     }
 
-    nrfx_err_t err;
+    int err;
+    nrfx_gpiote_t *gpiote = &GPIOTE_NRFX_INST_BY_NODE(DT_NODELABEL(gpiote0));
 
-    /* --- TIMER1 in counter mode (counts external events via PPI) --- */
+    /* --- TIMER1 in counter mode (counts external events via GPPI) --- */
     nrfx_timer_config_t tcfg = {
         .frequency = NRFX_MHZ_TO_HZ(1), /* irrelevant in counter mode */
         .mode = NRF_TIMER_MODE_COUNTER,
         .bit_width = NRF_TIMER_BIT_WIDTH_32,
         .p_context = NULL,
     };
-    err = nrfx_timer_init(&s_timer, &tcfg, timer_dummy_handler);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("TIMER1 init failed: 0x%x", err);
-        return err == NRFX_ERROR_INVALID_STATE ? -EBUSY : -EIO;
+    err = nrfx_timer_init(&s_timer, &tcfg, NULL);
+    if (err < 0) {
+        LOG_ERR("TIMER1 init failed: %d", err);
+        return err == -EALREADY ? -EBUSY : -EIO;
     }
 
-    err = gpiote_channel_alloc(&s_gpiote_channel);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("GPIOTE channel alloc failed: 0x%x", err);
+    err = nrfx_gpiote_channel_alloc(gpiote, &s_gpiote_channel);
+    if (err < 0) {
+        LOG_ERR("GPIOTE channel alloc failed: %d", err);
         nrfx_timer_uninit(&s_timer);
         return -EIO;
     }
@@ -125,26 +93,16 @@ int ws_sync_init(void)
                                NRF_GPIOTE_POLARITY_LOTOHI);
     nrf_gpiote_event_enable(NRF_GPIOTE, s_gpiote_channel);
 
-    /* --- PPI: GPIOTE IN event → TIMER1 COUNT task --- */
-    err = nrfx_ppi_channel_alloc(&s_ppi_channel);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("PPI alloc failed: 0x%x", err);
-        nrf_gpiote_event_disable(NRF_GPIOTE, s_gpiote_channel);
-        (void)gpiote_channel_free(s_gpiote_channel);
-        nrfx_timer_uninit(&s_timer);
-        return -EIO;
-    }
-
+    /* --- GPPI: GPIOTE IN event to TIMER1 COUNT task --- */
     uint32_t gpiote_evt_addr =
         nrf_gpiote_event_address_get(NRF_GPIOTE, nrf_gpiote_in_event_get(s_gpiote_channel));
     uint32_t timer_task_addr = nrfx_timer_task_address_get(&s_timer, NRF_TIMER_TASK_COUNT);
 
-    err = nrfx_ppi_channel_assign(s_ppi_channel, gpiote_evt_addr, timer_task_addr);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("PPI assign failed: 0x%x", err);
-        (void)nrfx_ppi_channel_free(s_ppi_channel);
+    err = nrfx_gppi_conn_alloc(gpiote_evt_addr, timer_task_addr, &s_gppi_handle);
+    if (err < 0) {
+        LOG_ERR("GPPI connection alloc failed: %d", err);
         nrf_gpiote_event_disable(NRF_GPIOTE, s_gpiote_channel);
-        (void)gpiote_channel_free(s_gpiote_channel);
+        (void)nrfx_gpiote_channel_free(gpiote, s_gpiote_channel);
         nrfx_timer_uninit(&s_timer);
         return -EIO;
     }
@@ -165,8 +123,8 @@ void ws_sync_start(void)
     nrfx_timer_clear(&s_timer);
     nrfx_timer_enable(&s_timer);
 
-    /* Enable PPI channel */
-    nrfx_ppi_channel_enable(s_ppi_channel);
+    /* Enable GPPI connection */
+    nrfx_gppi_conn_enable(s_gppi_handle);
 
     s_last_count = 0;
     s_first_sample = true;
@@ -183,7 +141,7 @@ void ws_sync_stop(void)
         return;
     }
 
-    nrfx_ppi_channel_disable(s_ppi_channel);
+    nrfx_gppi_conn_disable(s_gppi_handle);
     nrfx_timer_disable(&s_timer);
     s_running = false;
 
@@ -244,15 +202,9 @@ bool ws_sync_sample(uint32_t frame_counter, uint32_t edge_count, int32_t *correc
         return false;
     }
 
-    /* delta should be ~960 per 20ms frame.
-     * If delta > 320: ESP clock ran more edges than expected → ESP is
-     *   faster → nRF needs to speed up (negative correction = shrink frame).
-     * If delta < 320: ESP is slower → nRF needs to slow down (positive
-     *   correction = stretch frame).
-     *
-     * Each edge is 62.5 us (1/16000).  So the timing error in us:
-     *   error_us = (EXPECTED - delta) * 62.5
-     * We use fixed-point: (EXPECTED - delta) * 625 / 10
+    /* Expect 960 WS edges per 20 ms frame (48 kHz), scaled by elapsed_frames.
+     * The helper converts the edge difference to microseconds at the physical
+     * 48 kHz WS rate and bounds the resulting timing correction.
      */
 
     s_diag.last_correction_us = correction;

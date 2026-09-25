@@ -203,19 +203,19 @@ jobs:
     name: nRF52840 Zephyr firmware
     runs-on: ubuntu-latest
     # NCS supplies the Nordic ESB module used by this app; the matching toolchain
-    # image and annotated sdk-nrf v2.7.0 tag keep the hosted build reproducible.
+    # image and sdk-nrf v3.4.1 tag keep the hosted build reproducible.
     container:
-      image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.7.0@sha256:b481467f39ed524a2cb23fed8b9dcdc1e4f60972988b913c386538953c929247
+      image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v3.4.1@sha256:45b97cad97a9967c52d77d1d1a0f7dd8fe027edd17c05c3eda2eeadc23729418
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4.2.2
 
-      - name: Initialize nRF Connect SDK v2.7.0
+      - name: Initialize nRF Connect SDK v3.4.1
         shell: bash
         run: |
           west init -m https://github.com/nrfconnect/sdk-nrf.git \
-            --mr v2.7.0 \
+            --mr v3.4.1 \
             "$GITHUB_WORKSPACE/.ncs"
           cd "$GITHUB_WORKSPACE/.ncs"
           west update --narrow -o=--depth=1
@@ -233,7 +233,7 @@ jobs:
         with:
           name: nrf52840-firmware
           path: |
-            build-nrf/zephyr/zephyr.elf
-            build-nrf/zephyr/zephyr.hex
-            build-nrf/zephyr/zephyr.uf2
+            build-nrf/nrf_mesh/zephyr/zephyr.elf
+            build-nrf/nrf_mesh/zephyr/zephyr.hex
+            build-nrf/nrf_mesh/zephyr/zephyr.uf2
           retention-days: 7

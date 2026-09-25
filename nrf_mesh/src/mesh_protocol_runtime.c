@@ -312,7 +312,11 @@ int mesh_protocol_start(void)
     mesh_protocol_audio_reset_all_rf_e2e_trackers();
 
     /* Start RX so we can hear SYNC broadcasts from an existing coordinator */
-    esb_radio_start_rx();
+    int ret = esb_radio_start_rx();
+    if (ret) {
+        LOG_ERR("Cannot start mesh scanning RX: %d", ret);
+        return ret;
+    }
 
     /* Enter scanning state */
     s_state = MESH_STATE_SCANNING;

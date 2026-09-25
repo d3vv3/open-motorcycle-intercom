@@ -23,6 +23,7 @@ LOG_MODULE_REGISTER(esb_radio, LOG_LEVEL_INF);
 #define ESB_MAX_PAYLOAD_LEN CONFIG_ESB_MAX_PAYLOAD_LENGTH
 #define ESB_ADDR_LEN        5
 #define TX_DONE_TIMEOUT_US  1450
+#define TX_RECOVERY_TIMEOUT_MS 20
 
 /* RF robustness tuning */
 #ifndef ESB_BITRATE_250KBPS
@@ -48,10 +49,16 @@ static uint8_t s_local_addr[ESB_ADDR_LEN];
 static struct esb_payload s_tx_payload;
 static struct esb_payload s_rx_payload;
 static bool s_initialized = false;
+static bool s_faulted = false;
 static bool s_tx_in_progress = false; /* Prevent re-entry during TX */
 static bool s_rx_active = false;      /* Track if RX mode is running */
 static bool s_tx_recovery_pending = false;
-static bool s_recovery_restart_rx = false;
+static int64_t s_recovery_deadline_ms;
+static bool s_rx_requested = false;
+static enum esb_mode s_mode;
+static struct esb_config s_config;
+static uint8_t s_channel;
+static K_MUTEX_DEFINE(s_radio_mutex);
 
 /* The radio needs the external 32 MHz crystal (HFXO). The ESB library does not
  * request it; without this request the radio runs from the internal RC clock
@@ -77,6 +84,25 @@ static uint32_t s_rx_restart_fail_count = 0;
 
 /* Semaphore signaled when TX completes (success or fail) */
 static K_SEM_DEFINE(s_tx_done_sem, 0, 1);
+static void hfclk_stop(void);
+static void recovery_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(s_recovery_work, recovery_work_handler);
+
+static void fault_radio_locked(const char *reason)
+{
+    LOG_ERR("ESB radio faulted until reboot: %s", reason);
+    s_faulted = true;
+    s_tx_recovery_pending = false;
+    s_rx_active = false;
+    s_rx_requested = false;
+    if (s_initialized) {
+        /* esb_disable is the SDK's immediate-stop path; never reinit a busy TX. */
+        esb_disable();
+        s_initialized = false;
+    }
+    k_sem_reset(&s_tx_done_sem);
+    hfclk_stop();
+}
 
 /* ============================================================================
  * ESB Event Handler
@@ -120,9 +146,68 @@ static void on_esb_event(struct esb_evt const *event)
     }
 }
 
-static int restart_rx_after_tx(void)
+/* All role changes run under s_radio_mutex in thread context. esb_init resets
+ * FIFOs and PIDs; packets already passed to the application callback survive. */
+static int switch_mode_locked(enum esb_mode mode, bool force)
 {
-    int ret = esb_start_rx();
+    if (s_mode == mode && !force) {
+        return 0;
+    }
+    if (!esb_is_idle()) {
+        return -EBUSY;
+    }
+
+    struct esb_payload dropped;
+
+    /* RX is stopped; exclude the ESB event ISR's FIFO reader for this drain. */
+    unsigned int key = irq_lock();
+    for (int i = 0; i < CONFIG_ESB_RX_FIFO_SIZE; i++) {
+        if (esb_read_rx_payload(&dropped) != 0) {
+            break;
+        }
+        atomic_inc(&s_rx_flush_drop_count);
+    }
+    irq_unlock(key);
+    esb_disable();
+    s_initialized = false;
+    s_rx_active = false;
+
+    s_config.mode = mode;
+    int ret = esb_init(&s_config);
+
+    if (ret) {
+        /* SDK init can fail after allocating resources without public rollback. */
+        LOG_ERR("ESB reinit failed: %d; radio faulted until reboot", ret);
+        s_faulted = true;
+        hfclk_stop();
+        return ret;
+    }
+    s_initialized = true;
+    s_mode = mode;
+
+    ret = esb_set_rf_channel(s_channel);
+    if (!ret) {
+        ret = esb_set_base_address_0(broadcast_addr);
+    }
+    if (!ret) {
+        ret = esb_set_base_address_1(s_local_addr);
+    }
+    if (ret) {
+        LOG_ERR("ESB role address/channel setup failed: %d", ret);
+        esb_disable();
+        s_initialized = false;
+        hfclk_stop();
+    }
+    return ret;
+}
+
+static int restart_rx_after_tx_locked(void)
+{
+    int ret = switch_mode_locked(ESB_MODE_PRX, false);
+
+    if (ret == 0) {
+        ret = esb_start_rx();
+    }
 
     if (ret == 0) {
         s_rx_active = true;
@@ -130,6 +215,41 @@ static int restart_rx_after_tx(void)
         s_rx_restart_fail_count++;
     }
     return ret;
+}
+
+static void recovery_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    k_mutex_lock(&s_radio_mutex, K_FOREVER);
+    if (s_initialized && s_tx_recovery_pending) {
+        if (!esb_is_idle()) {
+            if (k_uptime_get() >= s_recovery_deadline_ms) {
+                fault_radio_locked("TX did not become idle");
+            } else {
+                k_work_reschedule(&s_recovery_work, K_MSEC(1));
+            }
+        } else {
+            /* Even if already PTX, reset SDK flags/FIFOs and pending old events
+             * before clearing the semaphore or accepting another payload. */
+            int ret = switch_mode_locked(s_rx_requested ? ESB_MODE_PRX : ESB_MODE_PTX,
+                                         true);
+            if (!ret && s_rx_requested) {
+                ret = esb_start_rx();
+                if (!ret) {
+                    s_rx_active = true;
+                } else {
+                    s_rx_restart_fail_count++;
+                }
+            }
+            if (ret) {
+                fault_radio_locked("TX recovery reinit/RX restart failed");
+            } else {
+                k_sem_reset(&s_tx_done_sem);
+                s_tx_recovery_pending = false;
+            }
+        }
+    }
+    k_mutex_unlock(&s_radio_mutex);
 }
 
 static void account_tx_wait(int64_t tx_start_us)
@@ -154,25 +274,19 @@ static void account_rx_pause(int64_t rx_pause_start_us)
     }
 }
 
-static void recover_tx_timeout(bool was_rx_active, int64_t tx_start_us, int64_t rx_pause_start_us)
+static void recover_tx_timeout(int64_t tx_start_us, int64_t rx_pause_start_us)
 {
     LOG_ERR("TX timed out");
     s_tx_timeout_count++;
     account_tx_wait(tx_start_us);
-    esb_flush_tx();
     for (int wait = 0; wait < 100 && !esb_is_idle(); wait++) {
         k_busy_wait(10);
     }
-    k_sem_reset(&s_tx_done_sem);
-    bool radio_idle = esb_is_idle();
-    s_tx_recovery_pending = !radio_idle;
+    s_tx_recovery_pending = true;
+    s_recovery_deadline_ms = k_uptime_get() + TX_RECOVERY_TIMEOUT_MS;
+    k_work_reschedule(&s_recovery_work, K_NO_WAIT);
     s_tx_in_progress = false;
-    if (was_rx_active) {
-        if (!radio_idle) {
-            s_recovery_restart_rx = true;
-        } else {
-            (void)restart_rx_after_tx();
-        }
+    if (s_rx_requested) {
         account_rx_pause(rx_pause_start_us);
     }
 }
@@ -256,8 +370,14 @@ static void hfclk_stop(void)
 
 int esb_radio_init(uint8_t channel)
 {
+    k_mutex_lock(&s_radio_mutex, K_FOREVER);
+    if (s_faulted) {
+        k_mutex_unlock(&s_radio_mutex);
+        return -EIO;
+    }
     if (s_initialized) {
         LOG_WRN("ESB already initialized");
+        k_mutex_unlock(&s_radio_mutex);
         return -EALREADY;
     }
 
@@ -266,6 +386,7 @@ int esb_radio_init(uint8_t channel)
     int clk_ret = hfclk_start();
     if (clk_ret) {
         hfclk_stop();
+        k_mutex_unlock(&s_radio_mutex);
         return clk_ret;
     }
 
@@ -285,30 +406,37 @@ int esb_radio_init(uint8_t channel)
             s_local_addr[2], s_local_addr[3], s_local_addr[4]);
 
     /* ESB configuration */
-    struct esb_config config = ESB_DEFAULT_CONFIG;
-    config.protocol = ESB_PROTOCOL_ESB_DPL; /* Dynamic payload length */
-    config.mode = ESB_MODE_PTX;             /* Start as PTX, switch as needed */
-    config.event_handler = on_esb_event;
-    config.bitrate = OMI_ESB_BITRATE;
-    config.crc = ESB_CRC_16BIT;
-    config.tx_output_power = OMI_ESB_TX_POWER_DBM;
-    config.retransmit_delay = 500;
-    config.retransmit_count = 3;
-    config.tx_mode = ESB_TXMODE_AUTO;
-    config.payload_length = ESB_MAX_PAYLOAD_LEN;
-    config.selective_auto_ack = true; /* Required for noack flag to work */
+    s_config = (struct esb_config)ESB_DEFAULT_CONFIG;
+    s_config.protocol = ESB_PROTOCOL_ESB_DPL; /* Dynamic payload length */
+    s_config.mode = ESB_MODE_PTX; /* Reinitialize as PRX when reception starts */
+    s_config.event_handler = on_esb_event;
+    s_config.bitrate = OMI_ESB_BITRATE;
+    s_config.crc = ESB_CRC_16BIT;
+    s_config.tx_output_power = OMI_ESB_TX_POWER_DBM;
+    s_config.retransmit_delay = 500;
+    s_config.retransmit_count = 3;
+    s_config.tx_mode = ESB_TXMODE_AUTO;
+    s_config.payload_length = ESB_MAX_PAYLOAD_LEN;
+    s_config.selective_auto_ack = true; /* Required for noack flag to work */
+    s_channel = channel;
 
-    int ret = esb_init(&config);
+    int ret = esb_init(&s_config);
     if (ret) {
-        LOG_ERR("ESB init failed: %d", ret);
+        /* SDK partial init may retain resources; do not retry until reboot. */
+        LOG_ERR("ESB init failed: %d; radio faulted until reboot", ret);
+        s_faulted = true;
+        hfclk_stop();
+        k_mutex_unlock(&s_radio_mutex);
         return ret;
     }
+    s_initialized = true;
+    s_mode = ESB_MODE_PTX;
 
     /* Set RF channel */
     ret = esb_set_rf_channel(channel);
     if (ret) {
         LOG_ERR("Set channel failed: %d", ret);
-        return ret;
+        goto init_cleanup;
     }
 
     /* Set up pipes:
@@ -317,36 +445,67 @@ int esb_radio_init(uint8_t channel)
     ret = esb_set_base_address_0(broadcast_addr);
     if (ret) {
         LOG_ERR("Set base addr 0 failed: %d", ret);
-        return ret;
+        goto init_cleanup;
     }
 
     ret = esb_set_base_address_1(s_local_addr);
     if (ret) {
         LOG_ERR("Set base addr 1 failed: %d", ret);
-        return ret;
+        goto init_cleanup;
     }
 
-    s_initialized = true;
+    s_rx_active = false;
+    s_rx_requested = false;
+    s_tx_recovery_pending = false;
     LOG_INF("ESB radio initialized (bitrate=2Mbps)");
-
+    k_mutex_unlock(&s_radio_mutex);
     return 0;
+
+init_cleanup:
+    esb_disable();
+    s_initialized = false;
+    hfclk_stop();
+    k_mutex_unlock(&s_radio_mutex);
+    return ret;
 }
 
 void esb_radio_deinit(void)
 {
+    k_mutex_lock(&s_radio_mutex, K_FOREVER);
     if (!s_initialized) {
+        k_mutex_unlock(&s_radio_mutex);
         return;
     }
 
+    if (s_rx_active) {
+        int ret = esb_stop_rx();
+        if (ret) {
+            LOG_ERR("Cannot deinit while RX is active: %d", ret);
+            k_mutex_unlock(&s_radio_mutex);
+            return;
+        }
+        s_rx_active = false;
+    }
+    if (!esb_is_idle()) {
+        LOG_ERR("Cannot deinit while ESB is busy");
+        k_mutex_unlock(&s_radio_mutex);
+        return;
+    }
     esb_disable();
     hfclk_stop();
     s_initialized = false;
+    s_rx_requested = false;
+    s_tx_recovery_pending = false;
+    (void)k_work_cancel_delayable(&s_recovery_work);
     LOG_INF("ESB radio deinitialized");
+    k_mutex_unlock(&s_radio_mutex);
 }
 
 void esb_radio_set_rx_callback(esb_rx_callback_t cb)
 {
+    unsigned int key = irq_lock();
     s_rx_callback = cb;
+    irq_unlock(key);
 }
 
 int esb_radio_send(const uint8_t *data, uint8_t len)
@@ -358,37 +517,35 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
 {
     int64_t tx_start_us = k_ticks_to_us_floor64(k_uptime_ticks());
     int64_t rx_pause_start_us = 0;
+    int ret;
 
-    if (!s_initialized || data == NULL || len == 0) {
+    if (addr == NULL || data == NULL || len == 0) {
         return -EINVAL;
     }
 
     if (len > ESB_MAX_PAYLOAD_LEN) {
         return -EMSGSIZE;
     }
+    if (k_mutex_lock(&s_radio_mutex, K_NO_WAIT) != 0) {
+        return -EBUSY;
+    }
+    if (s_faulted || !s_initialized) {
+        ret = s_faulted ? -EIO : -EINVAL;
+        goto out;
+    }
 
     if (s_tx_recovery_pending) {
-        if (!esb_is_idle()) {
-            s_tx_busy_count++;
-            return -EBUSY;
-        }
-        k_sem_reset(&s_tx_done_sem);
-        s_tx_recovery_pending = false;
-        if (s_recovery_restart_rx) {
-            if (restart_rx_after_tx() == 0) {
-                s_recovery_restart_rx = false;
-            } else {
-                s_tx_recovery_pending = true;
-                return -EIO;
-            }
-        }
+        s_tx_busy_count++;
+        ret = -EBUSY;
+        goto out;
     }
 
     /* Prevent re-entry - if already transmitting, drop this packet */
     if (s_tx_in_progress) {
         s_tx_busy_count++;
         LOG_WRN("TX busy, dropping packet");
-        return -EBUSY;
+        ret = -EBUSY;
+        goto out;
     }
     s_tx_in_progress = true;
 
@@ -396,22 +553,33 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
     bool was_rx_active = s_rx_active;
     if (was_rx_active) {
         rx_pause_start_us = k_ticks_to_us_floor64(k_uptime_ticks());
-        esb_stop_rx();
+        ret = esb_stop_rx();
+        if (ret) {
+            goto tx_done;
+        }
         s_rx_active = false;
+    }
+    if (!esb_is_idle()) {
+        ret = -EBUSY;
+        goto tx_done;
+    }
+
+    ret = switch_mode_locked(ESB_MODE_PTX, false);
+    if (ret) {
+        goto tx_done;
     }
 
     /* Flush any pending TX to prevent FIFO overflow */
-    esb_flush_tx();
+    ret = esb_flush_tx();
+    if (ret) {
+        goto tx_done;
+    }
 
     /* Set destination address */
-    int ret = esb_set_base_address_0(addr);
+    ret = esb_set_base_address_0(addr);
     if (ret) {
         LOG_ERR("Set TX addr failed: %d", ret);
-        s_tx_in_progress = false;
-        if (was_rx_active) {
-            (void)restart_rx_after_tx();
-        }
-        return ret;
+        goto tx_done;
     }
 
     /* Prepare payload */
@@ -428,17 +596,14 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
     if (ret) {
         s_tx_write_fail_count++;
         LOG_ERR("TX write failed: %d", ret);
-        s_tx_in_progress = false;
-        if (was_rx_active) {
-            (void)restart_rx_after_tx();
-        }
-        return ret;
+        goto tx_done;
     }
 
     /* Keep a lost completion event from occupying more than one TDMA slot. */
     if (k_sem_take(&s_tx_done_sem, K_USEC(TX_DONE_TIMEOUT_US)) != 0) {
-        recover_tx_timeout(was_rx_active, tx_start_us, rx_pause_start_us);
-        return -ETIMEDOUT;
+        recover_tx_timeout(tx_start_us, rx_pause_start_us);
+        ret = -ETIMEDOUT;
+        goto out;
     }
 
     /* Busy-wait for ESB to reach IDLE (should be immediate after sem) */
@@ -448,53 +613,99 @@ int esb_radio_send_to(const uint8_t *addr, const uint8_t *data, uint8_t len)
         idle_wait++;
     }
 
-    s_tx_in_progress = false;
-
-    /* Resume RX mode only if it was active before */
-    if (was_rx_active) {
-        int rx_ret = restart_rx_after_tx();
-        if (rx_ret == 0) {
-            account_rx_pause(rx_pause_start_us);
-        } else {
-            LOG_ERR("Failed to resume RX after TX: %d", rx_ret);
-            s_rx_active = false;
-        }
+    if (!esb_is_idle()) {
+        s_tx_recovery_pending = true;
+        s_recovery_deadline_ms = k_uptime_get() + TX_RECOVERY_TIMEOUT_MS;
+        k_work_reschedule(&s_recovery_work, K_MSEC(1));
+        ret = -EBUSY;
+        goto tx_done;
     }
-
-    if (s_last_tx_status == 0) {
+    ret = s_last_tx_status;
+    if (ret == 0) {
         s_tx_count++;
     }
     account_tx_wait(tx_start_us);
 
-    return s_last_tx_status;
+tx_done:
+    s_tx_in_progress = false;
+    if (s_rx_requested && s_initialized && !s_tx_recovery_pending && esb_is_idle() &&
+        !s_rx_active) {
+        int rx_ret = restart_rx_after_tx_locked();
+        if (rx_ret) {
+            fault_radio_locked("RX restart after TX failed");
+            if (ret == 0) {
+                ret = rx_ret;
+            }
+        }
+    }
+    if (was_rx_active) {
+        account_rx_pause(rx_pause_start_us);
+    }
+out:
+    k_mutex_unlock(&s_radio_mutex);
+    return ret;
 }
 
 int esb_radio_start_rx(void)
 {
+    k_mutex_lock(&s_radio_mutex, K_FOREVER);
+    if (s_faulted) {
+        k_mutex_unlock(&s_radio_mutex);
+        return -EIO;
+    }
     if (!s_initialized) {
+        k_mutex_unlock(&s_radio_mutex);
         return -EINVAL;
     }
 
-    int ret = esb_start_rx();
+    if (s_rx_active) {
+        k_mutex_unlock(&s_radio_mutex);
+        return 0;
+    }
+    if (!esb_is_idle()) {
+        k_mutex_unlock(&s_radio_mutex);
+        return -EBUSY;
+    }
+    if (s_tx_recovery_pending) {
+        k_mutex_unlock(&s_radio_mutex);
+        return -EBUSY;
+    }
+    int ret = switch_mode_locked(ESB_MODE_PRX, false);
+    if (!ret) {
+        ret = esb_start_rx();
+    }
     if (ret) {
         LOG_ERR("Start RX failed: %d", ret);
+        k_mutex_unlock(&s_radio_mutex);
         return ret;
     }
 
     s_rx_active = true;
+    s_rx_requested = true;
     LOG_DBG("RX started");
+    k_mutex_unlock(&s_radio_mutex);
     return 0;
 }
 
 void esb_radio_stop_rx(void)
 {
+    k_mutex_lock(&s_radio_mutex, K_FOREVER);
     if (!s_initialized) {
+        k_mutex_unlock(&s_radio_mutex);
         return;
     }
 
-    esb_stop_rx();
-    s_rx_active = false;
+    s_rx_requested = false;
+    if (s_rx_active) {
+        int ret = esb_stop_rx();
+        if (ret) {
+            LOG_ERR("Stop RX failed: %d", ret);
+        } else {
+            s_rx_active = false;
+        }
+    }
     LOG_DBG("RX stopped");
+    k_mutex_unlock(&s_radio_mutex);
 }
 
 void esb_radio_get_address(uint8_t *addr)
