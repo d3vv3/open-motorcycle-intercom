@@ -1,67 +1,49 @@
 # Architecture Overview
 
-OMI currently targets the ESP32-S31 Function CoreBoard-1. It has 16 MB flash,
-16 MB PSRAM, onboard ES8311 audio capture/codec, and NS4150B/J9 speaker output.
+OpenHelmet uses an ESP32-S31 Function CoreBoard-1 for audio and phone connectivity.
+An optional XIAO nRF52840 Sense provides a separate mesh radio.
 
-## Component Map
+## System Map
 
-| Area | Current owner |
+```mermaid
+flowchart LR
+    Phone[Phone] <-->|Bluetooth| S31[ESP32-S31]
+    Mic[Onboard microphone] --> S31
+    S31 --> Speaker[Speaker]
+    S31 <-->|SPI: encoded LC3 audio and control| NRF[nRF52840]
+    NRF <-->|ESB| Peers[Other mesh nodes]
+```
+
+The diagram shows the separate-radio setup. The nRF forwards encoded audio; it does not run the audio codec.
+
+| Responsibility | Owner |
 |---|---|
-| Board | S31 pins, ES8311/NS4150B, GPIO47 WS mirror |
-| Audio core | 16 kHz mono PCM, Opus, VOX/DTX, four-source decode/mix |
-| Audio route | A2DP resample/downmix, HFP 8/16 kHz route, call priority |
-| Voice cleanup | Mic-only noise suppression; ESP-SR AEC disabled (122 ms per 20 ms frame) |
-| Phone audio | Classic Bluetooth A2DP sink, AVRCP, HFP HF client |
-| Mesh | ESP-NOW or nRF ESB selected at startup |
-| Inter-MCU | `uart_bridge` legacy API name; SPI nRF master/S31 slave |
-| UI | BOOT release gestures and distinct notification beeps |
+| Microphone capture, VOX, LC3 encoding and decoding | S31 |
+| Playback, music mixing, and notification sounds | S31 |
+| Bluetooth music, media controls, and phone-call routes | S31 |
+| Buttons and application policy | S31 |
+| ESB radio, mesh membership, TDMA, and relaying | nRF, when selected |
+| SPI transfers | nRF master, S31 slave |
 
-The runtime requires PSRAM for audio routes, four Opus decoders, and AEC state.
-Audio initialization fails if the expected 16 MB PSRAM is missing. Task stacks,
-DMA buffers, and controller allocations are internal implementation details.
+Mesh audio is 16 kHz mono. Each 20 ms audio payload contains two 10 ms LC3 frames.
+VOX silence stops local encoding and audio transmission, while capture and mesh control traffic continue.
 
-## Bluetooth and Coexistence
+## Transport Selection
 
-Classic Bluetooth is implemented locally: A2DP sink with internal SBC PCM,
-AVRCP, and HFP Hands-Free client with internal CVSD/mSBC over HCI. HSP is not
-implemented. Pairing is closed by default; the bonded phone is retained, and a
-replacement-phone pairing window explicitly forgets existing bonds before
-opening discoverability.
+At startup, the S31 probes for a compatible LC3 nRF bridge.
 
-ESP-NOW and Classic Bluetooth are both enabled with software coexistence. This
-does not make ESP-NOW impossible, but product-quality simultaneous traffic and
-SCO latency are not yet validated. When the nRF bridge is selected, Wi-Fi is
-deinitialized and nRF ESB is preferred for phone-call reliability. Calls
-suspend or preempt A2DP locally.
+- **nRF ESB:** The nRF owns mesh communication. S31 Wi-Fi and ESP-NOW are disabled; Bluetooth remains enabled.
+- **ESP-NOW fallback:** Without a compatible bridge, the S31 also owns the mesh radio and TDMA schedule.
 
-## Mesh and Audio Ownership
+Mesh voice, Bluetooth music, and notifications can mix locally. Phone calls take priority over those playback sources.
 
-Without the bridge, the S31 owns ESP-NOW, TDMA, audio, and application policy.
-With the bridge, the nRF52840 owns ESB membership and TDMA while the S31 keeps
-all audio and phone processing. The nRF is SPI master and the S31 is slave.
-See [SPI flow control and ownership](protocol.md#spi-flow-control) and [TDMA scheduling](tdma.md).
+Bluetooth music and two-way mesh voice have worked together on two nRF-equipped pairs.
+Larger groups and sustained call performance still need validation.
 
-The mesh format remains 20 ms, 16 kHz mono Opus. Four remote decoder slots are
-independent of the maximum two relay grants. Audio route mixing gives calls
-exclusive priority; outside calls, mesh, music, and notifications may mix.
+## Details
 
-## Button Policy
-
-On release, 50 ms to less than 2 seconds is a contextual short press: it
-answers an incoming call, ends an ongoing call, or toggles A2DP play/pause when
-both media profiles are connected. It emits no notification tone. From 2 to
-less than 6 seconds, the button toggles mesh and emits a distinct mesh beep. A
-release at 6 seconds or longer opens a 120-second Bluetooth pairing window and
-emits a distinct pairing beep. Short-press behavior has not been hardware-
-tested. Do not hold BOOT while resetting or applying power, because that enters
-download mode.
-
-## Validation Caveats
-
-A2DP pairing/playback hardware validation passed, including a short music check
-and the telemetry playout fix. After scalar far-reference subtraction was
-removed, a normal-volume call was reported to sound good with no apparent
-microphone leakage. This does not establish production acoustic AEC: ESP-SR AEC
-is disabled and mic-only noise suppression remains active. Longer SCO stress
-testing remains outstanding. The physical nRF WS connection has not yet been
-validated with the S31.
+- [Wiring and power](wiring.md)
+- [Audio pipeline](audio.md)
+- [Packet formats and SPI flow control](protocol.md)
+- [TDMA scheduling](tdma.md)
+- [Button gestures](buttons.md)
