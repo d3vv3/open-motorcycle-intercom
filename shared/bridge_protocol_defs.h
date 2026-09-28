@@ -6,7 +6,8 @@
 
 #include "mesh_protocol_defs.h"
 
-#define BRIDGE_PROTOCOL_VERSION    3
+#define BRIDGE_PROTOCOL_VERSION    4
+#define BRIDGE_PROTOCOL_VERSION_V3 3
 #define BRIDGE_PROTOCOL_VERSION_V2 2
 #define BRIDGE_STATUS_V2_MARKER    0xA5
 #define BRIDGE_STATUS_V2_LENGTH    8
@@ -46,7 +47,32 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint8_t command;
     uint8_t generation;
+    uint8_t talk_channel; /* START group; STOP ignores value, but requires this layout. */
 } bridge_command_payload_t;
+
+static inline int bridge_mesh_command_valid(const bridge_command_payload_t *payload, size_t len)
+{
+    return payload != NULL && len == sizeof(*payload) &&
+           (payload->command == BRIDGE_COMMAND_MESH_STOP ||
+            (payload->command == BRIDGE_COMMAND_MESH_START &&
+             mesh_channel_valid(payload->talk_channel)));
+}
+
+/* One atomic word carries a coherent request; zero means no pending command. */
+static inline uint32_t bridge_mesh_request_pack(uint8_t command, uint8_t generation,
+                                                uint8_t talk_channel)
+{
+    return (uint32_t)command | ((uint32_t)generation << 8) | ((uint32_t)talk_channel << 16);
+}
+
+static inline bridge_command_payload_t bridge_mesh_request_unpack(uint32_t request)
+{
+    return (bridge_command_payload_t){
+        .command = (uint8_t)request,
+        .generation = (uint8_t)(request >> 8),
+        .talk_channel = (uint8_t)(request >> 16),
+    };
+}
 
 typedef struct __attribute__((packed)) {
     uint8_t command;
@@ -73,7 +99,7 @@ static inline int bridge_audio_supports_lc3(uint8_t version, uint8_t codec, uint
            frame_ms == MESH_FRAME_MS;
 }
 
-_Static_assert(sizeof(bridge_command_payload_t) == 2, "bridge command wire size changed");
+_Static_assert(sizeof(bridge_command_payload_t) == 3, "bridge command wire size changed");
 _Static_assert(sizeof(bridge_command_ack_payload_t) == 3, "bridge ACK wire size changed");
 _Static_assert(sizeof(bridge_status_payload_t) == 10, "bridge status wire size changed");
 _Static_assert(offsetof(bridge_status_payload_t, marker) == 7, "bridge status marker offset changed");

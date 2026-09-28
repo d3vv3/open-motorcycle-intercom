@@ -86,7 +86,7 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_fla
  */
 int mesh_protocol_send_audio_v2(const uint8_t *data, uint8_t len);
 
-void mesh_protocol_request_start(uint8_t generation);
+void mesh_protocol_request_start(uint8_t generation, uint8_t talk_channel);
 void mesh_protocol_request_stop(uint8_t generation);
 void mesh_protocol_request_status(void);
 

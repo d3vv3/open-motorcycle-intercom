@@ -81,6 +81,7 @@ typedef struct {
     uint8_t node_id;
     int8_t slot_index;
     uint8_t coordinator_id;
+    uint8_t talk_channel;
     bool participant_membership_known;
     uint8_t local_addr[5];
     uint8_t tx_seq;
@@ -178,11 +179,8 @@ typedef struct {
 
     /* Ingress and command state. */
     bool audio_ingress_enabled;
-    atomic_t requested_enabled;
-    atomic_t control_pending;
+    atomic_t pending_request; /* command | generation << 8 | talk_channel << 16; zero = none */
     atomic_t status_pending;
-    atomic_t requested_command;
-    atomic_t requested_generation;
 } mesh_protocol_context_t;
 
 /* Private module boundary; this is not included by the public protocol API. */

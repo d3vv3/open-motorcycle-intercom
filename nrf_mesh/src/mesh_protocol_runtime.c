@@ -41,11 +41,8 @@ LOG_MODULE_DECLARE(mesh);
 #define s_auto_ticks                   C->auto_ticks
 #define s_status_log_decim             C->status_log_decim
 #define s_tx_queue_depth_dbg           C->tx_queue_depth_dbg
-#define s_requested_enabled            C->requested_enabled
-#define s_control_pending              C->control_pending
+#define s_pending_request              C->pending_request
 #define s_status_pending               C->status_pending
-#define s_requested_command            C->requested_command
-#define s_requested_generation         C->requested_generation
 #define s_stat_tx_count                C->stat_tx_count
 #define s_stat_tx_fail                 C->stat_tx_fail
 #define s_stat_tx_starvation           C->stat_tx_starvation
@@ -231,15 +228,30 @@ static void command_work_handler(struct k_work *work)
     ARG_UNUSED(work);
 
     do {
-        if (atomic_set(&s_control_pending, 0) != 0) {
-            bool enable = atomic_get(&s_requested_enabled) != 0;
-            uint8_t command = (uint8_t)atomic_get(&s_requested_command);
-            uint8_t generation = (uint8_t)atomic_get(&s_requested_generation);
+        uint32_t request = (uint32_t)atomic_set(&s_pending_request, 0);
+        if (request != 0) {
+            bridge_command_payload_t pending = bridge_mesh_request_unpack(request);
+            uint8_t command = pending.command;
+            uint8_t generation = pending.generation;
+            uint8_t talk_channel = pending.talk_channel;
             int result = 0;
-            if (enable && s_state == MESH_STATE_IDLE) {
-                result = mesh_protocol_start();
-            } else if (!enable && s_state != MESH_STATE_IDLE) {
-                mesh_protocol_stop();
+            if (command == BRIDGE_COMMAND_MESH_START) {
+                if (!mesh_channel_valid(talk_channel)) {
+                    result = -EINVAL;
+                } else if (s_state == MESH_STATE_IDLE) {
+                    result = esb_radio_set_channel(mesh_channel_esb_rf(talk_channel));
+                    if (result == 0) {
+                        C->talk_channel = talk_channel;
+                        result = mesh_protocol_start();
+                    }
+                } else if (C->talk_channel != talk_channel) {
+                    result = -EBUSY;
+                }
+            } else if (command == BRIDGE_COMMAND_MESH_STOP) {
+                if (s_state != MESH_STATE_IDLE) {
+                    mesh_protocol_stop();
+                }
+                uart_bridge_discard_pending_audio();
             }
             uart_bridge_send_command_ack(command, generation, result);
             uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
@@ -249,24 +261,20 @@ static void command_work_handler(struct k_work *work)
             uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
                                     s_node_id, s_slot_index, s_coordinator_id);
         }
-    } while (atomic_get(&s_control_pending) != 0 || atomic_get(&s_status_pending) != 0);
+    } while (atomic_get(&s_pending_request) != 0 || atomic_get(&s_status_pending) != 0);
 }
 
-void mesh_protocol_request_start(uint8_t generation)
+void mesh_protocol_request_start(uint8_t generation, uint8_t talk_channel)
 {
-    atomic_set(&s_requested_enabled, 1);
-    atomic_set(&s_requested_command, BRIDGE_COMMAND_MESH_START);
-    atomic_set(&s_requested_generation, generation);
-    atomic_set(&s_control_pending, 1);
+    atomic_set(&s_pending_request,
+               bridge_mesh_request_pack(BRIDGE_COMMAND_MESH_START, generation, talk_channel));
     k_work_submit(&s_command_work);
 }
 
 void mesh_protocol_request_stop(uint8_t generation)
 {
-    atomic_set(&s_requested_enabled, 0);
-    atomic_set(&s_requested_command, BRIDGE_COMMAND_MESH_STOP);
-    atomic_set(&s_requested_generation, generation);
-    atomic_set(&s_control_pending, 1);
+    atomic_set(&s_pending_request,
+               bridge_mesh_request_pack(BRIDGE_COMMAND_MESH_STOP, generation, 0));
     k_work_submit(&s_command_work);
 }
 

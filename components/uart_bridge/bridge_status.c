@@ -130,6 +130,7 @@ static bool commit_status(const uart_bridge_status_t *incoming, bool detect_chan
 void bridge_status_apply_v2(const bridge_status_payload_t *payload)
 {
     if ((payload->version != BRIDGE_PROTOCOL_VERSION &&
+         payload->version != BRIDGE_PROTOCOL_VERSION_V3 &&
          payload->version != BRIDGE_PROTOCOL_VERSION_V2) ||
         payload->marker != BRIDGE_STATUS_V2_MARKER ||
         payload->mesh_state > BRIDGE_MESH_STATE_ACTIVE) {

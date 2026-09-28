@@ -17,9 +17,6 @@
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
-/* RF channel - must match other nodes */
-#define RF_CHANNEL 40
-
 /* SPI poll cadence for ESP32 bridge */
 #define SPI_POLL_MS 2
 
@@ -90,7 +87,7 @@ int main(void)
 
     /* Initialize ESB radio */
     printk("[DIAG] Initializing ESB radio...\n");
-    ret = esb_radio_init(RF_CHANNEL);
+    ret = esb_radio_init(mesh_channel_esb_rf(MESH_CHANNEL_DEFAULT));
     if (ret) {
         printk("[DIAG] ESB radio init FAILED: %d\n", ret);
         return ret;

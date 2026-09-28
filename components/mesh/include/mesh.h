@@ -54,7 +54,8 @@ _Static_assert(sizeof(mesh_sync_payload_t) == 12, "ESP-NOW SYNC wire size change
 typedef struct {
     uint8_t node_id;  /**< Local node ID (0 = auto-assign) */
     uint8_t tx_power; /**< TX power level (dBm) */
-    uint8_t channel;  /**< WiFi channel (1-13) */
+    uint8_t channel;  /**< WiFi RF channel mapped from talk_channel (1, 6, 11) */
+    uint8_t talk_channel; /**< Talk group (1-3) */
 } mesh_config_t;
 
 /**
@@ -62,7 +63,7 @@ typedef struct {
  */
 #define MESH_CONFIG_DEFAULT()                                                                      \
     {                                                                                              \
-        .node_id = 0, .tx_power = 20, .channel = 1,                                                \
+        .node_id = 0, .tx_power = 20, .channel = 1, .talk_channel = MESH_CHANNEL_DEFAULT,          \
     }
 
 /**

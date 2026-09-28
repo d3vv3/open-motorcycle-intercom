@@ -30,7 +30,8 @@ static void handle_rx_packet(uint8_t type, const uint8_t *payload, uint16_t len)
         if (len == sizeof(bridge_status_payload_t)) {
             bridge_status_payload_t status;
             memcpy(&status, payload, sizeof(status));
-            if (status.version == BRIDGE_PROTOCOL_VERSION) {
+            if (status.version == BRIDGE_PROTOCOL_VERSION ||
+                status.version == BRIDGE_PROTOCOL_VERSION_V3) {
                 bridge_status_apply_v2(&status);
             } else {
                 ESP_LOGW(TAG, "Ignoring 10-byte bridge status with version %u", status.version);

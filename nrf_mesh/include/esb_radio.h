@@ -37,6 +37,9 @@ typedef struct {
  */
 int esb_radio_init(uint8_t channel);
 
+/** Set RF channel only while initialized and RX/TX stopped; retain it for role reinitialization. */
+int esb_radio_set_channel(uint8_t channel);
+
 /**
  * @brief Deinitialize ESB radio
  */

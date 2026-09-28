@@ -90,6 +90,11 @@ void bridge_tx_discard_pending_audio(void)
     xSemaphoreGive(g_bridge.tx_mutex);
 }
 
+void uart_bridge_discard_pending_audio(void)
+{
+    bridge_tx_discard_pending_audio();
+}
+
 void bridge_tx_discard_for_expired_status(uint32_t generation)
 {
     if (g_bridge.tx_mutex == NULL || g_bridge.audio_slots_used == NULL ||

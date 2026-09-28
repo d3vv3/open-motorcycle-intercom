@@ -91,6 +91,7 @@ esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len
         .seq = 0,
         .ttl = 0,
         .flags = 0,
+        .talk_channel = s_config.talk_channel,
         .payload_len = len,
     };
     if (len > 0) {
@@ -266,13 +267,13 @@ void esp_now_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int l
     rx.rssi = info->rx_ctrl->rssi;
     rx.timestamp_us = esp_timer_get_time();
 
-    if (rx.header.version != MESH_PROTOCOL_VERSION) {
+    if (!mesh_header_accepts_channel(&rx.header, s_config.talk_channel)) {
         if (audio) STATS_INC(rx_audio_bad_header);
         goto done;
     }
 
     uint16_t payload_len = rx.header.payload_len;
-    if (payload_len > sizeof(rx.payload) || payload_len > (uint16_t)(len - sizeof(mesh_header_t))) {
+    if (payload_len > sizeof(rx.payload) || payload_len != (uint16_t)(len - sizeof(mesh_header_t))) {
         if (audio) STATS_INC(rx_audio_bad_header);
         goto done;
     }
@@ -388,6 +389,7 @@ esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint1
         .seq = 0,
         .ttl = 0,
         .flags = 0,
+        .talk_channel = s_config.talk_channel,
         .payload_len = len,
     };
     if (len > 0) {
@@ -610,6 +612,7 @@ esp_err_t send_join_request(void)
     header->seq = 0;
     header->ttl = 0;
     header->flags = 0;
+    header->talk_channel = s_config.talk_channel;
     header->payload_len = sizeof(payload);
 
     memcpy(buffer + sizeof(mesh_header_t), &payload, sizeof(payload));

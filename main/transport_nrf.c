@@ -13,6 +13,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 
 #include "app_state.h"
 #include "audio.h"
@@ -22,12 +23,11 @@
 #include "mesh.h"
 #include "mesh_intent.h"
 #include "rtt_probe.h"
+#include "transport_nrf_reconcile.h"
 #include "uart_bridge.h"
 
 static const char *TAG = "omi";
 
-#define NRF_RECONCILE_INTERVAL_MS   2000
-#define NRF_RECONCILE_MAX_ATTEMPTS  3
 #define NRF_NOTIFICATION_QUEUE_SIZE 8
 
 typedef struct {
@@ -52,11 +52,12 @@ static uint8_t s_notification_head = 0;
 static uint8_t s_notification_tail = 0;
 static uint32_t s_membership_generation = 0;
 static _Atomic bool s_enable_notification_pending = false;
+static _Atomic bool s_channel_confirmed = false;
 
 static bool nrf_lc3_ready(void)
 {
     uart_bridge_status_t status;
-    return uart_bridge_get_status(&status) == ESP_OK &&
+    return atomic_load(&s_channel_confirmed) && uart_bridge_get_status(&status) == ESP_OK &&
            status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
            status.audio_codec == MESH_AUDIO_CODEC_LC3 &&
            status.audio_frame_ms == MESH_AUDIO_V2_FRAME_MS &&
@@ -136,6 +137,8 @@ void transport_nrf_set_user_enabled(bool enabled)
 {
     xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
     mesh_intent_set(enabled);
+    if (!enabled) atomic_store(&s_channel_confirmed, false);
+    if (!enabled) uart_bridge_discard_pending_audio();
     atomic_store(&s_enable_notification_pending, enabled);
     s_membership_generation++;
     s_notification_head = 0;
@@ -390,7 +393,8 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
 
 static void bridge_status_callback(const uart_bridge_status_t *status)
 {
-    bool ready = status->protocol_version == BRIDGE_PROTOCOL_VERSION &&
+    bool ready = atomic_load(&s_channel_confirmed) &&
+                 status->protocol_version == BRIDGE_PROTOCOL_VERSION &&
                  status->audio_codec == MESH_AUDIO_CODEC_LC3 &&
                  status->audio_frame_ms == MESH_AUDIO_V2_FRAME_MS &&
                  status->mesh_state == BRIDGE_MESH_STATE_ACTIVE && status->node_id != 0;
@@ -466,6 +470,7 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
         e2e_diag_reset_all_sources();
         audio_tx_cache_reset(&s_previous_audio);
         atomic_store(&g_mesh_active, false);
+        atomic_store(&s_channel_confirmed, false);
         atomic_store(&s_enable_notification_pending, false);
         reset_membership_tracking();
         break;
@@ -486,6 +491,8 @@ static void reconcile_mesh_state(int64_t now_ms)
     uart_bridge_status_t status;
     if (uart_bridge_get_status(&status) != ESP_OK) {
         atomic_store(&g_mesh_active, false);
+        atomic_store(&s_channel_confirmed, false);
+        uart_bridge_discard_pending_audio();
         if (s_status_observed) {
             reset_membership_tracking();
         }
@@ -493,7 +500,8 @@ static void reconcile_mesh_state(int64_t now_ms)
         return;
     }
 
-    bool ready = status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
+    bool ready = atomic_load(&s_channel_confirmed) &&
+                 status.protocol_version == BRIDGE_PROTOCOL_VERSION &&
                  status.audio_codec == MESH_AUDIO_CODEC_LC3 &&
                  status.audio_frame_ms == MESH_AUDIO_V2_FRAME_MS &&
                  status.mesh_state == BRIDGE_MESH_STATE_ACTIVE && status.node_id != 0;
@@ -509,25 +517,36 @@ static void reconcile_mesh_state(int64_t now_ms)
     }
 
     atomic_store(&g_mesh_active, false);
-    bool disabled = status.mesh_state == BRIDGE_MESH_STATE_IDLE;
-    if ((!mesh_intent_enabled() && disabled) ||
-        (mesh_intent_enabled() && status.has_mesh_state && !disabled)) {
+    nrf_mesh_reconcile_action_t action = nrf_mesh_reconcile_action(
+        mesh_intent_enabled(), atomic_load(&s_channel_confirmed), status.mesh_state);
+    if (action == NRF_MESH_NO_COMMAND) {
         s_reconcile_attempts = 0;
         return;
     }
 
-    if (s_reconcile_attempts >= NRF_RECONCILE_MAX_ATTEMPTS ||
-        now_ms - s_restart_attempt_ms < NRF_RECONCILE_INTERVAL_MS) {
+    int64_t interval = nrf_mesh_reconcile_interval_ms(s_reconcile_attempts);
+    if (now_ms - s_restart_attempt_ms < interval) {
         return;
     }
 
     s_restart_attempt_ms = now_ms;
-    s_reconcile_attempts++;
-    esp_err_t ret = mesh_intent_enabled() ? uart_bridge_mesh_enable() : uart_bridge_mesh_disable();
+    if (s_reconcile_attempts < NRF_RECONCILE_MAX_ATTEMPTS) s_reconcile_attempts++;
+    if (action == NRF_MESH_STOP) {
+        atomic_store(&s_channel_confirmed, false);
+        uart_bridge_discard_pending_audio();
+    }
+    esp_err_t ret = action == NRF_MESH_START
+                        ? uart_bridge_mesh_enable(CONFIG_OMI_MESH_CHANNEL)
+                        : uart_bridge_mesh_disable();
+    if (ret == ESP_OK) {
+        atomic_store(&s_channel_confirmed, action == NRF_MESH_START);
+        s_reconcile_attempts = 0;
+    }
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Mesh %s reconcile failed (%u/%u): %s",
-                 mesh_intent_enabled() ? "enable" : "disable", s_reconcile_attempts,
-                 NRF_RECONCILE_MAX_ATTEMPTS, esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Mesh %s reconcile failed (retry cadence %lld ms): %s",
+                 action == NRF_MESH_START ? "enable" : "disable",
+                 (long long)nrf_mesh_reconcile_interval_ms(s_reconcile_attempts),
+                 esp_err_to_name(ret));
     }
 }
 
@@ -550,6 +569,7 @@ esp_err_t transport_nrf_init(void)
 
 void transport_nrf_attach(void)
 {
+    atomic_store(&s_channel_confirmed, false);
     uart_bridge_set_audio_callback(bridge_audio_callback);
     uart_bridge_set_event_callback(bridge_event_callback);
     uart_bridge_set_status_callback(bridge_status_callback);

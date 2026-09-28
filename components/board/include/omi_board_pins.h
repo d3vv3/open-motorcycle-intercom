@@ -6,6 +6,7 @@
 #ifndef OMI_BOARD_PINS_H
 #define OMI_BOARD_PINS_H
 
+#include <stdint.h>
 #include "sdkconfig.h"
 #include "esp_err.h"
 
@@ -44,5 +45,8 @@ esp_err_t omi_board_nrf_i2s_ws_sync_connect(void);
 
 /** Disconnect the nRF bridge sync input and reset it to a neutral input. */
 esp_err_t omi_board_nrf_i2s_ws_sync_disconnect(void);
+
+/** Set the onboard RGB indicator to the logical mesh channel color (1 green, 2 red, 3 blue). */
+esp_err_t board_set_channel_indicator(uint8_t channel);
 
 #endif /* OMI_BOARD_PINS_H */

@@ -9,6 +9,7 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "sdkconfig.h"
 
 #include "audio.h"
 #include "mesh.h"
@@ -87,7 +88,10 @@ static void mesh_peer_callback(const mesh_peer_info_t *peer, bool joined)
 
 esp_err_t transport_espnow_init(void)
 {
-    esp_err_t ret = mesh_init();
+    mesh_config_t config = MESH_CONFIG_DEFAULT();
+    config.talk_channel = CONFIG_OMI_MESH_CHANNEL;
+    config.channel = mesh_channel_espnow_rf(config.talk_channel);
+    esp_err_t ret = mesh_init_with_config(&config);
     if (ret != ESP_OK) {
         return ret;
     }

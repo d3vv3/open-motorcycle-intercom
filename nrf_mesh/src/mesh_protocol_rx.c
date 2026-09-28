@@ -48,7 +48,7 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi, int
         return;
     }
 
-    if (hdr->version != MESH_PROTOCOL_VERSION) {
+    if (!mesh_header_accepts_channel(hdr, C->talk_channel)) {
         s_stat_rf_rx_version_drop++;
         return;
     }

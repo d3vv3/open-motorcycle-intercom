@@ -103,6 +103,9 @@ esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len);
  */
 esp_err_t uart_bridge_send_audio_v2(const uint8_t *data, uint16_t len);
 
+/** Drop queued/inflight audio on a mesh stop or lost bridge session. */
+void uart_bridge_discard_pending_audio(void);
+
 /**
  * @brief Register callback for received audio
  * @param cb Callback function
@@ -154,7 +157,7 @@ bool uart_bridge_probe(uint32_t timeout_ms);
  * @brief Send mesh enable command to nRF52840
  * @return ESP_OK on success
  */
-esp_err_t uart_bridge_mesh_enable(void);
+esp_err_t uart_bridge_mesh_enable(uint8_t talk_channel);
 
 /**
  * @brief Send mesh disable command to nRF52840

@@ -20,6 +20,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "mesh_channel.h"
 
 /* ============================================================================
  * Protocol constants (wire-visible)
@@ -32,7 +33,7 @@
 #define MESH_SYNC_INTERVAL_FRAMES       10   /* SYNC broadcast cadence */
 #define MESH_NODE_TIMEOUT_MS            3000 /* Drop peer after this silence */
 #define MESH_KEEPALIVE_INTERVAL_MS      500  /* KEEPALIVE cadence */
-#define MESH_PROTOCOL_VERSION           0x03
+#define MESH_PROTOCOL_VERSION           0x04
 #define MESH_MAX_OPUS_BYTES             64
 #define MESH_LC3_FRAME_BYTES            48
 #define MESH_E2E_SEQUENCE_BYTES         2
@@ -49,7 +50,7 @@
 #define MESH_AUDIO_V2_MAX_FRAME_DATA    (3 * MESH_AUDIO_V2_MAX_FRAME_BYTES)
 #define MESH_AUDIO_V2_MAX_BUNDLE_SIZE                                                              \
     (MESH_AUDIO_V2_FIXED_HEADER_SIZE + MESH_AUDIO_V2_MAX_FRAME_DATA)
-#define MESH_AUDIO_V2_MAX_PACKET_SIZE (8 + MESH_AUDIO_V2_MAX_BUNDLE_SIZE)
+#define MESH_AUDIO_V2_MAX_PACKET_SIZE (9 + MESH_AUDIO_V2_MAX_BUNDLE_SIZE)
 #define MESH_MAX_ACTIVE_SPEAKERS      2 /* Concurrent relay-granted speakers */
 #define MESH_AUDIO_TTL_DEFAULT        2 /* Default relay TTL */
 
@@ -101,7 +102,7 @@ typedef enum {
 } mesh_pkt_type_t;
 
 /* ============================================================================
- * Packet header (8 bytes)
+ * Packet header (9 bytes). Version 4 peers reject older packets before parsing payloads.
  * ============================================================================ */
 
 typedef struct __attribute__((packed)) {
@@ -111,8 +112,15 @@ typedef struct __attribute__((packed)) {
     uint8_t seq;          /* Sequence number */
     uint8_t ttl;          /* Relay time-to-live */
     uint8_t flags;        /* Control flags */
+    uint8_t talk_channel; /* Logical talk group (1-3), not RF frequency */
     uint16_t payload_len; /* Payload length in bytes */
 } mesh_header_t;
+
+static inline int mesh_header_accepts_channel(const mesh_header_t *header, uint8_t local_channel)
+{
+    return header != NULL && header->version == MESH_PROTOCOL_VERSION &&
+           mesh_channel_valid(local_channel) && header->talk_channel == local_channel;
+}
 
 /* ============================================================================
  * Payload structures (wire-identical across transports)
@@ -182,8 +190,10 @@ typedef struct __attribute__((packed)) {
 #define MESH_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
 #endif
 
-MESH_STATIC_ASSERT(sizeof(mesh_header_t) == 8, "mesh_header_t wire size changed");
-MESH_STATIC_ASSERT(offsetof(mesh_header_t, payload_len) == 6,
+MESH_STATIC_ASSERT(sizeof(mesh_header_t) == 9, "mesh_header_t wire size changed");
+MESH_STATIC_ASSERT(offsetof(mesh_header_t, talk_channel) == 6,
+                   "mesh_header_t talk_channel offset changed");
+MESH_STATIC_ASSERT(offsetof(mesh_header_t, payload_len) == 7,
                    "mesh_header_t payload_len offset changed");
 MESH_STATIC_ASSERT(sizeof(mesh_audio_payload_t) == 70, "mesh_audio_payload_t wire size changed");
 MESH_STATIC_ASSERT(sizeof(mesh_audio_payload_t) == 4 + MESH_MAX_AUDIO_PAYLOAD,
@@ -205,7 +215,7 @@ MESH_STATIC_ASSERT(MESH_AUDIO_V2_FRAME_MS == MESH_FRAME_MS, "audio v2 frame dura
 MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_FRAME_BYTES == MESH_MAX_OPUS_BYTES,
                    "audio v2 frame limit changed");
 MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_BUNDLE_SIZE == 200, "audio v2 bundle limit changed");
-MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_PACKET_SIZE == 208, "audio v2 mesh packet limit changed");
+MESH_STATIC_ASSERT(MESH_AUDIO_V2_MAX_PACKET_SIZE == 209, "audio v2 mesh packet limit changed");
 MESH_STATIC_ASSERT(sizeof(mesh_header_t) + MESH_AUDIO_V2_MAX_BUNDLE_SIZE ==
                        MESH_AUDIO_V2_MAX_PACKET_SIZE,
                     "audio v2 packet size no longer matches mesh envelope");

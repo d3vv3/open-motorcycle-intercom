@@ -501,6 +501,30 @@ void esb_radio_deinit(void)
     k_mutex_unlock(&s_radio_mutex);
 }
 
+int esb_radio_set_channel(uint8_t channel)
+{
+    if (channel > 100) {
+        return -EINVAL;
+    }
+    k_mutex_lock(&s_radio_mutex, K_FOREVER);
+    int ret;
+    if (s_faulted) {
+        ret = -EIO;
+    } else if (!s_initialized) {
+        ret = -EINVAL;
+    } else if (s_rx_requested || s_rx_active || s_tx_in_progress || s_tx_recovery_pending ||
+               !esb_is_idle()) {
+        ret = -EBUSY;
+    } else {
+        ret = esb_set_rf_channel(channel);
+        if (ret == 0) {
+            s_channel = channel;
+        }
+    }
+    k_mutex_unlock(&s_radio_mutex);
+    return ret;
+}
+
 void esb_radio_set_rx_callback(esb_rx_callback_t cb)
 {
     unsigned int key = irq_lock();

@@ -21,6 +21,7 @@
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 
 #include "audio_bundle.h"
 #include "bridge_frame.h"
@@ -108,7 +109,7 @@ static uint8_t s_bridge_rx_expected = 0;
 static bool s_bridge_rx_seq_init = false;
 static uint32_t s_bridge_rx_seq_gap = 0;
 static uint32_t s_bridge_rx_crc_fail = 0;
-static bool s_last_audio_seq_valid = false;
+static atomic_t s_last_audio_seq_valid;
 static uint8_t s_last_audio_seq = 0;
 static uint32_t s_ack_pulse_count = 0;
 
@@ -141,18 +142,22 @@ static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
         return mesh_protocol_send_audio_v2(payload, len);
 
     case UART_PKT_COMMAND:
-        if (len > 0) {
-            uint8_t cmd_id = payload[0];
-            uint8_t generation = len >= sizeof(bridge_command_payload_t) ? payload[1] : 0;
-            LOG_INF("Received command: 0x%02X", cmd_id);
-            if (cmd_id == BRIDGE_COMMAND_MESH_START) {
-                mesh_protocol_request_start(generation);
-            } else if (cmd_id == BRIDGE_COMMAND_MESH_STOP) {
-                mesh_protocol_request_stop(generation);
-            } else if (cmd_id == BRIDGE_COMMAND_STATUS) {
-                printk("[uart_bridge] PING received, sending status\n");
-                mesh_protocol_request_status();
-            }
+        if (len == 1 && payload[0] == BRIDGE_COMMAND_STATUS) {
+            mesh_protocol_request_status();
+            return 0;
+        }
+        bridge_command_payload_t command;
+        if (len != sizeof(command)) {
+            return -EINVAL;
+        }
+        memcpy(&command, payload, sizeof(command));
+        if (!bridge_mesh_command_valid(&command, len)) {
+            return -EINVAL;
+        }
+        if (command.command == BRIDGE_COMMAND_MESH_START) {
+            mesh_protocol_request_start(command.generation, command.talk_channel);
+        } else {
+            mesh_protocol_request_stop(command.generation);
         }
         return 0;
 
@@ -215,14 +220,14 @@ static void parse_rx(const uint8_t *buf, size_t len)
         return;
     }
     if (frame.type == UART_PKT_AUDIO_V2) {
-        bool duplicate = s_last_audio_seq_valid && (seq == s_last_audio_seq);
+        bool duplicate = atomic_get(&s_last_audio_seq_valid) != 0 && (seq == s_last_audio_seq);
         if (duplicate) {
             s_audio_ingress_duplicate++;
             pulse_ack_line();
         } else if (handle_rx_packet(frame.type, frame.payload, (uint8_t)frame.payload_len) == 0) {
             s_audio_ingress_ok++;
             s_last_audio_seq = seq;
-            s_last_audio_seq_valid = true;
+            atomic_set(&s_last_audio_seq_valid, 1);
             pulse_ack_line();
         } else {
             s_audio_ingress_reject++;
@@ -356,6 +361,17 @@ int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len)
     return 0;
 }
 
+void uart_bridge_discard_pending_audio(void)
+{
+    if (!s_initialized) {
+        return;
+    }
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    s_audio_tail = s_audio_head;
+    atomic_set(&s_last_audio_seq_valid, 0);
+    k_mutex_unlock(&s_tx_lock);
+}
+
 int uart_bridge_send_event(uint8_t event_type, const uint8_t *data, uint8_t len)
 {
     if (!s_initialized) {
@@ -457,7 +473,7 @@ void uart_bridge_process(void)
     uint8_t tx_index = 0;
     uint8_t tx_type = 0;
 
-    /* Peek one packet. Advance its queue only after a successful transfer. */
+    /* Hold the queue lock through transfer so STOP cannot purge a frame already selected. */
     k_mutex_lock(&s_tx_lock, K_FOREVER);
     if (s_ctrl_head != s_ctrl_tail) {
         tx_index = s_ctrl_tail;
@@ -471,8 +487,6 @@ void uart_bridge_process(void)
         memcpy(s_tx_buf, e->buf, e->len);
         tx_kind = 1;
     }
-    k_mutex_unlock(&s_tx_lock);
-
     memset(s_rx_buf, 0, BRIDGE_SPI_MAX_XFER);
 
     /* Set up SPI buffer descriptors */
@@ -505,6 +519,7 @@ void uart_bridge_process(void)
     gpio_pin_set(s_cs_port, CS_PIN, 1); /* Deassert CS */
     txn_count++;
     if (ret) {
+        k_mutex_unlock(&s_tx_lock);
         s_spi_tx_fail++;
         if (txn_count <= 10) {
             printk("[spi_bridge] txn #%u FAILED: %d\n", txn_count, ret);
@@ -512,7 +527,6 @@ void uart_bridge_process(void)
         return;
     }
 
-    k_mutex_lock(&s_tx_lock, K_FOREVER);
     if (tx_kind == 1 && s_audio_tail == tx_index) {
         s_audio_tail = (s_audio_tail + 1) % TX_AUDIO_QUEUE_SIZE;
         s_spi_tx_audio++;

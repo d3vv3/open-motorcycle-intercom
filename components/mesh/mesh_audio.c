@@ -390,6 +390,7 @@ mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
     header->seq = 0;
     header->ttl = MESH_AUDIO_TTL_DEFAULT;
     header->flags = MESH_FLAG_RELAY_REQUEST;
+    header->talk_channel = s_config.talk_channel;
     header->payload_len = 4 + tx_item.len;
 
     uint8_t slot_ids[MESH_MAX_ACTIVE_SPEAKERS];

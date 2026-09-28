@@ -3,8 +3,7 @@
  * @brief Probe and mesh start/stop command exchange with the nRF.
  *
  * Commands are generation-tagged and retried until the nRF acknowledges
- * them. Older nRF firmware never sends a COMMAND_ACK; those are confirmed
- * by watching the reported mesh state change instead.
+ * application. Status alone cannot attest which talk group was selected.
  */
 
 #include "esp_log.h"
@@ -73,8 +72,11 @@ bool uart_bridge_probe(uint32_t timeout_ms)
     return false;
 }
 
-static esp_err_t send_mesh_command(bridge_command_t command)
+static esp_err_t send_mesh_command(bridge_command_t command, uint8_t talk_channel)
 {
+    if (command == BRIDGE_COMMAND_MESH_START && !mesh_channel_valid(talk_channel)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (!g_bridge.initialized) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -86,11 +88,9 @@ static esp_err_t send_mesh_command(bridge_command_t command)
     bridge_command_payload_t payload = {
         .command = command,
         .generation = ++g_bridge.command_generation,
+        .talk_channel = talk_channel,
     };
     esp_err_t result = ESP_ERR_TIMEOUT;
-    uart_bridge_status_t initial_status = {0};
-    uint32_t initial_status_generation =
-        uart_bridge_get_status(&initial_status) == ESP_OK ? initial_status.generation : 0;
     __atomic_store_n(&g_bridge.command_ack_received, false, __ATOMIC_RELEASE);
 
     for (int attempt = 1; attempt <= BRIDGE_COMMAND_MAX_ATTEMPTS; attempt++) {
@@ -109,22 +109,6 @@ static esp_err_t send_mesh_command(bridge_command_t command)
                 goto done;
             }
 
-            uart_bridge_status_t status;
-            if (uart_bridge_get_status(&status) == ESP_OK &&
-                status.generation != initial_status_generation) {
-                bool observed =
-                    command == BRIDGE_COMMAND_MESH_START
-                        ? (status.has_mesh_state ? status.mesh_state != BRIDGE_MESH_STATE_IDLE
-                                                 : status.mesh_state == BRIDGE_MESH_STATE_ACTIVE &&
-                                                       status.node_id != 0)
-                        : status.mesh_state == BRIDGE_MESH_STATE_IDLE;
-                if (observed) {
-                    ESP_LOGI(TAG, "Command 0x%02X confirmed by bridge status (legacy ACK fallback)",
-                             command);
-                    result = ESP_OK;
-                    goto done;
-                }
-            }
             vTaskDelay(pdMS_TO_TICKS(5));
         }
         ESP_LOGW(TAG, "Command 0x%02X generation %u ACK timeout (%d/%d)", command,
@@ -136,14 +120,14 @@ done:
     return result;
 }
 
-esp_err_t uart_bridge_mesh_enable(void)
+esp_err_t uart_bridge_mesh_enable(uint8_t talk_channel)
 {
     ESP_LOGI(TAG, "Requesting mesh enable from nRF52840");
-    return send_mesh_command(BRIDGE_COMMAND_MESH_START);
+    return send_mesh_command(BRIDGE_COMMAND_MESH_START, talk_channel);
 }
 
 esp_err_t uart_bridge_mesh_disable(void)
 {
     ESP_LOGI(TAG, "Requesting mesh disable from nRF52840");
-    return send_mesh_command(BRIDGE_COMMAND_MESH_STOP);
+    return send_mesh_command(BRIDGE_COMMAND_MESH_STOP, MESH_CHANNEL_DEFAULT);
 }

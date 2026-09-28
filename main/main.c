@@ -19,6 +19,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "sdkconfig.h"
 
 #include "app_state.h"
 #include "audio.h"
@@ -29,6 +30,7 @@
 #include "mesh_intent.h"
 #include "media_toggle_guard.h"
 #include "nvs_flash.h"
+#include "omi_board_pins.h"
 #include "power.h"
 #include "phone_audio.h"
 #include "rtt_probe.h"
@@ -480,6 +482,15 @@ static esp_err_t initialize_application(int64_t boot_time)
         return ret;
     }
     ESP_LOGI(TAG, "[%" PRId64 " ms] Power management initialized", get_time_ms());
+    static const char *const channel_colors[] = {"green", "red", "blue"};
+    ESP_LOGI(TAG, "Talk channel %d (%s): ESP-NOW RF %u, ESB RF %u",
+             CONFIG_OMI_MESH_CHANNEL, channel_colors[CONFIG_OMI_MESH_CHANNEL - 1],
+             mesh_channel_espnow_rf(CONFIG_OMI_MESH_CHANNEL),
+             mesh_channel_esb_rf(CONFIG_OMI_MESH_CHANNEL));
+    esp_err_t indicator_ret = board_set_channel_indicator(CONFIG_OMI_MESH_CHANNEL);
+    if (indicator_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Talk channel indicator unavailable: %s", esp_err_to_name(indicator_ret));
+    }
 
     /* Initialize button handler */
     ESP_LOGI(TAG, "");

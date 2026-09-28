@@ -199,6 +199,9 @@ jobs:
       - name: Run mesh wire tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/mesh_wire_test.c -o /tmp/mesh_wire_test && /tmp/mesh_wire_test
 
+      - name: Run mesh channel isolation and bridge command tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared tests/c/mesh_channel_test.c -o /tmp/mesh_channel_test && /tmp/mesh_channel_test
+
   nrf-zephyr:
     name: nRF52840 Zephyr firmware
     runs-on: ubuntu-latest

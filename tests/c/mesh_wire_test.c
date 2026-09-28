@@ -25,7 +25,7 @@ static void test_legacy_audio_wire_validation(void)
                                           MESH_LC3_FRAME_BYTES + 1, MESH_AUDIO_CODEC_LC3));
     assert(sizeof(mesh_audio_payload_t) == 70);
     assert(MESH_AUDIO_V2_MAX_BUNDLE_SIZE == 200);
-    assert(MESH_AUDIO_V2_MAX_PACKET_SIZE == 208);
+    assert(MESH_AUDIO_V2_MAX_PACKET_SIZE == 209);
 }
 
 int main(void)

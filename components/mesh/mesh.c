@@ -54,14 +54,18 @@ esp_err_t mesh_init(void)
 
 esp_err_t mesh_init_with_config(const mesh_config_t *config)
 {
+    if (config != NULL && !mesh_channel_valid(config->talk_channel)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (config != NULL && config->channel != mesh_channel_espnow_rf(config->talk_channel)) {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (s_initialized) {
         ESP_LOGW(TAG, "Already initialized");
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (config != NULL) {
-        s_config = *config;
-    }
+    s_config = config != NULL ? *config : (mesh_config_t)MESH_CONFIG_DEFAULT();
 
     ESP_LOGI(TAG, "Initializing mesh subsystem");
 

@@ -20,15 +20,16 @@
 
 LOG_MODULE_REGISTER(mesh, LOG_LEVEL_INF);
 
-/* Protocol v2 is a deliberate fail-closed RF migration: v1 peers are rejected. */
+/* Version 4 is a fail-closed RF migration: older peers have no talk group. */
 _Static_assert(MESH_PACKET_PAYLOAD_MAX == 200, "mesh payload capacity changed");
-_Static_assert(MESH_PACKET_OUTER_MAX == 208, "mesh packet capacity changed");
+_Static_assert(MESH_PACKET_OUTER_MAX == 209, "mesh packet capacity changed");
 _Static_assert(MESH_PACKET_OUTER_MAX <= UINT8_MAX, "ESB packet length no longer fits uint8_t");
 
 static mesh_protocol_context_t s_context = {
     .state = MESH_STATE_IDLE,
     .role = MESH_ROLE_NONE,
     .slot_index = -1,
+    .talk_channel = MESH_CHANNEL_DEFAULT,
 };
 
 mesh_protocol_context_t *mesh_protocol_context_get(void)

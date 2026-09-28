@@ -44,6 +44,7 @@ int mesh_protocol_tx_send_packet_ex(mesh_pkt_type_t type, const void *payload, u
     hdr->seq = seq;
     hdr->ttl = ttl;
     hdr->flags = flags;
+    hdr->talk_channel = mesh_protocol_context_get()->talk_channel;
     hdr->payload_len = len;
 
     if (payload && len > 0) {
@@ -84,6 +85,7 @@ int mesh_protocol_tx_queue_control(mesh_protocol_context_t *context, mesh_pkt_ty
     hdr->seq = context->tx_seq++;
     hdr->ttl = 0;
     hdr->flags = 0;
+    hdr->talk_channel = context->talk_channel;
     hdr->payload_len = len;
     if (payload != NULL && len > 0) {
         memcpy(entry->data + sizeof(*hdr), payload, len);
