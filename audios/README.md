@@ -15,6 +15,9 @@ Files contain mono, 24 kHz, 16-bit PCM WAV audio.
 | `channel_red.wav` | Channel Red |
 | `you_are_coordinator.wav` | You are coordinator |
 | `you_are_participant.wav` | You are participant |
+| `startup.wav` | Ready |
+| `peer_join.wav` | Peer joined |
+| `peer_leave.wav` | Peer left |
 
 ## Setup
 
@@ -70,3 +73,16 @@ create_audio 'Channel Red' channel_red.wav
 create_audio 'You are coordinator' you_are_coordinator.wav
 create_audio 'You are participant' you_are_participant.wav
 ```
+
+The additional startup and peer notifications use the same command and voice:
+
+```sh
+create_audio 'Ready' startup.wav
+create_audio 'Peer joined' peer_join.wav
+create_audio 'Peer left' peer_leave.wav
+```
+
+Firmware builds regenerate compact 16 kHz IMA ADPCM C data from these WAVs via
+`tools/encode_notifications.py` (Python standard library only). The firmware never
+loads WAVs at runtime. Run `python3 tools/encode_notifications.py --output /tmp/audio_prompts_data.c`
+to inspect the generated data independently of the build.
