@@ -18,7 +18,9 @@ idf_component_register(
         "mesh_tdma.c"
         "mesh_audio.c"
         "mesh_session.c"
+        "mesh_adaptive_esp.c"
         "../../shared/mesh_core.c"
+        "../../shared/mesh_adaptive.c"
     INCLUDE_DIRS "include" "../../shared"
     REQUIRES 
         esp_wifi

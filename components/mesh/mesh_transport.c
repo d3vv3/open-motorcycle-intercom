@@ -14,14 +14,24 @@ static control_priority_t control_priority(uint8_t type)
 {
     /* SYNC and lifecycle traffic preempt periodic control traffic. */
     switch (type) {
-    case MESH_PKT_SYNC:
+    case MESH_PKT_SYNC_V3:
         return CONTROL_PRIORITY_SYNC;
-    case MESH_PKT_JOIN_ACK:
+    case MESH_PKT_JOIN_V3:
+    case MESH_PKT_JOIN_ACK_V3:
+    case MESH_PKT_HANDOVER_PREPARE:
+    case MESH_PKT_HANDOVER_ACK:
+    case MESH_PKT_HANDOVER_COMMIT:
+    case MESH_PKT_HANDOVER_CANCEL:
+        return CONTROL_PRIORITY_CRITICAL;
+    case MESH_PKT_SLOT_MAP:
+    case MESH_PKT_MEMBERSHIP_V3:
     case MESH_PKT_LEAVE:
         return CONTROL_PRIORITY_LIFECYCLE;
-    case MESH_PKT_SLOT_MAP:
+    case MESH_PKT_SPEAKER_REQUEST:
+        return CONTROL_PRIORITY_REQUEST;
     case MESH_PKT_SPEAKER_GRANT:
     case MESH_PKT_SPEAKER_RELEASE:
+    case MESH_PKT_TOPOLOGY:
         return CONTROL_PRIORITY_TOPOLOGY;
     default:
         return CONTROL_PRIORITY_PERIODIC;
@@ -31,7 +41,8 @@ static control_priority_t control_priority(uint8_t type)
 static bool control_type_replaceable(uint8_t type)
 {
     return type == MESH_PKT_STATUS || type == MESH_PKT_KEEPALIVE || type == MESH_PKT_SLOT_MAP ||
-           type == MESH_PKT_SPEAKER_GRANT || type == MESH_PKT_JOIN_ACK;
+           type == MESH_PKT_SPEAKER_GRANT || type == MESH_PKT_TOPOLOGY ||
+           type == MESH_PKT_MEMBERSHIP_V3 || type == MESH_PKT_SPEAKER_REQUEST;
 }
 
 static void stats_set_control_depth(uint8_t depth, bool update_high_watermark)
@@ -62,7 +73,7 @@ void mesh_transport_restore_status_bitmaps(const control_tx_item_t *item)
 esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len,
                                  const uint8_t *dest_mac)
 {
-    if (type == MESH_PKT_SYNC) {
+    if (type == MESH_PKT_SYNC_V3) {
         return ESP_ERR_INVALID_ARG;
     }
     if (len > sizeof(s_control_queue[0].data) - sizeof(mesh_header_t) ||
@@ -89,7 +100,7 @@ esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len
         .type = type,
         .src_id = s_node_id,
         .seq = 0,
-        .ttl = 0,
+        .ttl = 2,
         .flags = 0,
         .talk_channel = s_config.talk_channel,
         .payload_len = len,
@@ -110,6 +121,9 @@ esp_err_t enqueue_control_packet(uint8_t type, const void *payload, uint16_t len
                 memcmp(queued->dest_mac, dest_mac, sizeof(queued->dest_mac)) != 0) {
                 continue;
             }
+            if (type == MESH_PKT_SPEAKER_REQUEST &&
+                (((const mesh_header_t *)queued->data)->flags & MESH_FLAG_RELAYED ||
+                 ((const mesh_header_t *)queued->data)->src_id != s_node_id)) continue;
 
             if (type == MESH_PKT_STATUS) {
                 mesh_status_payload_t *new_status =
@@ -183,15 +197,26 @@ bool dequeue_control_packet(control_tx_item_t *item)
     for (uint8_t i = 1; i < s_control_queue_count; i++) {
         bool overdue =
             (now_us - s_control_queue[i].enqueued_us) >= (CONTROL_MAX_PRIORITY_WAIT_MS * 1000);
-        if ((overdue && !selected_overdue) ||
-            (overdue == selected_overdue && overdue &&
-             s_control_queue[i].order < s_control_queue[selected].order) ||
-            (!overdue && !selected_overdue &&
-             (s_control_queue[i].priority > s_control_queue[selected].priority ||
-              (s_control_queue[i].priority == s_control_queue[selected].priority &&
+        if (s_control_queue[i].priority > s_control_queue[selected].priority ||
+            (s_control_queue[i].priority == s_control_queue[selected].priority &&
+             ((overdue && !selected_overdue) ||
+              (overdue == selected_overdue &&
                s_control_queue[i].order < s_control_queue[selected].order)))) {
             selected = i;
             selected_overdue = overdue;
+        }
+    }
+    uint32_t elapsed_sync_ms = s_mesh.forward_sync_last_tx_ms ?
+        (uint32_t)((now_us / 1000) - s_mesh.forward_sync_last_tx_ms) : UINT32_MAX;
+    if (elapsed_sync_ms >= MESH_FORWARD_SYNC_INTERVAL_MS) {
+        for (uint8_t i = 0; i < s_control_queue_count; i++) {
+            const mesh_header_t *h = (const mesh_header_t *)s_control_queue[i].data;
+            if (h->type == MESH_PKT_SYNC_V3 && (h->flags & MESH_FLAG_RELAYED) &&
+                (s_control_queue[selected].priority < CONTROL_PRIORITY_LIFECYCLE ||
+                 elapsed_sync_ms >= MESH_ADAPTIVE_SYNC_MAX_AGE_MS)) {
+                selected = i;
+                break;
+            }
         }
     }
     *item = s_control_queue[selected];
@@ -372,6 +397,84 @@ esp_err_t mesh_send_control_packet(mesh_pkt_type_t type, const void *payload, ui
     return enqueue_control_packet(type, payload, len, s_broadcast_mac);
 }
 
+esp_err_t enqueue_forward_packet(const mesh_adaptive_forward_packet_t *packet)
+{
+    if (!packet || packet->payload_len > MESH_CONTROL_MAX_PACKET_SIZE - sizeof(mesh_header_t))
+        return ESP_ERR_INVALID_ARG;
+    control_tx_item_t item = {.len = sizeof(mesh_header_t) + packet->payload_len,
+        .type = packet->header.type,
+        .priority = packet->header.type == MESH_PKT_SYNC_V3 ? CONTROL_PRIORITY_TOPOLOGY :
+                    control_priority(packet->header.type),
+        .enqueued_us = esp_timer_get_time() -
+            (int64_t)((uint32_t)((esp_timer_get_time() / 1000) - packet->enqueued_ms) * 1000U)};
+    memcpy(item.dest_mac, s_broadcast_mac, 6);
+    memcpy(item.data, &packet->header, sizeof(packet->header));
+    memcpy(item.data + sizeof(mesh_header_t), packet->payload, packet->payload_len);
+    control_tx_item_t evicted = {0};
+    bool have_evicted = false;
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    if (item.type == MESH_PKT_SPEAKER_REQUEST) {
+        for (uint8_t i = 0; i < s_control_queue_count; i++) {
+            mesh_header_t *h = (mesh_header_t *)s_control_queue[i].data;
+            if (h->type == MESH_PKT_SPEAKER_REQUEST &&
+                (h->flags & MESH_FLAG_RELAYED) && h->src_id == packet->header.src_id) {
+                item.order = s_control_queue[i].order;
+                s_control_queue[i] = item;
+                taskEXIT_CRITICAL(&s_control_queue_mux);
+                return ESP_OK;
+            }
+        }
+    }
+    if (s_control_queue_count == MESH_CONTROL_QUEUE_CAPACITY) {
+        uint8_t victim = 0;
+        for (uint8_t i = 1; i < s_control_queue_count; i++)
+            if (s_control_queue[i].priority < s_control_queue[victim].priority)
+                victim = i;
+        if (s_control_queue[victim].priority >= item.priority) {
+            taskEXIT_CRITICAL(&s_control_queue_mux);
+            STATS_INC(control_queue_drops);
+            return ESP_ERR_NO_MEM;
+        }
+        evicted = s_control_queue[victim];
+        have_evicted = true;
+        s_control_queue[victim] = s_control_queue[--s_control_queue_count];
+        STATS_INC(control_queue_drops);
+    }
+    item.order = s_control_queue_order++;
+    s_control_queue[s_control_queue_count++] = item;
+    uint8_t depth = s_control_queue_count;
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+    stats_set_control_depth(depth, true);
+    if (have_evicted) mesh_transport_restore_status_bitmaps(&evicted);
+    return ESP_OK;
+}
+
+bool mesh_coalesce_forward_sync(const mesh_rx_item_t *rx)
+{
+    bool replaced = false;
+    taskENTER_CRITICAL(&s_control_queue_mux);
+    for (uint8_t i = 0; i < s_control_queue_count; i++) {
+        control_tx_item_t *item = &s_control_queue[i];
+        mesh_header_t *h = (mesh_header_t *)item->data;
+        if (h->type != MESH_PKT_SYNC_V3 || !(h->flags & MESH_FLAG_RELAYED) ||
+            h->src_id != rx->header.src_id ||
+            item->len != sizeof(mesh_header_t) + sizeof(mesh_sync_v3_payload_t)) continue;
+        mesh_sync_v3_payload_t queued, received;
+        memcpy(&queued, item->data + sizeof(mesh_header_t), sizeof(queued));
+        memcpy(&received, rx->payload, sizeof(received));
+        if (queued.term != received.term || queued.leader_id != received.leader_id) continue;
+        *h = rx->header;
+        h->ttl = 1;
+        h->flags |= MESH_FLAG_RELAYED;
+        memcpy(item->data + sizeof(mesh_header_t), &received, sizeof(received));
+        item->enqueued_us = rx->timestamp_us;
+        replaced = true;
+        break;
+    }
+    taskEXIT_CRITICAL(&s_control_queue_mux);
+    return replaced;
+}
+
 esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint16_t len,
                                 const uint8_t *dest_mac)
 {
@@ -387,7 +490,7 @@ esp_err_t send_packet_immediate(mesh_pkt_type_t type, const void *payload, uint1
         .type = type,
         .src_id = s_node_id,
         .seq = 0,
-        .ttl = 0,
+        .ttl = 2,
         .flags = 0,
         .talk_channel = s_config.talk_channel,
         .payload_len = len,
@@ -451,9 +554,70 @@ esp_err_t tracked_esp_now_send(const tracked_esp_now_send_request_t *request)
         goto cleanup;
     }
 
+    bool topology_stamped = false;
+    if (header->type == MESH_PKT_TOPOLOGY && !(header->flags & MESH_FLAG_RELAYED)) {
+        mesh_topology_payload_t report;
+        if (header->payload_len != sizeof(report)) {
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        memcpy(&report, request->data + sizeof(*header), sizeof(report));
+        if (report.term != s_mesh.adaptive.term || report.leader_id != s_mesh.adaptive.leader_id) {
+            ret = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+        report.report_seq = s_mesh.report_wire_seq++;
+        memcpy(request->data + sizeof(*header), &report, sizeof(report));
+        topology_stamped = true;
+    }
+    if (header->type == MESH_PKT_SPEAKER_REQUEST && !(header->flags & MESH_FLAG_RELAYED)) {
+        mesh_speaker_request_payload_t speaker_request;
+        if (header->payload_len != sizeof(speaker_request)) {
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        memcpy(&speaker_request, request->data + sizeof(*header), sizeof(speaker_request));
+        if (speaker_request.term != s_mesh.adaptive.term) {
+            ret = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+        speaker_request.frame_counter = mesh_get_frame_counter();
+        memcpy(request->data + sizeof(*header), &speaker_request, sizeof(speaker_request));
+    }
+
+    if (header->type == MESH_PKT_SYNC_V3) {
+        mesh_sync_v3_payload_t sync;
+        if (header->payload_len != sizeof(sync) || request->len != sizeof(*header) + sizeof(sync)) {
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        memcpy(&sync, request->data + sizeof(*header), sizeof(sync));
+        int64_t stamp_us = esp_timer_get_time();
+        taskENTER_CRITICAL(&s_tdma_mux);
+        int64_t elapsed = stamp_us - s_frame_start_us;
+        uint32_t frame = s_frame_counter;
+        taskEXIT_CRITICAL(&s_tdma_mux);
+        if (elapsed < 0) elapsed = 0;
+        frame += (uint32_t)(elapsed / MESH_FRAME_US);
+        uint16_t phase = (uint16_t)(elapsed % MESH_FRAME_US);
+        uint32_t age = s_mesh.upstream_sync_us > 0 && stamp_us >= s_mesh.upstream_sync_us ?
+                       (uint32_t)((stamp_us - s_mesh.upstream_sync_us) / 1000) : UINT32_MAX;
+        bool relay = (header->flags & MESH_FLAG_RELAYED) != 0;
+        if (relay && sync.relay_depth == 1) sync.relay_depth = 0;
+        if (!mesh_adaptive_stamp_sync(&sync, relay,
+                                      frame, phase, age)) {
+            ret = ESP_ERR_INVALID_STATE;
+            goto cleanup;
+        }
+        memcpy(request->data + sizeof(*header), &sync, sizeof(sync));
+    }
     int64_t send_start_us = request->audio_origin ? admission_us : 0;
     ret = esp_now_send(request->dest_mac, request->data, request->len);
+    if (ret != ESP_OK && topology_stamped) s_mesh.report_wire_seq--;
     int64_t send_end_us = esp_timer_get_time();
+    if (ret == ESP_OK && header->type == MESH_PKT_SYNC_V3 &&
+        (header->flags & MESH_FLAG_RELAYED))
+        s_mesh.forward_sync_last_tx_ms = (uint32_t)(send_end_us / 1000);
     if (request->audio_origin) {
         mesh_timing_record(&s_stats.tx_esp_now_send, send_end_us - send_start_us);
     }
@@ -597,20 +761,22 @@ esp_err_t send_join_request(void)
         return ESP_ERR_TIMEOUT;
     }
 
-    mesh_join_payload_t payload = {
-        .capabilities = 0x01, /* Basic Opus support */
-        .reserved = 0,
-    };
+    mesh_join_v3_payload_t payload = {.origin = mesh_local_identity(),
+        .capabilities = MESH_CAP_OPUS | MESH_CAP_LC3};
+    if (s_state == MESH_STATE_JOINING) {
+        payload.target.address_len = 6;
+        memcpy(payload.target.address, s_coordinator_mac, 6);
+    }
 
     /* Wire contract: unassigned JOIN requests use source ID 0. */
-    uint8_t buffer[sizeof(mesh_header_t) + sizeof(mesh_join_payload_t)];
+    uint8_t buffer[sizeof(mesh_header_t) + sizeof(mesh_join_v3_payload_t)];
     mesh_header_t *header = (mesh_header_t *)buffer;
 
     header->version = MESH_PROTOCOL_VERSION;
-    header->type = MESH_PKT_JOIN;
+    header->type = MESH_PKT_JOIN_V3;
     header->src_id = 0; /* Unassigned */
     header->seq = 0;
-    header->ttl = 0;
+    header->ttl = 2;
     header->flags = 0;
     header->talk_channel = s_config.talk_channel;
     header->payload_len = sizeof(payload);
@@ -621,7 +787,7 @@ esp_err_t send_join_request(void)
         .dest_mac = s_broadcast_mac,
         .data = buffer,
         .len = sizeof(buffer),
-        .type = MESH_PKT_JOIN,
+        .type = MESH_PKT_JOIN_V3,
         .heard_bitmap = 0,
         .relay_bitmap = 0,
         .sequence = &s_control_tx_seq,
@@ -637,22 +803,15 @@ esp_err_t send_join_request(void)
 
 esp_err_t send_join_ack(uint8_t node_id, uint8_t slot, const uint8_t *dest_mac)
 {
-    mesh_join_ack_payload_t payload = {
+    mesh_join_ack_v3_payload_t payload = {
+        .target = {.address_len = 6},
         .assigned_id = node_id,
         .slot_index = slot,
         .coordinator_id = s_node_id,
+        .term = s_mesh.adaptive.term,
     };
-
-    if (!esp_now_is_peer_exist(dest_mac)) {
-        esp_now_peer_info_t peer = {0};
-        memcpy(peer.peer_addr, dest_mac, 6);
-        peer.channel = s_config.channel;
-        peer.ifidx = WIFI_IF_STA;
-        peer.encrypt = false;
-        esp_now_add_peer(&peer);
-    }
-
-    return enqueue_control_packet(MESH_PKT_JOIN_ACK, &payload, sizeof(payload), dest_mac);
+    memcpy(payload.target.address, dest_mac, 6);
+    return mesh_send_control_packet(MESH_PKT_JOIN_ACK_V3, &payload, sizeof(payload));
 }
 
 esp_err_t send_sync(void)
@@ -660,13 +819,12 @@ esp_err_t send_sync(void)
     taskENTER_CRITICAL(&s_tdma_mux);
     uint32_t frame_counter = s_frame_counter;
     taskEXIT_CRITICAL(&s_tdma_mux);
-    mesh_sync_payload_t payload = {
-        .frame_counter = frame_counter,
-        .drift_ppm = 0, /* TODO(sync): Set from a measured local clock offset. */
-    };
-    memcpy(payload.coordinator_addr, s_local_mac, sizeof(payload.coordinator_addr));
-
-    return send_packet_immediate(MESH_PKT_SYNC, &payload, sizeof(payload), s_broadcast_mac);
+    uint8_t member_count = (uint8_t)__builtin_popcount((unsigned)s_mesh.adaptive.members);
+    mesh_sync_v3_payload_t payload = {.leader = mesh_local_identity(),
+        .leader_id = s_node_id,
+        .member_count = member_count ? member_count : 1,
+        .term = s_mesh.adaptive.term, .frame_counter = frame_counter};
+    return send_packet_immediate(MESH_PKT_SYNC_V3, &payload, sizeof(payload), s_broadcast_mac);
 }
 
 esp_err_t send_keepalive(void)
@@ -682,27 +840,33 @@ esp_err_t send_keepalive(void)
 esp_err_t send_slot_map(void)
 {
     mesh_slot_map_payload_t payload = {0};
-    payload.slot_count = MESH_MAX_NODES;
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
+    if (s_slot_index >= 0 && s_slot_index < MESH_MAX_NODES)
+        payload.slot_ids[s_slot_index] = s_node_id;
     for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (s_peers[i].info.active && s_peers[i].info.slot_index >= 0 &&
+        if (s_peers[i].info.active && s_peers[i].info.node_id != s_node_id &&
+            s_peers[i].info.slot_index >= 0 &&
             s_peers[i].info.slot_index < MESH_MAX_NODES) {
             payload.slot_ids[s_peers[i].info.slot_index] = s_peers[i].info.node_id;
         }
     }
     xSemaphoreGive(s_peer_mutex);
+    for (uint8_t i = 0; i < MESH_MAX_NODES; i++)
+        if (payload.slot_ids[i]) payload.slot_count = i + 1;
 
     uint8_t sm_ids[MESH_MAX_ACTIVE_SPEAKERS];
     uint8_t sm_masks[MESH_MAX_ACTIVE_SPEAKERS];
     speaker_state_get(sm_ids, sm_masks);
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
-        if (sm_ids[i] != 0) {
-            payload.active_speaker_count++;
+        if (s_mesh.adaptive.members & mesh_core_node_bit(sm_ids[i])) {
+            uint8_t speaker = payload.active_speaker_count++;
+            payload.active_speaker_ids[speaker] = sm_ids[i];
+            payload.relay_masks[speaker] = sm_masks[i] & s_mesh.adaptive.members;
         }
     }
-    memcpy(payload.active_speaker_ids, sm_ids, sizeof(payload.active_speaker_ids));
-    memcpy(payload.relay_masks, sm_masks, sizeof(payload.relay_masks));
+
+    s_mesh.slot_map = payload;
 
     return mesh_send_control_packet(MESH_PKT_SLOT_MAP, &payload, sizeof(payload));
 }

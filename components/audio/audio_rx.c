@@ -62,6 +62,7 @@ static audio_packet_t packet_from_frame(const audio_frame_t *frame)
         .sequence = frame->seq,
         .mode = frame->has_seq ? AUDIO_PACKET_MODE_SEQUENCED : AUDIO_PACKET_MODE_ARRIVAL_ORDER,
         .active = frame->active,
+        .hop_count = frame->hop_count,
         .received_us =
             frame->timestamp_ms > 0 ? (uint64_t)frame->timestamp_ms * UINT64_C(1000) : 0u,
     };
@@ -196,7 +197,7 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     if (frame == NULL) {
         return record_rx_reject(ESP_ERR_INVALID_ARG, &g_audio.stats.rx_invalid);
     }
-    if (frame->len == 0 || frame->len > AUDIO_PACKET_MAX_SIZE) {
+    if (frame->len == 0 || frame->len > AUDIO_PACKET_MAX_SIZE || frame->hop_count > 1u) {
         return record_rx_reject(ESP_ERR_INVALID_SIZE, &g_audio.stats.rx_invalid);
     }
     SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();

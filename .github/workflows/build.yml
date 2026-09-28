@@ -125,6 +125,12 @@ jobs:
       - name: Run WS sync math tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Inrf_mesh/include tests/c/ws_sync_math_test.c -o /tmp/ws_sync_math_test && /tmp/ws_sync_math_test
 
+      - name: Run ESB RSSI conversion tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Inrf_mesh/include tests/c/esb_rssi_test.c -o /tmp/esb_rssi_test && /tmp/esb_rssi_test
+
+      - name: Run TDMA remote rate tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Inrf_mesh/include tests/c/tdma_remote_rate_test.c -o /tmp/tdma_remote_rate_test && /tmp/tdma_remote_rate_test
+
       - name: Run audio reblock tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio -Icomponents/audio/include components/audio/audio_reblock.c tests/c/audio_reblock_test.c -o /tmp/audio_reblock_test && /tmp/audio_reblock_test
 
@@ -167,6 +173,9 @@ jobs:
       - name: Run mesh membership reducer tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/mesh_membership.c tests/c/mesh_membership_test.c -o /tmp/mesh_membership_test && /tmp/mesh_membership_test
 
+      - name: Run adaptive mesh shared tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared shared/mesh_adaptive.c shared/mesh_membership.c tests/c/mesh_adaptive_test.c -o /tmp/mesh_adaptive_test && /tmp/mesh_adaptive_test
+
       - name: Run C suites under ASan and UBSan
         run: |
           set -e
@@ -176,11 +185,14 @@ jobs:
           cc $FLAGS $SAN -I. tests/c/mesh_tx_metrics_test.c -o /tmp/san_mesh_tx_metrics && /tmp/san_mesh_tx_metrics
           cc $FLAGS $SAN -I. tests/c/mesh_tx_slot_test.c -o /tmp/san_mesh_tx_slot && /tmp/san_mesh_tx_slot
           cc $FLAGS $SAN -Inrf_mesh/include tests/c/ws_sync_math_test.c -o /tmp/san_ws_sync_math && /tmp/san_ws_sync_math
+          cc $FLAGS $SAN -Inrf_mesh/include tests/c/esb_rssi_test.c -o /tmp/san_esb_rssi && /tmp/san_esb_rssi
+          cc $FLAGS $SAN -Inrf_mesh/include tests/c/tdma_remote_rate_test.c -o /tmp/san_tdma_remote_rate && /tmp/san_tdma_remote_rate
           cc $FLAGS $SAN -I. shared/audio_bundle.c tests/c/audio_bundle_test.c -o /tmp/san_audio_bundle && /tmp/san_audio_bundle
           cc $FLAGS $SAN -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/san_audio_tx_cache && /tmp/san_audio_tx_cache
           cc $FLAGS $SAN -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/san_bridge_frame && /tmp/san_bridge_frame
           cc $FLAGS $SAN -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/san_audio_rx_tracker && /tmp/san_audio_rx_tracker
           cc $FLAGS $SAN -I. shared/mesh_membership.c tests/c/mesh_membership_test.c -o /tmp/san_mesh_membership && /tmp/san_mesh_membership
+          cc $FLAGS $SAN -I. -Ishared shared/mesh_adaptive.c shared/mesh_membership.c tests/c/mesh_adaptive_test.c -o /tmp/san_mesh_adaptive && /tmp/san_mesh_adaptive
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/san_packet_store && /tmp/san_packet_store
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
            cc $FLAGS $SAN -Wno-sign-compare -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/san_audio_rate_converter && /tmp/san_audio_rate_converter

@@ -43,6 +43,7 @@ static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_i
     frame.len = len;
     frame.timestamp_ms = timestamp_us / 1000;
     frame.active = (audio_flags & MESH_AUDIO_FLAG_ACTIVE) != 0;
+    frame.hop_count = (audio_flags & MESH_AUDIO_FLAG_RELAYED) != 0 ? 1u : 0u;
     /* ESP-NOW carries no end-to-end audio sequence, so playout cannot detect holes. */
     frame.seq = 0;
     frame.has_seq = false;

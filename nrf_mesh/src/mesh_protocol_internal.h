@@ -11,6 +11,7 @@
 
 #include "audio_bundle.h"
 #include "mesh_core.h"
+#include "mesh_adaptive.h"
 #include "mesh_protocol.h"
 
 #define SCAN_TIMEOUT_MS           3000
@@ -58,6 +59,7 @@ struct rx_ring_entry {
 struct relay_entry {
     uint8_t data[MESH_PACKET_OUTER_MAX];
     uint8_t len;
+    uint32_t queued_ms;
 };
 
 struct rf_seq16_tracker {
@@ -86,8 +88,36 @@ typedef struct {
     uint8_t local_addr[5];
     uint8_t tx_seq;
     uint32_t last_sync_time;
+    uint32_t term;
+    mesh_wire_identity_t leader_identity;
+    /* RX, status, audio and TDMA work callbacks share Zephyr's single system
+     * workqueue. The radio ISR only publishes its protected RX ring. */
+    mesh_adaptive_t adaptive;
+    uint32_t direct_seq[MESH_MAX_NODES];
+    bool direct_seq_valid[MESH_MAX_NODES];
+    uint8_t direct_quality[MESH_MAX_NODES];
+    int8_t direct_rssi[MESH_MAX_NODES];
+    uint32_t direct_seen[MESH_MAX_NODES];
+    uint32_t graph_report_seq;
+    uint32_t air_report_seq;
+    uint32_t local_request_seq;
+    uint32_t last_local_active_ms;
+    uint32_t last_request_ms;
+    bool local_request_active;
+    uint8_t control_turn;
+    uint32_t last_prepare_tx;
+    uint32_t last_commit_tx;
+    uint32_t last_forward_sync;
+    uint32_t last_sync_log;
+    uint32_t convergence_until_ms;
+    uint32_t grant_hold_until_ms;
+    uint32_t last_membership_tx;
+    uint8_t authoritative_members;
     int join_attempts;
     mesh_core_dedupe_t dedupe;
+    mesh_core_dedupe_t control_presence_dedupe;
+    uint8_t join_last_seq[MESH_MAX_NODES], ack_last_seq[MESH_MAX_NODES];
+    uint8_t join_seq_seen, ack_seq_seen;
 
     /* Peers and speakers. */
     mesh_peer_info_t peers[MESH_MAX_NODES];
@@ -115,6 +145,8 @@ typedef struct {
     struct relay_entry control_ring[CONTROL_RING_SIZE];
     uint8_t control_head;
     uint8_t control_tail;
+    struct relay_entry priority_control;
+    bool priority_pending;
 
     /* Counters and telemetry. */
     uint32_t stat_ingress_purge_drop;
@@ -124,6 +156,9 @@ typedef struct {
     uint32_t stat_tx_starvation;
     uint32_t stat_tx_queue_drain;
     uint32_t stat_rx_count;
+    uint32_t stat_topology_tx_ok;
+    uint32_t stat_topology_rx_direct;
+    uint32_t stat_topology_rx_relayed;
     atomic_t stat_rx_drop;
     uint32_t stat_audio_fwd;
     atomic_t stat_tx_overwrite;
@@ -186,6 +221,22 @@ typedef struct {
 /* Private module boundary; this is not included by the public protocol API. */
 mesh_protocol_context_t *mesh_protocol_context_get(void);
 void mesh_protocol_update_peer_last_seen(uint8_t node_id, int8_t rssi);
+void mesh_protocol_note_peer_presence(uint8_t node_id);
+mesh_wire_identity_t mesh_protocol_local_identity(void);
+void mesh_protocol_adaptive_members(void);
+bool mesh_protocol_adaptive_bind_member(uint8_t id, const mesh_wire_identity_t *identity);
+bool mesh_protocol_adaptive_control_sequence_accept(uint8_t id, mesh_pkt_type_t type,
+                                                     uint8_t seq);
+int mesh_protocol_adaptive_publish_membership(void);
+bool mesh_protocol_adaptive_converging(void);
+void mesh_protocol_adaptive_observe(const mesh_header_t *hdr,
+                                    const mesh_topology_payload_t *report, int8_t rssi);
+void mesh_protocol_adaptive_report_tick(void);
+void mesh_protocol_adaptive_frame_tick(uint32_t frame);
+void mesh_protocol_adaptive_local_voice(bool active);
+bool mesh_protocol_adaptive_control_rx(const mesh_header_t *hdr, const uint8_t *payload,
+                                       int8_t rssi, int64_t timestamp_us);
+void mesh_protocol_adaptive_reset(void);
 
 void mesh_protocol_rx_init(void);
 void mesh_protocol_rx_stop(void);
@@ -196,6 +247,11 @@ void mesh_protocol_membership_bind_work(struct k_work_delayable *scan_work,
 uint32_t mesh_protocol_membership_scan_timeout_ms(void);
 uint8_t mesh_protocol_membership_bridge_peer_count(void);
 void mesh_protocol_membership_reset_session_data(void);
+void mesh_protocol_membership_discover(uint8_t leader_id);
+void mesh_protocol_membership_demote(uint8_t leader_id, uint32_t term,
+                                      mesh_wire_identity_t identity);
+void mesh_protocol_membership_rejoin(uint8_t leader_id, uint32_t term,
+                                     mesh_wire_identity_t identity);
 bool mesh_protocol_membership_process_rx_packet(const mesh_header_t *hdr, const uint8_t *payload,
                                                 int8_t rssi, int64_t timestamp_us);
 void mesh_protocol_membership_scan_work_handler(struct k_work *work);
@@ -214,10 +270,12 @@ void mesh_protocol_audio_clear_speaker_activity(void);
 void mesh_protocol_audio_clear_speaker_grants(void);
 void mesh_protocol_audio_clear_heard_relay_bitmaps(void);
 void mesh_protocol_audio_update_speaker_grants(void);
+void mesh_protocol_audio_expire_speakers(uint32_t now_ms);
 void mesh_protocol_audio_apply_slot_map_speakers(const mesh_slot_map_payload_t *slot_map);
 void mesh_protocol_audio_apply_speaker_grant(const mesh_speaker_grant_payload_t *grant);
 void mesh_protocol_audio_apply_speaker_release(const mesh_speaker_release_payload_t *release);
-bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi);
+bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
+                                           int64_t received_us);
 
 int mesh_protocol_tx_send_packet_ex(mesh_pkt_type_t type, const void *payload, uint16_t len,
                                     uint8_t ttl, uint8_t flags, uint8_t src_id, uint8_t seq);
@@ -230,7 +288,9 @@ int mesh_protocol_tx_send_keepalive(mesh_protocol_context_t *context);
 int mesh_protocol_tx_send_slot_map(mesh_protocol_context_t *context);
 int mesh_protocol_tx_send_status_packet(mesh_protocol_context_t *context);
 int mesh_protocol_tx_send_join_ack(mesh_protocol_context_t *context, uint8_t assigned_id,
-                                   uint8_t slot_index, const uint8_t target_addr[5]);
+                                    uint8_t slot_index, const uint8_t target_addr[5]);
+mesh_slot_map_payload_t mesh_protocol_tx_slot_snapshot(mesh_protocol_context_t *context);
+int mesh_protocol_tx_queue_priority(mesh_pkt_type_t type, const void *payload, uint16_t len);
 void mesh_protocol_tx_control_handler(uint32_t frame_counter);
 
 #endif /* OMI_MESH_PROTOCOL_INTERNAL_H */

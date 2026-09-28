@@ -15,6 +15,7 @@ typedef struct {
     uint8_t node_id;
     int8_t slot_index;
     uint8_t coordinator_id;
+    uint32_t term; /* nonzero after planned handover; disables cold-start MAC election */
     uint8_t peer_count;
     bool participant_membership_known;
     uint8_t local_address[MESH_MEMBERSHIP_MAX_ADDRESS_LEN];
@@ -51,6 +52,7 @@ typedef struct {
         struct {
             uint8_t coordinator_address[MESH_MEMBERSHIP_MAX_ADDRESS_LEN];
             uint8_t address_len;
+            uint32_t term;
         } sync;
         struct {
             uint8_t assigned_id;
@@ -96,5 +98,10 @@ typedef struct {
 
 mesh_membership_result_t mesh_membership_reduce(const mesh_membership_snapshot_t *current,
                                                 const mesh_membership_event_t *event);
+
+/* Apply an already-validated adaptive handover at its agreed frame boundary.
+ * No join, node-id reassignment, slot change or media reset occurs here. */
+bool mesh_membership_apply_handover(mesh_membership_snapshot_t *snapshot,
+                                    uint8_t old_leader, uint8_t new_leader, uint32_t term);
 
 #endif /* OMI_MESH_MEMBERSHIP_H */

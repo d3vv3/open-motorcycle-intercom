@@ -82,6 +82,7 @@ static mesh_membership_snapshot_t membership_snapshot(void)
         .node_id = s_node_id,
         .slot_index = s_slot_index,
         .coordinator_id = s_coordinator_id,
+        .term = C->term,
         .peer_count = s_peer_count,
         .participant_membership_known = s_participant_membership_known,
         .address_len = sizeof(s_local_addr),
@@ -97,14 +98,17 @@ static void apply_membership_snapshot(const mesh_membership_snapshot_t *snapshot
     s_node_id = snapshot->node_id;
     s_slot_index = snapshot->slot_index;
     s_coordinator_id = snapshot->coordinator_id;
+    C->term = snapshot->term;
     s_peer_count = snapshot->peer_count;
     s_participant_membership_known = snapshot->participant_membership_known;
 }
 
 static void reset_session_data(bool clear_heard_relay_bitmaps)
 {
+    mesh_protocol_adaptive_reset();
     memset(s_peers, 0, sizeof(C->peers));
     mesh_core_dedupe_reset(&s_dedupe);
+    mesh_core_dedupe_reset(&C->control_presence_dedupe);
     mesh_protocol_audio_reset_all_rf_e2e_trackers();
     mesh_protocol_audio_clear_relay_ring();
     memset(s_control_ring, 0, sizeof(C->control_ring));
@@ -147,68 +151,91 @@ void mesh_protocol_update_peer_last_seen(uint8_t node_id, int8_t rssi)
     }
 }
 
-static void process_sync(const mesh_header_t *hdr, const uint8_t *payload, int64_t timestamp_us)
+void mesh_protocol_note_peer_presence(uint8_t node_id)
 {
-    mesh_membership_event_t event = {
-        .type = MESH_MEMBERSHIP_EVENT_SYNC,
-        .sender_id = hdr->src_id,
-        .payload_valid = hdr->payload_len == sizeof(mesh_sync_payload_t),
-    };
-    if (event.payload_valid) {
-        const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
-        event.data.sync.address_len = sizeof(sync->coordinator_addr);
-        memcpy(event.data.sync.coordinator_address, sync->coordinator_addr,
-               sizeof(sync->coordinator_addr));
+    for (int i = 0; i < MESH_MAX_NODES; i++) {
+        if (s_peers[i].active && s_peers[i].node_id == node_id) {
+            s_peers[i].last_seen_ms = k_uptime_get();
+            return;
+        }
     }
-    mesh_membership_snapshot_t current = membership_snapshot();
-    mesh_membership_result_t transition = mesh_membership_reduce(&current, &event);
+}
 
-    if (transition.action == MESH_MEMBERSHIP_ACTION_DISCOVER_COORDINATOR) {
-        LOG_INF("Found mesh, coordinator=%d", hdr->src_id);
-        apply_membership_snapshot(&transition.next);
-        s_join_attempts = 0;
-        k_work_cancel_delayable(s_scan_work);
-        k_work_schedule(s_join_work, K_NO_WAIT);
-    } else if (transition.action == MESH_MEMBERSHIP_ACTION_ACCEPT_SYNC) {
-        const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)payload;
-        int64_t frame_start_us =
-            timestamp_us - (MESH_MAX_NODES * MESH_SLOT_MS * 1000) - NRF_SYNC_RX_LATENCY_US;
-        tdma_sync(sync->frame_counter, sync->drift_ppm, frame_start_us);
-        s_last_sync_time = k_uptime_get_32();
-    } else if (transition.action == MESH_MEMBERSHIP_ACTION_DEMOTE_COORDINATOR) {
-        LOG_WRN("Dual coordinator detected, joining lower-address coordinator");
-        mesh_log("MESH: Dual coordinator, joining lower-address winner");
-        mesh_protocol_audio_set_ingress_enabled(false, false);
-        tdma_stop();
-        apply_membership_snapshot(&transition.next);
-        s_join_attempts = 0;
-        reset_session_data(false);
-        k_work_cancel_delayable(s_status_work);
-        uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
-                                s_node_id, s_slot_index, s_coordinator_id);
-        k_work_schedule(s_join_work, K_NO_WAIT);
-    } else if ((transition.effects & MESH_MEMBERSHIP_EFFECT_REPORT_LOCAL_WIN) != 0U) {
-        LOG_INF("Dual coordinator detected, we have lower MAC - staying coordinator");
-    }
+void mesh_protocol_membership_discover(uint8_t leader_id)
+{
+    if (s_state != MESH_STATE_SCANNING || !mesh_core_node_id_valid(leader_id)) return;
+    s_state = MESH_STATE_JOINING;
+    s_coordinator_id = leader_id;
+    s_join_attempts = 0;
+    k_work_cancel_delayable(s_scan_work);
+    k_work_schedule(s_join_work, K_NO_WAIT);
+}
+
+void mesh_protocol_membership_demote(uint8_t leader_id, uint32_t term,
+                                     mesh_wire_identity_t identity)
+{
+    if (s_state != MESH_STATE_ACTIVE || s_role != MESH_ROLE_COORDINATOR) return;
+    mesh_protocol_audio_set_ingress_enabled(false, false);
+    tdma_stop();
+    reset_session_data(false);
+    k_work_cancel_delayable(s_status_work);
+    s_role = MESH_ROLE_NONE;
+    s_state = MESH_STATE_JOINING;
+    s_node_id = 0;
+    s_slot_index = -1;
+    s_coordinator_id = leader_id;
+    C->term = term;
+    C->leader_identity = identity;
+    s_join_attempts = 0;
+    uart_bridge_send_status(s_state, s_role, 0, 0, -1, s_coordinator_id);
+    k_work_schedule(s_join_work, K_NO_WAIT);
+}
+
+void mesh_protocol_membership_rejoin(uint8_t leader_id, uint32_t term,
+                                     mesh_wire_identity_t identity)
+{
+    if (s_state != MESH_STATE_ACTIVE || s_role != MESH_ROLE_PARTICIPANT) return;
+    mesh_protocol_audio_set_ingress_enabled(false, false);
+    tdma_stop();
+    reset_session_data(true);
+    k_work_cancel_delayable(s_status_work);
+    s_role = MESH_ROLE_NONE;
+    s_state = MESH_STATE_JOINING;
+    s_node_id = 0;
+    s_slot_index = -1;
+    s_coordinator_id = leader_id;
+    s_participant_membership_known = false;
+    C->term = term;
+    C->leader_identity = identity;
+    s_join_attempts = 0;
+    uart_bridge_send_event(BRIDGE_EVENT_SYNC_LOST, NULL, 0);
+    uart_bridge_send_status(s_state, s_role, BRIDGE_PEER_COUNT_UNKNOWN, 0, -1,
+                            s_coordinator_id);
+    k_work_schedule(s_join_work, K_NO_WAIT);
 }
 
 static void process_join(const mesh_header_t *hdr, const uint8_t *payload)
 {
     if (s_role != MESH_ROLE_COORDINATOR || hdr->src_id != 0 ||
-        hdr->payload_len != sizeof(mesh_join_v2_payload_t)) {
+        hdr->payload_len != sizeof(mesh_join_v3_payload_t)) {
         return;
     }
-    const mesh_join_v2_payload_t *join = (const mesh_join_v2_payload_t *)payload;
-    if ((join->capabilities & MESH_CAP_LC3) == 0u) {
+    const mesh_join_v3_payload_t *join = (const void *)payload;
+    if ((join->capabilities & MESH_CAP_LC3) == 0u || join->origin.address_len != 5 ||
+        memcmp(&join->origin, &C->leader_identity, sizeof(join->origin)) == 0 ||
+        memcmp(&join->target, &C->leader_identity, sizeof(join->target))) {
         return;
     }
     uint8_t assigned_id = 0;
     int8_t assigned_slot = -1;
+    bool new_member = false;
     for (int i = 0; i < MESH_MAX_NODES; i++) {
         if (s_peers[i].active &&
-            memcmp(s_peers[i].esb_addr, join->requester_addr, sizeof(join->requester_addr)) == 0) {
+            memcmp(s_peers[i].esb_addr, join->origin.address, 5) == 0) {
             assigned_id = s_peers[i].node_id;
             assigned_slot = s_peers[i].slot_index;
+            if (!mesh_protocol_adaptive_control_sequence_accept(assigned_id, MESH_PKT_JOIN_V3,
+                                                                hdr->seq)) return;
             s_peers[i].last_seen_ms = k_uptime_get();
             break;
         }
@@ -221,15 +248,25 @@ static void process_join(const mesh_header_t *hdr, const uint8_t *payload)
             }
         }
         assigned_id = mesh_core_first_free_node_id(occupied);
-        assigned_slot = mesh_core_slot_for_node_id(assigned_id);
+        uint8_t occupied_slots = (uint8_t)(1U << s_slot_index);
+        for (int i = 0; i < MESH_MAX_NODES; i++) if (s_peers[i].active &&
+            s_peers[i].slot_index >= 0 && s_peers[i].slot_index < MESH_MAX_NODES)
+            occupied_slots |= (uint8_t)(1U << s_peers[i].slot_index);
+        for (int slot = 0; slot < MESH_MAX_NODES; slot++)
+            if (!(occupied_slots & (1U << slot))) { assigned_slot = (int8_t)slot; break; }
+        if (assigned_slot < 0) return;
+        if (assigned_id && !mesh_protocol_adaptive_bind_member(assigned_id, &join->origin))
+            return;
         for (int i = 0; assigned_id != 0 && i < MESH_MAX_NODES; i++) {
             if (!s_peers[i].active) {
                 s_peers[i].node_id = assigned_id;
                 s_peers[i].slot_index = assigned_slot;
-                memcpy(s_peers[i].esb_addr, join->requester_addr, sizeof(s_peers[i].esb_addr));
+                memcpy(s_peers[i].esb_addr, join->origin.address, sizeof(s_peers[i].esb_addr));
                 s_peers[i].last_seen_ms = k_uptime_get();
                 s_peers[i].active = true;
-                s_peers[i].announced = false;
+                s_peers[i].announced = true;
+                s_peer_count++;
+                new_member = true;
                 break;
             }
         }
@@ -238,8 +275,18 @@ static void process_join(const mesh_header_t *hdr, const uint8_t *payload)
         LOG_WRN("No free slots for new node");
         return;
     }
+    if (!mesh_protocol_adaptive_bind_member(assigned_id, &join->origin)) return;
+    if (new_member) (void)mesh_protocol_adaptive_control_sequence_accept(assigned_id,
+                                                                          MESH_PKT_JOIN_V3,
+                                                                          hdr->seq);
     mesh_protocol_audio_reset_rf_e2e_tracker(assigned_id);
-    mesh_protocol_tx_send_join_ack(C, assigned_id, (uint8_t)assigned_slot, join->requester_addr);
+    if (new_member) {
+        uart_bridge_send_status(s_state, s_role, s_peer_count, s_node_id, s_slot_index,
+                                s_coordinator_id);
+        uart_bridge_send_event(BRIDGE_EVENT_PEER_JOINED, &assigned_id, sizeof(assigned_id));
+    }
+    mesh_protocol_adaptive_members();
+    mesh_protocol_tx_send_join_ack(C, assigned_id, (uint8_t)assigned_slot, join->origin.address);
     mesh_protocol_tx_send_slot_map(C);
 }
 
@@ -248,15 +295,16 @@ static void process_join_ack(const mesh_header_t *hdr, const uint8_t *payload)
     mesh_membership_event_t event = {
         .type = MESH_MEMBERSHIP_EVENT_JOIN_ACK,
         .sender_id = hdr->src_id,
-        .payload_valid = hdr->payload_len == sizeof(mesh_join_ack_v2_payload_t),
+        .payload_valid = hdr->payload_len == sizeof(mesh_join_ack_v3_payload_t),
     };
     if (event.payload_valid) {
-        const mesh_join_ack_v2_payload_t *ack = (const mesh_join_ack_v2_payload_t *)payload;
+        const mesh_join_ack_v3_payload_t *ack = (const void *)payload;
+        if (ack->term != C->term || ack->target.address_len != 5) return;
         event.data.join_ack.assigned_id = ack->assigned_id;
         event.data.join_ack.slot_index = ack->slot_index;
         event.data.join_ack.coordinator_id = ack->coordinator_id;
-        event.data.join_ack.address_len = sizeof(ack->target_addr);
-        memcpy(event.data.join_ack.target_address, ack->target_addr, sizeof(ack->target_addr));
+        event.data.join_ack.address_len = ack->target.address_len;
+        memcpy(event.data.join_ack.target_address, ack->target.address, 5);
     }
     mesh_membership_snapshot_t current = membership_snapshot();
     mesh_membership_result_t transition = mesh_membership_reduce(&current, &event);
@@ -269,6 +317,16 @@ static void process_join_ack(const mesh_header_t *hdr, const uint8_t *payload)
         mesh_protocol_audio_set_ingress_enabled(true, false);
         k_work_cancel_delayable(s_join_work);
         tdma_start(s_slot_index, false);
+        mesh_protocol_adaptive_members();
+        for (int i = 0; i < MESH_MAX_NODES; i++) if (!s_peers[i].active) {
+            s_peers[i].node_id = s_coordinator_id;
+            s_peers[i].slot_index = 0;
+            memcpy(s_peers[i].esb_addr, C->leader_identity.address, 5);
+            s_peers[i].active = true;
+            s_peers[i].announced = true;
+            s_peers[i].last_seen_ms = k_uptime_get();
+            break;
+        }
         s_last_sync_time = k_uptime_get_32();
         k_work_schedule(s_status_work, K_MSEC(STATUS_INTERVAL_MS));
         uart_bridge_send_status(s_state, s_role, BRIDGE_PEER_COUNT_UNKNOWN, s_node_id, s_slot_index,
@@ -277,80 +335,19 @@ static void process_join_ack(const mesh_header_t *hdr, const uint8_t *payload)
     }
 }
 
-static void process_status(const mesh_header_t *hdr, const uint8_t *payload, int8_t rssi)
-{
-    if (hdr->payload_len < sizeof(mesh_status_payload_t)) {
-        return;
-    }
-    const mesh_status_payload_t *status = (const mesh_status_payload_t *)payload;
-    mesh_protocol_update_peer_last_seen(hdr->src_id, rssi);
-    for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (s_peers[i].active && s_peers[i].node_id == hdr->src_id) {
-            s_peers[i].battery_pct = status->battery_pct;
-            s_peers[i].rssi_dbm = rssi;
-            s_peers[i].peer_count = status->peer_count;
-            s_peers[i].fw_version = status->fw_version;
-            s_peers[i].temperature_c = status->temperature_c;
-            s_peers[i].heard_bitmap = status->heard_bitmap;
-            s_peers[i].relay_bitmap = status->relay_bitmap;
-            s_peers[i].last_seen_ms = k_uptime_get();
-            break;
-        }
-    }
-}
-
-static void process_slot_map(const mesh_header_t *hdr, const uint8_t *payload)
-{
-    mesh_membership_event_t event = {
-        .type = MESH_MEMBERSHIP_EVENT_SLOT_MAP,
-        .sender_id = hdr->src_id,
-        .payload_valid = hdr->payload_len == sizeof(mesh_slot_map_payload_t),
-    };
-    if (event.payload_valid) {
-        memcpy(&event.data.slot_map, payload, sizeof(event.data.slot_map));
-    }
-    mesh_membership_snapshot_t current = membership_snapshot();
-    mesh_membership_result_t transition = mesh_membership_reduce(&current, &event);
-    if (transition.action == MESH_MEMBERSHIP_ACTION_APPLY_SLOT_MAP) {
-        const mesh_slot_map_payload_t *slot_map = &event.data.slot_map;
-        for (uint8_t slot = 0; slot < slot_map->slot_count; slot++) {
-            uint8_t node_id = slot_map->slot_ids[slot];
-            if (node_id == 0) {
-                continue;
-            }
-            for (int i = 0; i < MESH_MAX_NODES; i++) {
-                if (s_peers[i].active && s_peers[i].node_id == node_id) {
-                    s_peers[i].slot_index = (int8_t)slot;
-                    break;
-                }
-            }
-        }
-        apply_membership_snapshot(&transition.next);
-        tdma_set_slot_index(s_slot_index);
-        uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
-                                s_node_id, s_slot_index, s_coordinator_id);
-        mesh_protocol_audio_apply_slot_map_speakers(slot_map);
-    }
-}
-
 static void process_leave(const mesh_header_t *hdr, const uint8_t *payload)
 {
+    if (s_role != MESH_ROLE_COORDINATOR ||
+        hdr->payload_len != sizeof(mesh_leave_v2_payload_t)) return;
     mesh_membership_event_t event = {
         .type = MESH_MEMBERSHIP_EVENT_LEAVE,
         .sender_id = hdr->src_id,
-        .payload_valid =
-            hdr->payload_len == 0U || hdr->payload_len == sizeof(mesh_leave_v2_payload_t),
+        .payload_valid = true,
     };
-    if (hdr->payload_len == 0U) {
-        event.data.leave.identity = MESH_MEMBERSHIP_LEAVE_LEGACY;
-    } else if (hdr->payload_len == sizeof(mesh_leave_v2_payload_t)) {
-        const mesh_leave_v2_payload_t *leave = (const mesh_leave_v2_payload_t *)payload;
-        event.data.leave.identity = MESH_MEMBERSHIP_LEAVE_ADDRESS;
-        event.data.leave.address_len = sizeof(leave->sender_addr);
-        memcpy(event.data.leave.sender_address, leave->sender_addr, sizeof(leave->sender_addr));
-    } else {
-        event.data.leave.identity = MESH_MEMBERSHIP_LEAVE_INVALID;
-    }
+    const mesh_leave_v2_payload_t *leave = (const void *)payload;
+    event.data.leave.identity = MESH_MEMBERSHIP_LEAVE_ADDRESS;
+    event.data.leave.address_len = sizeof(leave->sender_addr);
+    memcpy(event.data.leave.sender_address, leave->sender_addr, sizeof(leave->sender_addr));
     int peer_index = -1;
     for (int i = 0; i < MESH_MAX_NODES; i++) {
         if (s_peers[i].active && s_peers[i].node_id == hdr->src_id) {
@@ -372,7 +369,9 @@ static void process_leave(const mesh_header_t *hdr, const uint8_t *payload)
     }
     if (transition.action == MESH_MEMBERSHIP_ACTION_REMOVE_PEER && peer_index >= 0) {
         s_peers[peer_index].active = false;
+        (void)mesh_protocol_adaptive_bind_member(transition.affected_node_id, NULL);
         apply_membership_snapshot(&transition.next);
+        mesh_protocol_audio_update_speaker_grants();
         mesh_core_dedupe_purge_node(&s_dedupe, transition.affected_node_id);
         mesh_protocol_audio_reset_rf_e2e_tracker(transition.affected_node_id);
         LOG_INF("Peer %u left, remaining peers: %u", transition.affected_node_id, s_peer_count);
@@ -391,27 +390,30 @@ static void process_leave(const mesh_header_t *hdr, const uint8_t *payload)
 bool mesh_protocol_membership_process_rx_packet(const mesh_header_t *hdr, const uint8_t *payload,
                                                 int8_t rssi, int64_t timestamp_us)
 {
+    ARG_UNUSED(rssi);
+    ARG_UNUSED(timestamp_us);
     switch (hdr->type) {
-    case MESH_PKT_SYNC:
-        process_sync(hdr, payload, timestamp_us);
+    case MESH_PKT_SYNC_V3:
+        /* SYNC_V3 is disciplined by the adaptive receiver with an RF timestamp. */
         return true;
-    case MESH_PKT_JOIN_V2:
+    case MESH_PKT_JOIN_V3:
         process_join(hdr, payload);
         return true;
-    case MESH_PKT_JOIN_ACK_V2:
+    case MESH_PKT_JOIN_ACK_V3:
         process_join_ack(hdr, payload);
+        return true;
+    case MESH_PKT_SYNC:
+    case MESH_PKT_JOIN_V2:
+    case MESH_PKT_JOIN_ACK_V2:
         return true;
     case MESH_PKT_JOIN:
     case MESH_PKT_JOIN_ACK:
         return true;
     case MESH_PKT_KEEPALIVE:
-        mesh_protocol_update_peer_last_seen(hdr->src_id, rssi);
-        return true;
     case MESH_PKT_STATUS:
-        process_status(hdr, payload, rssi);
+        /* Version 5 uses bound topology/requests for presence, not legacy telemetry. */
         return true;
     case MESH_PKT_SLOT_MAP:
-        process_slot_map(hdr, payload);
         return true;
     case MESH_PKT_LEAVE:
         process_leave(hdr, payload);
@@ -442,7 +444,11 @@ void mesh_protocol_membership_scan_work_handler(struct k_work *work)
     s_peers[0].announced = true;
     s_peers[0].last_seen_ms = k_uptime_get();
     s_peer_count = 0;
+    C->term = 1;
+    C->leader_identity = mesh_protocol_local_identity();
+    mesh_protocol_adaptive_members();
     tdma_start(s_slot_index, true);
+    tdma_set_clock_source(true);
     k_work_schedule(s_status_work, K_MSEC(STATUS_INTERVAL_MS));
     LOG_INF("ACTIVE as coordinator, node_id=%d, slot=%d", s_node_id, s_slot_index);
     uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
@@ -484,7 +490,8 @@ void mesh_protocol_membership_check_peer_timeouts(void)
     int64_t now = k_uptime_get();
     bool topology_changed = false;
     for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (!s_peers[i].active || s_peers[i].node_id == s_node_id ||
+        if (!s_peers[i].active || s_role != MESH_ROLE_COORDINATOR ||
+            s_peers[i].node_id == s_node_id ||
             s_peers[i].node_id == s_coordinator_id) {
             continue;
         }
@@ -492,6 +499,7 @@ void mesh_protocol_membership_check_peer_timeouts(void)
             uint8_t timed_out_id = s_peers[i].node_id;
             bool announced = s_peers[i].announced;
             s_peers[i].active = false;
+            (void)mesh_protocol_adaptive_bind_member(timed_out_id, NULL);
             mesh_core_dedupe_purge_node(&s_dedupe, timed_out_id);
             mesh_protocol_audio_reset_rf_e2e_tracker(timed_out_id);
             if (announced && s_peer_count > 0) {
@@ -506,6 +514,7 @@ void mesh_protocol_membership_check_peer_timeouts(void)
         }
     }
     if (topology_changed && s_role == MESH_ROLE_COORDINATOR) {
+        mesh_protocol_audio_update_speaker_grants();
         mesh_protocol_tx_send_slot_map(C);
     }
 }

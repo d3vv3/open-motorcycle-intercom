@@ -254,6 +254,7 @@ typedef struct {
     size_t len;
     uint16_t seq;
     bool active;
+    uint8_t hop_count;
     int64_t timestamp_us;
     predecessor_counter_targets_t counters;
 } predecessor_offer_t;
@@ -267,6 +268,7 @@ static void offer_predecessor(const predecessor_offer_t *offer)
     frame.len = (uint16_t)offer->len;
     frame.timestamp_ms = offer->timestamp_us / 1000;
     frame.active = offer->active;
+    frame.hop_count = offer->hop_count;
     frame.seq = offer->seq;
     frame.has_seq = true;
 
@@ -326,6 +328,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
         return;
     }
     uint16_t e2e_seq = bundle.current_seq;
+    uint8_t hop_count = (bundle.flags & AUDIO_BUNDLE_FLAG_RELAYED) != 0u ? 1u : 0u;
 
     e2e_diag_track_rx(src_id, e2e_seq);
 
@@ -343,6 +346,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
             .len = bundle.previous2_len,
             .seq = (uint16_t)(e2e_seq - 2u),
             .active = (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS2_ACTIVE) != 0,
+            .hop_count = hop_count,
             .timestamp_us = timestamp_us - 40000,
             .counters =
                 {
@@ -359,6 +363,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
             .len = bundle.previous1_len,
             .seq = (uint16_t)(e2e_seq - 1u),
             .active = (bundle.flags & AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE) != 0,
+            .hop_count = hop_count,
             .timestamp_us = timestamp_us - 20000,
             .counters =
                 {
@@ -373,6 +378,7 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     frame.len = (uint16_t)bundle.current_len;
     frame.timestamp_ms = timestamp_us / 1000;
     frame.active = (bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE) != 0;
+    frame.hop_count = hop_count;
     /* Hand the end-to-end sequence to playout so it can conceal missing frames. */
     frame.seq = e2e_seq;
     frame.has_seq = true;

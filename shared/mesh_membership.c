@@ -39,9 +39,8 @@ static bool join_ack_valid(const mesh_membership_snapshot_t *current,
     return current->state == MESH_STATE_JOINING && event->payload_valid &&
            address_length_valid(address_len) && address_len == current->address_len &&
            memcmp(event->data.join_ack.target_address, current->local_address, address_len) == 0 &&
-           node_id_valid(event->data.join_ack.assigned_id) &&
-           event->data.join_ack.slot_index > 0U &&
-           event->data.join_ack.slot_index < MESH_MAX_NODES &&
+            node_id_valid(event->data.join_ack.assigned_id) &&
+            event->data.join_ack.slot_index < MESH_MAX_NODES &&
            node_id_valid(event->data.join_ack.coordinator_id) &&
            event->data.join_ack.assigned_id != event->data.join_ack.coordinator_id &&
            event->sender_id == event->data.join_ack.coordinator_id &&
@@ -58,16 +57,13 @@ static bool slot_map_valid(const mesh_slot_map_payload_t *slot_map, uint8_t loca
 
     if (!node_id_valid(local_node_id) || !node_id_valid(coordinator_id) ||
         slot_map->slot_count == 0U || slot_map->slot_count > MESH_MAX_NODES ||
-        slot_map->slot_ids[0] != coordinator_id ||
         slot_map->active_speaker_count > MESH_MAX_ACTIVE_SPEAKERS) {
         return false;
     }
 
     for (uint8_t slot = 0; slot < slot_map->slot_count; slot++) {
         uint8_t node_id = slot_map->slot_ids[slot];
-        if (node_id == 0U) {
-            continue;
-        }
+        if (node_id == 0U) continue;
         if (!node_id_valid(node_id)) {
             return false;
         }
@@ -81,8 +77,13 @@ static bool slot_map_valid(const mesh_slot_map_payload_t *slot_map, uint8_t loca
             parsed_local_slot = (int8_t)slot;
         }
     }
-    if (parsed_local_slot <= 0) {
+    if (slot_map->slot_ids[slot_map->slot_count - 1U] == 0U ||
+        parsed_local_slot < 0 || parsed_member_count == 0U ||
+        (member_bitmap & (uint8_t)(1U << (coordinator_id - 1U))) == 0U) {
         return false;
+    }
+    for (uint8_t slot = slot_map->slot_count; slot < MESH_MAX_NODES; slot++) {
+        if (slot_map->slot_ids[slot] != 0U) return false;
     }
 
     uint8_t speaker_bitmap = 0U;
@@ -127,7 +128,8 @@ static mesh_membership_result_t reduce_sync(const mesh_membership_snapshot_t *cu
     }
 
     if (current->state == MESH_STATE_ACTIVE && current->role == MESH_ROLE_PARTICIPANT) {
-        if (event->sender_id == current->coordinator_id) {
+        if (event->sender_id == current->coordinator_id &&
+            (current->term == 0U || event->data.sync.term == current->term)) {
             result.action = MESH_MEMBERSHIP_ACTION_ACCEPT_SYNC;
         }
         return result;
@@ -137,6 +139,10 @@ static mesh_membership_result_t reduce_sync(const mesh_membership_snapshot_t *cu
         !address_length_valid(current->address_len) ||
         event->data.sync.address_len != current->address_len) {
         return result;
+    }
+
+    if (current->term != 0U || event->data.sync.term != 0U) {
+        return result; /* MAC tie-break applies only to cold-start clusters. */
     }
 
     int comparison = address_compare(event->data.sync.coordinator_address, current->local_address,
@@ -258,4 +264,20 @@ mesh_membership_result_t mesh_membership_reduce(const mesh_membership_snapshot_t
         result.next = *current;
         return result;
     }
+}
+
+bool mesh_membership_apply_handover(mesh_membership_snapshot_t *snapshot,
+                                    uint8_t old_leader, uint8_t new_leader, uint32_t term)
+{
+    if (snapshot == NULL || snapshot->state != MESH_STATE_ACTIVE ||
+        !node_id_valid(snapshot->node_id) || snapshot->coordinator_id != old_leader ||
+        !node_id_valid(new_leader) || new_leader == old_leader ||
+        snapshot->slot_index < 0 || snapshot->slot_index >= MESH_MAX_NODES ||
+        term <= snapshot->term) {
+        return false;
+    }
+    snapshot->coordinator_id = new_leader;
+    snapshot->term = term;
+    snapshot->role = snapshot->node_id == new_leader ? MESH_ROLE_COORDINATOR : MESH_ROLE_PARTICIPANT;
+    return true;
 }

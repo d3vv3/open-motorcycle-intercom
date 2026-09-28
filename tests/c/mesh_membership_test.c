@@ -152,7 +152,9 @@ static void test_join_ack_activation(void)
     assert(mesh_membership_reduce(&joining, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
     event = valid_ack();
     event.data.join_ack.slot_index = 0U;
-    assert(mesh_membership_reduce(&joining, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
+    assert(mesh_membership_reduce(&joining, &event).action ==
+           MESH_MEMBERSHIP_ACTION_ACTIVATE_PARTICIPANT);
+    assert(mesh_membership_reduce(&joining, &event).next.slot_index == 0);
     event.data.join_ack.slot_index = MESH_MAX_NODES;
     assert(mesh_membership_reduce(&joining, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
 }
@@ -164,10 +166,10 @@ static mesh_membership_event_t valid_slot_map(void)
         .sender_id = 1U,
         .payload_valid = true,
     };
-    event.data.slot_map.slot_count = MESH_MAX_NODES;
+    event.data.slot_map.slot_count = 3U;
     event.data.slot_map.slot_ids[0] = 1U;
-    event.data.slot_map.slot_ids[3] = 3U;
-    event.data.slot_map.slot_ids[5] = 5U;
+    event.data.slot_map.slot_ids[1] = 3U;
+    event.data.slot_map.slot_ids[2] = 5U;
     return event;
 }
 
@@ -179,15 +181,46 @@ static void test_slot_map_update(void)
     mesh_membership_event_t event = valid_slot_map();
     mesh_membership_result_t result = mesh_membership_reduce(&participant, &event);
     assert(result.action == MESH_MEMBERSHIP_ACTION_APPLY_SLOT_MAP);
-    assert(result.next.slot_index == 3 && result.next.peer_count == 2U);
+    assert(result.next.slot_index == 1 && result.next.peer_count == 2U);
     assert(result.next.participant_membership_known);
     assert(result.effects == MESH_MEMBERSHIP_EFFECT_NONE);
 
-    event.data.slot_map.slot_ids[5] = 3U;
+    event.data.slot_map.slot_ids[2] = 3U;
     assert(mesh_membership_reduce(&participant, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
     event = valid_slot_map();
     event.sender_id = 2U;
     assert(mesh_membership_reduce(&participant, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
+
+    participant.node_id = 1U;
+    participant.slot_index = 0;
+    participant.coordinator_id = 3U;
+    event = valid_slot_map();
+    event.sender_id = 3U;
+    result = mesh_membership_reduce(&participant, &event);
+    assert(result.action == MESH_MEMBERSHIP_ACTION_APPLY_SLOT_MAP);
+    assert(result.next.slot_index == 0 && result.next.coordinator_id == 3U);
+    event.data.slot_map.slot_ids[1] = 0U;
+    event.data.slot_map.slot_ids[2] = 3U;
+    result = mesh_membership_reduce(&participant, &event);
+    assert(result.action == MESH_MEMBERSHIP_ACTION_APPLY_SLOT_MAP);
+    assert(result.next.slot_index == 0 && result.next.peer_count == 1U);
+    event.data.slot_map.slot_ids[2] = 0U;
+    assert(mesh_membership_reduce(&participant, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
+    event = valid_slot_map();
+    event.sender_id = 3U;
+    event.data.slot_map.slot_ids[0] = 5U;
+    event.data.slot_map.slot_ids[2] = 1U;
+    event.data.slot_map.slot_ids[1] = 5U;
+    assert(mesh_membership_reduce(&participant, &event).action == MESH_MEMBERSHIP_ACTION_IGNORE);
+
+    event = valid_slot_map();
+    event.data.slot_map.slot_ids[1] = 0U;
+    event.data.slot_map.slot_ids[2] = 3U;
+    mesh_membership_snapshot_t sparse_participant = snapshot(MESH_STATE_ACTIVE,
+                                                               MESH_ROLE_PARTICIPANT);
+    result = mesh_membership_reduce(&sparse_participant, &event);
+    assert(result.action == MESH_MEMBERSHIP_ACTION_APPLY_SLOT_MAP);
+    assert(result.next.slot_index == 2 && result.next.peer_count == 1U);
 }
 
 static mesh_membership_event_t leave_event(mesh_membership_leave_identity_t identity,

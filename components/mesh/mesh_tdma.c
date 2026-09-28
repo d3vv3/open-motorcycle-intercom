@@ -11,11 +11,9 @@
 
 bool owns_control_window(uint32_t frame_counter)
 {
-    /* Slot ownership rotates by frame. Every sync frame is reserved for the
-     * coordinator in slot 0 so participants never contend with timing sync. */
-    uint8_t owner_slot = (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0
-                             ? 0
-                             : (uint8_t)(frame_counter % MESH_VOICE_SLOTS);
+    if ((frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0)
+        return s_role == MESH_ROLE_COORDINATOR;
+    uint8_t owner_slot = (uint8_t)(frame_counter % MESH_VOICE_SLOTS);
     return s_slot_index == (int8_t)owner_slot;
 }
 
@@ -74,6 +72,8 @@ void service_frame_boundary(const frame_event_t *event)
     uint32_t frame_counter = s_frame_counter;
     s_frame_start_us = frame_start_us;
     taskEXIT_CRITICAL(&s_tdma_mux);
+
+    mesh_adaptive_frame_tick(frame_counter, (uint32_t)(esp_timer_get_time() / 1000));
 
     if (owns_control_window(frame_counter)) {
         taskENTER_CRITICAL(&s_tdma_mux);
@@ -216,12 +216,17 @@ void service_control_window(void)
     }
     bool sync_due =
         s_role == MESH_ROLE_COORDINATOR && (frame_counter % MESH_SYNC_INTERVAL_FRAMES) == 0;
+    bool candidate_grace_sync = s_role == MESH_ROLE_COORDINATOR &&
+        s_mesh.adaptive.transition_done && s_mesh.adaptive.local_id == s_mesh.adaptive.leader_id &&
+        (int32_t)((uint32_t)(esp_timer_get_time() / 1000) -
+                  s_mesh.adaptive.recovery_deadline_ms) <= 0 &&
+        ((frame_counter / MESH_VOICE_SLOTS) % 2U) == 0;
 
     if (!wait_for_tx_idle(0)) {
         int64_t remaining_us = control_deadline_us - esp_timer_get_time();
         TickType_t wait_ticks = remaining_us > 0 ? pdMS_TO_TICKS((remaining_us + 999) / 1000) : 0;
         if (!wait_for_tx_idle(wait_ticks) || esp_timer_get_time() > control_deadline_us) {
-            if (sync_due) {
+            if (sync_due || candidate_grace_sync) {
                 STATS_INC(control_queue_drops);
             }
             return;
@@ -236,7 +241,7 @@ void service_control_window(void)
         return;
     }
 
-    if (sync_due) {
+    if (sync_due || candidate_grace_sync) {
         if (send_sync() != ESP_OK) {
             STATS_INC(control_queue_drops);
         }
@@ -245,6 +250,25 @@ void service_control_window(void)
 
     control_tx_item_t item;
     if (wait_for_tx_idle(0) && dequeue_control_packet(&item)) {
+        const mesh_header_t *header = (const mesh_header_t *)item.data;
+        if (header->flags & MESH_FLAG_RELAYED) {
+            if (item.type == MESH_PKT_SYNC_V3) {
+                mesh_sync_v3_payload_t sync;
+                memcpy(&sync, item.data + sizeof(mesh_header_t), sizeof(sync));
+                if (sync.term != s_mesh.adaptive.term ||
+                    sync.leader_id != s_mesh.adaptive.leader_id) {
+                    STATS_INC(control_queue_drops);
+                    return;
+                }
+            }
+            int64_t max_age_us = item.type == MESH_PKT_SYNC_V3 ?
+                MESH_ADAPTIVE_SYNC_MAX_AGE_MS * 1000LL :
+                item.priority >= CONTROL_PRIORITY_LIFECYCLE ? 2400000LL : 1000000LL;
+            if (esp_timer_get_time() - item.enqueued_us > max_age_us) {
+                STATS_INC(control_queue_drops);
+                return;
+            }
+        }
         const mesh_status_payload_t *status = NULL;
         uint8_t heard_bitmap = 0;
         uint8_t relay_bitmap = 0;
@@ -261,7 +285,8 @@ void service_control_window(void)
             .type = item.type,
             .heard_bitmap = heard_bitmap,
             .relay_bitmap = relay_bitmap,
-            .sequence = &s_control_tx_seq,
+            .sequence = ((mesh_header_t *)item.data)->flags & MESH_FLAG_RELAYED ? NULL :
+                        &s_control_tx_seq,
             .audio_origin = false,
         });
         if (ret != ESP_OK) {

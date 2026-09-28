@@ -75,7 +75,8 @@ audio_packet_store_push(audio_packet_store_t *store, const audio_packet_t *packe
 {
     size_t slot;
 
-    if (store == NULL || packet == NULL || !audio_packet_mode_valid(packet->mode)) {
+    if (store == NULL || packet == NULL || !audio_packet_mode_valid(packet->mode) ||
+        packet->hop_count > 1u) {
         return AUDIO_PACKET_STORE_PUSH_INVALID_ARGUMENT;
     }
     if (packet->length == 0u || packet->length > AUDIO_PACKET_MAX_SIZE) {
@@ -151,7 +152,12 @@ audio_packet_store_push(audio_packet_store_t *store, const audio_packet_t *packe
     if (!store->mode_set) {
         store->mode = packet->mode;
         store->mode_set = true;
-        store->prefill_deadline_ms = now_ms + AUDIO_PACKET_STORE_PREFILL_MS;
+        /* Policy is latched per source at startup/rebuffer. A path change only changes
+         * packet metadata; it must not flush decode state or restart prefill. These
+         * bounds start at RX admission, not at the unavailable capture timestamp. */
+        store->policy_hop_count = packet->hop_count;
+        store->prefill_deadline_ms = now_ms + (packet->hop_count != 0u
+            ? AUDIO_PACKET_STORE_RELAY_PREFILL_MS : AUDIO_PACKET_STORE_DIRECT_PREFILL_MS);
     }
     ++store->depth;
     return AUDIO_PACKET_STORE_PUSH_OK;
@@ -221,7 +227,9 @@ audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *sto
         return AUDIO_PACKET_STORE_POP_NOT_DUE;
     }
     if (!store->playout_started) {
-        if (store->depth < AUDIO_PACKET_STORE_PREFILL_PACKETS &&
+        size_t prefill_packets = store->policy_hop_count != 0u
+            ? AUDIO_PACKET_STORE_RELAY_PREFILL_PACKETS : AUDIO_PACKET_STORE_DIRECT_PREFILL_PACKETS;
+        if (store->depth < prefill_packets &&
             now_ms < store->prefill_deadline_ms) {
             return AUDIO_PACKET_STORE_POP_NOT_DUE;
         }
@@ -236,7 +244,9 @@ audio_packet_store_pop_result_t audio_packet_store_pop(audio_packet_store_t *sto
         packet_ready =
             store->occupied[slot] && store->packets[slot].sequence == store->expected_sequence;
     }
-    if (!packet_ready && now_ms < store->next_deadline_ms + AUDIO_PACKET_STORE_LATE_GRACE_MS) {
+    uint64_t late_grace_ms = store->policy_hop_count != 0u
+        ? AUDIO_PACKET_STORE_RELAY_LATE_GRACE_MS : AUDIO_PACKET_STORE_DIRECT_LATE_GRACE_MS;
+    if (!packet_ready && now_ms < store->next_deadline_ms + late_grace_ms) {
         return AUDIO_PACKET_STORE_POP_NOT_DUE;
     }
 

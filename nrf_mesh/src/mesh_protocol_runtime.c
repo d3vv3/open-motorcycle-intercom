@@ -108,16 +108,14 @@ static void status_work_handler(struct k_work *work)
 
     /* Reap silent peers once per status tick (1 Hz). */
     mesh_protocol_membership_check_peer_timeouts();
+    mesh_protocol_adaptive_report_tick();
 
-    /* Send mesh status and keepalive over RF */
+    /* Topology is the periodic RF presence report; legacy status packets would
+     * consume the same bounded control windows needed by forwarded JOIN/ACK. */
     if (s_role == MESH_ROLE_COORDINATOR) {
         mesh_protocol_audio_update_speaker_grants();
     }
-    int status_ret = mesh_protocol_tx_send_status_packet(C);
-    mesh_protocol_tx_send_keepalive(C);
-    if (status_ret == 0) {
-        mesh_protocol_audio_clear_heard_relay_bitmaps();
-    }
+    mesh_protocol_audio_clear_heard_relay_bitmaps();
 
     /* Log packet stats */
     esb_radio_timing_stats_t esb_stats = {0};
@@ -192,7 +190,8 @@ static void status_work_handler(struct k_work *work)
             "correction_apply=%u correction_applied_us=%lld correction_pending_us=%d "
             "last_correction_us=%d commanded_period_us=%u measured_interval_us=%u "
             "callback_jitter_us=%d callback_jitter_max_us=%u skipped_frames=%u sync_acquire=%u "
-            "sync_reacquire=%u sync_history_miss=%u sync_frame_diff=%d sync_phase_us=%d\n",
+             "sync_reacquire=%u sync_history_miss=%u sync_frame_diff=%d sync_phase_us=%d "
+             "remote_rate_ppm=%d remote_rate_valid=%u\n",
             s_node_id, tdma_stats.slot_due, tdma_stats.slot_submit_drop, tdma_stats.slot_late_drop,
             tdma_stats.control_due, tdma_stats.control_submit_drop, tdma_stats.control_late_drop,
             tdma_stats.discipline_due, tdma_stats.discipline_submit_drop,
@@ -204,7 +203,8 @@ static void status_work_handler(struct k_work *work)
             tdma_stats.callback_jitter_max_us, tdma_stats.skipped_frame_count,
             tdma_stats.sync_acquire_count, tdma_stats.sync_reacquire_count,
             tdma_stats.sync_history_miss_count, tdma_stats.sync_frame_diff,
-            tdma_stats.sync_phase_correction_us);
+             tdma_stats.sync_phase_correction_us, tdma_stats.remote_rate_ppm,
+             (unsigned)tdma_stats.remote_rate_valid);
         printk("PIPE v=1 dev=nrf stage=rf node=%u tx_ok=%u tx_timeout=%u tx_busy=%u "
                "tx_write_drop=%u tx_event_fail=%u rx_no_callback=%u rx_flush_drop=%u "
                "rx_restart_drop=%u tx_wait_max_us=%u rx_pause_max_us=%u\n",
@@ -302,8 +302,10 @@ int mesh_protocol_init(void)
 
     /* Get local address */
     esb_radio_get_address(s_local_addr);
+    mesh_protocol_adaptive_reset();
 
     s_state = MESH_STATE_IDLE;
+    mesh_protocol_adaptive_reset();
     mesh_protocol_audio_reset_all_rf_e2e_trackers();
     mesh_protocol_audio_set_ingress_enabled(false, false);
     return 0;
@@ -377,6 +379,7 @@ void mesh_protocol_stop(void)
     s_skip_count = 0;
 
     s_role = MESH_ROLE_NONE;
+    mesh_protocol_adaptive_reset();
     s_node_id = 0;
     s_slot_index = -1;
     s_coordinator_id = 0;

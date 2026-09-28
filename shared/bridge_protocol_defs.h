@@ -6,7 +6,7 @@
 
 #include "mesh_protocol_defs.h"
 
-#define BRIDGE_PROTOCOL_VERSION    4
+#define BRIDGE_PROTOCOL_VERSION    5
 #define BRIDGE_PROTOCOL_VERSION_V3 3
 #define BRIDGE_PROTOCOL_VERSION_V2 2
 #define BRIDGE_STATUS_V2_MARKER    0xA5

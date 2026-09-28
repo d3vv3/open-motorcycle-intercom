@@ -7,10 +7,13 @@
 
 #define AUDIO_PACKET_STORE_CAPACITY            16u
 #define AUDIO_PACKET_MAX_SIZE                  64u
-#define AUDIO_PACKET_STORE_PREFILL_PACKETS     3u
-#define AUDIO_PACKET_STORE_PREFILL_MS          60u
+#define AUDIO_PACKET_STORE_DIRECT_PREFILL_PACKETS 2u
+#define AUDIO_PACKET_STORE_DIRECT_PREFILL_MS      40u
+#define AUDIO_PACKET_STORE_RELAY_PREFILL_PACKETS  3u
+#define AUDIO_PACKET_STORE_RELAY_PREFILL_MS       60u
 #define AUDIO_PACKET_STORE_FRAME_MS            20u
-#define AUDIO_PACKET_STORE_LATE_GRACE_MS       40u
+#define AUDIO_PACKET_STORE_DIRECT_LATE_GRACE_MS 20u
+#define AUDIO_PACKET_STORE_RELAY_LATE_GRACE_MS  40u
 #define AUDIO_PACKET_STORE_EMPTY_MISSING_LIMIT 5u
 
 _Static_assert(AUDIO_PACKET_STORE_CAPACITY < UINT16_C(0x8000),
@@ -28,6 +31,7 @@ typedef struct {
     audio_packet_mode_t mode;
     bool active;
     uint64_t received_us;
+    uint8_t hop_count; /* 0 direct (including zero-initialized callers), 1 relayed */
 } audio_packet_t;
 
 typedef enum {
@@ -63,6 +67,7 @@ typedef struct {
     bool playout_started;
     bool dtx_idle;
     bool sequence_uncertain;
+    uint8_t policy_hop_count;
     uint64_t prefill_deadline_ms;
     uint64_t next_deadline_ms;
 } audio_packet_store_t;

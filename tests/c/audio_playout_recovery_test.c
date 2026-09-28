@@ -34,6 +34,7 @@ static audio_packet_t make_packet(uint16_t sequence, bool active)
     packet.sequence = sequence;
     packet.mode = AUDIO_PACKET_MODE_SEQUENCED;
     packet.active = active;
+    packet.hop_count = 1u; /* Preserve relay recovery timing in these legacy cases. */
     return packet;
 }
 
@@ -120,7 +121,7 @@ static void push_redundant_bundle_oldest_first(audio_packet_store_t *store)
         .current_seq = BUNDLE_SEQUENCE,
         .stream_id = 1u,
         .codec = MESH_AUDIO_V2_CODEC_LC3,
-        .flags = AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
+        .flags = AUDIO_BUNDLE_FLAG_RELAYED | AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
                  AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE |
                  AUDIO_BUNDLE_FLAG_PREVIOUS2_PRESENT |
                  AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE,
@@ -141,10 +142,14 @@ static void push_redundant_bundle_oldest_first(audio_packet_store_t *store)
     packets[2] = make_packet(parsed.current_seq,
                              (parsed.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE) != 0u);
     memcpy(packets[2].data, parsed.current_data, MESH_LC3_FRAME_BYTES);
+    for (index = 0u; index < 3u; ++index) {
+        packets[index].hop_count = (parsed.flags & AUDIO_BUNDLE_FLAG_RELAYED) != 0u ? 1u : 0u;
+    }
 
     for (index = 0u; index < 3u; ++index) {
         assert(packets[index].sequence == FIRST_LOST_SEQUENCE + index);
         assert(packets[index].active == (index != 0u));
+        assert(packets[index].hop_count == 1u);
         assert(audio_packet_store_push(store, &packets[index], BUNDLE_ARRIVAL_MS) ==
                AUDIO_PACKET_STORE_PUSH_OK);
         assert(audio_packet_store_depth(store) == index + 1u);
@@ -181,6 +186,7 @@ static void test_redundant_bundle_recovers_two_losses(void)
         assert(result == AUDIO_PACKET_STORE_POP_PACKET);
         assert(packet.sequence == FIRST_LOST_SEQUENCE + index);
         assert(packet.active == (index != 0u));
+        assert(packet.hop_count == 1u);
         decode_and_push(&resampler, &packet);
     }
     assert(missing_count == 0u);

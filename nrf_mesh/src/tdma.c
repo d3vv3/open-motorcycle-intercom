@@ -13,6 +13,7 @@
 #include <zephyr/sys/util.h>
 
 #include "mesh_protocol.h"
+#include "tdma_remote_rate.h"
 #include "ws_sync.h"
 
 LOG_MODULE_REGISTER(tdma, LOG_LEVEL_INF);
@@ -32,6 +33,8 @@ LOG_MODULE_REGISTER(tdma, LOG_LEVEL_INF);
 #define SYNC_REACQUIRE_FRAME_THRESHOLD    4
 #define SYNC_REACQUIRE_PHASE_THRESHOLD_US MESH_GUARD_US
 #define FRAME_HISTORY_SIZE                16
+
+_Static_assert(TDMA_REMOTE_RATE_FRAME_US == FRAME_US, "remote rate frame must match TDMA");
 
 /* ============================================================================
  * Static Variables
@@ -70,8 +73,24 @@ static uint32_t s_control_frame = 0;
 static int64_t s_control_start_us = 0;
 static int64_t s_control_deadline_us = 0;
 static tdma_stats_t s_stats;
+static tdma_remote_rate_t s_remote_rate;
 static uint32_t s_discipline_frame = 0;
 static uint32_t s_discipline_edge_count = 0;
+static uint32_t s_reacquire_diag_last_ms;
+static uint32_t s_reacquire_diag_count;
+
+static void log_reacquire_decision(const char *reason, uint32_t incoming, uint32_t local,
+                                   int32_t frame_diff, int64_t raw_phase_us, bool phase_known,
+                                   uint32_t commanded_us, uint32_t measured_us)
+{
+    uint32_t now = k_uptime_get_32();
+    if (s_reacquire_diag_count++ >= 3U &&
+        (uint32_t)(now - s_reacquire_diag_last_ms) < 1000U) return;
+    s_reacquire_diag_last_ms = now;
+    LOG_WRN("SYNC reacquire reason=%s incoming=%u local=%u delta=%d raw_phase_us=%lld "
+            "phase_known=%u commanded_us=%u measured_us=%u", reason, incoming, local,
+            frame_diff, (long long)raw_phase_us, phase_known, commanded_us, measured_us);
+}
 
 struct frame_boundary {
     uint32_t frame_counter;
@@ -421,8 +440,7 @@ static void acquire_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t fram
     k_timer_start(&s_frame_timer, K_USEC(next_deadline_us - now_us), K_NO_WAIT);
     k_spin_unlock(&s_tdma_lock, key);
 
-    LOG_INF("SYNC %s: frame=%u drift=%d ppm", reacquire ? "reacquired" : "acquired", frame_counter,
-            drift_ppm);
+    if (!reacquire) LOG_INF("SYNC acquired: frame=%u drift=%d ppm", frame_counter, drift_ppm);
 }
 
 /* ============================================================================
@@ -455,6 +473,11 @@ int tdma_start(int8_t slot_index, bool synchronized)
     }
 
     s_slot_index = slot_index;
+    tdma_remote_rate_reset(&s_remote_rate);
+    s_stats.remote_rate_ppm = 0;
+    s_stats.remote_rate_valid = false;
+    s_reacquire_diag_count = 0;
+    s_reacquire_diag_last_ms = 0;
     s_frame_counter = 0;
     s_frame_start_us = k_ticks_to_us_floor64(k_uptime_ticks());
     frame_history_invalidate_locked();
@@ -492,6 +515,9 @@ void tdma_stop(void)
     }
 
     s_running = false;
+    tdma_remote_rate_reset(&s_remote_rate);
+    s_stats.remote_rate_ppm = 0;
+    s_stats.remote_rate_valid = false;
     s_synchronized = false;
     s_local_clock_source = false;
     s_timer_quiesced = true;
@@ -543,6 +569,35 @@ uint32_t tdma_get_frame_counter(void)
     uint32_t frame_counter = s_frame_counter;
     k_spin_unlock(&s_tdma_lock, key);
     return frame_counter;
+}
+
+bool tdma_clock_snapshot(uint32_t *frame, uint16_t *phase_us)
+{
+    int64_t now = k_ticks_to_us_floor64(k_uptime_ticks());
+    k_spinlock_key_t key = k_spin_lock(&s_tdma_lock);
+    bool valid = s_running && s_synchronized;
+    int64_t elapsed = now - s_frame_start_us;
+    if (valid && elapsed >= 0 && elapsed < FRAME_US) {
+        *frame = s_frame_counter;
+        *phase_us = (uint16_t)elapsed;
+    } else {
+        valid = false;
+    }
+    k_spin_unlock(&s_tdma_lock, key);
+    return valid;
+}
+
+void tdma_set_clock_source(bool local)
+{
+    k_spinlock_key_t key = k_spin_lock(&s_tdma_lock);
+    /* Also called for participant-to-participant handover to a new leader. */
+    tdma_remote_rate_reset(&s_remote_rate);
+    s_stats.remote_rate_ppm = 0;
+    s_stats.remote_rate_valid = false;
+    set_rate_correction_locked(0);
+    s_rate_residual = 0;
+    s_local_clock_source = local;
+    k_spin_unlock(&s_tdma_lock, key);
 }
 
 int32_t tdma_get_time_to_slot_us(void)
@@ -607,9 +662,16 @@ void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us
         return;
     }
 
+    if (!s_local_clock_source) {
+        (void)tdma_remote_rate_observe(&s_remote_rate, frame_counter, frame_start_us);
+    }
+    s_stats.remote_rate_ppm = s_remote_rate.ppm;
+    s_stats.remote_rate_valid = s_remote_rate.valid;
+    int16_t rate_ppm = s_remote_rate.valid ? s_remote_rate.ppm : drift_ppm;
+
     if (!s_synchronized) {
         k_spin_unlock(&s_tdma_lock, key);
-        acquire_sync(frame_counter, drift_ppm, frame_start_us, false);
+        acquire_sync(frame_counter, rate_ppm, frame_start_us, false);
         return;
     }
 
@@ -618,8 +680,16 @@ void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us
     s_stats.sync_frame_diff = frame_diff;
     if (frame_diff > SYNC_REACQUIRE_FRAME_THRESHOLD ||
         frame_diff < -SYNC_REACQUIRE_FRAME_THRESHOLD) {
+        int64_t local_start_us = 0;
+        bool phase_known = frame_history_lookup_locked(frame_counter, &local_start_us);
+        int64_t raw_phase_us = phase_known ? frame_start_us - local_start_us : 0;
+        uint32_t local = s_frame_counter;
+        uint32_t commanded = s_stats.commanded_period_us;
+        uint32_t measured = s_stats.measured_interval_us;
         k_spin_unlock(&s_tdma_lock, key);
-        acquire_sync(frame_counter, drift_ppm, frame_start_us, true);
+        log_reacquire_decision("frame", frame_counter, local, frame_diff, raw_phase_us, phase_known,
+                               commanded, measured);
+        acquire_sync(frame_counter, rate_ppm, frame_start_us, true);
         return;
     }
 
@@ -632,18 +702,24 @@ void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us
         return;
     }
 
-    int32_t phase_error_us = (int32_t)CLAMP(frame_start_us - local_frame_start_us,
+    int64_t raw_phase_us = frame_start_us - local_frame_start_us;
+    int32_t phase_error_us = (int32_t)CLAMP(raw_phase_us,
                                             -MAX_PENDING_CORRECTION_US, MAX_PENDING_CORRECTION_US);
     s_stats.sync_phase_correction_us = phase_error_us;
     if (phase_error_us > SYNC_REACQUIRE_PHASE_THRESHOLD_US ||
         phase_error_us < -SYNC_REACQUIRE_PHASE_THRESHOLD_US) {
+        uint32_t local = s_frame_counter;
+        uint32_t commanded = s_stats.commanded_period_us;
+        uint32_t measured = s_stats.measured_interval_us;
         k_spin_unlock(&s_tdma_lock, key);
-        acquire_sync(frame_counter, drift_ppm, frame_start_us, true);
+        log_reacquire_decision("phase", frame_counter, local, frame_diff, raw_phase_us, true,
+                               commanded, measured);
+        acquire_sync(frame_counter, rate_ppm, frame_start_us, true);
         return;
     }
 
     s_pending_correction_us = phase_error_us;
     s_stats.correction_pending_us = s_pending_correction_us;
-    set_rate_correction_locked(drift_ppm);
+    set_rate_correction_locked(rate_ppm);
     k_spin_unlock(&s_tdma_lock, key);
 }

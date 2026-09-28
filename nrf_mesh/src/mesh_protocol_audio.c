@@ -91,6 +91,9 @@ static struct k_work s_audio_ingress_work;
 #define s_e2e_rf_rx_gap_fr             s_context.e2e_rf_rx_gap_fr
 #define s_e2e_rf_rx_reset_evt          s_context.e2e_rf_rx_reset_evt
 #define s_e2e_spi_out_frames           s_context.e2e_spi_out_frames
+#define AUDIO_CURRENT_ONLY_AIRTIME_US  (ESB_NORMAL_RAMP_US + \
+    (ESB_2MBPS_OVERHEAD_BYTES + sizeof(mesh_header_t) + MESH_AUDIO_V2_FIXED_HEADER_SIZE + \
+     MESH_LC3_FRAME_BYTES) * ESB_2MBPS_US_PER_BYTE + AUDIO_TX_MARGIN_US)
 
 static void audio_ingress_work_handler(struct k_work *work);
 static void drain_audio_ingress(void);
@@ -172,7 +175,6 @@ static bool relay_permitted_for_source(uint8_t src_id, uint8_t flags);
 static void note_audio_activity(uint8_t src_id, uint8_t audio_flags);
 static bool is_speaker_granted(uint8_t node_id);
 void mesh_protocol_audio_update_speaker_grants(void);
-static uint8_t compute_relay_mask(uint8_t speaker_id);
 void mesh_protocol_audio_apply_speaker_grant(const mesh_speaker_grant_payload_t *grant);
 static void clear_speaker_grants(void);
 static int send_speaker_grant(void);
@@ -242,20 +244,6 @@ static void note_audio_activity(uint8_t src_id, uint8_t audio_flags)
     s_active_speaker_deadline_ms[src_id] = now + ACTIVE_SPEAKER_TIMEOUT_MS;
 }
 
-static uint8_t compute_relay_mask(uint8_t speaker_id)
-{
-    mesh_core_peer_snapshot_t peers[MESH_MAX_NODES];
-
-    for (int i = 0; i < MESH_MAX_NODES; i++) {
-        peers[i] = (mesh_core_peer_snapshot_t){
-            .node_id = s_peers[i].node_id,
-            .heard_bitmap = s_peers[i].heard_bitmap,
-            .active = s_peers[i].active,
-        };
-    }
-    return mesh_core_relay_mask(speaker_id, s_node_id, s_heard_bitmap, peers, MESH_MAX_NODES);
-}
-
 void mesh_protocol_audio_apply_speaker_grant(const mesh_speaker_grant_payload_t *grant)
 {
     clear_speaker_grants();
@@ -289,7 +277,8 @@ void mesh_protocol_audio_update_speaker_grants(void)
 
     int64_t active_since[MESH_MAX_NODES + 1] = {0};
     for (uint8_t node_id = 1; node_id <= MESH_MAX_NODES; node_id++) {
-        if (s_active_speaker_deadline_ms[node_id] > now) {
+        if (s_active_speaker_deadline_ms[node_id] > now ||
+            mesh_adaptive_speaker_request_active(&s_context.adaptive, node_id, (uint32_t)now)) {
             active_since[node_id] =
                 s_speaker_active_since_ms[node_id] > 0 ? s_speaker_active_since_ms[node_id] : 1;
         }
@@ -297,7 +286,16 @@ void mesh_protocol_audio_update_speaker_grants(void)
     idx =
         (int)mesh_core_select_speakers(previous, MESH_MAX_ACTIVE_SPEAKERS, active_since, selected);
     for (int i = 0; i < idx; i++) {
-        relay_masks[i] = compute_relay_mask(selected[i]);
+        uint8_t mask = 0;
+        int route = mesh_adaptive_route(&s_context.adaptive, selected[i], (uint32_t)now, &mask);
+        if (route >= 0) {
+            relay_masks[i] = mask;
+        } else if (s_context.grant_hold_until_ms != 0 &&
+                   (int32_t)(s_context.grant_hold_until_ms - (uint32_t)now) > 0) {
+            /* Preserve a committed grant while the new-term graph repopulates. */
+            for (int j = 0; j < MESH_MAX_ACTIVE_SPEAKERS; j++)
+                if (previous[j] == selected[i]) relay_masks[i] = s_relay_masks[j];
+        }
     }
 
     for (int i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
@@ -329,7 +327,21 @@ void mesh_protocol_audio_update_speaker_grants(void)
     }
 }
 
-static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, uint8_t flags)
+void mesh_protocol_audio_expire_speakers(uint32_t now_ms)
+{
+    if (s_role != MESH_ROLE_COORDINATOR) return;
+    for (uint8_t i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
+        uint8_t id = s_active_speaker_ids[i];
+        if (id && s_active_speaker_deadline_ms[id] <= now_ms &&
+            !mesh_adaptive_speaker_request_active(&s_context.adaptive, id, now_ms)) {
+            mesh_protocol_audio_update_speaker_grants();
+            return;
+        }
+    }
+}
+
+static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, uint8_t flags,
+                                 uint32_t received_ms)
 {
     if (ttl == 0 || len < sizeof(mesh_header_t) || len > MESH_PACKET_OUTER_MAX ||
         data[1] != MESH_PKT_AUDIO_V2) {
@@ -345,6 +357,7 @@ static bool enqueue_relay_packet(const uint8_t *data, uint8_t len, uint8_t ttl, 
     struct relay_entry *entry = &s_relay_ring[s_relay_head];
     memcpy(entry->data, data, len);
     entry->len = len;
+    entry->queued_ms = received_ms;
 
     mesh_header_t *hdr = (mesh_header_t *)entry->data;
     hdr->ttl = ttl;
@@ -433,7 +446,8 @@ void mesh_protocol_audio_apply_speaker_release(const mesh_speaker_release_payloa
     }
 }
 
-bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi)
+bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi,
+                                           int64_t received_us)
 {
     const mesh_header_t *hdr = (const mesh_header_t *)data;
     const uint8_t *payload = data + sizeof(mesh_header_t);
@@ -454,6 +468,12 @@ bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int
             s_stat_rf_rx_malformed++;
             return true;
         }
+        if (!(s_context.adaptive.members & mesh_core_node_bit(hdr->src_id)) ||
+            !mesh_adaptive_identity_valid(&s_context.adaptive.nodes[hdr->src_id - 1].identity) ||
+            ((hdr->flags & MESH_FLAG_RELAYED) ? hdr->ttl != 1 : hdr->ttl != 2)) {
+            s_stat_rf_rx_malformed++;
+            return true;
+        }
         if (hdr->src_id == s_node_id) {
             s_stat_rf_rx_self_drop++;
             return true;
@@ -469,24 +489,34 @@ bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int
         }
         s_stat_bundle_rx++;
         s_stat_bundle_max_bytes = MAX(s_stat_bundle_max_bytes, hdr->payload_len);
-        mesh_protocol_update_peer_last_seen(hdr->src_id, rssi);
+        if ((hdr->flags & MESH_FLAG_RELAYED) == 0)
+            mesh_protocol_update_peer_last_seen(hdr->src_id, rssi);
+        else
+            mesh_protocol_note_peer_presence(hdr->src_id);
         note_audio_activity(hdr->src_id, bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE);
         if (s_role == MESH_ROLE_COORDINATOR)
             mesh_protocol_audio_update_speaker_grants();
         track_rf_e2e_sequence(hdr->src_id, bundle.current_seq);
         s_stat_rf_rx_audio_ok++;
-        if (uart_bridge_send_audio_v2(hdr->src_id, payload, (uint8_t)hdr->payload_len) == 0) {
+        uint8_t delivery[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
+        memcpy(delivery, payload, hdr->payload_len);
+        delivery[3] = (uint8_t)((delivery[3] & ~MESH_AUDIO_V2_FLAG_RELAYED) |
+                                ((hdr->flags & MESH_FLAG_RELAYED) ? MESH_AUDIO_V2_FLAG_RELAYED : 0));
+        if (uart_bridge_send_audio_v2(hdr->src_id, delivery, (uint8_t)hdr->payload_len) == 0) {
             s_stat_audio_fwd++;
             s_e2e_spi_out_frames++;
             s_stat_spi_out_ok++;
         } else
             s_stat_spi_out_drop++;
     }
-    if (hdr->ttl > 0 && (hdr->flags & MESH_FLAG_RELAY_REQUEST) != 0 &&
-        relay_permitted_for_source(hdr->src_id, hdr->flags)) {
+    if (hdr->ttl == 2 && !(hdr->flags & MESH_FLAG_RELAYED) &&
+        (hdr->flags & MESH_FLAG_RELAY_REQUEST) != 0 &&
+        relay_permitted_for_source(hdr->src_id, hdr->flags) &&
+        (uint32_t)(k_uptime_get_32() - (uint32_t)(received_us / 1000)) <= MESH_FRAME_MS) {
         (void)enqueue_relay_packet(data, (uint8_t)(sizeof(mesh_header_t) + hdr->payload_len),
-                                   (uint8_t)(hdr->ttl - 1),
-                                   (uint8_t)(hdr->flags | MESH_FLAG_RELAYED));
+                                    (uint8_t)(hdr->ttl - 1),
+                                    (uint8_t)(hdr->flags | MESH_FLAG_RELAYED),
+                                    (uint32_t)(received_us / 1000));
     }
     return true;
 }
@@ -553,7 +583,7 @@ static bool deferred_tail_has_proven_successor(void)
 }
 
 static int transmit_relay_audio_v2(uint8_t *packet, uint8_t *packet_len, bool *prev1_forwarded,
-                                   bool *prev2_forwarded)
+                                   bool *prev2_forwarded, uint32_t reserve_us)
 {
     mesh_header_t *hdr = (mesh_header_t *)packet;
 
@@ -573,6 +603,8 @@ static int transmit_relay_audio_v2(uint8_t *packet, uint8_t *packet_len, bool *p
     *prev1_forwarded = bundle.previous1_len != 0u;
     *prev2_forwarded = bundle.previous2_len != 0u;
     uint32_t remaining_us = tdma_get_current_slot_remaining_us();
+    if (remaining_us < reserve_us + AUDIO_CURRENT_ONLY_AIRTIME_US) return -ETIME;
+    remaining_us -= reserve_us;
     bool bundle_valid = true;
 
     /* Candidate outer lengths: as-is, after stripping prev2, then prev1.
@@ -627,7 +659,7 @@ static int transmit_relay_audio_v2(uint8_t *packet, uint8_t *packet_len, bool *p
     return -EINVAL;
 }
 
-static void transmit_relay_entry(void)
+static bool transmit_relay_entry(uint32_t reserve_us)
 {
     __DMB();
     uint8_t packet[MESH_PACKET_OUTER_MAX];
@@ -640,7 +672,8 @@ static void transmit_relay_entry(void)
     if (packet_len >= sizeof(mesh_header_t) && packet_len <= sizeof(packet) &&
         queued->data[1] == MESH_PKT_AUDIO_V2) {
         memcpy(packet, queued->data, packet_len);
-        ret = transmit_relay_audio_v2(packet, &packet_len, &prev1_forwarded, &prev2_forwarded);
+        ret = transmit_relay_audio_v2(packet, &packet_len, &prev1_forwarded, &prev2_forwarded,
+                                      reserve_us);
     } else {
         s_stat_bundle_bad++;
     }
@@ -661,10 +694,12 @@ static void transmit_relay_entry(void)
     }
 
     s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
+    return ret == 0;
 }
 
 static enum local_tx_outcome transmit_local_entry(const struct tx_audio_entry *entry,
-                                                  uint8_t tx_flags, bool retain_prev1)
+                                                  uint8_t tx_flags, bool retain_prev1,
+                                                  uint32_t reserve_us)
 {
     int ret = -EINVAL;
     bool count_e2e = false;
@@ -679,12 +714,16 @@ static enum local_tx_outcome transmit_local_entry(const struct tx_audio_entry *e
         bool prev2_stripped = false;
 
         memcpy(bundle_data, entry->data, bundle_len);
+        bundle_data[3] &= (uint8_t)~MESH_AUDIO_V2_FLAG_RELAYED;
         if (!audio_bundle_parse(bundle_data, bundle_len, &bundle)) {
             s_stat_bundle_bad++;
         } else {
             prev1_forwarded = bundle.previous1_len != 0u;
             prev2_forwarded = bundle.previous2_len != 0u;
             uint32_t remaining_us = tdma_get_current_slot_remaining_us();
+            if (remaining_us < reserve_us + AUDIO_CURRENT_ONLY_AIRTIME_US)
+                return LOCAL_TX_FAILED;
+            remaining_us -= reserve_us;
             bool bundle_valid = true;
 
             /* Candidate outer lengths: as-is, after stripping prev2, then
@@ -793,6 +832,12 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
     drain_audio_ingress();
 
     uint32_t now = k_uptime_get_32();
+    while (!relay_queue_empty() &&
+           (uint32_t)(now - s_relay_ring[s_relay_tail].queued_ms) > MESH_FRAME_MS) {
+        s_stat_relay_ring_drop++;
+        s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
+    }
+
     bool has_audio_source = s_stat_spi_audio_in != 0 && (now - s_last_audio_in_time) < 120;
 
     uint8_t depth = tx_queue_depth();
@@ -800,6 +845,29 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
 
     bool local_pending = s_state == MESH_STATE_ACTIVE && s_tx_head != s_tx_tail;
     bool relay_pending = !relay_queue_empty();
+    if (local_pending && relay_pending && !s_local_deferred_pending &&
+        tdma_get_current_slot_remaining_us() >= 2U * AUDIO_CURRENT_ONLY_AIRTIME_US) {
+        uint8_t flags = MESH_FLAG_RELAY_REQUEST |
+            (is_speaker_granted(s_node_id) ? MESH_FLAG_SPEAKER_GRANTED : 0);
+        bool relay_first = s_relay_contention_turn;
+        s_relay_contention_turn = !s_relay_contention_turn;
+        if (relay_first) {
+            (void)transmit_relay_entry(AUDIO_CURRENT_ONLY_AIRTIME_US);
+            if (tdma_get_current_slot_remaining_us() >= AUDIO_CURRENT_ONLY_AIRTIME_US) {
+                enum local_tx_outcome outcome =
+                    transmit_local_entry(&s_tx_audio_ring[s_tx_tail], flags, false, 0);
+                consume_local_audio_entries(1, outcome == LOCAL_TX_SUCCESS);
+            }
+        } else {
+            enum local_tx_outcome outcome =
+                transmit_local_entry(&s_tx_audio_ring[s_tx_tail], flags, false,
+                                     AUDIO_CURRENT_ONLY_AIRTIME_US);
+            consume_local_audio_entries(1, outcome == LOCAL_TX_SUCCESS);
+            if (tdma_get_current_slot_remaining_us() >= AUDIO_CURRENT_ONLY_AIRTIME_US)
+                (void)transmit_relay_entry(0);
+        }
+        return;
+    }
     uint16_t deferred_seq = 0;
     /* local_tail_is_active_v2() parses the tail entry, so keep the original
      * short-circuit: only inspect the tail once contention actually holds. */
@@ -816,7 +884,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         s_local_deferred_pending = true;
         s_local_deferred_seq = deferred_seq;
         s_relay_contention_turn = false;
-        transmit_relay_entry();
+        (void)transmit_relay_entry(0);
     } else if (local_pending) {
         bool proven_successor = deferred_tail_has_proven_successor();
         s_local_deferred_pending = false;
@@ -829,7 +897,7 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         if (proven_successor) {
             uint8_t successor_index = (uint8_t)((s_tx_tail + 1) % TX_AUDIO_RING_SIZE);
             enum local_tx_outcome successor_result =
-                transmit_local_entry(&s_tx_audio_ring[successor_index], tx_flags, true);
+                transmit_local_entry(&s_tx_audio_ring[successor_index], tx_flags, true, 0);
             if (successor_result == LOCAL_TX_SUCCESS) {
                 consume_local_audio_entries(2, true);
                 s_stat_local_deferred_recovery++;
@@ -847,13 +915,13 @@ static void slot_tx_handler(uint8_t slot_index, uint32_t frame_counter)
         }
 
         enum local_tx_outcome local_result =
-            transmit_local_entry(&s_tx_audio_ring[s_tx_tail], tx_flags, false);
+            transmit_local_entry(&s_tx_audio_ring[s_tx_tail], tx_flags, false, 0);
         if (relay_pending && !s_relay_contention_turn) {
             s_relay_contention_turn = true;
         }
         consume_local_audio_entries(1, local_result == LOCAL_TX_SUCCESS);
     } else if (relay_pending) {
-        transmit_relay_entry();
+        (void)transmit_relay_entry(0);
         s_relay_contention_turn = false;
     } else {
         /* FIXME(timing): the ESP frame clock and the TDMA slot clock are
@@ -908,6 +976,8 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
     s_stat_spi_audio_in++;
     s_last_audio_in_time = k_uptime_get_32();
     note_audio_activity(s_node_id, audio_flags);
+    if (audio_flags != 0) s_context.last_local_active_ms = k_uptime_get_32();
+    mesh_protocol_adaptive_local_voice(audio_flags != 0);
     if (s_slot_index >= 0) {
         int32_t tts_us = tdma_get_time_to_slot_us();
         if (tts_us >= 0) {

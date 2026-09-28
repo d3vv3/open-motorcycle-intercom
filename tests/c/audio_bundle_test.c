@@ -89,6 +89,25 @@ static void test_one_predecessor(void)
     assert(memcmp(parsed.current_data, current, sizeof(current)) == 0);
 }
 
+static void test_relay_flag_without_predecessors(void)
+{
+    uint8_t current[MESH_LC3_FRAME_BYTES] = {0};
+    uint8_t wire[MESH_AUDIO_V2_FIXED_HEADER_SIZE + MESH_LC3_FRAME_BYTES];
+    size_t wire_len = 0u;
+    audio_bundle_view_t parsed;
+    audio_bundle_view_t input = make_bundle(NULL, 0u, NULL, 0u, current,
+                                           sizeof(current), 3u, AUDIO_BUNDLE_FLAG_RELAYED);
+    assert(AUDIO_BUNDLE_FLAG_RELAYED == 0x20u && AUDIO_BUNDLE_FLAG_MASK == 0x3fu);
+    assert(audio_bundle_encode(&input, wire, sizeof(wire), &wire_len));
+    assert(wire_len == sizeof(wire) && wire[3] == 0x20u);
+    assert(audio_bundle_parse(wire, wire_len, &parsed));
+    assert(parsed.flags == AUDIO_BUNDLE_FLAG_RELAYED);
+    input.flags = 0x40u;
+    assert(!audio_bundle_encode(&input, wire, sizeof(wire), &wire_len));
+    wire[3] = 0x40u;
+    expect_parse_rejected(wire, sizeof(wire));
+}
+
 static void test_max_and_pointer_order(void)
 {
     uint8_t previous2[MESH_LC3_FRAME_BYTES];
@@ -113,6 +132,7 @@ static void test_max_and_pointer_order(void)
     assert(audio_bundle_parse(wire, wire_len, &parsed));
     assert(parsed.codec == MESH_AUDIO_V2_CODEC_LC3);
     assert(parsed.current_seq == 0u);
+    assert(parsed.flags == AUDIO_BUNDLE_FLAG_MASK);
     assert((uint16_t)(parsed.current_seq - 1u) == UINT16_C(65535));
     assert((uint16_t)(parsed.current_seq - 2u) == UINT16_C(65534));
     assert(parsed.previous2_data == wire + 8u);
@@ -208,7 +228,7 @@ static void test_malformed_wire(void)
     wire[1] = 10u;
     expect_parse_rejected(wire, one_len);
     wire[1] = 20u;
-    wire[3] = 0x20u;
+    wire[3] = 0x40u;
     expect_parse_rejected(wire, one_len);
     wire[3] = 0u;
     wire[6] = 0u;
@@ -309,7 +329,7 @@ static void test_encode_rejections_and_bounds(void)
     input.previous2_len = 49u;
     assert(!audio_bundle_encode(&input, wire, sizeof(wire), &wire_len));
     input.previous2_len = MESH_LC3_FRAME_BYTES;
-    input.flags = 0x20u;
+    input.flags = 0x40u;
     assert(!audio_bundle_encode(&input, wire, sizeof(wire), &wire_len));
     input.flags = AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE;
     input.previous1_len = 0u;
@@ -348,7 +368,8 @@ static void test_strip_two_to_one_to_zero(void)
     assert(parsed.codec == MESH_AUDIO_V2_CODEC_LC3 && wire[0] == parsed.codec);
     assert(parsed.flags == (AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE |
                             AUDIO_BUNDLE_FLAG_PREVIOUS1_PRESENT |
-                            AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE));
+                            AUDIO_BUNDLE_FLAG_PREVIOUS1_ACTIVE |
+                            AUDIO_BUNDLE_FLAG_RELAYED));
     assert(parsed.previous2_data == NULL && parsed.previous2_len == 0u);
     assert(memcmp(parsed.previous1_data, previous1, sizeof(previous1)) == 0);
     assert(memcmp(parsed.current_data, current, sizeof(current)) == 0);
@@ -357,7 +378,7 @@ static void test_strip_two_to_one_to_zero(void)
     assert(wire_len == 56u && wire[7] == 0u);
     assert(audio_bundle_parse(wire, wire_len, &parsed));
     assert(parsed.codec == MESH_AUDIO_V2_CODEC_LC3 && wire[0] == parsed.codec);
-    assert(parsed.flags == AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE);
+    assert(parsed.flags == (AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE | AUDIO_BUNDLE_FLAG_RELAYED));
     assert(parsed.previous1_data == NULL && parsed.previous1_len == 0u);
     assert(memcmp(parsed.current_data, current, sizeof(current)) == 0);
 
@@ -624,6 +645,7 @@ int main(void)
 {
     test_zero_predecessors();
     test_one_predecessor();
+    test_relay_flag_without_predecessors();
     test_max_and_pointer_order();
     test_boundary_active_flags();
     test_all_presence_flag_combinations();

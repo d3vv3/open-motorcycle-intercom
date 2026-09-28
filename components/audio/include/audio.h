@@ -169,6 +169,7 @@ typedef struct {
     bool active;          /**< Sender VOX active (speech) vs intentional silence/comfort frame */
     uint16_t seq;         /**< End-to-end frame sequence (valid only when has_seq) */
     bool has_seq;         /**< Transport supplied a per-frame sequence number */
+    uint8_t hop_count;    /**< Validated receive path: 0 direct, 1 relayed (default 0) */
 } audio_frame_t;
 
 /**

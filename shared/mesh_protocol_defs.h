@@ -33,7 +33,8 @@
 #define MESH_SYNC_INTERVAL_FRAMES       10   /* SYNC broadcast cadence */
 #define MESH_NODE_TIMEOUT_MS            3000 /* Drop peer after this silence */
 #define MESH_KEEPALIVE_INTERVAL_MS      500  /* KEEPALIVE cadence */
-#define MESH_PROTOCOL_VERSION           0x04
+#define MESH_PROTOCOL_VERSION           0x05
+#define MESH_CONTROL_MAX_PACKET_SIZE    209U
 #define MESH_MAX_OPUS_BYTES             64
 #define MESH_LC3_FRAME_BYTES            48
 #define MESH_E2E_SEQUENCE_BYTES         2
@@ -61,12 +62,14 @@
 
 /* Audio payload flags */
 #define MESH_AUDIO_FLAG_ACTIVE               0x01
+#define MESH_AUDIO_FLAG_RELAYED              0x02
 #define MESH_AUDIO_V2_FLAG_CURRENT_ACTIVE    0x01
 #define MESH_AUDIO_V2_FLAG_PREVIOUS1_PRESENT 0x02
 #define MESH_AUDIO_V2_FLAG_PREVIOUS1_ACTIVE  0x04
 #define MESH_AUDIO_V2_FLAG_PREVIOUS2_PRESENT 0x08
 #define MESH_AUDIO_V2_FLAG_PREVIOUS2_ACTIVE  0x10
-#define MESH_AUDIO_V2_FLAG_MASK              0x1F
+#define MESH_AUDIO_V2_FLAG_RELAYED           0x20
+#define MESH_AUDIO_V2_FLAG_MASK              0x3F
 
 /* ============================================================================
  * Enums
@@ -99,10 +102,20 @@ typedef enum {
     MESH_PKT_JOIN_V2 = 0x0B,         /* Identity-bearing JOIN (nRF/ESB) */
     MESH_PKT_JOIN_ACK_V2 = 0x0C,     /* Identity-targeted JOIN_ACK (nRF/ESB) */
     MESH_PKT_AUDIO_V2 = 0x0D,        /* Redundant LC3 audio bundle */
+    MESH_PKT_TOPOLOGY = 0x0E,
+    MESH_PKT_JOIN_V3 = 0x0F,
+    MESH_PKT_JOIN_ACK_V3 = 0x10,
+    MESH_PKT_SYNC_V3 = 0x11,
+    MESH_PKT_HANDOVER_PREPARE = 0x12,
+    MESH_PKT_HANDOVER_ACK = 0x13,
+    MESH_PKT_HANDOVER_COMMIT = 0x14,
+    MESH_PKT_HANDOVER_CANCEL = 0x15,
+    MESH_PKT_MEMBERSHIP_V3 = 0x16, /* Authoritative complete ID/identity snapshot */
+    MESH_PKT_SPEAKER_REQUEST = 0x17, /* Pre-grant activity, one relay allowed */
 } mesh_pkt_type_t;
 
 /* ============================================================================
- * Packet header (9 bytes). Version 4 peers reject older packets before parsing payloads.
+ * Packet header (9 bytes). Version 5 peers reject older packets before parsing payloads.
  * ============================================================================ */
 
 typedef struct __attribute__((packed)) {
@@ -125,9 +138,8 @@ static inline int mesh_header_accepts_channel(const mesh_header_t *header, uint8
 /* ============================================================================
  * Payload structures (wire-identical across transports)
  *
- * NOTE: mesh_sync_payload_t is intentionally NOT here - its coordinator
- * address width differs per transport (6-byte MAC vs 5-byte ESB address), so
- * each platform header defines its own.
+ * Legacy mesh_sync_payload_t remains transport-specific. SYNC_V3 below uses
+ * a padded identity so it is byte-identical on both transports.
  * ============================================================================ */
 
 typedef struct __attribute__((packed)) {
@@ -155,12 +167,88 @@ typedef struct __attribute__((packed)) {
 } mesh_keepalive_payload_t;
 
 typedef struct __attribute__((packed)) {
-    uint8_t slot_count;                                   /* Number of active slots */
+    uint8_t slot_count;                                   /* Last occupied slot + 1; holes valid */
     uint8_t slot_ids[MESH_MAX_NODES];                     /* Node ID per slot (0 = empty) */
     uint8_t active_speaker_count;                         /* Number of granted speakers */
     uint8_t active_speaker_ids[MESH_MAX_ACTIVE_SPEAKERS]; /* Granted speaker IDs */
     uint8_t relay_masks[MESH_MAX_ACTIVE_SPEAKERS];        /* Relay bitmap per speaker */
 } mesh_slot_map_payload_t;
+
+/* Version 5 control: multi-byte integers use little-endian wire order on both
+ * radios. Address bytes beyond address_len must be zero. Source ID 0 requires
+ * the JOIN origin identity; forwarded headers retain original src/seq. */
+typedef struct __attribute__((packed)) {
+    uint8_t address_len;
+    uint8_t address[6];
+} mesh_wire_identity_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t term;
+    uint32_t revision; /* per leader/term, uint32 serial ordering */
+    uint8_t leader_id;
+    mesh_slot_map_payload_t slot_map;
+    mesh_wire_identity_t identities[MESH_MAX_NODES]; /* indexed by node ID - 1 */
+} mesh_membership_v3_payload_t;
+
+typedef struct __attribute__((packed)) {
+    mesh_wire_identity_t origin;
+    uint8_t capabilities;
+    mesh_wire_identity_t target;
+} mesh_join_v3_payload_t;
+
+typedef struct __attribute__((packed)) {
+    mesh_wire_identity_t target;
+    uint8_t capabilities;
+    uint8_t assigned_id;
+    uint8_t slot_index;
+    uint8_t coordinator_id;
+    uint32_t term;
+} mesh_join_ack_v3_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t report_seq; /* independent monotonic reporting sequence */
+    mesh_wire_identity_t origin;
+    uint8_t direct_mask; /* original RF observations only */
+    int8_t rssi_dbm[MESH_MAX_NODES];
+    uint8_t quality[MESH_MAX_NODES]; /* 0..100 percent, 255 unknown */
+    uint8_t leader_id;
+    uint32_t term;
+    mesh_slot_map_payload_t slot_map;
+} mesh_topology_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t term;
+    uint32_t request_seq;
+    uint32_t frame_counter;
+    uint8_t active; /* 0 release, 1 request */
+} mesh_speaker_request_payload_t;
+
+typedef struct __attribute__((packed)) {
+    mesh_wire_identity_t leader;
+    uint8_t leader_id;
+    uint8_t member_count; /* Origin leader's joined count; relay preserves unchanged */
+    uint32_t term;
+    uint32_t frame_counter;
+    uint16_t phase_us; /* 0..19999, sampled immediately before transmission */
+    uint8_t relay_depth; /* 0 direct, 1 qualified relay */
+} mesh_sync_v3_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t old_leader_id;
+    uint8_t candidate_id;
+    uint32_t next_term;
+    uint32_t switch_frame;
+    uint8_t members;
+    mesh_slot_map_payload_t slot_map;
+} mesh_handover_payload_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t old_leader_id;
+    uint8_t candidate_id;
+    uint32_t next_term;
+    uint32_t switch_frame;
+    uint8_t acknowledger_id;
+} mesh_handover_ack_payload_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t battery_pct;     /* Battery percentage (0-100, 255=unknown) */
@@ -191,6 +279,21 @@ typedef struct __attribute__((packed)) {
 #endif
 
 MESH_STATIC_ASSERT(sizeof(mesh_header_t) == 9, "mesh_header_t wire size changed");
+MESH_STATIC_ASSERT(sizeof(mesh_wire_identity_t) == 7, "identity size");
+MESH_STATIC_ASSERT(sizeof(mesh_membership_v3_payload_t) == 79, "membership v3 size");
+MESH_STATIC_ASSERT(offsetof(mesh_membership_v3_payload_t, identities) == 23,
+                   "membership v3 identity offset");
+MESH_STATIC_ASSERT(sizeof(mesh_header_t) + sizeof(mesh_membership_v3_payload_t) <=
+                       MESH_CONTROL_MAX_PACKET_SIZE, "membership v3 packet capacity");
+MESH_STATIC_ASSERT(sizeof(mesh_join_v3_payload_t) == 15, "join size");
+MESH_STATIC_ASSERT(sizeof(mesh_join_ack_v3_payload_t) == 15, "join ack size");
+MESH_STATIC_ASSERT(sizeof(mesh_topology_payload_t) == 47, "topology size");
+MESH_STATIC_ASSERT(sizeof(mesh_speaker_request_payload_t) == 13, "speaker request size");
+MESH_STATIC_ASSERT(sizeof(mesh_sync_v3_payload_t) == 20, "sync size");
+MESH_STATIC_ASSERT(sizeof(mesh_handover_payload_t) == 25, "handover size");
+MESH_STATIC_ASSERT(sizeof(mesh_handover_ack_payload_t) == 11, "handover ack size");
+MESH_STATIC_ASSERT(sizeof(mesh_header_t) + sizeof(mesh_topology_payload_t) <=
+                       MESH_CONTROL_MAX_PACKET_SIZE, "control capacity");
 MESH_STATIC_ASSERT(offsetof(mesh_header_t, talk_channel) == 6,
                    "mesh_header_t talk_channel offset changed");
 MESH_STATIC_ASSERT(offsetof(mesh_header_t, payload_len) == 7,

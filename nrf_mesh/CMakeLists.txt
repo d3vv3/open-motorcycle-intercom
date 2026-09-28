@@ -15,12 +15,14 @@ target_sources(app PRIVATE
     src/mesh_protocol_runtime.c
     src/mesh_protocol_membership.c
     src/mesh_protocol_audio.c
+    src/mesh_protocol_adaptive.c
     src/mesh_protocol_tx.c
     src/ws_sync.c
     ../shared/audio_bundle.c
     ../shared/bridge_frame.c
     ../shared/mesh_core.c
     ../shared/mesh_membership.c
+    ../shared/mesh_adaptive.c
 )
 
 target_include_directories(app PRIVATE

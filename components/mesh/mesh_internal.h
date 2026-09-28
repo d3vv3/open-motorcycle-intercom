@@ -20,6 +20,7 @@
 
 #include "mesh.h"
 #include "mesh_core.h"
+#include "mesh_adaptive.h"
 #include "mesh_jitter_buffer.h"
 #include "mesh_tx_slot.h"
 
@@ -34,6 +35,7 @@ _Static_assert(MESH_JITTER_BUFFER_DEPTH == MESH_JITTER_CAPACITY, "jitter capacit
 #define MESH_SCAN_TIMEOUT_MS         2000
 #define MESH_JOIN_TIMEOUT_MS         5000
 #define MESH_STATUS_INTERVAL_MS      1000
+#define MESH_SPEAKER_REQUEST_INTERVAL_MS 400
 #define RELAY_RING_SIZE              16
 #define ACTIVE_SPEAKER_TIMEOUT_MS    1500
 #define CONTENTION_MIN_INTERVAL_MS   100
@@ -42,6 +44,7 @@ _Static_assert(MESH_JITTER_BUFFER_DEPTH == MESH_JITTER_CAPACITY, "jitter capacit
 #define RX_QUIESCE_TIMEOUT_MS        50
 #define TASK_QUIESCE_TIMEOUT_MS      250
 #define CONTROL_MAX_PRIORITY_WAIT_MS 500
+#define MESH_FORWARD_SYNC_INTERVAL_MS 550U
 
 #define MESH_FRAME_US             (MESH_FRAME_MS * 1000)
 #define MESH_SLOT_US              (MESH_SLOT_MS * 1000)
@@ -73,6 +76,7 @@ typedef struct {
 typedef struct {
     uint8_t data[sizeof(mesh_header_t) + sizeof(mesh_audio_payload_t)];
     uint16_t len;
+    int64_t enqueued_us;
 } relay_entry_t;
 
 typedef struct {
@@ -105,12 +109,14 @@ typedef enum {
     /* NOTE: Higher priorities are served first; overdue control packets retain FIFO order. */
     CONTROL_PRIORITY_PERIODIC = 1,
     CONTROL_PRIORITY_TOPOLOGY,
+    CONTROL_PRIORITY_REQUEST,
     CONTROL_PRIORITY_LIFECYCLE,
+    CONTROL_PRIORITY_CRITICAL,
     CONTROL_PRIORITY_SYNC,
 } control_priority_t;
 
 typedef struct {
-    uint8_t data[sizeof(mesh_header_t) + sizeof(mesh_slot_map_payload_t)];
+    uint8_t data[MESH_CONTROL_MAX_PACKET_SIZE];
     uint8_t dest_mac[6];
     uint16_t len;
     uint32_t order;
@@ -137,6 +143,39 @@ typedef struct {
     uint8_t heard_bitmap;
     uint8_t relay_bitmap;
     int64_t active_speaker_deadline_ms[MESH_MAX_NODES + 1];
+    int64_t active_speaker_since_ms[MESH_MAX_NODES + 1];
+    bool local_voice_active; /* Producer writes under speaker_mux. */
+    int64_t local_voice_deadline_ms;
+    bool local_request_announced;
+    uint32_t local_request_last_ms;
+    uint32_t local_request_seq;
+    uint32_t local_request_term;
+    uint32_t speaker_transition_grace_ms;
+    uint8_t speaker_transition_grants;
+    mesh_adaptive_t adaptive; /* Mesh task only. */
+    mesh_slot_map_payload_t slot_map;
+    uint32_t report_seq;
+    uint32_t report_wire_seq;
+    int64_t upstream_sync_us;
+    uint8_t discovery_relay_mac[6];
+    uint32_t discovery_relay_ms;
+    uint32_t discovered_term;
+    uint32_t handover_retry_ms;
+    uint32_t handover_commit_retry_ms;
+    uint32_t membership_publish_ms;
+    uint32_t forward_sync_last_tx_ms;
+    struct {
+        uint32_t seen_ms;
+        uint32_t direct_seen_ms;
+        int8_t rssi;
+        mesh_core_seq8_t seq;
+        uint32_t received, lost;
+        uint8_t pdr_quality;
+        bool pdr_seen;
+        bool report_seen;
+        uint32_t report_seq;
+        uint32_t report_ms;
+    } neighbors[MESH_MAX_NODES];
 
     peer_tracking_t peers[MESH_MAX_NODES];
     uint8_t peer_count;
@@ -191,6 +230,8 @@ typedef struct {
     relay_entry_t relay_ring[RELAY_RING_SIZE];
     uint8_t relay_head;
     uint8_t relay_tail;
+    bool relay_turn;
+    bool relay_capacity_logged;
     mesh_jitter_buffer_t jitter_buffer;
     SemaphoreHandle_t jitter_mutex;
 
@@ -222,6 +263,7 @@ extern const uint8_t s_broadcast_mac[6];
 #define s_heard_bitmap               s_mesh.heard_bitmap
 #define s_relay_bitmap               s_mesh.relay_bitmap
 #define s_active_speaker_deadline_ms s_mesh.active_speaker_deadline_ms
+#define s_active_speaker_since_ms    s_mesh.active_speaker_since_ms
 #define s_peers                      s_mesh.peers
 #define s_peer_count                 s_mesh.peer_count
 #define s_coordinator_id             s_mesh.coordinator_id
@@ -320,6 +362,25 @@ void speaker_state_set(const uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS],
 void status_bitmaps_snapshot_and_clear(uint8_t *heard, uint8_t *relayed);
 void note_audio_activity(uint8_t src_id, uint8_t audio_flags);
 uint8_t compute_relay_mask(uint8_t speaker_id);
+void mesh_adaptive_local_init(void);
+void mesh_adaptive_members_update(void);
+void mesh_send_topology(void);
+void mesh_send_membership(void);
+void mesh_request_local_speaker(uint32_t now_ms);
+void mesh_observe_direct_report(const mesh_rx_item_t *rx, const mesh_topology_payload_t *report);
+void mesh_speaker_grants_snapshot(void);
+void mesh_refresh_peer_liveness(uint8_t src_id, int64_t received_us);
+bool mesh_adaptive_bound_sender(const mesh_rx_item_t *rx);
+void mesh_adaptive_maintenance(uint32_t now_ms);
+void mesh_adaptive_frame_tick(uint32_t frame, uint32_t now_ms);
+void mesh_adaptive_apply_transition(void);
+void mesh_rejoin_after_eviction(const mesh_rx_item_t *rx,
+                                const mesh_membership_v3_payload_t *snapshot);
+bool mesh_handle_adaptive_control(const mesh_rx_item_t *rx);
+void mesh_observe_direct(const mesh_rx_item_t *rx);
+mesh_wire_identity_t mesh_local_identity(void);
+esp_err_t enqueue_forward_packet(const mesh_adaptive_forward_packet_t *packet);
+bool mesh_coalesce_forward_sync(const mesh_rx_item_t *rx);
 void send_speaker_release_for(uint8_t speaker_id);
 void update_speaker_grants(void);
 void clear_transient_mesh_state(void);

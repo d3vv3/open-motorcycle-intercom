@@ -4,6 +4,7 @@
  */
 
 #include "esb_radio.h"
+#include "esb_rssi.h"
 
 #include <esb.h>
 #include <nrfx_clock.h>
@@ -129,7 +130,8 @@ static void on_esb_event(struct esb_evt const *event)
         while (rx_count < 8 && esb_read_rx_payload(&s_rx_payload) == 0) {
             rx_count++;
             if (s_rx_callback && s_rx_payload.length > 0) {
-                s_rx_callback(s_rx_payload.data, s_rx_payload.length, NULL, s_rx_payload.rssi);
+                s_rx_callback(s_rx_payload.data, s_rx_payload.length, NULL,
+                              esb_rssi_to_dbm(s_rx_payload.rssi));
             } else if (!s_rx_callback) {
                 atomic_inc(&s_rx_no_callback_count);
             }

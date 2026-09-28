@@ -12,6 +12,7 @@ static audio_packet_t packet(uint16_t sequence, audio_packet_mode_t mode, bool a
     value.sequence = sequence;
     value.mode = mode;
     value.active = active;
+    value.hop_count = 1u; /* Existing recovery/deadline cases exercise relay bounds. */
     value.received_us = (uint64_t)sequence * 1000u + 17u;
     return value;
 }
@@ -463,6 +464,13 @@ static void test_mode_mismatch_reset_and_lengths(void)
            AUDIO_PACKET_STORE_PUSH_INVALID_LENGTH);
     assert(audio_packet_store_depth(&store) == 0u);
 
+    value.length = 2u;
+    value.hop_count = 2u;
+    assert(audio_packet_store_push(&store, &value, 0u) ==
+           AUDIO_PACKET_STORE_PUSH_INVALID_ARGUMENT);
+    assert(audio_packet_store_depth(&store) == 0u);
+    value.hop_count = 1u;
+
     value.length = AUDIO_PACKET_MAX_SIZE;
     assert(audio_packet_store_push(&store, &value, 5u) == AUDIO_PACKET_STORE_PUSH_OK);
     value = packet(2u, AUDIO_PACKET_MODE_ARRIVAL_ORDER, true);
@@ -479,6 +487,70 @@ static void test_mode_mismatch_reset_and_lengths(void)
            AUDIO_PACKET_STORE_PUSH_INVALID_ARGUMENT);
     assert(audio_packet_store_depth(NULL) == 0u);
     audio_packet_store_reset(NULL);
+}
+
+static void test_independent_path_policies(void)
+{
+    audio_packet_store_t direct, relay;
+    audio_packet_t out = {0};
+    audio_packet_t value;
+    audio_packet_store_reset(&direct);
+    audio_packet_store_reset(&relay);
+
+    value = packet(10u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    value.hop_count = 0u;
+    assert(audio_packet_store_push(&direct, &value, 100u) == AUDIO_PACKET_STORE_PUSH_OK);
+    value = packet(20u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    assert(audio_packet_store_push(&relay, &value, 100u) == AUDIO_PACKET_STORE_PUSH_OK);
+    value = packet(11u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    value.hop_count = 0u;
+    assert(audio_packet_store_push(&direct, &value, 101u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(audio_packet_store_pop(&relay, 101u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&direct, 101u, &out) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(out.sequence == 10u && out.hop_count == 0u);
+    assert(audio_packet_store_pop(&direct, 101u, &out) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(out.sequence == 11u);
+    assert(audio_packet_store_pop(&direct, 160u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&direct, 161u, &out) == AUDIO_PACKET_STORE_POP_MISSING);
+    assert(audio_packet_store_pop(&relay, 159u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&relay, 160u, &out) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(out.sequence == 20u && out.hop_count == 1u);
+    assert(audio_packet_store_pop(&relay, 219u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&relay, 220u, &out) == AUDIO_PACKET_STORE_POP_MISSING);
+
+    /* A switched path retains its sequence/decode continuity and latched grace;
+     * the other source's timing is untouched. Rebuffer/reset chooses the new policy. */
+    value = packet(13u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    value.hop_count = 1u;
+    assert(audio_packet_store_push(&direct, &value, 201u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(direct.policy_hop_count == 0u && direct.expected_sequence == 13u);
+    assert(audio_packet_store_pop(&direct, 201u, &out) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(out.hop_count == 1u);
+    assert(relay.policy_hop_count == 1u && relay.expected_sequence == 22u);
+    audio_packet_store_reset(&direct);
+    assert(audio_packet_store_push(&direct, &value, 202u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(direct.policy_hop_count == 1u && direct.prefill_deadline_ms == 262u);
+}
+
+static void test_direct_prefill_timeout_and_late_recovery(void)
+{
+    audio_packet_store_t store;
+    audio_packet_t value = packet(30u, AUDIO_PACKET_MODE_SEQUENCED, true);
+    audio_packet_t out = {0};
+    value.hop_count = 0u;
+    audio_packet_store_reset(&store);
+    assert(audio_packet_store_push(&store, &value, 0u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(audio_packet_store_pop(&store, 39u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 40u, &out) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(audio_packet_store_pop(&store, 59u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    value.sequence = 31u;
+    assert(audio_packet_store_push(&store, &value, 59u) == AUDIO_PACKET_STORE_PUSH_OK);
+    assert(audio_packet_store_pop(&store, 59u, &out) == AUDIO_PACKET_STORE_POP_PACKET);
+    assert(out.sequence == 31u);
+    assert(audio_packet_store_pop(&store, 99u, &out) == AUDIO_PACKET_STORE_POP_NOT_DUE);
+    assert(audio_packet_store_pop(&store, 100u, &out) == AUDIO_PACKET_STORE_POP_MISSING);
+    value.sequence = 32u;
+    assert(audio_packet_store_push(&store, &value, 100u) == AUDIO_PACKET_STORE_PUSH_LATE);
 }
 
 int main(void)
@@ -501,6 +573,8 @@ int main(void)
     test_lost_dtx_transition_wrap();
     test_arrival_order();
     test_mode_mismatch_reset_and_lengths();
+    test_independent_path_policies();
+    test_direct_prefill_timeout_and_late_recovery();
     puts("audio_packet_store tests passed");
     return 0;
 }

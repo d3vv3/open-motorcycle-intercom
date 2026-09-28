@@ -57,8 +57,10 @@ static void process_rx_packet(const uint8_t *data, uint8_t len, int8_t rssi, int
 
     s_stat_rx_count++;
 
+    if (mesh_protocol_adaptive_control_rx(hdr, payload, rssi, timestamp_us)) return;
+
     if ((hdr->type == MESH_PKT_AUDIO || hdr->type == MESH_PKT_AUDIO_V2) &&
-        mesh_protocol_audio_process_rx_packet(data, len, rssi)) {
+        mesh_protocol_audio_process_rx_packet(data, len, rssi, timestamp_us)) {
         return;
     }
 

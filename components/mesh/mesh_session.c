@@ -15,6 +15,7 @@ typedef struct {
     int64_t join_deadline;
     int64_t last_keepalive;
     int64_t last_status;
+    int64_t last_topology;
     int64_t last_beacon;
     int join_attempts;
     bool saw_lower_mac;
@@ -50,17 +51,40 @@ static void mesh_task_scan(mesh_task_state_t *task, int64_t now)
             return;
         }
 
-        if (rx.header.type == MESH_PKT_SYNC &&
-            rx.header.payload_len == sizeof(mesh_sync_payload_t) && rx.header.src_id > 0 &&
+        if (rx.header.type == MESH_PKT_SYNC_V3 &&
+            rx.header.payload_len == sizeof(mesh_sync_v3_payload_t) && rx.header.src_id > 0 &&
             rx.header.src_id <= MESH_MAX_NODES) {
+            mesh_sync_v3_payload_t sync;
+            memcpy(&sync, rx.payload, sizeof(sync));
+            if ((rx.header.flags & ~MESH_FLAG_RELAYED) ||
+                rx.header.ttl != ((rx.header.flags & MESH_FLAG_RELAYED) ? 1 : 2) ||
+                sync.relay_depth != !!(rx.header.flags & MESH_FLAG_RELAYED) ||
+                !mesh_adaptive_identity_valid(&sync.leader) || sync.leader.address_len != 6 ||
+                sync.member_count < 1 || sync.member_count > MESH_MAX_NODES ||
+                sync.leader_id != rx.header.src_id || !sync.term || sync.phase_us >= MESH_FRAME_US ||
+                (!(rx.header.flags & MESH_FLAG_RELAYED) &&
+                 memcmp(sync.leader.address, rx.src_mac, 6))) return;
             ESP_LOGI(TAG, "Found existing mesh, coordinator=%d", rx.header.src_id);
             s_coordinator_id = rx.header.src_id;
-            memcpy(s_coordinator_mac, rx.src_mac, sizeof(s_coordinator_mac));
+            memcpy(s_coordinator_mac, sync.leader.address, sizeof(s_coordinator_mac));
+            s_mesh.discovered_term = sync.term;
+            if (rx.header.flags & MESH_FLAG_RELAYED) {
+                memcpy(s_mesh.discovery_relay_mac, rx.src_mac, 6);
+                s_mesh.discovery_relay_ms = (uint32_t)(rx.timestamp_us / 1000);
+            } else {
+                s_mesh.discovery_relay_ms = 0;
+            }
             set_state(MESH_STATE_JOINING);
             task->join_attempts = 0;
             task->last_join_attempt = 0;
             return;
-        } else if (rx.header.type == MESH_PKT_JOIN) {
+        } else if (rx.header.type == MESH_PKT_JOIN_V3 && rx.header.src_id == 0 &&
+                   rx.header.payload_len == sizeof(mesh_join_v3_payload_t) &&
+                   rx.header.flags == 0 && rx.header.ttl == 2) {
+            mesh_join_v3_payload_t join;
+            memcpy(&join, rx.payload, sizeof(join));
+            if (join.origin.address_len != 6 ||
+                memcmp(join.origin.address, rx.src_mac, 6)) return;
             /* Lower MAC wins coordinator election. */
             if (mesh_core_address_compare(rx.src_mac, s_local_mac, sizeof(s_local_mac)) < 0) {
                 ESP_LOGI(TAG, "SCAN: Saw node with lower MAC, deferring coordinator role");
@@ -69,7 +93,6 @@ static void mesh_task_scan(mesh_task_state_t *task, int64_t now)
             } else {
                 ESP_LOGI(TAG, "SCAN: Saw node with higher MAC, we may become coordinator");
             }
-        } else if (rx.header.type == MESH_PKT_JOIN_ACK) {
         }
     }
 
@@ -92,6 +115,7 @@ static void mesh_task_scan(mesh_task_state_t *task, int64_t now)
         s_node_id = 1;
         s_slot_index = 0;
         s_coordinator_id = 1;
+        memcpy(s_coordinator_mac, s_local_mac, 6);
 
         xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
         s_peers[0].info.node_id = 1;
@@ -101,6 +125,10 @@ static void mesh_task_scan(mesh_task_state_t *task, int64_t now)
         s_peers[0].info.last_seen_ms = now / 1000;
         s_peer_count = 1;
         xSemaphoreGive(s_peer_mutex);
+
+        mesh_adaptive_local_init();
+        s_mesh.slot_map = (mesh_slot_map_payload_t){.slot_count = 1,
+                                                     .slot_ids = {1}};
 
         advance_tdma_generation();
         s_frame_start_us = esp_timer_get_time();
@@ -161,6 +189,7 @@ static void mesh_task_drain_active_rx_and_deliver_audio(void)
         mesh_timing_record(&s_stats.rx_dequeue_age, handle_start_us - rx.timestamp_us);
         handle_packet(&rx);
         mesh_timing_record(&s_stats.rx_handle, esp_timer_get_time() - handle_start_us);
+        if (s_state != MESH_STATE_ACTIVE) break;
         processed++;
         if (processed >= 32) {
             break;
@@ -171,7 +200,7 @@ static void mesh_task_drain_active_rx_and_deliver_audio(void)
         ESP_LOGD(TAG, "ACTIVE: processed %d packets (high load)", processed);
     }
 
-    if (s_audio_cb) {
+    if (s_state == MESH_STATE_ACTIVE && s_audio_cb) {
         uint8_t audio_data[MESH_MAX_OPUS_BYTES];
         uint16_t audio_len;
         uint8_t src_id;
@@ -189,6 +218,51 @@ static void mesh_task_drain_active_rx_and_deliver_audio(void)
     }
 }
 
+void mesh_rejoin_after_eviction(const mesh_rx_item_t *rx,
+                                const mesh_membership_v3_payload_t *snapshot)
+{
+    ESP_LOGW(TAG, "Authoritative membership removed local node %u; rejoining leader %u",
+             s_node_id, snapshot->leader_id);
+    xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
+    advance_tdma_generation();
+    esp_timer_stop(s_frame_timer);
+    esp_timer_stop(s_slot_timer);
+    esp_timer_stop(s_control_timer);
+    xSemaphoreGive(s_frame_timer_mutex);
+    drain_slot_signal();
+    clear_transient_mesh_state();
+    s_mesh.slot_map = (mesh_slot_map_payload_t){0};
+
+    int8_t leader_slot = -1;
+    for (uint8_t slot = 0; slot < snapshot->slot_map.slot_count; slot++)
+        if (snapshot->slot_map.slot_ids[slot] == snapshot->leader_id) leader_slot = slot;
+    xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
+    memset(s_peers, 0, sizeof(s_peers));
+    s_peers[0].info.node_id = snapshot->leader_id;
+    memcpy(s_peers[0].info.mac_addr, snapshot->identities[snapshot->leader_id - 1].address, 6);
+    s_peers[0].info.slot_index = leader_slot;
+    s_peers[0].info.last_seen_ms = rx->timestamp_us / 1000;
+    s_peers[0].info.active = true;
+    s_peer_count = 1;
+    xSemaphoreGive(s_peer_mutex);
+
+    s_node_id = 0;
+    s_slot_index = -1;
+    s_role = MESH_ROLE_PARTICIPANT;
+    s_coordinator_id = snapshot->leader_id;
+    memcpy(s_coordinator_mac, snapshot->identities[snapshot->leader_id - 1].address, 6);
+    s_mesh.discovered_term = snapshot->term;
+    s_mesh.upstream_sync_us = 0;
+    s_mesh.forward_sync_last_tx_ms = 0;
+    if (rx->header.flags & MESH_FLAG_RELAYED) {
+        memcpy(s_mesh.discovery_relay_mac, rx->src_mac, 6);
+        s_mesh.discovery_relay_ms = (uint32_t)(rx->timestamp_us / 1000);
+    } else s_mesh.discovery_relay_ms = 0;
+    memset(&s_mesh.adaptive, 0, sizeof(s_mesh.adaptive));
+    memset(s_mesh.neighbors, 0, sizeof(s_mesh.neighbors));
+    set_state(MESH_STATE_JOINING);
+}
+
 static void mesh_task_run_active_maintenance(mesh_task_state_t *task, int64_t now)
 {
     if ((now - task->last_keepalive) > (MESH_KEEPALIVE_INTERVAL_MS * 1000)) {
@@ -203,6 +277,19 @@ static void mesh_task_run_active_maintenance(mesh_task_state_t *task, int64_t no
         send_status();
         task->last_status = now;
     }
+
+    if ((now - task->last_topology) >= MESH_ADAPTIVE_REPORT_MS * 1000LL) {
+        mesh_send_topology();
+        task->last_topology = now;
+    }
+
+    mesh_request_local_speaker((uint32_t)(now / 1000));
+
+    if (s_role == MESH_ROLE_COORDINATOR &&
+        (uint32_t)((now / 1000) - s_mesh.membership_publish_ms) >= MESH_ADAPTIVE_REPORT_MS)
+        mesh_send_membership();
+
+    mesh_adaptive_maintenance((uint32_t)(now / 1000));
 
     check_peer_timeouts();
 }
@@ -267,8 +354,10 @@ void mesh_task(void *arg)
 
         case MESH_STATE_ACTIVE:
             mesh_task_drain_active_rx_and_deliver_audio();
-            mesh_task_run_active_maintenance(&task, now);
-            mesh_task_dispatch_timer_event();
+            if (s_state == MESH_STATE_ACTIVE) {
+                mesh_task_run_active_maintenance(&task, now);
+                mesh_task_dispatch_timer_event();
+            }
             if (s_state != MESH_STATE_ACTIVE) last_active_loop_us = 0;
             break;
 
@@ -283,30 +372,43 @@ void mesh_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void handle_speaker_grant_packet(const mesh_rx_item_t *rx)
+static bool handle_speaker_grant_packet(const mesh_rx_item_t *rx)
 {
-    if (rx->header.payload_len < sizeof(mesh_speaker_grant_payload_t)) {
-        return;
-    }
+    if (rx->header.payload_len != sizeof(mesh_speaker_grant_payload_t)) return false;
 
     const mesh_speaker_grant_payload_t *grant = (const mesh_speaker_grant_payload_t *)rx->payload;
+    if (grant->speaker_count > MESH_MAX_ACTIVE_SPEAKERS) return false;
     uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
     uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
-    for (uint8_t i = 0; i < grant->speaker_count && i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
+    for (uint8_t i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
+        if (i >= grant->speaker_count) {
+            if (grant->speaker_ids[i] || grant->relay_masks[i]) return false;
+            continue;
+        }
+        uint8_t id = grant->speaker_ids[i];
+        if (!(s_mesh.adaptive.members & mesh_core_node_bit(id)) ||
+            (i && id == grant->speaker_ids[0]) ||
+            (grant->relay_masks[i] & (uint8_t)~s_mesh.adaptive.members)) return false;
         ids[i] = grant->speaker_ids[i];
         masks[i] = grant->relay_masks[i];
     }
     speaker_state_set(ids, masks);
+    return true;
 }
 
-static void handle_speaker_release_packet(const mesh_rx_item_t *rx)
+static bool handle_speaker_release_packet(const mesh_rx_item_t *rx)
 {
-    if (rx->header.payload_len < sizeof(mesh_speaker_release_payload_t)) {
-        return;
-    }
+    if (rx->header.payload_len != sizeof(mesh_speaker_release_payload_t)) return false;
 
     const mesh_speaker_release_payload_t *release =
         (const mesh_speaker_release_payload_t *)rx->payload;
+    if (release->speaker_count > MESH_MAX_ACTIVE_SPEAKERS) return false;
+    for (uint8_t i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
+        if (i >= release->speaker_count) {
+            if (release->speaker_ids[i]) return false;
+        } else if (!mesh_core_node_bit(release->speaker_ids[i]) ||
+                   (i && release->speaker_ids[i] == release->speaker_ids[0])) return false;
+    }
     uint8_t ids[MESH_MAX_ACTIVE_SPEAKERS];
     uint8_t masks[MESH_MAX_ACTIVE_SPEAKERS];
     speaker_state_get(ids, masks);
@@ -318,7 +420,14 @@ static void handle_speaker_release_packet(const mesh_rx_item_t *rx)
             }
         }
     }
+    if (!ids[0] && ids[1]) {
+        ids[0] = ids[1];
+        masks[0] = masks[1];
+        ids[1] = 0;
+        masks[1] = 0;
+    }
     speaker_state_set(ids, masks);
+    return true;
 }
 
 static void handle_leave_packet(const mesh_rx_item_t *rx)
@@ -357,8 +466,14 @@ static void handle_leave_packet(const mesh_rx_item_t *rx)
         ESP_LOGW(TAG, "Ignoring stale/unknown LEAVE: node_id=%u, MAC=" MACSTR, rx->header.src_id,
                  MAC2STR(rx->src_mac));
     }
-    if (s_role == MESH_ROLE_COORDINATOR) {
+    if (peer_removed && s_role == MESH_ROLE_COORDINATOR) {
+        mesh_adaptive_members_update();
+        taskENTER_CRITICAL(&s_speaker_mux);
+        s_active_speaker_deadline_ms[rx->header.src_id] = 0;
+        taskEXIT_CRITICAL(&s_speaker_mux);
+        update_speaker_grants();
         send_slot_map();
+        mesh_send_membership();
     }
 }
 
@@ -366,25 +481,19 @@ void handle_packet(const mesh_rx_item_t *rx)
 {
     ESP_LOGD(TAG, "handle_packet: type=0x%02X from src_id=%d", rx->header.type, rx->header.src_id);
 
+    if (mesh_handle_adaptive_control(rx)) return;
+
     switch (rx->header.type) {
     case MESH_PKT_AUDIO:
         handle_audio_packet(rx);
         break;
 
-    case MESH_PKT_JOIN:
-        handle_join_packet(rx);
-        break;
-
-    case MESH_PKT_JOIN_ACK:
-        handle_join_ack_packet(rx);
-        break;
-
-    case MESH_PKT_SYNC:
-        handle_sync_packet(rx);
-        break;
-
     case MESH_PKT_KEEPALIVE:
-        handle_keepalive_packet(rx);
+        if (mesh_adaptive_bound_sender(rx) &&
+            rx->header.payload_len == sizeof(mesh_keepalive_payload_t)) {
+            handle_keepalive_packet(rx);
+            mesh_refresh_peer_liveness(rx->header.src_id, rx->timestamp_us);
+        }
         break;
 
     case MESH_PKT_SLOT_MAP:
@@ -392,19 +501,25 @@ void handle_packet(const mesh_rx_item_t *rx)
         break;
 
     case MESH_PKT_STATUS:
-        handle_status_packet(rx);
+        if (mesh_adaptive_bound_sender(rx) &&
+            rx->header.payload_len == sizeof(mesh_status_payload_t)) {
+            handle_status_packet(rx);
+            mesh_refresh_peer_liveness(rx->header.src_id, rx->timestamp_us);
+        }
         break;
 
     case MESH_PKT_SPEAKER_GRANT:
-        handle_speaker_grant_packet(rx);
+        if (handle_speaker_grant_packet(rx))
+            mesh_refresh_peer_liveness(rx->header.src_id, rx->timestamp_us);
         break;
 
     case MESH_PKT_SPEAKER_RELEASE:
-        handle_speaker_release_packet(rx);
+        if (handle_speaker_release_packet(rx))
+            mesh_refresh_peer_liveness(rx->header.src_id, rx->timestamp_us);
         break;
 
     case MESH_PKT_LEAVE:
-        handle_leave_packet(rx);
+        if (mesh_adaptive_bound_sender(rx)) handle_leave_packet(rx);
         break;
 
     default:
@@ -419,7 +534,10 @@ void handle_join_packet(const mesh_rx_item_t *rx)
         return;
     }
 
-    ESP_LOGI(TAG, "JOIN request from " MACSTR, MAC2STR(rx->src_mac));
+    mesh_join_v3_payload_t join;
+    memcpy(&join, rx->payload, sizeof(join));
+    const uint8_t *origin_mac = join.origin.address;
+    ESP_LOGI(TAG, "JOIN request from " MACSTR, MAC2STR(origin_mac));
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
 
@@ -428,7 +546,7 @@ void handle_join_packet(const mesh_rx_item_t *rx)
     int8_t existing_slot = -1;
 
     for (int i = 0; i < MESH_MAX_NODES; i++) {
-        if (memcmp(s_peers[i].info.mac_addr, rx->src_mac, 6) == 0 && s_peers[i].info.active) {
+        if (memcmp(s_peers[i].info.mac_addr, origin_mac, 6) == 0 && s_peers[i].info.active) {
             already_joined = true;
             existing_id = s_peers[i].info.node_id;
             existing_slot = s_peers[i].info.slot_index;
@@ -443,7 +561,8 @@ void handle_join_packet(const mesh_rx_item_t *rx)
     if (already_joined) {
         xSemaphoreGive(s_peer_mutex);
         mesh_core_dedupe_purge_node(&s_dedupe, existing_id);
-        send_join_ack(existing_id, existing_slot, rx->src_mac);
+        send_join_ack(existing_id, existing_slot, origin_mac);
+        mesh_send_membership();
         return;
     }
 
@@ -454,7 +573,14 @@ void handle_join_packet(const mesh_rx_item_t *rx)
         }
     }
     uint8_t new_id = mesh_core_first_free_node_id(occupied);
-    int8_t new_slot = mesh_core_slot_for_node_id(new_id);
+    int8_t new_slot = -1;
+    bool used[MESH_MAX_NODES] = {0};
+    if (s_slot_index >= 0) used[s_slot_index] = true;
+    for (int i = 0; i < MESH_MAX_NODES; i++)
+        if (s_peers[i].info.active && s_peers[i].info.slot_index >= 0)
+            used[s_peers[i].info.slot_index] = true;
+    for (int slot = 0; slot < MESH_MAX_NODES; slot++)
+        if (!used[slot]) { new_slot = slot; break; }
 
     if (new_id == 0 || new_slot < 0) {
         xSemaphoreGive(s_peer_mutex);
@@ -467,7 +593,7 @@ void handle_join_packet(const mesh_rx_item_t *rx)
     for (int i = 0; i < MESH_MAX_NODES; i++) {
         if (!s_peers[i].info.active) {
             s_peers[i].info.node_id = new_id;
-            memcpy(s_peers[i].info.mac_addr, rx->src_mac, 6);
+            memcpy(s_peers[i].info.mac_addr, origin_mac, 6);
             s_peers[i].info.slot_index = new_slot;
             s_peers[i].info.active = true;
             s_peers[i].info.last_seen_ms = rx->timestamp_us / 1000;
@@ -479,7 +605,7 @@ void handle_join_packet(const mesh_rx_item_t *rx)
             peer_added = true;
 
             ESP_LOGI(TAG, "Assigned node_id=%d, slot=%d to " MACSTR, new_id, new_slot,
-                     MAC2STR(rx->src_mac));
+                      MAC2STR(origin_mac));
 
             break;
         }
@@ -493,8 +619,10 @@ void handle_join_packet(const mesh_rx_item_t *rx)
         }
     }
 
-    send_join_ack(new_id, new_slot, rx->src_mac);
+    mesh_adaptive_members_update();
+    send_join_ack(new_id, new_slot, origin_mac);
     send_slot_map();
+    mesh_send_membership();
 }
 
 void handle_join_ack_packet(const mesh_rx_item_t *rx)
@@ -503,31 +631,31 @@ void handle_join_ack_packet(const mesh_rx_item_t *rx)
         return;
     }
 
-    if (rx->header.payload_len != sizeof(mesh_join_ack_payload_t)) {
+    if (rx->header.payload_len != sizeof(mesh_join_ack_v3_payload_t)) {
         return;
     }
 
-    const mesh_join_ack_payload_t *ack = (const mesh_join_ack_payload_t *)rx->payload;
+    mesh_join_ack_v3_payload_t ack;
+    memcpy(&ack, rx->payload, sizeof(ack));
     uint8_t expected_coordinator = s_state == MESH_STATE_JOINING ? s_coordinator_id : 0;
-    if (!mesh_core_join_assignment_valid(ack, rx->header.src_id, expected_coordinator,
-                                         MESH_VOICE_SLOTS) ||
-        (s_state == MESH_STATE_JOINING &&
-         memcmp(rx->src_mac, s_coordinator_mac, sizeof(s_coordinator_mac)) != 0)) {
+    if (ack.assigned_id < 1 || ack.assigned_id > MESH_MAX_NODES ||
+        ack.slot_index >= MESH_VOICE_SLOTS || ack.coordinator_id != rx->header.src_id ||
+        (expected_coordinator && ack.coordinator_id != expected_coordinator) ||
+        ack.target.address_len != 6 || memcmp(ack.target.address, s_local_mac, 6)) {
         return;
     }
 
-    ESP_LOGI(TAG, "JOIN_ACK received: node_id=%d, slot=%d, coordinator=%d", ack->assigned_id,
-             ack->slot_index, ack->coordinator_id);
+    ESP_LOGI(TAG, "JOIN_ACK received: node_id=%d, slot=%d, coordinator=%d", ack.assigned_id,
+              ack.slot_index, ack.coordinator_id);
 
-    s_node_id = ack->assigned_id;
-    s_slot_index = ack->slot_index;
-    s_coordinator_id = ack->coordinator_id;
-    memcpy(s_coordinator_mac, rx->src_mac, sizeof(s_coordinator_mac));
+    s_node_id = ack.assigned_id;
+    s_slot_index = ack.slot_index;
+    s_coordinator_id = ack.coordinator_id;
     s_role = MESH_ROLE_PARTICIPANT;
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
-    s_peers[0].info.node_id = ack->coordinator_id;
-    memcpy(s_peers[0].info.mac_addr, rx->src_mac, 6);
+    s_peers[0].info.node_id = ack.coordinator_id;
+    memcpy(s_peers[0].info.mac_addr, s_coordinator_mac, 6);
     s_peers[0].info.slot_index = 0;
     s_peers[0].info.active = true;
     s_peers[0].info.last_seen_ms = rx->timestamp_us / 1000;
@@ -535,11 +663,24 @@ void handle_join_ack_packet(const mesh_rx_item_t *rx)
     xSemaphoreGive(s_peer_mutex);
 
     esp_now_peer_info_t peer = {0};
-    memcpy(peer.peer_addr, rx->src_mac, 6);
+    memcpy(peer.peer_addr, s_coordinator_mac, 6);
     peer.channel = s_config.channel;
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     esp_now_add_peer(&peer);
+
+    mesh_adaptive_init(&s_mesh.adaptive, s_node_id, s_coordinator_id, ack.term,
+                       mesh_core_node_bit(s_node_id) | mesh_core_node_bit(s_coordinator_id),
+                       (uint32_t)(rx->timestamp_us / 1000));
+    memset(s_mesh.neighbors, 0, sizeof(s_mesh.neighbors));
+    s_mesh.report_seq = 0;
+    s_mesh.report_wire_seq = 0;
+    s_mesh.forward_sync_last_tx_ms = 0;
+    mesh_wire_identity_t self = mesh_local_identity();
+    mesh_wire_identity_t leader = {.address_len = 6};
+    memcpy(leader.address, s_coordinator_mac, 6);
+    (void)mesh_adaptive_set_member(&s_mesh.adaptive, s_node_id, &self);
+    (void)mesh_adaptive_set_member(&s_mesh.adaptive, s_coordinator_id, &leader);
 
     STATS_INC(join_successes);
     set_state(MESH_STATE_ACTIVE);
@@ -549,36 +690,45 @@ void handle_join_ack_packet(const mesh_rx_item_t *rx)
 
 void handle_sync_packet(const mesh_rx_item_t *rx)
 {
-    if (rx->header.payload_len != sizeof(mesh_sync_payload_t) || rx->header.src_id == 0 ||
+    if (rx->header.payload_len != sizeof(mesh_sync_v3_payload_t) || rx->header.src_id == 0 ||
         rx->header.src_id > MESH_MAX_NODES) {
         return;
     }
 
-    const mesh_sync_payload_t *sync = (const mesh_sync_payload_t *)rx->payload;
+    mesh_sync_v3_payload_t packet;
+    memcpy(&packet, rx->payload, sizeof(packet));
+    const mesh_sync_v3_payload_t *sync = &packet;
 
     if (s_role == MESH_ROLE_PARTICIPANT && s_state == MESH_STATE_ACTIVE &&
-        (rx->header.src_id != s_coordinator_id ||
-         memcmp(rx->src_mac, s_coordinator_mac, sizeof(s_coordinator_mac)) != 0)) {
+        rx->header.src_id != s_coordinator_id) {
         return;
     }
-    if (memcmp(sync->coordinator_addr, rx->src_mac, sizeof(sync->coordinator_addr)) != 0) {
+    if (s_role != MESH_ROLE_COORDINATOR &&
+        memcmp(sync->leader.address, s_coordinator_mac, 6) != 0) {
         return;
     }
 
     STATS_INC(sync_received);
 
-    /* A lower-MAC coordinator wins a conflict. */
-    if (s_role == MESH_ROLE_COORDINATOR && rx->header.src_id != s_node_id) {
-        const uint8_t *remote_addr = rx->src_mac;
-
-        if (mesh_core_address_compare(remote_addr, s_local_mac, sizeof(s_local_mac)) < 0) {
-            ESP_LOGW(TAG, "Coordinator conflict detected! Node %d has lower MAC - demoting",
-                     rx->header.src_id);
-            demote_to_participant(remote_addr, rx->header.src_id);
-        } else {
-            ESP_LOGW(TAG, "Coordinator conflict detected! We have lower MAC - ignoring their SYNC");
+    /* Cold-start merge only: an established multi-member mesh never yields here. */
+    if (s_role == MESH_ROLE_COORDINATOR &&
+        memcmp(sync->leader.address, s_local_mac, 6) != 0) {
+        mesh_wire_identity_t local = mesh_local_identity();
+        if (s_mesh.adaptive.term != 1 || s_mesh.adaptive.prepared ||
+            s_mesh.adaptive.transition_done || sync->term != 1 ||
+            !mesh_adaptive_cold_join(&local,
+                (uint8_t)__builtin_popcount((unsigned)s_mesh.adaptive.members),
+                &sync->leader, sync->member_count)) {
+            ESP_LOGW(TAG, "Ignoring foreign cold SYNC: local members=0x%02x remote count=%u",
+                     s_mesh.adaptive.members, sync->member_count);
             return;
         }
+        ESP_LOGW(TAG, "Joining established/lower-identity leader %u (%u members)",
+                 rx->header.src_id, sync->member_count);
+        s_mesh.discovered_term = sync->term;
+        s_mesh.discovery_relay_ms = 0;
+        demote_to_participant(sync->leader.address, rx->header.src_id);
+        return;
     }
 
     if (s_role == MESH_ROLE_PARTICIPANT) {
@@ -589,8 +739,8 @@ void handle_sync_packet(const mesh_rx_item_t *rx)
 
         int32_t frame_delta = (int32_t)(sync->frame_counter - local_frame_counter);
         int64_t expected_frame_start = local_frame_start_us + (MESH_FRAME_US * frame_delta);
-        int64_t actual_frame_start =
-            rx->timestamp_us - (MESH_VOICE_SLOTS * MESH_SLOT_US) - ESPNOW_SYNC_RX_LATENCY_US;
+        int64_t actual_frame_start = rx->timestamp_us - sync->phase_us -
+                                     ESPNOW_SYNC_RX_LATENCY_US;
         int32_t drift_us = (int32_t)(actual_frame_start - expected_frame_start);
 
         /* Bound each correction to 500 us. */
@@ -622,6 +772,8 @@ void handle_sync_packet(const mesh_rx_item_t *rx)
             ESP_LOGD(TAG, "SYNC drift: %d us", drift_us);
         }
     }
+
+    s_mesh.upstream_sync_us = rx->timestamp_us;
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     for (int i = 0; i < MESH_MAX_NODES; i++) {
@@ -661,10 +813,37 @@ void handle_slot_map_packet(const mesh_rx_item_t *rx)
     }
 
     const mesh_slot_map_payload_t *slot_map = (const mesh_slot_map_payload_t *)rx->payload;
-    mesh_core_slot_map_result_t parsed;
-    if (!mesh_core_slot_map_valid(slot_map, s_node_id, s_coordinator_id, &parsed)) {
+    uint8_t members = 0;
+    int8_t local_slot = -1;
+    if (slot_map->slot_count == 0 || slot_map->slot_count > MESH_MAX_NODES ||
+        slot_map->active_speaker_count > MESH_MAX_ACTIVE_SPEAKERS) return;
+    for (uint8_t slot = 0; slot < MESH_MAX_NODES; slot++) {
+        uint8_t id = slot_map->slot_ids[slot];
+        if (slot >= slot_map->slot_count) {
+            if (id) return;
+            continue;
+        }
+        if (!id) continue;
+        uint8_t mask = mesh_core_node_bit(id);
+        if (!mask || (members & mask)) return;
+        members |= mask;
+        if (id == s_node_id) local_slot = slot;
+    }
+    if (!slot_map->slot_ids[slot_map->slot_count - 1] || local_slot < 0 ||
+        members != s_mesh.adaptive.members ||
+        !(members & mesh_core_node_bit(s_coordinator_id))) {
         return;
     }
+    for (uint8_t i = 0; i < MESH_MAX_ACTIVE_SPEAKERS; i++) {
+        uint8_t id = slot_map->active_speaker_ids[i];
+        if (i < slot_map->active_speaker_count && !(members & mesh_core_node_bit(id))) return;
+        if (i && i < slot_map->active_speaker_count &&
+            id == slot_map->active_speaker_ids[0]) return;
+        if (i >= slot_map->active_speaker_count && (id || slot_map->relay_masks[i])) return;
+        if (slot_map->relay_masks[i] & (uint8_t)~members) return;
+    }
+
+    s_mesh.slot_map = *slot_map;
 
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     for (uint8_t slot = 0; slot < slot_map->slot_count; slot++) {
@@ -680,8 +859,10 @@ void handle_slot_map_packet(const mesh_rx_item_t *rx)
             }
         }
     }
-    s_slot_index = parsed.local_slot;
-    s_peer_count = (uint8_t)(parsed.member_count - 1U);
+    s_slot_index = local_slot;
+    s_peer_count = 0;
+    for (int i = 0; i < MESH_MAX_NODES; i++)
+        if (s_peers[i].info.active && s_peers[i].info.node_id != s_node_id) s_peer_count++;
 
     uint8_t sm_ids[MESH_MAX_ACTIVE_SPEAKERS] = {0};
     uint8_t sm_masks[MESH_MAX_ACTIVE_SPEAKERS] = {0};
@@ -691,6 +872,7 @@ void handle_slot_map_packet(const mesh_rx_item_t *rx)
     }
     speaker_state_set(sm_ids, sm_masks);
     xSemaphoreGive(s_peer_mutex);
+    mesh_refresh_peer_liveness(rx->header.src_id, rx->timestamp_us);
 }
 
 void handle_status_packet(const mesh_rx_item_t *rx)
@@ -705,7 +887,7 @@ void handle_status_packet(const mesh_rx_item_t *rx)
     for (int i = 0; i < MESH_MAX_NODES; i++) {
         if (s_peers[i].info.node_id == rx->header.src_id) {
             s_peers[i].info.last_seen_ms = rx->timestamp_us / 1000;
-            s_peers[i].info.rssi_dbm = rx->rssi;
+            if (!(rx->header.flags & MESH_FLAG_RELAYED)) s_peers[i].info.rssi_dbm = rx->rssi;
             s_peers[i].info.heard_bitmap = status->heard_bitmap;
             s_peers[i].info.relay_bitmap = status->relay_bitmap;
             s_peers[i].info.battery_pct = status->battery_pct;
@@ -787,8 +969,10 @@ void check_peer_timeouts(void)
     }
 
     if (timed_out_count > 0 && s_role == MESH_ROLE_COORDINATOR) {
+        mesh_adaptive_members_update();
         update_speaker_grants();
         send_slot_map();
+        mesh_send_membership();
     }
 
     if (coordinator_lost) {

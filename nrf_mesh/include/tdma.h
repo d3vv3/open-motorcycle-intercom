@@ -39,6 +39,8 @@ typedef struct {
     int32_t sync_phase_correction_us;
     uint32_t commanded_period_us;
     uint32_t measured_interval_us;
+    int16_t remote_rate_ppm;
+    bool remote_rate_valid;
     int32_t callback_jitter_us;
     uint32_t callback_jitter_max_us;
 } tdma_stats_t;
@@ -72,6 +74,8 @@ void tdma_get_stats(tdma_stats_t *stats);
  * @brief Get current frame counter
  */
 uint32_t tdma_get_frame_counter(void);
+bool tdma_clock_snapshot(uint32_t *frame, uint16_t *phase_us);
+void tdma_set_clock_source(bool local);
 
 /**
  * @brief Get microseconds until our TX slot
@@ -87,7 +91,7 @@ uint32_t tdma_get_current_slot_remaining_us(void);
 /**
  * @brief Synchronize to coordinator timing
  * @param frame_counter Coordinator's frame counter
- * @param drift_ppm Coordinator period correction in ppm; positive is longer.
+ * @param drift_ppm Initial fallback correction in ppm until remote frames establish a rate.
  */
 void tdma_sync(uint32_t frame_counter, int16_t drift_ppm, int64_t frame_start_us);
 

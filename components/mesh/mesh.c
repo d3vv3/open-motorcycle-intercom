@@ -450,6 +450,18 @@ esp_err_t mesh_stop(void)
     memset(s_coordinator_mac, 0, sizeof(s_coordinator_mac));
     s_control_tx_seq = 0;
     s_audio_tx_seq = 0;
+    s_mesh.report_seq = 0;
+    s_mesh.report_wire_seq = 0;
+    memset(&s_mesh.adaptive, 0, sizeof(s_mesh.adaptive));
+    memset(s_mesh.neighbors, 0, sizeof(s_mesh.neighbors));
+    memset(&s_mesh.slot_map, 0, sizeof(s_mesh.slot_map));
+    s_mesh.upstream_sync_us = 0;
+    s_mesh.membership_publish_ms = 0;
+    s_mesh.relay_turn = false;
+    s_mesh.relay_capacity_logged = false;
+    s_mesh.discovered_term = 0;
+    s_mesh.discovery_relay_ms = 0;
+    s_mesh.forward_sync_last_tx_ms = 0;
 
 #ifdef MESH_S31_COEX_PREFER_WIFI
     restore_coex_preference();
@@ -490,6 +502,8 @@ uint8_t mesh_get_node_id(void)
 
 uint8_t mesh_get_node_count(void)
 {
+    if (s_state == MESH_STATE_ACTIVE && s_mesh.adaptive.local_id == s_node_id)
+        return (uint8_t)__builtin_popcount((unsigned)s_mesh.adaptive.members);
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
     uint8_t count = s_peer_count;
     if (s_state == MESH_STATE_ACTIVE && s_role == MESH_ROLE_PARTICIPANT && s_node_id != 0) {
@@ -557,6 +571,12 @@ esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags
     item.len = len;
     item.audio_flags = audio_flags;
     item.timestamp_us = esp_timer_get_time();
+
+    taskENTER_CRITICAL(&s_speaker_mux);
+    s_mesh.local_voice_active = (audio_flags & MESH_AUDIO_FLAG_ACTIVE) != 0;
+    s_mesh.local_voice_deadline_ms = s_mesh.local_voice_active ?
+        (item.timestamp_us / 1000) + MESH_ADAPTIVE_REQUEST_ACTIVE_MS : 0;
+    taskEXIT_CRITICAL(&s_speaker_mux);
 
     if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
         STATS_INC(tx_queue_full);
