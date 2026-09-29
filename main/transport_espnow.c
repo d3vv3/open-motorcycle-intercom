@@ -6,12 +6,14 @@
 #include "transport_espnow.h"
 
 #include <string.h>
+#include <stdatomic.h>
 
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "sdkconfig.h"
 
 #include "audio.h"
+#include "app_state.h"
 #include "mesh.h"
 #include "power.h"
 
@@ -30,8 +32,9 @@ void transport_espnow_send_audio(const uint8_t *data, uint16_t len, bool active)
  * @brief Callback from mesh subsystem when audio frame is received
  */
 static void mesh_audio_callback(const uint8_t *data, uint16_t len, uint8_t src_id,
-                                uint8_t audio_flags, int64_t timestamp_us)
+                                 uint8_t audio_flags, int64_t timestamp_us)
 {
+    if (!atomic_load(&g_mesh_active)) return;
     audio_frame_t frame;
 
     if (len > sizeof(frame.data)) {
@@ -87,10 +90,10 @@ static void mesh_peer_callback(const mesh_peer_info_t *peer, bool joined)
     }
 }
 
-esp_err_t transport_espnow_init(void)
+esp_err_t transport_espnow_init(uint8_t channel)
 {
     mesh_config_t config = MESH_CONFIG_DEFAULT();
-    config.talk_channel = CONFIG_OMI_MESH_CHANNEL;
+    config.talk_channel = channel;
     config.channel = mesh_channel_espnow_rf(config.talk_channel);
     esp_err_t ret = mesh_init_with_config(&config);
     if (ret != ESP_OK) {

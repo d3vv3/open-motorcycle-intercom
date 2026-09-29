@@ -1,54 +1,5 @@
-/**
- * @file audio_notify.c
- * @brief Notification tone synthesis mixed into the playout frame.
- */
-
+/** Voice notifications mixed in the 16 kHz playout domain. */
 #include "audio_internal.h"
-#include "audio_notification_tone.h"
-
-static uint8_t notification_tone_count(audio_notify_t type)
-{
-    if (type == AUDIO_NOTIFY_STARTUP) {
-        return 3;
-    }
-    if (type == AUDIO_NOTIFY_PEER_JOIN || type == AUDIO_NOTIFY_PEER_LEAVE ||
-        type == AUDIO_NOTIFY_MESH_ENABLED || type == AUDIO_NOTIFY_MESH_DISABLED) {
-        return 2;
-    }
-    if (type == AUDIO_NOTIFY_BLUETOOTH_PAIRING) return 3;
-    return 1;
-}
-
-static uint32_t notification_frequency_millihz(audio_notify_t type, uint8_t tone_index)
-{
-    static const uint32_t startup[] = {261630u, 329630u, 392000u};
-    static const uint32_t join[] = {440000u, 880000u};
-    static const uint32_t leave[] = {880000u, 440000u};
-    switch (type) {
-    case AUDIO_NOTIFY_STARTUP:
-        return startup[tone_index];
-    case AUDIO_NOTIFY_PEER_JOIN:
-        return join[tone_index];
-    case AUDIO_NOTIFY_PEER_LEAVE:
-        return leave[tone_index];
-    case AUDIO_NOTIFY_MESH_ENABLED:
-        return join[tone_index];
-    case AUDIO_NOTIFY_MESH_DISABLED:
-        return leave[tone_index];
-    case AUDIO_NOTIFY_BLUETOOTH_PAIRING:
-        return 988000u;
-    default:
-        return 0u;
-    }
-}
-
-static void notification_start_tone(audio_notification_state_t *note)
-{
-    note->phase = 0u;
-    note->phase_step = audio_notification_phase_step(
-        notification_frequency_millihz(note->type, note->tone_index),
-        g_audio.config.sample_rate);
-}
 
 size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consumed)
 {
@@ -58,53 +9,34 @@ size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consume
     for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
         if (!note->active) {
             audio_notification_request_t request;
-            if (xQueueReceive(g_audio.notification_queue, &request, 0) != pdTRUE) {
+            if (xQueueReceive(g_audio.notification_queue, &request, 0) != pdTRUE)
                 return contributed;
-            }
-            note->active = true;
             *request_consumed = true;
+            note->active = audio_prompt_start(
+                &note->player, audio_prompt_for_notification((audio_notify_t)request.type));
+            if (!note->active) continue;
+            note->mixed_samples = 0u;
+            note->output_samples = (uint32_t)(((uint64_t)note->player.clip->samples *
+                                               g_audio.config.sample_rate + 15999u) / 16000u);
             AUDIO_STATS_LOCK();
             if (g_audio.stats.notify_started_count != UINT32_MAX)
                 g_audio.stats.notify_started_count++;
             AUDIO_STATS_UNLOCK();
-            note->type = (audio_notify_t)request.type;
-            note->tone_index = 0;
-            note->segment_sample = 0;
-            note->in_gap = false;
-            notification_start_tone(note);
         }
-        int32_t tone = 0;
-        if (!note->in_gap) {
-            tone = audio_notification_tone_sample(note->phase);
-            note->phase += note->phase_step;
-            contributed++;
-            g_audio.pcm_output[i] = audio_route_mix_sample(false, i < base_present_samples, true,
-                                                            g_audio.pcm_output[i],
-                                                            audio_route_saturate(tone), 0);
+        int16_t sample;
+        if (audio_prompt_next(&note->player, g_audio.config.sample_rate, &sample)) {
+            g_audio.pcm_output[i] = audio_prompt_mix(
+                i < base_present_samples ? g_audio.pcm_output[i] : 0, sample,
+                note->mixed_samples++, note->output_samples, g_audio.config.sample_rate);
+            contributed = i + 1u;
         }
-
-        note->segment_sample++;
-        uint16_t segment_length =
-            note->in_gap ? NOTIFICATION_GAP_SAMPLES : NOTIFICATION_BEEP_SAMPLES;
-        if (note->segment_sample < segment_length) {
-            continue;
-        }
-        note->segment_sample = 0;
-        if (note->in_gap) {
-            note->in_gap = false;
-            note->tone_index++;
-            notification_start_tone(note);
-        } else if (note->tone_index + 1u < notification_tone_count(note->type)) {
-            note->in_gap = true;
-        } else {
+        if (note->player.position >= note->player.clip->samples) {
             note->active = false;
             AUDIO_STATS_LOCK();
             if (g_audio.stats.notify_completed_count != UINT32_MAX)
                 g_audio.stats.notify_completed_count++;
             AUDIO_STATS_UNLOCK();
         }
-        /* Start each tone or gap on a frame boundary so contribution remains a prefix. */
-        return contributed;
     }
     return contributed;
 }
@@ -112,15 +44,9 @@ size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consume
 esp_err_t audio_play_notification(audio_notify_t type)
 {
     SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();
-    if (lifecycle_mutex == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (audio_called_from_worker()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (type < AUDIO_NOTIFY_STARTUP || type > AUDIO_NOTIFY_BLUETOOTH_PAIRING) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (lifecycle_mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (audio_called_from_worker()) return ESP_ERR_INVALID_STATE;
+    if (audio_prompt_for_notification(type) == NULL) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     if (!g_audio.initialized || g_audio.stopping || g_audio.deinitializing ||
         g_audio.notification_queue == NULL) {

@@ -955,6 +955,11 @@ void audio_playout_task(void *arg)
                 cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_REMOTE, remote_span);
             }
             base_present_samples = base_present ? AUDIO_FRAME_SAMPLES : 0u;
+            if (g_audio.config.mode == AUDIO_MODE_MESH)
+                audio_gain_apply(&g_audio.mesh_gain, g_audio.pcm_output, AUDIO_FRAME_SAMPLES,
+                                 audio_get_volume(AUDIO_VOLUME_MESH), g_audio.config.sample_rate);
+            base_present_samples = audio_voice_contribution_samples(
+                g_audio.pcm_output, base_present_samples, 0u);
             bool request_consumed;
             int64_t mix_start_us = esp_timer_get_time();
             size_t notification_samples = audio_notify_mix_frame(base_present_samples,
@@ -1023,6 +1028,8 @@ void audio_playout_task(void *arg)
             if (g_audio.voice_presence_frame[i] != 0) voice_present = i + 1u;
         }
         if (!call_active) audio_route_mix_music_48k(voice_present);
+        audio_limit_cue_mix(&g_audio.volume_limit_cue, g_audio.hw_output,
+                            AUDIO_HW_FRAME_SAMPLES, 1u, AUDIO_HW_SAMPLE_RATE);
         uint32_t work_us = (uint32_t)(esp_timer_get_time() - work_start_us);
         AUDIO_STATS_LOCK();
         add_timing_us(&g_audio.playout_work_us_sum, work_us);

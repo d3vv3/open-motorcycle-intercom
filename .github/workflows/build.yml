@@ -97,8 +97,11 @@ jobs:
       - name: Run audio PCM resampler tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/audio_pcm_resampler_test && /tmp/audio_pcm_resampler_test
 
-      - name: Run audio notification tone tests
-        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include tests/c/audio_notification_tone_test.c -lm -o /tmp/audio_notification_tone_test && /tmp/audio_notification_tone_test
+      - name: Run audio prompt tests
+        run: python3 tools/encode_notifications.py --output /tmp/audio_prompts_data.c && cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_prompt.c /tmp/audio_prompts_data.c tests/c/audio_prompt_test.c -o /tmp/audio_prompt_test && /tmp/audio_prompt_test
+
+      - name: Run audio volume and limit cue tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio components/audio/audio_volume_mix.c tests/c/audio_volume_mix_test.c -o /tmp/audio_volume_mix_test && /tmp/audio_volume_mix_test
 
       - name: Run audio rate converter tests
         run: cc -std=c11 -Wall -Wextra -Werror -Wno-sign-compare -pedantic -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/audio_rate_converter_test && /tmp/audio_rate_converter_test
@@ -202,7 +205,8 @@ jobs:
             cc $FLAGS $SAN -Icomponents/phone_audio/include components/phone_audio/phone_audio_call_state.c tests/c/phone_audio_call_state_test.c -o /tmp/san_phone_audio_call_state && /tmp/san_phone_audio_call_state
            cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
-          cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
+           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
+           cc $FLAGS $SAN -Icomponents/audio components/audio/audio_volume_mix.c tests/c/audio_volume_mix_test.c -o /tmp/san_audio_volume_mix && /tmp/san_audio_volume_mix
            cc $FLAGS $SAN -I. -Icomponents/audio/include shared/audio_bundle.c shared/audio_tx_cache.c components/audio/audio_packet_store.c components/audio/audio_pcm_resampler.c tests/c/audio_playout_recovery_test.c -o /tmp/san_playout && /tmp/san_playout
 
       - name: Run mesh jitter buffer tests
@@ -213,6 +217,9 @@ jobs:
 
       - name: Run mesh channel isolation and bridge command tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared tests/c/mesh_channel_test.c -o /tmp/mesh_channel_test && /tmp/mesh_channel_test
+
+      - name: Run runtime channel and button control tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared -Imain -Icomponents/button/include tests/c/runtime_channel_control_test.c -o /tmp/runtime_channel_control_test && /tmp/runtime_channel_control_test
 
   nrf-zephyr:
     name: nRF52840 Zephyr firmware

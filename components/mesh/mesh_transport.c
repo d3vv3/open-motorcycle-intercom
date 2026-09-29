@@ -250,7 +250,7 @@ esp_err_t init_esp_now_transport(void)
 
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, s_broadcast_mac, sizeof(peer.peer_addr));
-    peer.channel = s_config.channel;
+    peer.channel = 0; /* Track the local WiFi channel after an IDLE-only switch. */
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     if ((ret = esp_now_add_peer(&peer)) != ESP_OK) {
@@ -367,9 +367,13 @@ void esp_now_send_cb(const esp_now_send_info_t *send_info, esp_now_send_status_t
 
     s_last_tx_status = status;
     s_tx_inflight.active = false;
-    s_tx_callbacks_active--;
     taskEXIT_CRITICAL(&s_transport_mux);
     xSemaphoreGive(s_tx_done_semaphore);
+    /* wait_for_tx_idle() must not release this callback until after its
+     * final use of the semaphore that mesh_deinit() may delete. */
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_tx_callbacks_active--;
+    taskEXIT_CRITICAL(&s_transport_mux);
 }
 
 /* Called with transport mux held, then takes stats mux in the established order. */
@@ -677,17 +681,22 @@ bool wait_for_tx_idle(TickType_t timeout_ticks)
     TickType_t start = xTaskGetTickCount();
     while (true) {
         taskENTER_CRITICAL(&s_transport_mux);
-        bool active = s_tx_inflight.active;
+        bool active = s_tx_inflight.active || s_tx_callbacks_active != 0;
         taskEXIT_CRITICAL(&s_transport_mux);
         if (!active) {
             return true;
         }
 
         TickType_t elapsed = xTaskGetTickCount() - start;
-        if (elapsed >= timeout_ticks ||
-            xSemaphoreTake(s_tx_done_semaphore, timeout_ticks - elapsed) != pdTRUE) {
-            return false;
+        if (elapsed >= timeout_ticks) {
+            /* Completion signals before the callback's final decrement. Check
+             * once more at the deadline so a just-finished callback succeeds. */
+            taskENTER_CRITICAL(&s_transport_mux);
+            bool idle = !s_tx_inflight.active && s_tx_callbacks_active == 0;
+            taskEXIT_CRITICAL(&s_transport_mux);
+            return idle;
         }
+        (void)xSemaphoreTake(s_tx_done_semaphore, 1);
     }
 }
 

@@ -32,6 +32,14 @@ void transport_nrf_tick(int64_t now_ms);
 /** @brief Apply a runtime mesh-intent transition (tracking and cache resets). */
 void transport_nrf_set_user_enabled(bool enabled);
 
+/** Select desired channel. Immediately gates audio, purges bridge audio, and
+ * requires a matched STOP ACK before any START for the new channel. Called
+ * by the main task; subsequent tick retries the pending radio transition. */
+esp_err_t transport_nrf_set_channel(uint8_t channel);
+
+/** Fresh, ACK-confirmed ACTIVE session role, or false when not ready. */
+bool transport_nrf_active_role(bool *coordinator);
+
 /** @brief Restart the reconciliation attempt budget. */
 void transport_nrf_reset_reconciliation(void);
 

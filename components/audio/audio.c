@@ -22,6 +22,44 @@ static portMUX_TYPE s_audio_lifecycle_init_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_audio_route_handle_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_audio_route_users;
 static bool s_audio_route_closing;
+uint8_t audio_get_volume(audio_volume_target_t target)
+{
+    if (target == AUDIO_VOLUME_MESH || target == AUDIO_VOLUME_BLUETOOTH)
+        return audio_volume_levels_get(&g_audio.volumes, target == AUDIO_VOLUME_BLUETOOTH);
+    return 0u;
+}
+
+esp_err_t audio_set_volume(audio_volume_target_t target, uint8_t percent)
+{
+    if (percent > 100u || (target != AUDIO_VOLUME_MESH && target != AUDIO_VOLUME_BLUETOOTH))
+        return ESP_ERR_INVALID_ARG;
+    if (audio_called_from_worker()) return ESP_ERR_INVALID_STATE;
+    SemaphoreHandle_t mutex = audio_lifecycle_mutex_get();
+    if (mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!g_audio.initialized || g_audio.stopping || g_audio.deinitializing) {
+        xSemaphoreGive(mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    audio_volume_levels_set(&g_audio.volumes, target == AUDIO_VOLUME_BLUETOOTH, percent);
+    xSemaphoreGive(mutex);
+    return ESP_OK;
+}
+
+esp_err_t audio_play_volume_limit(void)
+{
+    SemaphoreHandle_t mutex = audio_lifecycle_mutex_get();
+    if (mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (!g_audio.initialized || g_audio.stopping || g_audio.deinitializing ||
+        !atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
+        xSemaphoreGive(mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    (void)audio_limit_cue_request(&g_audio.volume_limit_cue);
+    xSemaphoreGive(mutex);
+    return ESP_OK;
+}
 
 static void free_audio_route_storage(void)
 {
@@ -273,6 +311,11 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
     g_audio.config = requested;
+    audio_volume_levels_reset(&g_audio.volumes);
+    audio_gain_reset(&g_audio.mesh_gain);
+    audio_gain_reset(&g_audio.bluetooth_gain);
+    memset(&g_audio.program_mix, 0, sizeof(g_audio.program_mix));
+    audio_limit_cue_reset(&g_audio.volume_limit_cue);
 
     if (audio_rate_converter_create(&g_audio.capture_rate_converter, AUDIO_HW_SAMPLE_RATE,
                                     g_audio.config.sample_rate) != 0 ||
@@ -394,6 +437,7 @@ static void audio_unwind_locked(void)
     atomic_store_explicit(&g_audio.running, false, memory_order_release);
     atomic_store_explicit(&g_audio.call_priority_active, false, memory_order_release);
     audio_join_workers_locked();
+    audio_limit_cue_reset(&g_audio.volume_limit_cue);
     audio_hw_codec_stop();
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
     AUDIO_STATS_LOCK();
@@ -498,6 +542,7 @@ static esp_err_t audio_stop_locked(void)
         return ESP_ERR_INVALID_STATE;
     }
     audio_join_workers_locked();
+    audio_limit_cue_reset(&g_audio.volume_limit_cue);
     audio_hw_codec_stop();
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
     (void)audio_rate_converter_reset(g_audio.voice_playback_converter);

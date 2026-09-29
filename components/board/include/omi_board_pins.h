@@ -27,6 +27,10 @@
 /* Onboard controls. */
 #define OMI_BOARD_GPIO_BOOT_BUTTON 61
 #define OMI_BOARD_GPIO_RGB         60
+/* External normally-open buttons to J2 GND (pin 8); J2 pins 12, 7, 10. */
+#define OMI_BOARD_GPIO_BUTTON_MINUS  1
+#define OMI_BOARD_GPIO_BUTTON_CENTER 2
+#define OMI_BOARD_GPIO_BUTTON_PLUS   3
 
 /* nRF bridge on J2. */
 #define OMI_BOARD_GPIO_NRF_ACK          42 /* nRF -> ESP32 ACK */

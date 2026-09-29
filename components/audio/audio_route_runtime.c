@@ -106,7 +106,9 @@ bool audio_route_render_call_frame(void)
     bool active = g_audio.bluetooth_call.active && g_audio.bluetooth_call.configured;
     if (active) {
         size_t produced = audio_route_stream_render(&g_audio.bluetooth_call, g_audio.pcm_output,
-                                                    AUDIO_FRAME_SAMPLES);
+                                                     AUDIO_FRAME_SAMPLES);
+        audio_gain_apply(&g_audio.bluetooth_gain, g_audio.pcm_output, AUDIO_FRAME_SAMPLES,
+                         audio_get_volume(AUDIO_VOLUME_BLUETOOTH), g_audio.config.sample_rate);
         if (produced != AUDIO_FRAME_SAMPLES) {
             AUDIO_STATS_LOCK();
             g_audio.stats.bluetooth_call_underruns++;
@@ -273,11 +275,11 @@ void audio_route_mix_music_48k(size_t voice_present_samples)
         AUDIO_STATS_UNLOCK();
     }
     int64_t mix_start = esp_timer_get_time();
-    for (size_t i = 0u; i < AUDIO_HW_FRAME_SAMPLES; ++i) {
-        g_audio.hw_output[i] = audio_route_mix_sample(
-            false, i < voice_present_samples, i < music_samples, g_audio.hw_output[i],
-            i < music_samples ? g_audio.music_converted[i] : 0, 0);
-    }
+    audio_gain_apply(&g_audio.bluetooth_gain, g_audio.music_converted, music_samples,
+                     audio_get_volume(AUDIO_VOLUME_BLUETOOTH), AUDIO_HW_SAMPLE_RATE);
+    audio_program_mix(&g_audio.program_mix, g_audio.hw_output, AUDIO_HW_FRAME_SAMPLES,
+                      voice_present_samples, g_audio.music_converted, music_samples,
+                      AUDIO_HW_SAMPLE_RATE);
     uint64_t mix_us = esp_timer_get_time() - mix_start;
     if (active) {
         int64_t elapsed_us = esp_timer_get_time() - render_start_us;

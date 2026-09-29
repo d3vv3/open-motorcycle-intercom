@@ -40,6 +40,10 @@ void audio_rx_reset_codecs_and_resamplers(void)
 {
     for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
         opus_decoder_ctl(g_audio.rx_sources[i].decoder, OPUS_RESET_STATE);
+#if defined(AUDIO_S31_LC3_WIRE)
+        if (g_audio.rx_sources[i].lc3_decoder != NULL)
+            (void)esp_lc3_codec_reset(g_audio.rx_sources[i].lc3_decoder);
+#endif
         audio_pcm_resampler_reset(&g_audio.rx_sources[i].resampler);
         g_audio.rx_sources[i].decoded_active = false;
     }
@@ -52,6 +56,9 @@ void audio_rx_service_reset_request(void)
     }
     audio_rx_reset_source_metadata();
     audio_rx_reset_codecs_and_resamplers();
+    audio_sample_fifo_reset(&g_audio.voice_fifo);
+    audio_sample_fifo_reset(&g_audio.voice_presence_fifo);
+    (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
     xSemaphoreGive(g_audio.rx_reset_done);
 }
 
@@ -267,20 +274,20 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     return ret;
 }
 
-void audio_clear_rx_frames(void)
+esp_err_t audio_reset_mesh_rx(void)
 {
     SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();
     if (lifecycle_mutex == NULL) {
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
     if (audio_called_from_worker()) {
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     if (!g_audio.initialized || g_audio.stopping || g_audio.deinitializing ||
         g_audio.rx_reset_mutex == NULL) {
         xSemaphoreGive(lifecycle_mutex);
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
     xSemaphoreTake(g_audio.rx_reset_mutex, portMAX_DELAY);
     xSemaphoreTake(g_audio.rx_reset_done, 0);
@@ -297,4 +304,10 @@ void audio_clear_rx_frames(void)
     }
     xSemaphoreGive(g_audio.rx_reset_mutex);
     xSemaphoreGive(lifecycle_mutex);
+    return ESP_OK;
+}
+
+void audio_clear_rx_frames(void)
+{
+    (void)audio_reset_mesh_rx();
 }

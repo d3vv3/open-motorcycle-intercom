@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -218,7 +219,12 @@ typedef struct {
     SemaphoreHandle_t task_stopped_semaphore;
     SemaphoreHandle_t audio_producer_mutex;
     SemaphoreHandle_t stop_mutex;
+    _Atomic(TaskHandle_t) lifecycle_owner; /* Published only after successful init. */
     bool stopping;
+    bool quiesced; /* Protected by transport_mux; true only after full stop teardown. */
+    bool stop_task_confirmed; /* Protected by stop_mutex. */
+    bool stop_leave_pending; /* Protected by stop_mutex; completion checked on retry. */
+    uint32_t lifecycle_generation; /* Protected by transport_mux; rejects stale IDLE notifications. */
     bool rx_enabled;
     uint8_t rx_callbacks_active;
     bool send_callback_enabled;

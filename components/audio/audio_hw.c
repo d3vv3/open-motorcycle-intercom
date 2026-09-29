@@ -300,7 +300,7 @@ esp_err_t audio_hw_codec_start(const audio_config_t *config)
         return ret;
     }
     g_audio.play_open = true;
-    ret = esp_codec_dev_set_out_vol(g_audio.play_dev, 60);
+    ret = esp_codec_dev_set_out_vol(g_audio.play_dev, AUDIO_CODEC_OUTPUT_VOLUME);
     if (ret != ESP_CODEC_DEV_OK) {
         audio_hw_codec_stop();
         return ret;

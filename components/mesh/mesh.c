@@ -18,6 +18,7 @@
 
 const char *const TAG = "mesh";
 const uint8_t s_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static atomic_bool s_init_in_progress = ATOMIC_VAR_INIT(false);
 
 #ifdef MESH_S31_COEX_PREFER_WIFI
 static bool s_coex_restore_pending;
@@ -47,6 +48,13 @@ mesh_context_t s_mesh = {
     .last_tx_status = ESP_NOW_SEND_SUCCESS,
 };
 
+static bool lifecycle_owned_by_caller(void)
+{
+    if (xPortInIsrContext()) return false;
+    TaskHandle_t owner = atomic_load(&s_mesh.lifecycle_owner);
+    return owner != NULL && owner == xTaskGetCurrentTaskHandle();
+}
+
 esp_err_t mesh_init(void)
 {
     return mesh_init_with_config(NULL);
@@ -54,15 +62,19 @@ esp_err_t mesh_init(void)
 
 esp_err_t mesh_init_with_config(const mesh_config_t *config)
 {
+    if (xPortInIsrContext() || atomic_exchange(&s_init_in_progress, true))
+        return ESP_ERR_INVALID_STATE;
+    if (atomic_load(&s_mesh.lifecycle_owner) != NULL || s_initialized) {
+        atomic_store(&s_init_in_progress, false);
+        return ESP_ERR_INVALID_STATE;
+    }
     if (config != NULL && !mesh_channel_valid(config->talk_channel)) {
+        atomic_store(&s_init_in_progress, false);
         return ESP_ERR_INVALID_ARG;
     }
     if (config != NULL && config->channel != mesh_channel_espnow_rf(config->talk_channel)) {
+        atomic_store(&s_init_in_progress, false);
         return ESP_ERR_INVALID_ARG;
-    }
-    if (s_initialized) {
-        ESP_LOGW(TAG, "Already initialized");
-        return ESP_ERR_INVALID_STATE;
     }
 
     s_config = config != NULL ? *config : (mesh_config_t)MESH_CONFIG_DEFAULT();
@@ -90,6 +102,7 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
         !s_tx_done_semaphore || !s_task_stopped_semaphore || !s_audio_producer_mutex ||
         !s_stop_mutex || !s_frame_timer_mutex || !s_frame_event_queue || !s_timer_queue_set) {
         ESP_LOGE(TAG, "Failed to create semaphores");
+        atomic_store(&s_init_in_progress, false);
         return ESP_ERR_NO_MEM;
     }
     xQueueAddToSet(s_slot_semaphore, s_timer_queue_set);
@@ -101,6 +114,7 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
 
     if (!s_tx_queue || !s_rx_queue) {
         ESP_LOGE(TAG, "Failed to create queues");
+        atomic_store(&s_init_in_progress, false);
         return ESP_ERR_NO_MEM;
     }
 
@@ -155,11 +169,16 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     taskENTER_CRITICAL(&s_transport_mux);
     s_tx_inflight = (tx_inflight_t){0};
     s_stopping = false;
+    s_mesh.quiesced = true;
+    s_mesh.stop_task_confirmed = true;
+    s_mesh.stop_leave_pending = false;
     s_rx_enabled = false;
     s_rx_callbacks_active = 0;
     taskEXIT_CRITICAL(&s_transport_mux);
 
     s_initialized = true;
+    atomic_store(&s_mesh.lifecycle_owner, xTaskGetCurrentTaskHandle());
+    atomic_store(&s_init_in_progress, false);
     ESP_LOGI(TAG, "Mesh subsystem initialized");
 
     return ESP_OK;
@@ -167,15 +186,19 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
 
 esp_err_t mesh_deinit(void)
 {
-    if (!s_initialized) {
+    if (!lifecycle_owned_by_caller() || !s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG, "Deinitializing mesh subsystem");
 
     esp_err_t result = ESP_OK;
-    if (s_state != MESH_STATE_IDLE) {
+    if (!mesh_is_quiesced()) {
         result = mesh_stop();
+    }
+    if (!mesh_is_quiesced()) {
+        ESP_LOGE(TAG, "Cannot deinitialize while mesh task or callbacks are active");
+        return result == ESP_OK ? ESP_ERR_TIMEOUT : result;
     }
 #ifdef MESH_S31_COEX_PREFER_WIFI
     restore_coex_preference();
@@ -265,22 +288,43 @@ esp_err_t mesh_deinit(void)
         s_timer_queue_set = NULL;
     }
 
+    taskENTER_CRITICAL(&s_transport_mux);
     s_initialized = false;
+    s_mesh.lifecycle_generation++;
+    taskEXIT_CRITICAL(&s_transport_mux);
     s_role = MESH_ROLE_NONE;
     s_node_id = 0;
     s_slot_index = -1;
+    /* Teardown is complete even if LEAVE reported a non-OK radio result. */
+    atomic_store(&s_mesh.lifecycle_owner, NULL);
 
     return result;
 }
 
+/* Only the IDLE lifecycle transition is dispatched by the caller. The mesh
+ * task dispatches its initial SCANNING transition before processing traffic. */
+static void notify_idle_if_current(mesh_state_cb_t cb, mesh_state_t old_state,
+                                   uint32_t generation)
+{
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool current = s_initialized && s_state == MESH_STATE_IDLE &&
+                   s_mesh.lifecycle_generation == generation;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    if (!current) return;
+    if (cb) cb(old_state, MESH_STATE_IDLE);
+    ESP_LOGI(TAG, "State: %d -> %d", old_state, MESH_STATE_IDLE);
+}
+
 esp_err_t mesh_start(void)
 {
-    if (!s_initialized) {
+    if (!lifecycle_owned_by_caller() || !s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (s_state != MESH_STATE_IDLE) {
-        ESP_LOGW(TAG, "Mesh already started");
+    xSemaphoreTake(s_stop_mutex, portMAX_DELAY);
+    if (s_state != MESH_STATE_IDLE || !mesh_is_quiesced()) {
+        ESP_LOGW(TAG, "Mesh not quiesced for start");
+        xSemaphoreGive(s_stop_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -289,6 +333,7 @@ esp_err_t mesh_start(void)
     if (!s_esp_now_ready) {
         esp_err_t ret = init_esp_now_transport();
         if (ret != ESP_OK) {
+            xSemaphoreGive(s_stop_mutex);
             return ret;
         }
     }
@@ -305,10 +350,16 @@ esp_err_t mesh_start(void)
 #endif
 
     taskENTER_CRITICAL(&s_transport_mux);
+    s_mesh.quiesced = false;
     s_stopping = false;
     s_rx_enabled = true;
     taskEXIT_CRITICAL(&s_transport_mux);
-    set_state(MESH_STATE_SCANNING);
+    s_mesh.stop_task_confirmed = false;
+    s_mesh.stop_leave_pending = false;
+    taskENTER_CRITICAL(&s_transport_mux);
+    s_state = MESH_STATE_SCANNING;
+    s_mesh.lifecycle_generation++;
+    taskEXIT_CRITICAL(&s_transport_mux);
     (void)xSemaphoreTake(s_task_stopped_semaphore, 0);
 
     BaseType_t ret = xTaskCreatePinnedToCore(mesh_task, "mesh", MESH_TASK_STACK_SIZE, NULL,
@@ -319,14 +370,37 @@ esp_err_t mesh_start(void)
         taskENTER_CRITICAL(&s_transport_mux);
         s_rx_enabled = false;
         taskEXIT_CRITICAL(&s_transport_mux);
-        set_state(MESH_STATE_IDLE);
+        s_mesh.stop_task_confirmed = true;
+        taskENTER_CRITICAL(&s_transport_mux);
+        s_state = MESH_STATE_IDLE;
+        uint32_t generation = ++s_mesh.lifecycle_generation;
+        s_mesh.quiesced = true;
+        taskEXIT_CRITICAL(&s_transport_mux);
 #ifdef MESH_S31_COEX_PREFER_WIFI
         restore_coex_preference();
 #endif
+        mesh_state_cb_t cb = s_state_cb;
+        xSemaphoreGive(s_stop_mutex);
+        notify_idle_if_current(cb, MESH_STATE_SCANNING, generation);
         return ESP_ERR_NO_MEM;
     }
 
+    /* The creator does not wait for the task: its callback can safely reenter
+     * lifecycle APIs once this mutex is released. */
+    xTaskNotifyGive(s_mesh_task);
+    xSemaphoreGive(s_stop_mutex);
     return ESP_OK;
+}
+
+bool mesh_is_quiesced(void)
+{
+    if (!s_initialized) return false;
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool quiesced = s_mesh.quiesced && s_state == MESH_STATE_IDLE && !s_stopping && !s_rx_enabled &&
+                    s_rx_callbacks_active == 0 && s_tx_callbacks_active == 0 &&
+                    !s_tx_inflight.active;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    return quiesced;
 }
 
 uint32_t drain_rx_queue_for_reset(void)
@@ -344,12 +418,12 @@ uint32_t drain_rx_queue_for_reset(void)
 
 esp_err_t mesh_stop(void)
 {
-    if (!s_initialized) {
+    if (!lifecycle_owned_by_caller() || !s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
 
     xSemaphoreTake(s_stop_mutex, portMAX_DELAY);
-    if (s_state == MESH_STATE_IDLE && !s_stopping) {
+    if (s_state == MESH_STATE_IDLE && mesh_is_quiesced()) {
 #ifdef MESH_S31_COEX_PREFER_WIFI
         restore_coex_preference();
 #endif
@@ -365,6 +439,8 @@ esp_err_t mesh_stop(void)
     s_stopping = true;
     s_rx_enabled = false;
     taskEXIT_CRITICAL(&s_transport_mux);
+    if (!s_mesh.stop_task_confirmed && s_mesh_task != NULL)
+        xTaskNotifyGive(s_mesh_task);
 
     xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
     advance_tdma_generation();
@@ -376,49 +452,45 @@ esp_err_t mesh_stop(void)
 
     xSemaphoreGive(s_slot_semaphore);
     xSemaphoreGive(s_control_semaphore);
-    if (s_mesh_task != NULL && xSemaphoreTake(s_task_stopped_semaphore,
-                                              pdMS_TO_TICKS(TASK_QUIESCE_TIMEOUT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out stopping mesh task");
-        TaskHandle_t task = s_mesh_task;
-        s_mesh_task = NULL;
-        if (task != NULL) {
-            vTaskDelete(task);
+    if (!s_mesh.stop_task_confirmed) {
+        if (xSemaphoreTake(s_task_stopped_semaphore,
+                           pdMS_TO_TICKS(TASK_QUIESCE_TIMEOUT_MS)) != pdTRUE) {
+            ESP_LOGE(TAG, "Timed out waiting for cooperative mesh task exit; retry stop later");
+            xSemaphoreGive(s_stop_mutex);
+            return ESP_ERR_TIMEOUT;
         }
-        result = ESP_ERR_TIMEOUT;
+        s_mesh.stop_task_confirmed = true;
     }
 
     /* NOTE: Wait for an admitted producer before resetting its queue. */
     xSemaphoreTake(s_audio_producer_mutex, portMAX_DELAY);
     xSemaphoreGive(s_audio_producer_mutex);
 
-    bool force_transport_cleanup = false;
     if (!wait_for_rx_quiesced(pdMS_TO_TICKS(RX_QUIESCE_TIMEOUT_MS)) ||
         !wait_for_tx_idle(pdMS_TO_TICKS(TX_QUIESCE_TIMEOUT_MS))) {
-        ESP_LOGE(TAG, "Timed out quiescing ESP-NOW callbacks");
-        result = ESP_ERR_TIMEOUT;
-        force_transport_cleanup = true;
+        ESP_LOGE(TAG, "Timed out quiescing ESP-NOW callbacks; retry stop later");
+        xSemaphoreGive(s_stop_mutex);
+        return ESP_ERR_TIMEOUT;
     }
 
-    if (was_active && !force_transport_cleanup) {
-        esp_err_t leave_ret = send_packet_immediate(MESH_PKT_LEAVE, NULL, 0, s_broadcast_mac);
-        if (leave_ret != ESP_OK) {
-            result = leave_ret;
-        } else if (!wait_for_tx_idle(pdMS_TO_TICKS(TX_QUIESCE_TIMEOUT_MS))) {
-            ESP_LOGE(TAG, "Timed out waiting for LEAVE completion");
-            result = ESP_ERR_TIMEOUT;
-            force_transport_cleanup = true;
-        } else {
+    if (was_active) {
+        if (!s_mesh.stop_leave_pending) {
+            esp_err_t leave_ret = send_packet_immediate(MESH_PKT_LEAVE, NULL, 0, s_broadcast_mac);
+            if (leave_ret != ESP_OK) result = leave_ret;
+            else s_mesh.stop_leave_pending = true;
+        }
+        if (s_mesh.stop_leave_pending) {
+            if (!wait_for_tx_idle(pdMS_TO_TICKS(TX_QUIESCE_TIMEOUT_MS))) {
+                ESP_LOGE(TAG, "Timed out waiting for LEAVE completion; retry stop later");
+                xSemaphoreGive(s_stop_mutex);
+                return ESP_ERR_TIMEOUT;
+            }
+            s_mesh.stop_leave_pending = false;
             taskENTER_CRITICAL(&s_transport_mux);
             esp_now_send_status_t leave_status = s_last_tx_status;
             taskEXIT_CRITICAL(&s_transport_mux);
-            if (leave_status != ESP_NOW_SEND_SUCCESS) {
-                result = ESP_FAIL;
-            }
+            if (leave_status != ESP_NOW_SEND_SUCCESS) result = ESP_FAIL;
         }
-    }
-
-    if (force_transport_cleanup) {
-        force_cleanup_esp_now_transport();
     }
 
     /* NOTE: No producer or admitted callback may reach a queue after this point. */
@@ -466,13 +538,47 @@ esp_err_t mesh_stop(void)
 #ifdef MESH_S31_COEX_PREFER_WIFI
     restore_coex_preference();
 #endif
-    set_state(MESH_STATE_IDLE);
+    mesh_state_t old_state = s_state;
     taskENTER_CRITICAL(&s_transport_mux);
+    s_state = MESH_STATE_IDLE;
+    uint32_t generation = ++s_mesh.lifecycle_generation;
     s_stopping = false;
+    s_mesh.quiesced = true;
     taskEXIT_CRITICAL(&s_transport_mux);
 
+    mesh_state_cb_t cb = s_state_cb;
     xSemaphoreGive(s_stop_mutex);
+    notify_idle_if_current(cb, old_state, generation);
     return result;
+}
+
+esp_err_t mesh_set_talk_channel(uint8_t channel)
+{
+    if (!lifecycle_owned_by_caller() || !s_initialized) return ESP_ERR_INVALID_STATE;
+    if (!mesh_channel_valid(channel)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_stop_mutex, portMAX_DELAY);
+    if (s_state != MESH_STATE_IDLE || !mesh_is_quiesced()) {
+        xSemaphoreGive(s_stop_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t previous = s_config.channel;
+    uint8_t rf = mesh_channel_espnow_rf(channel);
+    if (rf == previous) {
+        s_config.talk_channel = channel;
+        xSemaphoreGive(s_stop_mutex);
+        return ESP_OK;
+    }
+    esp_err_t ret = esp_wifi_set_channel(rf, WIFI_SECOND_CHAN_NONE);
+    if (ret != ESP_OK) {
+        esp_err_t rollback = esp_wifi_set_channel(previous, WIFI_SECOND_CHAN_NONE);
+        if (rollback != ESP_OK) ESP_LOGE(TAG, "RF rollback failed: %s", esp_err_to_name(rollback));
+        xSemaphoreGive(s_stop_mutex);
+        return ret;
+    }
+    s_config.channel = rf;
+    s_config.talk_channel = channel;
+    xSemaphoreGive(s_stop_mutex);
+    return ESP_OK;
 }
 
 bool mesh_is_initialized(void)

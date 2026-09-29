@@ -231,6 +231,11 @@ typedef void (*mesh_state_cb_t)(mesh_state_t old_state, mesh_state_t new_state);
  */
 typedef void (*mesh_peer_cb_t)(const mesh_peer_info_t *peer, bool joined);
 
+/* The task that successfully initializes mesh owns lifecycle start/stop,
+ * channel changes and deinit until teardown completes. Once initialized,
+ * other tasks (and always ISRs) receive ESP_ERR_INVALID_STATE. Mesh-task
+ * state/peer callbacks must enqueue lifecycle requests for the owner. */
+
 /**
  * @brief Initialize the mesh subsystem with default configuration
  * @return ESP_OK on success
@@ -266,10 +271,25 @@ esp_err_t mesh_start(void);
  * @brief Stop mesh networking
  *
  * Sends LEAVE packet and stops TDMA scheduler.
+ * A task/callback/LEAVE-completion timeout returns ESP_ERR_TIMEOUT without
+ * clearing live state; call again to finish the cooperative stop. A failed
+ * LEAVE send or reported failure returns that error after successful cleanup,
+ * in which case mesh_is_quiesced() is true.
  *
  * @return ESP_OK on success
  */
 esp_err_t mesh_stop(void);
+
+/** True only after cooperative task exit, RX callback drain, TX idle and
+ * full stopped-state cleanup (or immediately after initialization). A failed
+ * LEAVE may still return an error from mesh_stop() with this predicate true;
+ * timeout paths keep it false until a later mesh_stop() completes. */
+bool mesh_is_quiesced(void);
+
+/** Change RF and talk group only while initialized, IDLE and quiesced (after mesh_stop).
+ * On RF failure the previous config is retained and RF rollback is attempted;
+ * the mesh remains stopped. */
+esp_err_t mesh_set_talk_channel(uint8_t channel);
 
 /**
  * @brief Check if mesh subsystem is initialized

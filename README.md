@@ -93,9 +93,10 @@ See the [wiring guide](docs/wiring.md) for the current assembled prototype.
 ### Ongoing
 
 - [ ] Drop mesh during phone call; resume mesh after call ends
-- [ ] Mesh channels with RGB LED channel indicator by color (e.g. green=1, red=2, blue=3, etc.)
-- [ ] Buttons for channel selection, volume, mesh toggle, and Bluetooth pairing
-- [ ] Replace beeps with voice prompts for button operations
+- [x] Mesh channels with RGB LED channel indicator by color (e.g. green=1, red=2, blue=3, etc.)
+- [x] Buttons for channel selection, volume, mesh toggle, and Bluetooth pairing
+- [x] Multi-hop mesh
+- [x] Replace beeps with voice prompts for button operations
 - [ ] Power budgeting and optimization for 8-16 hours of active riding per charge
 - [ ] Testing on real motorcycle rides
 - [ ] E2EE

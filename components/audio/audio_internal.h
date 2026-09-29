@@ -8,7 +8,7 @@
  * - audio_capture.c: capture task, DSP chain, encode, TX callback.
  * - audio_playout.c: playout task, decode, mixing, and I2S writes.
  * - audio_rx.c: RX packet admission and source reset handshakes.
- * - audio_notify.c: notification tone synthesis.
+ * - audio_notify.c: notification voice playout.
  *
  * NOTE: API lock order is lifecycle -> RX reset -> RX sources -> short
  * portMUX locks. Task code never holds a portMUX lock while taking a mutex.
@@ -38,6 +38,7 @@
 #include "audio_capture_fifo.h"
 #include "audio_rate_converter.h"
 #include "audio_sample_fifo.h"
+#include "audio_volume_mix.h"
 #include "opus.h"
 #if defined(AUDIO_S31_LC3_WIRE)
 #include "esp_lc3_codec.h"
@@ -63,6 +64,7 @@
 #define AUDIO_FRAME_SAMPLES 320
 #define AUDIO_HW_SAMPLE_RATE 48000
 #define AUDIO_HW_FRAME_SAMPLES 960
+#define AUDIO_CODEC_OUTPUT_VOLUME 60u
 #define AUDIO_CAPTURE_FIFO_CAPACITY 640
 #define AUDIO_PLAYBACK_CONVERTED_CAPACITY (AUDIO_HW_FRAME_SAMPLES * 2u)
 #define AUDIO_PLAYBACK_FIFO_CAPACITY      (AUDIO_HW_FRAME_SAMPLES * 2u)
@@ -79,8 +81,6 @@
 
 #define LOOPBACK_QUEUE_SIZE       8
 #define NOTIFICATION_QUEUE_SIZE   4
-#define NOTIFICATION_BEEP_SAMPLES 1600
-#define NOTIFICATION_GAP_SAMPLES  400
 
 typedef struct {
     float x1, x2;
@@ -116,12 +116,9 @@ typedef struct {
 
 typedef struct {
     bool active;
-    audio_notify_t type;
-    uint8_t tone_index;
-    uint16_t segment_sample;
-    bool in_gap;
-    uint32_t phase;
-    uint32_t phase_step;
+    audio_prompt_player_t player;
+    uint32_t mixed_samples;
+    uint32_t output_samples;
 } audio_notification_state_t;
 
 /*
@@ -140,6 +137,11 @@ typedef struct {
     atomic_bool rx_reset_requested;
     atomic_bool voice_playback_reset_requested;
     atomic_uint music_playback_generation;
+    audio_volume_levels_t volumes;
+    audio_gain_ramp_t mesh_gain;
+    audio_gain_ramp_t bluetooth_gain;
+    audio_program_mix_t program_mix;
+    audio_limit_cue_t volume_limit_cue;
     audio_config_t config;
     SemaphoreHandle_t lifecycle_mutex;
     StaticSemaphore_t lifecycle_mutex_storage;

@@ -11,6 +11,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -24,10 +25,13 @@
 #include "app_state.h"
 #include "audio.h"
 #include "button.h"
+#include "button_control.h"
 #include "cpu_profile.h"
 #include "e2e_diag.h"
 #include "mesh.h"
 #include "mesh_intent.h"
+#include "mesh_channel_pref.h"
+#include "runtime_channel_control.h"
 #include "media_toggle_guard.h"
 #include "nvs_flash.h"
 #include "omi_board_pins.h"
@@ -51,8 +55,14 @@ static const char *TAG = "omi";
 #define RTT_LOG_INTERVAL_MS 10000
 
 _Atomic bool g_mesh_active = false;
-static atomic_bool s_short_press_pending = ATOMIC_VAR_INIT(false);
-static atomic_bool s_pairing_pending = ATOMIC_VAR_INIT(false);
+typedef struct { button_id_t id; button_event_t event; } button_action_t;
+static QueueHandle_t s_button_actions;
+static atomic_uint s_button_drops = ATOMIC_VAR_INIT(0);
+static atomic_bool s_channel_transition = ATOMIC_VAR_INIT(false);
+static bool s_esp_channel_pending;
+static bool s_esp_enable_announcement_pending;
+static bool s_role_announced;
+static bool s_last_coordinator;
 static media_toggle_guard_t s_media_toggle_guard;
 
 /*
@@ -138,6 +148,7 @@ static esp_err_t init_audio_with_test_flags(void)
  */
 static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us)
 {
+    if (atomic_load(&s_channel_transition)) return;
     switch (s_active_transport) {
     case TRANSPORT_ESP_NOW:
         transport_espnow_send_audio(data, len, active);
@@ -155,6 +166,7 @@ static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, in
 
 static void audio_tx_idle_callback(int64_t timestamp_us)
 {
+    if (atomic_load(&s_channel_transition)) return;
     if (s_active_transport == TRANSPORT_NRF52840) {
         transport_nrf_skip_audio_frame(timestamp_us);
     }
@@ -183,7 +195,8 @@ static void disable_mesh_from_button(void)
         atomic_store(&g_mesh_active, false);
         transport_nrf_cancel_enable_notification();
         transport_nrf_reset_membership_tracking();
-        audio_clear_rx_frames();
+        (void)audio_reset_mesh_rx();
+        s_role_announced = false;
         (void)audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
         ESP_LOGI(TAG, "Mesh disabled");
     } else {
@@ -228,23 +241,16 @@ static void enable_mesh_from_button(void)
     }
 }
 
-/**
- * @brief Handle release-classified BOOT gestures.
- */
-static void button_gesture_callback(button_gesture_t gesture, int gpio)
+/** Enqueue release events without blocking the button task. */
+static void button_action_callback(button_id_t id, button_event_t event, void *context)
 {
-    if (gesture == BUTTON_GESTURE_BLUETOOTH_PAIRING) {
-        atomic_store_explicit(&s_pairing_pending, true, memory_order_release);
-        return;
-    }
-    if (gesture == BUTTON_GESTURE_SHORT_PRESS) {
-        atomic_store_explicit(&s_short_press_pending, true, memory_order_release);
-        return;
-    }
-    if (gesture != BUTTON_GESTURE_MESH_TOGGLE) return;
+    (void)context;
+    button_action_t action = {.id = id, .event = event};
+    if (xQueueSend(s_button_actions, &action, 0) != pdTRUE) atomic_fetch_add(&s_button_drops, 1);
+}
 
-    ESP_LOGI(TAG, "BOOT mesh gesture detected on GPIO %d - toggling mesh", gpio);
-
+static void process_mesh_toggle(void)
+{
     bool requested_enabled = !mesh_intent_enabled();
     esp_err_t ret = mesh_intent_persist(requested_enabled);
     if (ret != ESP_OK) {
@@ -254,6 +260,12 @@ static void button_gesture_callback(button_gesture_t gesture, int gpio)
     transport_nrf_set_user_enabled(requested_enabled);
     transport_nrf_reset_reconciliation();
 
+    if (requested_enabled && s_esp_channel_pending) {
+        s_esp_enable_announcement_pending = true;
+        ESP_LOGI(TAG, "Mesh enable pending selected channel application");
+        return;
+    }
+    if (!requested_enabled) s_esp_enable_announcement_pending = false;
     if (requested_enabled) {
         enable_mesh_from_button();
     } else {
@@ -266,9 +278,9 @@ static void process_pairing_request(void)
     esp_err_t ret = phone_audio_set_discoverable(true);
     if (ret == ESP_OK) {
         (void)audio_play_notification(AUDIO_NOTIFY_BLUETOOTH_PAIRING);
-        ESP_LOGI(TAG, "BOOT gesture opened Bluetooth pairing window for 120 seconds");
+        ESP_LOGI(TAG, "Center hold opened Bluetooth pairing window for 120 seconds");
     } else {
-        ESP_LOGW(TAG, "BOOT pairing gesture unavailable: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Center pairing unavailable: %s", esp_err_to_name(ret));
     }
 }
 
@@ -287,14 +299,14 @@ static void process_media_toggle(bool request_pending, int64_t now_ms)
         &s_media_toggle_guard, request_pending, valid, phone_state.media_streaming,
         phone_state.media_transition_ms, now_ms);
     if (decision == MEDIA_TOGGLE_DROPPED) {
-        ESP_LOGW(TAG, "BOOT media toggle dropped: A2DP state transition was not observed");
+        ESP_LOGW(TAG, "Media toggle dropped: A2DP state transition was not observed");
     } else if (decision == MEDIA_TOGGLE_DISPATCH) {
         bool sent_streaming = phone_state.media_streaming;
         esp_err_t ret = sent_streaming ? phone_audio_pause() : phone_audio_play();
         bool arm_guard = ret != ESP_ERR_NO_MEM;
         media_toggle_guard_command_result(&s_media_toggle_guard, arm_guard,
                                           sent_streaming, get_time_ms());
-        ESP_LOGI(TAG, "BOOT short press: %s media (%s)",
+        ESP_LOGI(TAG, "Center press: %s media (%s)",
                  sent_streaming ? "pause" : "play", esp_err_to_name(ret));
     }
 }
@@ -304,7 +316,7 @@ static void process_short_press(int64_t now_ms)
     phone_audio_state_t phone_state;
     esp_err_t ret = phone_audio_get_state(&phone_state);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "BOOT short press state unavailable: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Center press state unavailable: %s", esp_err_to_name(ret));
         return;
     }
 
@@ -312,7 +324,7 @@ static void process_short_press(int64_t now_ms)
         case PHONE_AUDIO_CALL_PHASE_INCOMING:
             media_toggle_guard_reset(&s_media_toggle_guard);
             ret = phone_audio_answer_call();
-            ESP_LOGI(TAG, "BOOT short press: answer call (%s)", esp_err_to_name(ret));
+            ESP_LOGI(TAG, "Center press: answer call (%s)", esp_err_to_name(ret));
             return;
         case PHONE_AUDIO_CALL_PHASE_OUTGOING_DIALING:
         case PHONE_AUDIO_CALL_PHASE_OUTGOING_ALERTING:
@@ -320,7 +332,7 @@ static void process_short_press(int64_t now_ms)
         case PHONE_AUDIO_CALL_PHASE_HELD:
             media_toggle_guard_reset(&s_media_toggle_guard);
             ret = phone_audio_reject_call();
-            ESP_LOGI(TAG, "BOOT short press: end call (%s)", esp_err_to_name(ret));
+            ESP_LOGI(TAG, "Center press: end call (%s)", esp_err_to_name(ret));
             return;
         case PHONE_AUDIO_CALL_PHASE_IDLE:
             break;
@@ -329,10 +341,160 @@ static void process_short_press(int64_t now_ms)
     if (phone_audio_get_call_state(&phone_state.call) != ESP_OK ||
         phone_state.call.phase != PHONE_AUDIO_CALL_PHASE_IDLE) {
         media_toggle_guard_reset(&s_media_toggle_guard);
-        ESP_LOGI(TAG, "BOOT short press: media action skipped because call is no longer idle");
+        ESP_LOGI(TAG, "Center press: media action skipped because call is no longer idle");
         return;
     }
     process_media_toggle(true, now_ms);
+}
+
+static audio_notify_t channel_voice(uint8_t channel)
+{
+    return (audio_notify_t)(AUDIO_NOTIFY_CHANNEL_GREEN + channel - 1);
+}
+
+static void apply_pending_esp_channel(void)
+{
+    if (!s_esp_channel_pending) return;
+    if (!omi_esp_channel_can_apply(mesh_get_state() == MESH_STATE_IDLE, mesh_is_quiesced())) return;
+    uint8_t target = mesh_channel_pref_selected();
+    esp_err_t ret = mesh_set_talk_channel(target);
+    if (ret == ESP_OK) {
+        if (mesh_intent_enabled()) ret = mesh_start();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Talk channel %u pending radio application: %s", target, esp_err_to_name(ret));
+        return;
+    }
+    s_esp_channel_pending = false;
+    atomic_store(&s_channel_transition, false);
+    atomic_store(&g_mesh_active, mesh_intent_enabled());
+    if (s_esp_enable_announcement_pending && mesh_intent_enabled())
+        (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+    s_esp_enable_announcement_pending = false;
+    ESP_LOGI(TAG, "Talk channel %u active on ESP-NOW RF %u", target, mesh_channel_espnow_rf(target));
+}
+
+static void process_channel_selection(int direction)
+{
+    uint8_t target = mesh_channel_cycle(mesh_channel_pref_selected(), direction);
+    esp_err_t ret = mesh_channel_pref_persist(target);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Talk channel %u not selected (NVS commit failed): %s", target,
+                 esp_err_to_name(ret));
+        return;
+    }
+    esp_err_t led = board_set_channel_indicator(target);
+    if (led != ESP_OK) ESP_LOGW(TAG, "Talk channel indicator unavailable: %s", esp_err_to_name(led));
+    (void)audio_play_notification(channel_voice(target));
+    ESP_LOGI(TAG, "Selected talk channel %u; radio may still be pending", target);
+    atomic_store(&s_channel_transition, true);
+    atomic_store(&g_mesh_active, false);
+    s_role_announced = false;
+    if (s_active_transport == TRANSPORT_NRF52840) {
+        ret = transport_nrf_set_channel(target);
+        uart_bridge_discard_pending_audio();
+        transport_nrf_reset_tx_cache();
+    } else if (s_active_transport == TRANSPORT_ESP_NOW) {
+        s_esp_channel_pending = true;
+        ret = mesh_stop();
+        if (ret != ESP_OK && mesh_is_quiesced())
+            ESP_LOGW(TAG, "Mesh stop returned %s but quiesced; proceeding with channel change",
+                     esp_err_to_name(ret));
+    }
+    esp_err_t flush = audio_reset_mesh_rx();
+    if (flush != ESP_OK) {
+        ESP_LOGE(TAG, "Mesh RX flush failed; channel %u held pending: %s", target, esp_err_to_name(flush));
+        /* Do not allow a new session to admit old audio until a successful flush. */
+        return;
+    }
+    if (s_active_transport == TRANSPORT_ESP_NOW &&
+        !omi_esp_channel_can_apply(mesh_get_state() == MESH_STATE_IDLE, mesh_is_quiesced())) {
+        ESP_LOGE(TAG, "Talk channel %u pending mesh quiescence (stop: %s)", target,
+                 esp_err_to_name(ret));
+        return;
+    }
+    if (ret != ESP_OK && s_active_transport != TRANSPORT_ESP_NOW) {
+        ESP_LOGE(TAG, "Talk channel %u pending transport stop: %s", target, esp_err_to_name(ret));
+        return;
+    }
+    if (s_active_transport == TRANSPORT_ESP_NOW) apply_pending_esp_channel();
+    else atomic_store(&s_channel_transition, false); /* nRF gates through confirmed ACK. */
+}
+
+static void process_button_action(button_action_t action, int64_t now_ms)
+{
+    omi_action_t command = omi_button_action(action.id, action.event);
+    if (command == OMI_ACTION_CHANNEL_PREVIOUS || command == OMI_ACTION_CHANNEL_NEXT) {
+        phone_audio_state_t phone_state = {0};
+        esp_err_t ret = phone_audio_get_state(&phone_state);
+        if (ret != ESP_OK)
+            ESP_LOGW(TAG, "Side hold state unavailable; action skipped: %s", esp_err_to_name(ret));
+        command = omi_side_hold_action(command, ret == ESP_OK,
+                                       ret == ESP_OK && phone_state.media_streaming,
+                                       ret == ESP_OK && phone_state.call.phase == PHONE_AUDIO_CALL_PHASE_IDLE);
+    }
+    switch (command) {
+        case OMI_ACTION_CALL_MEDIA: process_short_press(now_ms); break;
+        case OMI_ACTION_MESH_TOGGLE: process_mesh_toggle(); break;
+        case OMI_ACTION_PAIRING: process_pairing_request(); break;
+        case OMI_ACTION_CHANNEL_PREVIOUS: process_channel_selection(-1); break;
+        case OMI_ACTION_CHANNEL_NEXT: process_channel_selection(1); break;
+        case OMI_ACTION_PREVIOUS_TRACK:
+        case OMI_ACTION_NEXT_TRACK: {
+            esp_err_t ret = command == OMI_ACTION_NEXT_TRACK ? phone_audio_next() : phone_audio_previous();
+            const char *direction = command == OMI_ACTION_NEXT_TRACK ? "next" : "previous";
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "Side hold: %s track skipped: %s", direction, esp_err_to_name(ret));
+            else
+                ESP_LOGI(TAG, "Side hold: %s track sent", direction);
+            break;
+        }
+        case OMI_ACTION_VOLUME_DOWN:
+        case OMI_ACTION_VOLUME_UP:
+        case OMI_ACTION_BLUETOOTH_VOLUME_DOWN:
+        case OMI_ACTION_BLUETOOTH_VOLUME_UP: {
+            omi_volume_target_t selected = omi_volume_action_target(command);
+            audio_volume_target_t target = selected == OMI_VOLUME_BLUETOOTH ?
+                AUDIO_VOLUME_BLUETOOTH : AUDIO_VOLUME_MESH;
+            int direction = omi_volume_action_direction(command);
+            uint8_t current = audio_get_volume(target);
+            uint8_t next = mesh_volume_step(current, direction);
+            esp_err_t ret = audio_set_volume(target, next);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Volume request failed: %s", esp_err_to_name(ret));
+            } else if (mesh_volume_at_limit(current, next, direction)) {
+                esp_err_t cue = audio_play_volume_limit();
+                if (cue != ESP_OK) ESP_LOGW(TAG, "Volume limit cue failed: %s", esp_err_to_name(cue));
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+static void announce_active_role(void)
+{
+    bool coordinator = false;
+    bool ready = false;
+    if (mesh_intent_enabled() && !atomic_load(&s_channel_transition)) {
+        if (s_active_transport == TRANSPORT_NRF52840)
+            ready = transport_nrf_active_role(&coordinator);
+        else if (s_active_transport == TRANSPORT_ESP_NOW && mesh_get_state() == MESH_STATE_ACTIVE) {
+            mesh_role_t role = mesh_get_role();
+            ready = role == MESH_ROLE_COORDINATOR || role == MESH_ROLE_PARTICIPANT;
+            coordinator = role == MESH_ROLE_COORDINATOR;
+        }
+    }
+    if (!ready) { s_role_announced = false; return; }
+    omi_role_voice_t voice = omi_role_announcement(ready, s_role_announced,
+                                                    s_last_coordinator, coordinator);
+    if (voice != OMI_ROLE_QUIET) {
+        if (audio_play_notification(voice == OMI_ROLE_COORDINATOR ? AUDIO_NOTIFY_ROLE_COORDINATOR :
+                                   AUDIO_NOTIFY_ROLE_PARTICIPANT) == ESP_OK) {
+            s_role_announced = true;
+            s_last_coordinator = coordinator;
+        }
+    }
 }
 
 /* ============================================================================
@@ -472,6 +634,7 @@ static esp_err_t initialize_application(int64_t boot_time)
     ESP_ERROR_CHECK(init_nvs());
     ESP_LOGI(TAG, "[%" PRId64 " ms] NVS initialized", get_time_ms());
     ESP_ERROR_CHECK(mesh_intent_load());
+    ESP_ERROR_CHECK(mesh_channel_pref_load(CONFIG_OMI_MESH_CHANNEL));
     ESP_LOGI(TAG, "Persisted mesh intent: %s", mesh_intent_enabled() ? "enabled" : "disabled");
     ESP_ERROR_CHECK(transport_nrf_init());
 
@@ -482,18 +645,20 @@ static esp_err_t initialize_application(int64_t boot_time)
         return ret;
     }
     ESP_LOGI(TAG, "[%" PRId64 " ms] Power management initialized", get_time_ms());
+    uint8_t selected_channel = mesh_channel_pref_selected();
     static const char *const channel_colors[] = {"green", "red", "blue"};
     ESP_LOGI(TAG, "Talk channel %d (%s): ESP-NOW RF %u, ESB RF %u",
-             CONFIG_OMI_MESH_CHANNEL, channel_colors[CONFIG_OMI_MESH_CHANNEL - 1],
-             mesh_channel_espnow_rf(CONFIG_OMI_MESH_CHANNEL),
-             mesh_channel_esb_rf(CONFIG_OMI_MESH_CHANNEL));
-    esp_err_t indicator_ret = board_set_channel_indicator(CONFIG_OMI_MESH_CHANNEL);
+              selected_channel, channel_colors[selected_channel - 1],
+              mesh_channel_espnow_rf(selected_channel), mesh_channel_esb_rf(selected_channel));
+    esp_err_t indicator_ret = board_set_channel_indicator(selected_channel);
     if (indicator_ret != ESP_OK) {
         ESP_LOGW(TAG, "Talk channel indicator unavailable: %s", esp_err_to_name(indicator_ret));
     }
 
     /* Initialize button handler */
     ESP_LOGI(TAG, "");
+    s_button_actions = xQueueCreate(16, sizeof(button_action_t));
+    if (s_button_actions == NULL) return ESP_ERR_NO_MEM;
     ret = button_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize button: %s", esp_err_to_name(ret));
@@ -502,6 +667,8 @@ static esp_err_t initialize_application(int64_t boot_time)
     ESP_LOGI(TAG, "[%" PRId64 " ms] Button handler initialized", get_time_ms());
 
     select_transport();
+    if (s_active_transport == TRANSPORT_NRF52840)
+        ESP_ERROR_CHECK(transport_nrf_set_channel(selected_channel));
 
     /* Initialize audio subsystem (after SPI so DMA channels are available) */
     ESP_LOGI(TAG, "");
@@ -536,7 +703,7 @@ static esp_err_t initialize_application(int64_t boot_time)
 
     /* Now initialize ESP-NOW mesh if needed (after audio) */
     if (s_active_transport == TRANSPORT_ESP_NOW) {
-        ret = transport_espnow_init();
+        ret = transport_espnow_init(selected_channel);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initialize mesh: %s", esp_err_to_name(ret));
             if (phone_ret == ESP_OK) (void)phone_audio_deinit();
@@ -571,7 +738,8 @@ static esp_err_t initialize_application(int64_t boot_time)
         if (phone_ret == ESP_OK) (void)phone_audio_deinit();
         return ret;
     }
-    button_register_gesture_callback(button_gesture_callback);
+    button_register_callback(button_action_callback, NULL);
+    (void)audio_play_notification(channel_voice(selected_channel));
 
     /* The persisted user policy is reconciled with the selected transport. */
     if (s_active_transport == TRANSPORT_NRF52840) {
@@ -603,18 +771,33 @@ static void run_runtime_health_loop(int64_t boot_time)
 #endif
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(20));
 
         int64_t now_ms = get_time_ms();
 
-        bool short_press = atomic_exchange_explicit(&s_short_press_pending, false,
-                                                    memory_order_acq_rel);
-        if (short_press) process_short_press(now_ms);
-        else process_media_toggle(false, now_ms);
+        button_action_t action;
+        unsigned handled = 0;
+        while (handled++ < 16 && xQueueReceive(s_button_actions, &action, 0) == pdTRUE)
+            process_button_action(action, now_ms);
+        process_media_toggle(false, now_ms);
+        unsigned dropped = atomic_exchange(&s_button_drops, 0);
+        if (dropped) ESP_LOGW(TAG, "Button queue full; dropped %u newest actions", dropped);
 
-        /* When both intents are pending, call/media handling takes priority. */
-        if (atomic_exchange_explicit(&s_pairing_pending, false, memory_order_acq_rel)) {
-            process_pairing_request();
+        if (s_active_transport == TRANSPORT_ESP_NOW && s_esp_channel_pending) {
+            static int64_t last_retry_ms;
+            if (now_ms - last_retry_ms >= 2000) {
+                last_retry_ms = now_ms;
+                if (!omi_esp_channel_can_apply(mesh_get_state() == MESH_STATE_IDLE,
+                                               mesh_is_quiesced())) {
+                    esp_err_t stop_ret = mesh_stop();
+                    if (stop_ret != ESP_OK)
+                        ESP_LOGW(TAG, "Mesh stop result (state %u): %s", mesh_get_state(),
+                                 esp_err_to_name(stop_ret));
+                }
+                if (omi_esp_channel_can_apply(mesh_get_state() == MESH_STATE_IDLE,
+                                              mesh_is_quiesced()) && audio_reset_mesh_rx() == ESP_OK)
+                    apply_pending_esp_channel();
+            }
         }
 
         now_ms = get_time_ms();
@@ -640,8 +823,13 @@ static void run_runtime_health_loop(int64_t boot_time)
 
         if (s_active_transport == TRANSPORT_NRF52840) {
             static int64_t last_rtt_log_ms = 0;
+            static int64_t last_flush_retry_ms;
 
-            transport_nrf_tick(now_ms);
+            if (atomic_load(&s_channel_transition) && now_ms - last_flush_retry_ms >= 2000) {
+                last_flush_retry_ms = now_ms;
+                if (audio_reset_mesh_rx() == ESP_OK) atomic_store(&s_channel_transition, false);
+            }
+            if (!atomic_load(&s_channel_transition)) transport_nrf_tick(now_ms);
 #if !defined(APP_S31_LC3_WIRE)
             /* LC3 nRF firmware does not ACK legacy BRIDGE_PKT_AUDIO RTT probes. */
             rtt_probe_tick(now_ms, g_mesh_active, uart_bridge_is_connected());
@@ -658,6 +846,7 @@ static void run_runtime_health_loop(int64_t boot_time)
                 last_rtt_log_ms = now_ms;
             }
         }
+        announce_active_role();
 
         if ((now_ms - last_health_check) >= health_interval_ms) {
             log_system_health(now_ms, boot_time);

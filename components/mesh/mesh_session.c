@@ -313,6 +313,17 @@ void mesh_task(void *arg)
 {
     ESP_LOGI(TAG, "Mesh task started");
 
+    /* The creator has committed startup before releasing this gate. Stop also
+     * wakes us so a cancelled startup can exit without emitting SCANNING. */
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    taskENTER_CRITICAL(&s_transport_mux);
+    bool announce_scanning = !s_stopping && s_state == MESH_STATE_SCANNING;
+    taskEXIT_CRITICAL(&s_transport_mux);
+    if (announce_scanning) {
+        if (s_state_cb) s_state_cb(MESH_STATE_IDLE, MESH_STATE_SCANNING);
+        ESP_LOGI(TAG, "State: %d -> %d", MESH_STATE_IDLE, MESH_STATE_SCANNING);
+    }
+
     mesh_task_state_t task = {
         .scan_start = esp_timer_get_time(),
         .prev_state = s_state,
@@ -367,8 +378,8 @@ void mesh_task(void *arg)
         }
     }
 
-    xSemaphoreGive(s_task_stopped_semaphore);
     s_mesh_task = NULL;
+    xSemaphoreGive(s_task_stopped_semaphore);
     vTaskDelete(NULL);
 }
 
@@ -664,7 +675,7 @@ void handle_join_ack_packet(const mesh_rx_item_t *rx)
 
     esp_now_peer_info_t peer = {0};
     memcpy(peer.peer_addr, s_coordinator_mac, 6);
-    peer.channel = s_config.channel;
+    peer.channel = 0;
     peer.ifidx = WIFI_IF_STA;
     peer.encrypt = false;
     esp_now_add_peer(&peer);

@@ -23,7 +23,7 @@ static inline int64_t nrf_mesh_reconcile_interval_ms(uint8_t attempts)
 }
 
 static inline nrf_mesh_reconcile_action_t nrf_mesh_reconcile_action(bool enabled, bool confirmed,
-                                                                     uint8_t bridge_state)
+                                                                      uint8_t bridge_state)
 {
     if (!enabled) {
         return bridge_state == BRIDGE_MESH_STATE_IDLE ? NRF_MESH_NO_COMMAND : NRF_MESH_STOP;
@@ -32,6 +32,19 @@ static inline nrf_mesh_reconcile_action_t nrf_mesh_reconcile_action(bool enabled
         return bridge_state == BRIDGE_MESH_STATE_IDLE ? NRF_MESH_START : NRF_MESH_NO_COMMAND;
     }
     return bridge_state == BRIDGE_MESH_STATE_IDLE ? NRF_MESH_START : NRF_MESH_STOP;
+}
+
+static inline nrf_mesh_reconcile_action_t nrf_channel_reconcile_action(
+    bool enabled, bool confirmed, bool stop_ack_required, uint8_t bridge_state)
+{
+    return stop_ack_required ? NRF_MESH_STOP :
+           nrf_mesh_reconcile_action(enabled, confirmed, bridge_state);
+}
+
+static inline bool nrf_channel_start_confirmed(bool ack_ok, uint8_t attempted,
+                                                uint8_t target, bool enabled)
+{
+    return ack_ok && enabled && attempted == target;
 }
 
 #endif

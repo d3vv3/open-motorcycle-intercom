@@ -38,7 +38,7 @@ endif()
 
 idf_component_register(
     SRCS "audio.c" "audio_hw.c" "audio_capture.c" "audio_opus_stage_profile.c" "audio_playout.c" "audio_rx.c"
-         "audio_notify.c" "vox.c" "voice_cleanup.c" "audio_packet_store.c"
+           "audio_notify.c" "audio_prompt.c" "audio_volume_mix.c" "${CMAKE_CURRENT_BINARY_DIR}/audio_prompts_data.c" "vox.c" "voice_cleanup.c" "audio_packet_store.c"
              "audio_pcm_resampler.c" "audio_rate_converter.c" "audio_capture_fifo.c" "audio_sample_fifo.c" "audio_rx_source_select.c" "audio_reblock.c" "audio_aec.c"
          "audio_route.c" "audio_route_runtime.c"
     INCLUDE_DIRS "include"
@@ -59,6 +59,19 @@ idf_component_register(
           lc3_bench
           esp_lc3_bench
 )
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(AUDIO_PROMPT_WAVS
+    startup peer_join peer_leave mesh_on mesh_off phone_pairing channel_green channel_red
+    channel_blue you_are_coordinator you_are_participant)
+list(TRANSFORM AUDIO_PROMPT_WAVS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/../../audios/")
+list(TRANSFORM AUDIO_PROMPT_WAVS APPEND ".wav")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/audio_prompts_data.c"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/encode_notifications.py"
+            --audios "${CMAKE_CURRENT_SOURCE_DIR}/../../audios"
+            --output "${CMAKE_CURRENT_BINARY_DIR}/audio_prompts_data.c"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/encode_notifications.py" ${AUDIO_PROMPT_WAVS}
+    VERBATIM)
 
 if(CONFIG_IDF_TARGET_ESP32S31)
     idf_component_get_property(OPUS_COMPONENT_DIR 78__esp-opus COMPONENT_DIR)

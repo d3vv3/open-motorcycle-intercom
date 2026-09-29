@@ -7,7 +7,7 @@
  * - Opus encode/decode
  * - VOX detection
  * - Packet-store and adaptive PCM playout
- * - Notification tone synthesis
+ * - Voice notifications
  */
 
 #ifndef OMI_AUDIO_H
@@ -20,6 +20,7 @@
 #include "esp_err.h"
 
 #include "omi_board_pins.h"
+#include "audio_prompt.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -391,6 +392,26 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id);
 /** Clear queued remote audio and reset receive decoder state. */
 void audio_clear_rx_frames(void);
 
+/** Synchronously flush mesh RX packet stores, decoder and buffered voice output on
+ * the playout owner. Caller must gate old-channel RX until this returns; I2S DMA
+ * already submitted to hardware cannot be retracted. Bluetooth and prompts remain active. */
+esp_err_t audio_reset_mesh_rx(void);
+
+/** Independent software playback gains; both default to 100 at initialization.
+ * The hardware codec remains at its fixed 60 percent output setting. */
+typedef enum {
+    AUDIO_VOLUME_MESH,
+    AUDIO_VOLUME_BLUETOOTH,
+} audio_volume_target_t;
+
+/** Set gain (0..100), without resetting queued audio. Invalid targets or values
+ * return ESP_ERR_INVALID_ARG; unavailable audio returns ESP_ERR_INVALID_STATE. */
+esp_err_t audio_set_volume(audio_volume_target_t target, uint8_t percent);
+/** Last accepted level, or 0 for an invalid target. */
+uint8_t audio_get_volume(audio_volume_target_t target);
+/** Schedule one high-priority three-beep cue; repeated requests coalesce until it ends. */
+esp_err_t audio_play_volume_limit(void);
+
 /**
  * @brief Register callback for encoded TX frames (mesh mode)
  *
@@ -471,21 +492,9 @@ size_t audio_bluetooth_mic_available_samples(void);
  * ============================================================================ */
 
 /**
- * @brief Notification sound types
- */
-typedef enum {
-    AUDIO_NOTIFY_STARTUP,       /**< Startup: 3-tone ascending arpeggio */
-    AUDIO_NOTIFY_PEER_JOIN,     /**< Peer joined: low-high ascending beeps */
-    AUDIO_NOTIFY_PEER_LEAVE,    /**< Peer left: high-low descending beeps */
-    AUDIO_NOTIFY_MESH_ENABLED,  /**< Mesh enabled: rising two-note beep */
-    AUDIO_NOTIFY_MESH_DISABLED, /**< Mesh disabled: falling two-note beep */
-    AUDIO_NOTIFY_BLUETOOTH_PAIRING, /**< Bluetooth pairing: three high beeps */
-} audio_notify_t;
-
-/**
  * @brief Play a notification sound
  *
- * Queues a notification tone for the audio playback task.
+ * Queues a voice clip for the audio playback task.
  * Non-blocking - queues the sound for playback.
  *
  * @param type Type of notification sound
