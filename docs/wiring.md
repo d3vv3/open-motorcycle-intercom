@@ -1,6 +1,6 @@
 # ESP32-S31 Function CoreBoard Wiring
 
-This guide describes the wiring tested on two prototype pairs:
+This guide describes the bridge/audio wiring tested on two prototype pairs.
 
 - ESP32-S31-Function-CoreBoard-1
 - Seeed XIAO nRF52840 Sense running the `nrf_mesh` firmware
@@ -8,6 +8,22 @@ This guide describes the wiring tested on two prototype pairs:
 
 The older ESP32-S3, MAX9814, PCM5102A, and MAX98357A prototype uses different
 pins. Do not use its GPIO map with this firmware.
+
+## External Buttons
+
+Add three normally-open momentary switches. Connect one terminal of each switch
+to its GPIO and the other to CoreBoard `J2` pin 8 (`G`, ground):
+
+| Button | ESP32-S31 GPIO | CoreBoard J2 header pin | Other terminal |
+| --- | ---: | ---: | --- |
+| Minus | GPIO1 | pin 12 | `G` / pin 8 |
+| Center / play | GPIO2 | pin 7 | `G` / pin 8 |
+| Plus | GPIO3 | pin 10 | `G` / pin 8 |
+
+These are **J2 header positions**, not module pad numbers. Check the J2 pin-1
+marking and [Espressif's official J2 diagram](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html#j2)
+before wiring, especially on third-party CoreBoard revisions.
+See [buttons.md](buttons.md) for timing and actions.
 
 ## Onboard Audio
 
@@ -127,7 +143,7 @@ Then connect USB only to the CoreBoard.
 <details>
 <summary>CoreBoard Pins to Avoid</summary>
 
-- GPIO61 is the BOOT button and a strapping pin.
+- GPIO61 is the BOOT button and a strapping pin, not a runtime control on the new S31 firmware.
 - GPIO60 drives the onboard RGB LED and is a strapping pin.
 - GPIO37 is a strapping pin.
 - GPIO58 and GPIO59 are UART0 through the onboard USB-to-UART bridge.
@@ -140,15 +156,15 @@ The bridge map uses GPIO42 through GPIO47 and avoids these conflicts.
 
 </details>
 
-For BOOT button gestures and notification sounds, see [Button gestures](buttons.md).
+For external-button gestures and voice prompts, see [Button controls](buttons.md).
 
 ## Bring-up Order
 
-1. With power disconnected, connect ground, ACK, SPI, WS, and the speaker as shown above.
+1. With power disconnected, connect ground, ACK, SPI, WS, the three buttons, and the speaker as shown above.
 2. Use the separate-USB arrangement for flashing; leave the shared `3V3` wire disconnected.
-3. Flash matching S31 and nRF firmware with bridge protocol v3 and LC3 support.
+3. Flash matching S31 and nRF firmware with bridge protocol v5 and LC3 support.
 4. Let the XIAO boot, then reset the S31 so it can probe the bridge.
-5. Confirm the S31 log selects nRF ESB and reports bridge protocol 3, LC3, and 20 ms audio frames.
+5. Confirm the S31 log selects nRF ESB and reports bridge protocol 5, LC3, and 20 ms audio frames.
 6. Repeat for the second pair and confirm that the mesh reports a peer.
 7. Speak near each microphone in turn and check the opposite speaker.
 

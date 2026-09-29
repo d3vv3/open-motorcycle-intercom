@@ -9,7 +9,7 @@ For each pair, use:
 
 - An ESP32-S31 Function CoreBoard-1 with 16 MB flash and 16 MB PSRAM.
 - A XIAO nRF52840 Sense and a passive 4 ohm, 3 W speaker.
-- Data-capable USB cables and the connections in [wiring.md](wiring.md).
+- Three normally-open momentary buttons, data-capable USB cables, and the connections in [wiring.md](wiring.md).
 
 The CoreBoard already contains the microphone, codec, and speaker amplifier.
 Do not add the external audio modules from the older ESP32-S3 prototype.
@@ -66,7 +66,7 @@ west build --sysbuild -b xiao_ble/nrf52840 \
 
 The tested target is also used for our XIAO Sense boards.
 The application image is `build-nrf341/nrf_mesh/zephyr/zephyr.uf2`.
-Both ends need matching LC3 protocol-v3 firmware; an older Opus bridge is not compatible.
+Both ends need matching LC3 mesh/bridge protocol-v5 firmware; an older Opus bridge is not compatible.
 
 ## Flash the Boards
 
@@ -106,13 +106,11 @@ Repeat with the other S31's serial identity.
 ## First Checks
 
 1. Let each nRF boot, then reset its S31 so the SPI probe can find it.
-2. Confirm nRF ESB selection, bridge protocol 3, LC3, and 20 ms audio in the S31 logs.
-3. On each fresh S31, hold BOOT for 2 to under 6 seconds, then release it to enable mesh.
+2. Confirm nRF ESB selection, bridge protocol 5, LC3, and 20 ms audio in the S31 logs.
+3. On each fresh S31, hold the external center/play button for 2 to under 6 seconds, then release it to enable mesh.
 4. Confirm that the two nodes join the same mesh and report a peer.
 5. Speak near each microphone and listen at the opposite speaker.
-6. Use the [button gestures](buttons.md) to pair a phone and test music alongside mesh voice.
-
-Mesh starts disabled on fresh boards. The setting persists across restarts; the same gesture toggles it on existing installations.
+6. Use the [external button controls](buttons.md) to pair a phone, select a talk channel, and test music alongside mesh voice.
 
 With VOX enabled, silence stops LC3 encoding and audio transmission after the hangover period.
 Capture and control traffic continue; quiet audio counters alone are not a fault.
@@ -121,7 +119,6 @@ There is no pre-roll buffer, so the start of quiet speech can be clipped.
 An absent or incompatible nRF bridge causes ESP-NOW fallback at startup.
 Check the selected transport before comparing results. With nRF selected, S31 Wi-Fi is off and Bluetooth remains enabled.
 
-Two-pair music and voice operation has been tested. Larger groups and sustained calls still need validation.
 For normal one-cable operation, follow the power transition in [wiring.md](wiring.md) before reconnecting the shared supply.
 
 ## Capture Logs and Run Tests

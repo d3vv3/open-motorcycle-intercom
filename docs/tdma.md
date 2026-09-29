@@ -16,8 +16,13 @@ Each 20 ms audio payload contains two 10 ms LC3 frames: 24 bytes each, 48 bytes 
 They travel together in one packet.
 Redundant previous audio increases packet size, not the transmission cadence.
 
-Slot ownership is fixed: `slot_index = node_id - 1`.
-Local and relay audio share one transmission opportunity per node per frame.
+The authoritative slot map assigns each member's slot;
+removing a node may leave a hole without renumbering other members,
+including through a planned coordinator handover.
+ESP-NOW sends at most one local or relay audio packet per node per frame,
+alternating under contention.
+nRF ESB may attempt a second packet only if guarded remaining airtime suffices;
+full-rate local plus relay is not guaranteed.
 Relay grants are limited to two active speakers.
 
 The guard leaves 1.5 ms before each slot's deadline.
@@ -33,10 +38,13 @@ The schedule does not guarantee collision-free RF operation.
 
 The nRF owns ESB timing when the bridge is active.
 Participants synchronize to the coordinator and reacquire SYNC after loss.
+Control-window ownership rotates by slot over eight frames (160 ms);
+forwarded SYNC uses the relay's current synchronized frame/phase at TX, not its receive timestamp.
+A planned successor also sends SYNC in its own control windows after promotion.
 S31 GPIO47 provides a physical 48 kHz WS reference, separate from the 16 kHz mono LC3 audio.
 The current runtime does not enable WS-based TDMA clock correction.
 
-Two-board operation has been tested; eight-node operation still needs validation.
+Earlier two-board operation has been tested; the new adaptive relay/handover paths still await hardware validation, as does eight-node operation.
 Timing counters alone do not prove end-to-end audio latency or RF delivery.
 
-See [protocol.md](protocol.md) for packet and bridge formats.
+See [protocol.md](protocol.md) for packet and bridge formats and [adaptive mesh](mesh.md) for grant acquisition and latency limits.

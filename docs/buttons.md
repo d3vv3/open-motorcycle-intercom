@@ -1,14 +1,22 @@
-# BOOT Button Gestures
+# Buttons
 
-Use BOOT only after the firmware has started:
+Use the **-**, **play**, and **+** buttons. For setup, see [button wiring](wiring.md#external-buttons).
+Hold for the time shown, then release to perform the action.
 
-- Release after 50 ms to under 2 seconds: contextual call or A2DP play/pause
-  control. Releases under 50 ms have no action.
-- Hold for 2 to under 6 seconds, then release: toggle mesh.
-- Hold for at least 6 seconds, then release: open Bluetooth pairing for 120 seconds.
+| Action | Controls |
+| --- | --- |
+| Mesh volume | Tap **- / +** |
+| Bluetooth volume (music and calls) | Hold **play** and tap **- / +** |
+| Play or pause music | Tap **play** |
+| Answer or end a call | Tap **play** |
+| Previous or next song | While Bluetooth music is playing, hold **- / +** for **1 second** |
+| Previous or next mesh channel | Pause Bluetooth music, then hold **- / +** for **1 second** |
+| Turn mesh on or off | Hold **play** for **2-5 seconds** |
+| Pair a phone | Hold **play** for **6 seconds**, then connect within **2 minutes** |
 
-Mesh enabled uses a rising two-note beep. Mesh disabled uses a falling two-note
-beep. Bluetooth pairing uses three high beeps.
+- Three beeps mean minimum or maximum volume. Volume levels reset when you restart the device.
+- Channels cycle **green -> red -> blue**. The LED shows your channel, which is saved across restarts.
+- Use the same channel as the people you want to talk to.
+- After adjusting Bluetooth volume, releasing **play** does not trigger another action.
 
-Do not hold BOOT while pressing RESET or applying power. That enters firmware
-download mode instead of registering a runtime gesture.
+The onboard **BOOT** button is for firmware flashing, not everyday controls.

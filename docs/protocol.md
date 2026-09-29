@@ -1,38 +1,46 @@
-# Mesh and Bridge Protocol v3
+# Mesh and Bridge Protocol v5
 
-The current LC3 firmware uses mesh version `0x03` and SPI bridge version `3`.
+The current LC3 firmware uses mesh version `0x05` and SPI bridge version `5`.
 The name `AUDIO_V2` identifies a packet format; it does not mean protocol version 2.
+For routing, topology, membership, speaker grants, and handover behavior, see [adaptive mesh](mesh.md).
 
 ## Mesh Radio Header
 
-Every mesh packet starts with this packed 8-byte header:
+Every mesh packet starts with this packed 9-byte header:
 
 | Offset | Field | Bytes | Meaning |
 |---:|---|---:|---|
-| 0 | `version` | 1 | `0x03` |
+| 0 | `version` | 1 | `0x05` |
 | 1 | `type` | 1 | Message ID below |
 | 2 | `src_id` | 1 | Source node; `0` for an unassigned joining node |
 | 3 | `seq` | 1 | Radio packet sequence |
 | 4 | `ttl` | 1 | Remaining hop limit |
 | 5 | `flags` | 1 | Relay request, relayed, and speaker-granted bits |
-| 6 | `payload_len` | 2 | Payload length, little-endian |
+| 6 | `talk_channel` | 1 | Logical talk group (1-3); mismatched groups are rejected |
+| 7 | `payload_len` | 2 | Payload length, little-endian |
 
-Assigned node IDs are 1-8, with TDMA slot `node_id - 1`.
+Assigned node IDs are 1-8; the authoritative slot map assigns their TDMA slots (holes need not be renumbered).
 Receivers reject mismatched protocol versions and invalid packet lengths.
 
 | ID | Message | Purpose |
 |---:|---|---|
 | `0x01` | `AUDIO` | ESP-NOW audio; rejected by the current nRF audio path |
-| `0x02` / `0x03` | `JOIN` / `JOIN_ACK` | Membership request and assignment |
+| `0x02` / `0x03` | `JOIN` / `JOIN_ACK` | Legacy membership IDs |
 | `0x04` | `LEAVE` | Departure |
-| `0x05` / `0x06` | `SYNC` / `SLOT_MAP` | Timing and slot assignments |
+| `0x05` / `0x06` | `SYNC` / `SLOT_MAP` | Legacy timing / slot-map ID |
 | `0x07` / `0x08` | `STATUS` / `KEEPALIVE` | Node status and liveness |
 | `0x09` / `0x0A` | `SPEAKER_GRANT` / `SPEAKER_RELEASE` | Speaker-control IDs |
-| `0x0B` / `0x0C` | `JOIN_V2` / `JOIN_ACK_V2` | Extended membership IDs |
+| `0x0B` / `0x0C` | `JOIN_V2` / `JOIN_ACK_V2` | Legacy identity-bearing membership IDs |
 | `0x0D` | `AUDIO_V2` | LC3 bundle used by nRF ESB |
+| `0x0E` | `TOPOLOGY` | Direct observations, 32-bit report sequence (47-byte payload) |
+| `0x0F` / `0x10` | `JOIN_V3` / `JOIN_ACK_V3` | Identity-bearing targeted JOIN/ACK (15 bytes each) |
+| `0x11` | `SYNC_V3` | Term, leader identity, joined member count, frame/phase and relay depth (20 bytes) |
+| `0x12`-`0x15` | `HANDOVER_PREPARE` / `ACK` / `COMMIT` / `CANCEL` | Planned handover (25-byte proposal or 11-byte ACK) |
+| `0x16` | `MEMBERSHIP_V3` | Full authoritative ID/identity/slot map with term and revision (79 bytes) |
+| `0x17` | `SPEAKER_REQUEST` | Pre-grant voice activity/release, 13 bytes; one forwarding hop |
 
 These are shared IDs; not every transport uses every message.
-The nRF coordinator requires the LC3 capability bit in `JOIN_V2` requests.
+The nRF coordinator requires the LC3 capability bit in `JOIN_V3` requests.
 ESP-NOW membership does not enforce the same capability check; use matching firmware on all nodes.
 
 ## LC3 Audio Bundles
@@ -58,14 +66,15 @@ The oldest predecessor's length is inferred from the remaining payload size.
 | `0x01` | Current audio active |
 | `0x02` / `0x04` | Immediate predecessor present / active |
 | `0x08` / `0x10` | Oldest predecessor present / active |
+| `0x20` | Relayed bundle indicator |
 
 Other flag bits are rejected. The S31 currently attaches at most one predecessor; the format supports two.
 
 | Audio units | Bundle bytes | Bytes with mesh header |
 |---|---:|---:|
-| Current only | 56 | 64 |
-| Current + one predecessor | 104 | 112 |
-| Current + two predecessors | 152 | 160 |
+| Current only | 56 | 65 |
+| Current + one predecessor | 104 | 113 |
+| Current + two predecessors | 152 | 161 |
 
 The 16-bit audio sequence is separate from the 8-bit radio packet sequence.
 During VOX silence, no LC3 audio is encoded or sent. There is no explicit end-of-speech packet.
@@ -80,9 +89,9 @@ Coordinator SYNC is scheduled every 200 ms. The nRF queues STATUS and KEEPALIVE 
 ESP-NOW schedules keepalives every 500 ms. Peer timeout is 3 seconds.
 These control messages continue during VOX silence.
 
-The coordinator grants relay service to at most two active speakers.
+The coordinator grants relay service to at most two active speakers. `SPEAKER_REQUEST` can travel through one relay before a grant; voice onset may require several control windows before relayed audio is permitted.
 Audio starts with TTL 2; the implemented relay path permits one forwarding hop.
-See [TDMA scheduling](tdma.md) for slot ownership and deadlines.
+See [TDMA scheduling](tdma.md) for slot ownership and deadlines, and [adaptive mesh](mesh.md) for handover, capacity, and latency caveats.
 
 nRF ESB sends with RF acknowledgments disabled. Lost audio is handled through predecessors and receiver concealment, not RF retransmission.
 ESP-NOW completion callbacks have separate MAC-layer semantics; they do not prove application delivery.
@@ -114,7 +123,7 @@ Receive timestamps are assigned locally; they are not included in this payload.
 
 ### Status and Compatibility
 
-The v3 STATUS payload is 10 bytes, in this order:
+The v5 STATUS payload is 10 bytes, in this order:
 
 ```text
 role | peer_count | node_id | version | mesh_state | slot_index |
@@ -122,7 +131,7 @@ coordinator_id | marker | audio_codec | audio_frame_ms
 ```
 
 Each field is one byte; `slot_index` is signed. The marker is `0xA5`.
-Startup selects nRF only after a fresh status advertises version 3, LC3, and 20 ms audio.
+Startup selects nRF only after a fresh status advertises version 5, LC3, and 20 ms audio.
 Audio transfer additionally requires an ACTIVE mesh and an assigned node ID.
 Older 3-byte and 8-byte statuses remain readable but do not establish LC3 compatibility.
 
@@ -130,7 +139,7 @@ Older 3-byte and 8-byte statuses remain readable but do not establish LC3 compat
 
 - **Audio admission:** The nRF pulses GPIO ACK for 20 µs after admitting audio to bounded RAM ingress or recognizing its admitted duplicate.
   The S31 retains and repeats unacknowledged SPI audio until ACK or a 50 ms timeout. ACK does not confirm RF delivery.
-- **Commands:** MESH_START and MESH_STOP carry a command byte and generation byte.
+- **Commands:** MESH_START and MESH_STOP carry a three-byte payload: command, generation, talk group (STOP ignores the group).
   A COMMAND_ACK event returns the command, matching generation, and signed result: zero for success, minus one for failure.
 
 ### SPI Flow Control
