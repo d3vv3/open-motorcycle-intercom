@@ -1,0 +1,107 @@
+# Immutable release inputs: import the pinned SDK root and override its active tags.
+# Disabled groups remain upstream defaults; enabling them is outside this lock.
+# Bootstrap: copy this file to /work/ncs/release-manifest/west.yml, then
+# west init -l /work/ncs/release-manifest && west update
+manifest:
+  version: "0.13"
+  group-filter:
+    - -nrf-802154
+    - -dragoon
+    - -find-my
+    - -ant
+    - -babblesim
+    - -sidewalk
+    - -bsec
+    - +optional
+  projects:
+    - name: nrf
+      path: nrf
+      url: https://github.com/nrfconnect/sdk-nrf
+      revision: 5cb85570ca43bc344d3145c2338128eacf4b48ec
+      import: true
+      west-commands: scripts/west-commands.yml
+    - name: zephyr
+      url: https://github.com/nrfconnect/sdk-zephyr
+      revision: 100befc70c74f7ec83dd8ac3171ee18eeddb4dbd
+      import:
+        name-allowlist:
+          - TraceRecorderSource
+          - canopennode
+          - chre
+          - cmsis
+          - cmsis-dsp
+          - cmsis-nn
+          - edtt
+          - fatfs
+          - hal_nordic
+          - hal_st
+          - hal_wurthelektronik
+          - liblc3
+          - libmetal
+          - littlefs
+          - loramac-node
+          - lvgl
+          - lz4
+          - mipi-sys-t
+          - nanopb
+          - net-tools
+          - nrf_hw_models
+          - open-amp
+          - picolibc
+          - segger
+          - tinycrypt
+          - tf-m-tests
+          - uoscore-uedhoc
+          - zcbor
+          - zscilib
+    - name: mcuboot
+      url: https://github.com/nrfconnect/sdk-mcuboot
+      revision: daf2946a0f07a14b57bd69d29ac4cdde6f810fb7
+      path: bootloader/mcuboot
+    - name: mbedtls
+      path: modules/crypto/mbedtls
+      url: https://github.com/nrfconnect/sdk-mbedtls
+      revision: 72868c6f1421afa92cba9f6fe6d1a3f108c174b7
+    - name: nrfxlib
+      url: https://github.com/nrfconnect/sdk-nrfxlib
+      path: nrfxlib
+      revision: 37e2ac22b6a6d9d9a62c95e8dc2c102d4371c62e
+    - name: trusted-firmware-m
+      url: https://github.com/nrfconnect/sdk-trusted-firmware-m
+      path: modules/tee/tf-m/trusted-firmware-m
+      revision: 553c47a6a4c490bc799f2b455dfd0ebe3a49b0d0
+    - name: matter
+      url: https://github.com/nrfconnect/sdk-connectedhomeip
+      path: modules/lib/matter
+      revision: 022f2c92f6fc04ddebeea443513d050a6bd1d222
+      west-commands: scripts/west/west-commands.yml
+      submodules:
+        - name: nlio
+          path: third_party/nlio/repo
+        - name: nlassert
+          path: third_party/nlassert/repo
+        - name: nlunit-test
+          path: third_party/nlunit-test/repo
+        - name: pigweed
+          path: third_party/pigweed/repo
+        - name: jsoncpp
+          path: third_party/jsoncpp/repo
+      userdata:
+        ncs:
+          upstream-url: https://github.com/project-chip/connectedhomeip
+          upstream-sha: 181b0cb14ff007ec912f2ba6627e05dfb066c008
+          compare-by-default: false
+    - name: suit-generator
+      url: https://github.com/nrfconnect/suit-generator
+      revision: 34583134444365cbf35a591c7f8c5c497a10feef
+      path: modules/lib/suit-generator
+    - name: suit-processor
+      url: https://github.com/nrfconnect/suit-processor
+      revision: 45059255a7c863e00c2a31db7af268446208633b
+      path: modules/lib/suit-processor
+    - name: memfault-firmware-sdk
+      path: modules/lib/memfault-firmware-sdk
+      revision: 3d51c80bc58933671403eca7c5250a9b03294c5e
+      url: https://github.com/memfault/memfault-firmware-sdk
+  self:
+    path: release-manifest

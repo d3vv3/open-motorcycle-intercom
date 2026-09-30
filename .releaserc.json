@@ -1,0 +1,24 @@
+{
+  "branches": [
+    "main",
+    { "name": "next", "prerelease": "alpha" }
+  ],
+  "tagFormat": "v${version}",
+  "plugins": [
+    ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+    ["@semantic-release/release-notes-generator", { "preset": "conventionalcommits" }],
+    ["@semantic-release/exec", {
+      "prepareCmd": "python3 tools/release/build.py --version ${nextRelease.version} --source-sha ${nextRelease.gitHead} --profile esp32s31 --output-dir dist/release && test \"$(git ls-remote origin refs/heads/${branch.name} | cut -f1)\" = \"${nextRelease.gitHead}\""
+    }],
+    ["@semantic-release/github", {
+      "assets": ["dist/release/*"],
+      "successComment": false,
+      "failComment": false,
+      "failTitle": false,
+      "labels": false,
+      "releasedLabels": false,
+      "addReleases": false,
+      "discussionCategoryName": false
+    }]
+  ]
+}

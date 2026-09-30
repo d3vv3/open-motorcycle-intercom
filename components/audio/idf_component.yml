@@ -3,7 +3,13 @@
 
 dependencies:
   78/esp-opus:
-    version: "^1.0.0"
+    version: "1.0.5"
+  espressif/dl_fft:
+    version: "==0.7.0"
+    require: private
+  espressif/esp-dl:
+    version: "==3.3.11"
+    require: private
   espressif/esp_codec_dev:
     version: "2.0.0-beta5"
     require: private

@@ -5,6 +5,7 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -56,6 +57,7 @@ jobs:
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
           retention-days: 7
+          if-no-files-found: error
 
   python:
     name: Python and shared headers
@@ -264,8 +266,8 @@ jobs:
         shell: bash
         run: |
           cd "$GITHUB_WORKSPACE/.ncs"
-          west build -b xiao_ble/nrf52840 "$GITHUB_WORKSPACE/nrf_mesh" \
-            -d "$GITHUB_WORKSPACE/build-nrf"
+          west build --sysbuild -b xiao_ble/nrf52840 "$GITHUB_WORKSPACE/nrf_mesh" \
+            -d "$GITHUB_WORKSPACE/build-nrf" -- -Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y
 
       - name: Upload nRF52840 artifacts
         uses: actions/upload-artifact@v4.6.2
@@ -276,3 +278,47 @@ jobs:
             build-nrf/nrf_mesh/zephyr/zephyr.hex
             build-nrf/nrf_mesh/zephyr/zephyr.uf2
           retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish paired firmware
+    needs: [esp-idf, python, nrf-zephyr]
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/next') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: firmware-release
+      cancel-in-progress: false
+    steps:
+      - name: Checkout exact source commit and release history
+        uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked release dependencies
+        run: npm ci
+
+      - name: Reject stale workflow source
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git ls-remote origin "refs/heads/$RELEASE_BRANCH" | cut -f1)" = "$RELEASE_SHA"
+
+      - name: Build, validate, tag, and publish firmware
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release

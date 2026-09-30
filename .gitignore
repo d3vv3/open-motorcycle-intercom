@@ -4,10 +4,10 @@
 build/
 sdkconfig
 sdkconfig.old
-dependencies.lock
 
 # Managed components (downloaded by IDF component manager)
 managed_components/
+node_modules/
 
 # Build output files
 *.bin

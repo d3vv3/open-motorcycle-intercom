@@ -766,6 +766,8 @@ static esp_err_t initialize_application(int64_t boot_time)
     rtt_probe_init();
 
     ESP_LOGI(TAG, "OMI - Open Motorcycle Intercom");
+    ESP_LOGI(TAG, "Firmware version: %s", OMI_FIRMWARE_VERSION);
+    ESP_LOGI(TAG, "Git SHA: %s", OMI_GIT_SHA);
     ESP_LOGI(TAG, "Boot time: %" PRId64 " ms", boot_time);
     ESP_LOGI(TAG, "IDF version: %s", esp_get_idf_version());
     ESP_LOGI(TAG, "Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());

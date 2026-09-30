@@ -73,6 +73,8 @@ int main(void)
     k_sleep(K_MSEC(1000));
 
     printk("\n\n*** OMI Mesh Firmware booted ***\n\n");
+    printk("Firmware version: %s\n", OMI_FIRMWARE_VERSION);
+    printk("Git SHA: %s\n", OMI_GIT_SHA);
 
     if (bridge_ret != 0 && bridge_ret != -EALREADY) {
         printk("[DIAG] UART bridge init FAILED: %d\n", bridge_ret);

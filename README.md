@@ -164,6 +164,9 @@ Joined-node control packets use a bounded queue and scheduled ownership. Unassig
 
 ## Quick Start
 
+For published paired flash bundles and the alpha/stable release process, see
+[Firmware releases](docs/releases.md).
+
 ### Prerequisites
 
 - [ESP-IDF v6.1 preview](https://docs.espressif.com/projects/esp-idf/en/release-v6.1/esp32s31/get-started/)

@@ -1,0 +1,106 @@
+# Immutable release inputs: import the pinned SDK root and override its active tags.
+# Disabled groups remain upstream defaults; enabling them is outside this lock.
+# Bootstrap: copy this file to /work/ncs/release-manifest/west.yml, then
+# west init -l /work/ncs/release-manifest && west update
+manifest:
+  version: "0.13"
+  group-filter:
+    - -nrf-802154
+    - -dragoon
+    - -find-my
+    - -babblesim
+    - -libmodem
+    - -bsec
+    - -doc-internal
+    - +optional
+    - +testing
+  projects:
+    - name: nrf
+      path: nrf
+      url: https://github.com/nrfconnect/sdk-nrf
+      revision: b20f8619ba9a5530f8c34b0a130d829947cfe55d
+      import: true
+      west-commands: scripts/west-commands.yml
+    - name: zephyr
+      url: https://github.com/nrfconnect/sdk-zephyr
+      revision: 33fa6a7aac6a4401d16a67cb9f27a3483fa02dd6
+      import:
+        name-allowlist:
+          - canopennode
+          - chre
+          - cmsis
+          - cmsis-dsp
+          - cmsis-nn
+          - cmsis_6
+          - dhara
+          - edtt
+          - fatfs
+          - hal_st
+          - hal_tdk
+          - hal_wurthelektronik
+          - liblc3
+          - libmetal
+          - libsbc
+          - littlefs
+          - loramac-node
+          - lvgl
+          - lz4
+          - mipi-sys-t
+          - mldsa-native
+          - nanopb
+          - net-tools
+          - nrf_hw_models
+          - open-amp
+          - percepio
+          - picolibc
+          - segger
+          - tf-m-tests
+          - tf-psa-crypto
+          - uoscore-uedhoc
+          - zcbor
+          - zscilib
+    - name: mcuboot
+      url: https://github.com/nrfconnect/sdk-mcuboot
+      revision: 8122be0de002ede060d37aa39b2a7f18aecc00c3
+      path: bootloader/mcuboot
+    - name: mbedtls
+      path: modules/crypto/mbedtls
+      url: https://github.com/nrfconnect/sdk-mbedtls
+      revision: 804249ddcdcf78a16f9be760b9ff1f65c2f29d9e
+    - name: oberon-psa-crypto
+      path: modules/crypto/oberon-psa-crypto
+      url: https://github.com/nrfconnect/sdk-oberon-psa-crypto
+      revision: e8db62ed0fba5028e7ae0eba7b1fb63436ae6416
+    - name: nrfxlib
+      url: https://github.com/nrfconnect/sdk-nrfxlib
+      path: nrfxlib
+      revision: bb715183a57ac501907b63df2079c3fbcd067641
+    - name: trusted-firmware-m
+      url: https://github.com/nrfconnect/sdk-trusted-firmware-m
+      path: modules/tee/tf-m/trusted-firmware-m
+      revision: b0d724bc0f2f46a396d59280476ec06fad1d4ecd
+    - name: matter
+      url: https://github.com/nrfconnect/sdk-connectedhomeip
+      path: modules/lib/matter
+      revision: 1206d45da3271670e676f2371670a30154d4429e
+      west-commands: scripts/west/west-commands.yml
+      submodules:
+        - name: nlio
+          path: third_party/nlio/repo
+        - name: nlassert
+          path: third_party/nlassert/repo
+        - name: pigweed
+          path: third_party/pigweed/repo
+        - name: jsoncpp
+          path: third_party/jsoncpp/repo
+      userdata:
+        ncs:
+          upstream-url: https://github.com/project-chip/connectedhomeip
+          upstream-sha: 181b0cb14ff007ec912f2ba6627e05dfb066c008
+          compare-by-default: false
+    - name: memfault-firmware-sdk
+      path: modules/lib/memfault-firmware-sdk
+      revision: ec32c7f1bb928d5c6b0f6206c115585143ab782c
+      url: https://github.com/memfault/memfault-firmware-sdk
+  self:
+    path: release-manifest
