@@ -218,6 +218,7 @@ typedef struct {
     SemaphoreHandle_t tx_done_semaphore;
     SemaphoreHandle_t task_stopped_semaphore;
     SemaphoreHandle_t audio_producer_mutex;
+    atomic_bool local_audio_enabled;
     SemaphoreHandle_t stop_mutex;
     _Atomic(TaskHandle_t) lifecycle_owner; /* Published only after successful init. */
     bool stopping;
@@ -306,6 +307,7 @@ extern const uint8_t s_broadcast_mac[6];
 #define s_tx_done_semaphore          s_mesh.tx_done_semaphore
 #define s_task_stopped_semaphore     s_mesh.task_stopped_semaphore
 #define s_audio_producer_mutex       s_mesh.audio_producer_mutex
+#define s_local_audio_enabled        s_mesh.local_audio_enabled
 #define s_stop_mutex                 s_mesh.stop_mutex
 #define s_stopping                   s_mesh.stopping
 #define s_rx_enabled                 s_mesh.rx_enabled

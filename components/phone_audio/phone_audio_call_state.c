@@ -1,4 +1,22 @@
 #include "phone_audio_call_state.h"
+#include <string.h>
+
+bool phone_audio_hfp_connection_allowed(bool a2dp_selected, const uint8_t *a2dp_peer,
+                                        bool hf_pending, bool hf_bound, bool teardown_requested,
+                                        const uint8_t *hf_peer, const uint8_t *event_peer,
+                                        bool disconnected)
+{
+    bool occupied = hf_pending || hf_bound;
+    bool match = occupied && memcmp(hf_peer, event_peer, 6u) == 0;
+    if (disconnected) return match;
+    return a2dp_selected && !teardown_requested &&
+           memcmp(a2dp_peer, event_peer, 6u) == 0 && (!occupied || match);
+}
+
+bool phone_audio_a2dp_selection_allowed(bool a2dp_selected, bool hf_pending, bool hf_bound)
+{
+    return !a2dp_selected && !hf_pending && !hf_bound;
+}
 
 void phone_audio_call_state_reduce(const phone_audio_call_indicators_t *indicators,
                                    phone_audio_call_state_t *state)

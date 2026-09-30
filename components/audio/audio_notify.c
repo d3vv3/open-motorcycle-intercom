@@ -43,6 +43,7 @@ size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consume
 
 esp_err_t audio_play_notification(audio_notify_t type)
 {
+    if (type == AUDIO_NOTIFY_INCOMING_CALL) return audio_play_incoming_call();
     SemaphoreHandle_t lifecycle_mutex = audio_lifecycle_mutex_get();
     if (lifecycle_mutex == NULL) return ESP_ERR_INVALID_STATE;
     if (audio_called_from_worker()) return ESP_ERR_INVALID_STATE;
@@ -63,4 +64,25 @@ esp_err_t audio_play_notification(audio_notify_t type)
     }
     xSemaphoreGive(lifecycle_mutex);
     return ESP_OK;
+}
+
+esp_err_t audio_play_incoming_call(void)
+{
+    SemaphoreHandle_t mutex = audio_lifecycle_mutex_get();
+    if (mutex == NULL || xSemaphoreTake(mutex, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+    bool ready = g_audio.initialized && !g_audio.stopping && !g_audio.deinitializing &&
+        atomic_load_explicit(&g_audio.running, memory_order_acquire);
+    bool accepted = ready && audio_urgent_request(&g_audio.incoming_call);
+    xSemaphoreGive(mutex);
+    return accepted ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+uint32_t audio_set_incoming_call(bool incoming)
+{
+    return audio_urgent_set_incoming(&g_audio.incoming_call, incoming);
+}
+
+void audio_cancel_incoming_call(void)
+{
+    (void)audio_set_incoming_call(false);
 }

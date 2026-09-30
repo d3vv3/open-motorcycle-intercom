@@ -29,6 +29,36 @@ static phone_audio_call_state_t reduce_disconnected(void)
 
 int main(void)
 {
+    const uint8_t bound_peer[6] = {1, 2, 3, 4, 5, 6};
+    const uint8_t other_peer[6] = {6, 5, 4, 3, 2, 1};
+    phone_audio_call_indicators_t retained = {
+        .slc_connected = true, .call = 1, .audio_connected = true, .sample_rate = 8000,
+    };
+    phone_audio_call_state_t retained_state = {0};
+    phone_audio_call_state_reduce(&retained, &retained_state);
+    assert(retained_state.phase == PHONE_AUDIO_CALL_PHASE_ACTIVE);
+    assert(!phone_audio_a2dp_selection_allowed(false, false, true));
+    assert(!phone_audio_a2dp_selection_allowed(false, true, false));
+    assert(!phone_audio_hfp_connection_allowed(false, bound_peer, false, true, true,
+                                               bound_peer, other_peer, true));
+    assert(phone_audio_hfp_connection_allowed(false, bound_peer, false, true, true,
+                                              bound_peer, bound_peer, true));
+    assert(!phone_audio_hfp_connection_allowed(false, bound_peer, false, true, true,
+                                               bound_peer, bound_peer, false));
+    assert(!phone_audio_hfp_connection_allowed(false, bound_peer, true, false, true,
+                                               bound_peer, bound_peer, false));
+    assert(phone_audio_hfp_connection_allowed(false, bound_peer, true, false, true,
+                                              bound_peer, bound_peer, true));
+    assert(phone_audio_a2dp_selection_allowed(false, false, false));
+    assert(!phone_audio_a2dp_selection_allowed(true, false, false));
+    assert(phone_audio_hfp_connection_allowed(true, bound_peer, true, false, false,
+                                              bound_peer, bound_peer, false));
+    assert(!phone_audio_hfp_connection_allowed(true, bound_peer, true, false, false,
+                                               bound_peer, other_peer, true));
+    assert(!phone_audio_hfp_connection_allowed(true, bound_peer, true, false, false,
+                                               bound_peer, other_peer, false));
+    assert(phone_audio_hfp_connection_allowed(true, bound_peer, false, false, false,
+                                              bound_peer, bound_peer, false));
     for (uint8_t call = 0; call <= 1; ++call) {
         for (uint8_t setup = 0; setup <= 3; ++setup) {
             for (uint8_t held = 0; held <= 2; ++held) {

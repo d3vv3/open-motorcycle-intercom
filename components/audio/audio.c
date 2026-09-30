@@ -9,12 +9,39 @@
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 
 #include "audio_internal.h"
 
 static const char *TAG = "audio";
 
 audio_context_t g_audio;
+audio_mesh_call_state_t g_audio_mesh_call;
+atomic_uint g_audio_mesh_rx_cutoff_ms;
+
+uint32_t audio_mesh_call_update(bool active)
+{
+    return audio_mesh_call_state_update(&g_audio_mesh_call, active);
+}
+
+bool audio_mesh_call_active(void) { return audio_mesh_call_state_active(&g_audio_mesh_call); }
+bool audio_mesh_call_blocked(void) { return audio_mesh_call_state_blocked(&g_audio_mesh_call); }
+uint32_t audio_mesh_call_epoch(void) { return audio_mesh_call_state_epoch(&g_audio_mesh_call); }
+bool audio_mesh_tx_epoch_allowed(uint32_t epoch)
+{
+    return audio_mesh_call_state_tx_allowed(&g_audio_mesh_call, epoch);
+}
+
+bool audio_mesh_call_resume(uint32_t expected_epoch)
+{
+    /* Gate remains closed until the RX cutoff is published. The caller must
+     * have completed the transport and playout flush before invoking this. */
+    if (!audio_mesh_call_blocked() || audio_mesh_call_active() ||
+        audio_mesh_call_epoch() != expected_epoch) return false;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    atomic_store_explicit(&g_audio_mesh_rx_cutoff_ms, now_ms, memory_order_release);
+    return audio_mesh_call_state_resume(&g_audio_mesh_call, expected_epoch);
+}
 portMUX_TYPE g_audio_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_audio_task_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_audio_far_ref_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -59,6 +86,18 @@ esp_err_t audio_play_volume_limit(void)
     (void)audio_limit_cue_request(&g_audio.volume_limit_cue);
     xSemaphoreGive(mutex);
     return ESP_OK;
+}
+
+esp_err_t audio_play_call_end(void)
+{
+    SemaphoreHandle_t mutex = audio_lifecycle_mutex_get();
+    if (mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    bool ready = g_audio.initialized && !g_audio.stopping && !g_audio.deinitializing &&
+        atomic_load_explicit(&g_audio.running, memory_order_acquire);
+    bool accepted = ready && audio_limit_cue_request_end(&g_audio.volume_limit_cue);
+    xSemaphoreGive(mutex);
+    return accepted ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
 static void free_audio_route_storage(void)
@@ -316,6 +355,8 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
     audio_gain_reset(&g_audio.bluetooth_gain);
     memset(&g_audio.program_mix, 0, sizeof(g_audio.program_mix));
     audio_limit_cue_reset(&g_audio.volume_limit_cue);
+    /* The callback may publish an incoming call before audio_init(). */
+    g_audio.incoming_call.playing = false;
 
     if (audio_rate_converter_create(&g_audio.capture_rate_converter, AUDIO_HW_SAMPLE_RATE,
                                     g_audio.config.sample_rate) != 0 ||
@@ -438,6 +479,7 @@ static void audio_unwind_locked(void)
     atomic_store_explicit(&g_audio.call_priority_active, false, memory_order_release);
     audio_join_workers_locked();
     audio_limit_cue_reset(&g_audio.volume_limit_cue);
+    audio_cancel_incoming_call();
     audio_hw_codec_stop();
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
     AUDIO_STATS_LOCK();
@@ -543,6 +585,7 @@ static esp_err_t audio_stop_locked(void)
     }
     audio_join_workers_locked();
     audio_limit_cue_reset(&g_audio.volume_limit_cue);
+    audio_cancel_incoming_call();
     audio_hw_codec_stop();
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
     (void)audio_rate_converter_reset(g_audio.voice_playback_converter);

@@ -76,6 +76,7 @@ struct tx_entry {
 static struct tx_entry s_audio_q[TX_AUDIO_QUEUE_SIZE];
 static uint8_t s_audio_head = 0;
 static uint8_t s_audio_tail = 0;
+static bool s_audio_delivery_enabled = true;
 
 /* Control events can outpace an SPI poll; this FIFO prevents overwriting an unread event. */
 /* aislop-ignore-next-line ai-slop/trivial-comment -- C preprocessor directive */
@@ -156,8 +157,12 @@ static int handle_rx_packet(uint8_t type, const uint8_t *payload, uint8_t len)
         }
         if (command.command == BRIDGE_COMMAND_MESH_START) {
             mesh_protocol_request_start(command.generation, command.talk_channel);
-        } else {
+        } else if (command.command == BRIDGE_COMMAND_MESH_STOP) {
             mesh_protocol_request_stop(command.generation);
+        } else if (command.command == BRIDGE_COMMAND_AUDIO_PAUSE) {
+            mesh_protocol_request_audio_pause(command.generation);
+        } else if (command.command == BRIDGE_COMMAND_AUDIO_RESUME) {
+            mesh_protocol_request_audio_resume(command.generation);
         }
         return 0;
 
@@ -342,6 +347,10 @@ int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len)
     }
 
     k_mutex_lock(&s_tx_lock, K_FOREVER);
+    if (!s_audio_delivery_enabled) {
+        k_mutex_unlock(&s_tx_lock);
+        return -EAGAIN;
+    }
     uint8_t cur_head = s_audio_head;
     uint8_t next_head = (uint8_t)((cur_head + 1) % TX_AUDIO_QUEUE_SIZE);
     if (next_head == s_audio_tail) {
@@ -369,6 +378,20 @@ void uart_bridge_discard_pending_audio(void)
     k_mutex_lock(&s_tx_lock, K_FOREVER);
     s_audio_tail = s_audio_head;
     atomic_set(&s_last_audio_seq_valid, 0);
+    k_mutex_unlock(&s_tx_lock);
+}
+
+void uart_bridge_set_audio_delivery_enabled(bool enabled)
+{
+    if (!s_initialized) {
+        return;
+    }
+    /* SPI transfer holds this lock until complete, including an already selected frame. */
+    k_mutex_lock(&s_tx_lock, K_FOREVER);
+    s_audio_delivery_enabled = false;
+    s_audio_tail = s_audio_head;
+    atomic_set(&s_last_audio_seq_valid, 0);
+    s_audio_delivery_enabled = enabled;
     k_mutex_unlock(&s_tx_lock);
 }
 

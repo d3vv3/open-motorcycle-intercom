@@ -347,6 +347,14 @@ esp_err_t mesh_get_peer_info(uint8_t node_id, mesh_peer_info_t *info);
  */
 esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags);
 
+/** Owner-task local-audio gate; leaves membership, control and third-party relay
+ * running. Disabling purges queued local TX and local playback, but cannot
+ * retract an already submitted radio packet. Call outside mesh callbacks. */
+esp_err_t mesh_set_local_audio_enabled(bool enabled);
+/** Callback-safe immediate close; the owner must subsequently call the setter
+ * to purge queued audio. No lifecycle or radio operation occurs here. */
+void mesh_request_local_audio_pause(void);
+
 /**
  * @brief Register callback for received audio frames
  * @param cb Callback function

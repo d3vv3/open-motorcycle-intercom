@@ -63,8 +63,14 @@ Packet and PCM buffers provide startup prefill and absorb timing variation.
 Their presence means codec frame duration alone does not describe end-to-end latency.
 
 Outside phone calls, remote voice, Bluetooth music, and notification tones can mix locally.
-An active HFP call takes playback priority and suppresses those other sources.
-Mesh microphone transmission can still continue during a call, subject to VOX.
+An answered or held HFP call gates local mesh mic TX and local mesh playback immediately;
+the mesh stays joined and continues control traffic and relaying other participants' audio.
+Ringing and outgoing dialing/alerting alone do not gate mesh audio.
+An incoming announcement is urgent and canceled on answer, reject, or disconnect;
+a completed answered call gets one end beep.
+On call end the local gate remains closed until transport audio is flushed,
+the mesh RX decoder is reset, and the transport confirms resume.
+Audio already submitted to RF or I2S hardware before the call edge cannot be retracted.
 
 ## Bluetooth and Voice Cleanup
 

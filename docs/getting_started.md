@@ -66,7 +66,7 @@ west build --sysbuild -b xiao_ble/nrf52840 \
 
 The tested target is also used for our XIAO Sense boards.
 The application image is `build-nrf341/nrf_mesh/zephyr/zephyr.uf2`.
-Both ends need matching LC3 mesh/bridge protocol-v5 firmware; an older Opus bridge is not compatible.
+Both ends need matching LC3 firmware with bridge protocol 6; update the S31 and nRF together.
 
 ## Flash the Boards
 

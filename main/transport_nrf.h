@@ -20,7 +20,8 @@ esp_err_t transport_nrf_init(void);
 void transport_nrf_attach(void);
 
 /** @brief Encode and enqueue one encoded frame as a redundant bundle over SPI. */
-void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us);
+void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active,
+                              int64_t timestamp_us, uint32_t mesh_epoch);
 
 /** @brief Account for a quiet LC3 frame; sequence advance is capped at five per spell.
  * No bridge traffic. */

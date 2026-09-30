@@ -21,6 +21,7 @@
 
 #include "omi_board_pins.h"
 #include "audio_prompt.h"
+#include "audio_mesh_call.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,8 +118,11 @@ typedef void (*audio_activity_cb_t)(bool active);
  * @param len Length of encoded data (typically 20-40 bytes)
  * @param active true when VOX marks the frame as active speech
  * @param timestamp_us Capture timestamp in microseconds
+ * @param mesh_epoch Local call-gate epoch; check with audio_mesh_tx_epoch_allowed()
+ * immediately before transport enqueue. Never send it over the wire.
  */
-typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us);
+typedef void (*audio_tx_cb_t)(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us,
+                              uint32_t mesh_epoch);
 
 /** Called from the capture task once per intentionally skipped mesh LC3 frame.
  * No encoded data is available; transport may advance its frame sequence.
@@ -171,6 +175,7 @@ typedef struct {
     uint16_t seq;         /**< End-to-end frame sequence (valid only when has_seq) */
     bool has_seq;         /**< Transport supplied a per-frame sequence number */
     uint8_t hop_count;    /**< Validated receive path: 0 direct, 1 relayed (default 0) */
+    uint32_t mesh_epoch;  /**< Local TX metadata only; not part of the radio packet. */
 } audio_frame_t;
 
 /**
@@ -397,6 +402,19 @@ void audio_clear_rx_frames(void);
  * already submitted to hardware cannot be retracted. Bluetooth and prompts remain active. */
 esp_err_t audio_reset_mesh_rx(void);
 
+/** Nonblocking HFP callback entry: transition immediately closes mesh TX/RX and
+ * increments the 30-bit epoch. Repeated identical values do nothing. A false
+ * transition remains blocked until the owner flushes bridge and audio RX and
+ * acknowledges transport resume, then calls resume with this token. */
+uint32_t audio_mesh_call_update(bool active);
+bool audio_mesh_call_active(void);
+bool audio_mesh_call_blocked(void);
+uint32_t audio_mesh_call_epoch(void);
+bool audio_mesh_call_resume(uint32_t expected_epoch);
+/** TX callback must check this immediately before enqueuing to transport; a
+ * callback already in progress when the gate closes needs a transport-side check. */
+bool audio_mesh_tx_epoch_allowed(uint32_t epoch);
+
 /** Independent software playback gains; both default to 100 at initialization.
  * The hardware codec remains at its fixed 60 percent output setting. */
 typedef enum {
@@ -411,6 +429,9 @@ esp_err_t audio_set_volume(audio_volume_target_t target, uint8_t percent);
 uint8_t audio_get_volume(audio_volume_target_t target);
 /** Schedule one high-priority three-beep cue; repeated requests coalesce until it ends. */
 esp_err_t audio_play_volume_limit(void);
+/** One 80 ms beep on final output, independent of mesh/Bluetooth gain. A call-end
+ * request during a volume cue coalesces into one beep after that cue finishes. */
+esp_err_t audio_play_call_end(void);
 
 /**
  * @brief Register callback for encoded TX frames (mesh mode)
@@ -501,6 +522,15 @@ size_t audio_bluetooth_mic_available_samples(void);
  * @return ESP_OK on success
  */
 esp_err_t audio_play_notification(audio_notify_t type);
+/** HFP state callback: nonblocking and valid before audio_init(). Only a
+ * false->true edge schedules an announcement. Repeated true never replays it.
+ * False cancels and invalidates any prior player, including a claimed clip.
+ * Incoming eligibility is independent of mesh call privacy (call waiting). */
+uint32_t audio_set_incoming_call(bool incoming);
+/** Urgent incoming announcement overlays final hardware PCM even during SCO. */
+esp_err_t audio_play_incoming_call(void);
+/** Compatibility wrapper for audio_set_incoming_call(false). */
+void audio_cancel_incoming_call(void);
 
 #ifdef __cplusplus
 }

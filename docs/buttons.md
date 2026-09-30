@@ -5,7 +5,7 @@ Hold for the time shown, then release to perform the action.
 
 | Action | Controls |
 | --- | --- |
-| Mesh volume | Tap **- / +** |
+| Mesh volume (Bluetooth call volume during an active or held call) | Tap **- / +** |
 | Bluetooth volume (music and calls) | Hold **play** and tap **- / +** |
 | Play or pause music | Tap **play** |
 | Answer or end a call | Tap **play** |
@@ -18,5 +18,7 @@ Hold for the time shown, then release to perform the action.
 - Channels cycle **green -> red -> blue**. The LED shows your channel, which is saved across restarts.
 - Use the same channel as the people you want to talk to.
 - After adjusting Bluetooth volume, releasing **play** does not trigger another action.
+- Bluetooth volume also adjusts the paired phone's volume when supported; music and calls keep separate levels, and call volume moves in coarser steps.
+- Incoming calls announce once; ringing does not mute the mesh. Answering or holding a call mutes only this device's mesh microphone and local mesh playback. Other mesh participants remain connected and can relay through this device. Ending the call restores local mesh audio after the transport confirms the flush.
 
 The onboard **BOOT** button is for firmware flashing, not everyday controls.

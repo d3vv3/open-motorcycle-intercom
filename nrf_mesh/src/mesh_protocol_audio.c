@@ -8,6 +8,7 @@
 #include <zephyr/logging/log.h>
 
 #include "esb_radio.h"
+#include "mesh_audio_delivery.h"
 #include "mesh_protocol_internal.h"
 #include "mesh_tx_metrics.h"
 #include "tdma.h"
@@ -158,6 +159,41 @@ void mesh_protocol_audio_set_ingress_enabled(bool enabled, bool purge)
         k_msgq_purge(&s_audio_ingress_queue);
     }
     k_mutex_unlock(&s_audio_ingress_lock);
+}
+
+void mesh_protocol_audio_set_local_enabled(bool enabled)
+{
+    /* Close admission before waiting for a producer already holding the mutex. */
+    if (!enabled) {
+        atomic_set(&s_context.local_audio_enabled, 0);
+        s_context.local_audio_receive_cutoff_us =
+            k_ticks_to_us_floor64(k_uptime_ticks());
+    }
+    k_mutex_lock(&s_audio_ingress_lock, K_FOREVER);
+    atomic_inc(&s_context.local_audio_epoch);
+    s_stat_ingress_purge_drop += k_msgq_num_used_get(&s_audio_ingress_queue);
+    k_msgq_purge(&s_audio_ingress_queue);
+    k_mutex_unlock(&s_audio_ingress_lock);
+
+    mesh_protocol_audio_purge_tx_ring();
+    s_tx_queue_depth_dbg = 0;
+    s_last_audio_in_time = 0;
+    if (mesh_core_node_id_valid(s_node_id)) {
+        s_active_speaker_deadline_ms[s_node_id] = 0;
+        s_speaker_active_since_ms[s_node_id] = 0;
+        s_heard_bitmap &= (uint8_t)~mesh_core_node_bit(s_node_id);
+    }
+    if (!enabled) {
+        mesh_protocol_adaptive_local_voice(false);
+        if (s_role == MESH_ROLE_COORDINATOR) {
+            mesh_protocol_audio_update_speaker_grants();
+        }
+    } else {
+        /* Packets still in the ISR RX ring retain their original receipt timestamp. */
+        s_context.local_audio_receive_cutoff_us =
+            k_ticks_to_us_floor64(k_uptime_ticks());
+        atomic_set(&s_context.local_audio_enabled, 1);
+    }
 }
 
 void mesh_protocol_audio_purge_tx_ring(void)
@@ -498,16 +534,22 @@ bool mesh_protocol_audio_process_rx_packet(const uint8_t *data, uint8_t len, int
             mesh_protocol_audio_update_speaker_grants();
         track_rf_e2e_sequence(hdr->src_id, bundle.current_seq);
         s_stat_rf_rx_audio_ok++;
-        uint8_t delivery[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
-        memcpy(delivery, payload, hdr->payload_len);
-        delivery[3] = (uint8_t)((delivery[3] & ~MESH_AUDIO_V2_FLAG_RELAYED) |
-                                ((hdr->flags & MESH_FLAG_RELAYED) ? MESH_AUDIO_V2_FLAG_RELAYED : 0));
-        if (uart_bridge_send_audio_v2(hdr->src_id, delivery, (uint8_t)hdr->payload_len) == 0) {
-            s_stat_audio_fwd++;
-            s_e2e_spi_out_frames++;
-            s_stat_spi_out_ok++;
-        } else
-            s_stat_spi_out_drop++;
+        if (mesh_audio_delivery_allowed(atomic_get(&s_context.local_audio_enabled) != 0,
+                                        received_us, s_context.local_audio_receive_cutoff_us)) {
+            uint8_t delivery[MESH_AUDIO_V2_MAX_BUNDLE_SIZE];
+            memcpy(delivery, payload, hdr->payload_len);
+            delivery[3] = (uint8_t)((delivery[3] & ~MESH_AUDIO_V2_FLAG_RELAYED) |
+                                    ((hdr->flags & MESH_FLAG_RELAYED) ?
+                                         MESH_AUDIO_V2_FLAG_RELAYED : 0));
+            if (uart_bridge_send_audio_v2(hdr->src_id, delivery,
+                                          (uint8_t)hdr->payload_len) == 0) {
+                s_stat_audio_fwd++;
+                s_e2e_spi_out_frames++;
+                s_stat_spi_out_ok++;
+            } else {
+                s_stat_spi_out_drop++;
+            }
+        }
     }
     if (hdr->ttl == 2 && !(hdr->flags & MESH_FLAG_RELAYED) &&
         (hdr->flags & MESH_FLAG_RELAY_REQUEST) != 0 &&
@@ -950,7 +992,7 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
                                  uint8_t packet_type)
 {
     audio_bundle_view_t bundle;
-    if (s_state != MESH_STATE_ACTIVE) {
+    if (s_state != MESH_STATE_ACTIVE || atomic_get(&s_context.local_audio_enabled) == 0) {
         s_stat_ingress_inactive_drop++;
         return -EAGAIN;
     }
@@ -1018,10 +1060,13 @@ static int process_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio
 }
 
 static int queue_audio_ingress(const uint8_t *data, uint8_t len, uint8_t audio_flags,
-                               uint8_t packet_type)
+                               uint8_t packet_type, uint32_t arrival_epoch)
 {
     k_mutex_lock(&s_audio_ingress_lock, K_FOREVER);
-    if (!s_audio_ingress_enabled) {
+    if (!s_audio_ingress_enabled ||
+        !bridge_audio_epoch_accept(arrival_epoch,
+                                   (uint32_t)atomic_get(&s_context.local_audio_epoch),
+                                   atomic_get(&s_context.local_audio_enabled))) {
         k_mutex_unlock(&s_audio_ingress_lock);
         return -EAGAIN;
     }
@@ -1061,6 +1106,7 @@ int mesh_protocol_send_audio(const uint8_t *data, uint8_t len, uint8_t audio_fla
 
 int mesh_protocol_send_audio_v2(const uint8_t *data, uint8_t len)
 {
+    uint32_t arrival_epoch = (uint32_t)atomic_get(&s_context.local_audio_epoch);
     audio_bundle_view_t bundle;
 
     if (!audio_bundle_parse(data, len, &bundle)) {
@@ -1068,7 +1114,7 @@ int mesh_protocol_send_audio_v2(const uint8_t *data, uint8_t len)
         return -EINVAL;
     }
     return queue_audio_ingress(data, len, bundle.flags & AUDIO_BUNDLE_FLAG_CURRENT_ACTIVE,
-                               MESH_PKT_AUDIO_V2);
+                               MESH_PKT_AUDIO_V2, arrival_epoch);
 }
 
 static void drain_audio_ingress(void)

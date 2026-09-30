@@ -43,14 +43,24 @@ void audio_program_mix(audio_program_mix_t *state, int16_t *voice, size_t frames
                        size_t voice_present, const int16_t *music, size_t music_samples,
                        uint32_t rate);
 
+typedef enum {
+    AUDIO_CUE_IDLE = 0,
+    AUDIO_CUE_LIMIT = 1,
+    AUDIO_CUE_END = 2,
+    AUDIO_CUE_LIMIT_WITH_PENDING_END = 3,
+} audio_cue_state_t;
+
 typedef struct {
-    atomic_bool busy;
+    atomic_uint state;
     uint32_t position;
     uint32_t phase;
 } audio_limit_cue_t;
 
 void audio_limit_cue_reset(audio_limit_cue_t *cue);
+bool audio_limit_cue_busy(const audio_limit_cue_t *cue);
 bool audio_limit_cue_request(audio_limit_cue_t *cue);
+/* Returns true when an end beep is scheduled or coalesced with one in progress. */
+bool audio_limit_cue_request_end(audio_limit_cue_t *cue);
 void audio_limit_cue_mix(audio_limit_cue_t *cue, int16_t *interleaved,
                          size_t frames, uint8_t channels, uint32_t rate);
 

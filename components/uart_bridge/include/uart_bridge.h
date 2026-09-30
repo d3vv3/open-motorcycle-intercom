@@ -165,6 +165,14 @@ esp_err_t uart_bridge_mesh_enable(uint8_t talk_channel);
  */
 esp_err_t uart_bridge_mesh_disable(void);
 
+/** Pause only this device's mesh TX and local mesh playback. May block for
+ * command ACK/retries: call from the main owner task, never an HFP callback. */
+esp_err_t uart_bridge_mesh_audio_pause(void);
+
+/** Resume this device's mesh TX and playback after flushing stale audio.
+ * May block for command ACK/retries: call from the main owner task only. */
+esp_err_t uart_bridge_mesh_audio_resume(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -6,7 +6,7 @@
 
 #include "mesh_protocol_defs.h"
 
-#define BRIDGE_PROTOCOL_VERSION    5
+#define BRIDGE_PROTOCOL_VERSION    6
 #define BRIDGE_PROTOCOL_VERSION_V3 3
 #define BRIDGE_PROTOCOL_VERSION_V2 2
 #define BRIDGE_STATUS_V2_MARKER    0xA5
@@ -24,6 +24,8 @@ typedef enum {
     BRIDGE_COMMAND_MESH_START = 0x01,
     BRIDGE_COMMAND_MESH_STOP = 0x02,
     BRIDGE_COMMAND_STATUS = 0x03,
+    BRIDGE_COMMAND_AUDIO_PAUSE = 0x04,
+    BRIDGE_COMMAND_AUDIO_RESUME = 0x05,
 } bridge_command_t;
 
 typedef enum {
@@ -47,15 +49,24 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint8_t command;
     uint8_t generation;
-    uint8_t talk_channel; /* START group; STOP ignores value, but requires this layout. */
+    uint8_t talk_channel; /* START group; STOP/PAUSE/RESUME ignore this byte. */
 } bridge_command_payload_t;
 
 static inline int bridge_mesh_command_valid(const bridge_command_payload_t *payload, size_t len)
 {
     return payload != NULL && len == sizeof(*payload) &&
            (payload->command == BRIDGE_COMMAND_MESH_STOP ||
+            payload->command == BRIDGE_COMMAND_AUDIO_PAUSE ||
+            payload->command == BRIDGE_COMMAND_AUDIO_RESUME ||
             (payload->command == BRIDGE_COMMAND_MESH_START &&
              mesh_channel_valid(payload->talk_channel)));
+}
+
+/* A producer that started before a pause/resume boundary cannot enqueue afterward. */
+static inline int bridge_audio_epoch_accept(uint32_t arrival_epoch, uint32_t current_epoch,
+                                            int local_audio_enabled)
+{
+    return local_audio_enabled && arrival_epoch == current_epoch;
 }
 
 /* One atomic word carries a coherent request; zero means no pending command. */

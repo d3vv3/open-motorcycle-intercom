@@ -7,7 +7,8 @@ int main(void)
 {
     assert(bridge_audio_supports_lc3(BRIDGE_PROTOCOL_VERSION, MESH_AUDIO_V2_CODEC_LC3,
                                       MESH_FRAME_MS));
-    assert(BRIDGE_PROTOCOL_VERSION == 5u);
+    assert(BRIDGE_PROTOCOL_VERSION == 6u);
+    assert(!bridge_audio_supports_lc3(5u, MESH_AUDIO_V2_CODEC_LC3, MESH_FRAME_MS));
     assert(!bridge_audio_supports_lc3(4u, MESH_AUDIO_V2_CODEC_LC3, MESH_FRAME_MS));
     assert(!bridge_audio_supports_lc3(BRIDGE_PROTOCOL_VERSION - 1u,
                                       MESH_AUDIO_V2_CODEC_LC3, MESH_FRAME_MS));

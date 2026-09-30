@@ -46,6 +46,12 @@ typedef struct {
     bool outgoing_ready_pending;
 } phone_audio_stats_t;
 
+/** Called with a snapshot after each reduced HFP call-state change, outside the
+ * phone call-state lock. Must not block or call phone lifecycle APIs. Registration
+ * immediately replays the current snapshot (also before phone_audio_init). */
+typedef void (*phone_audio_call_state_cb_t)(const phone_audio_call_state_t *state, void *context);
+void phone_audio_set_call_state_callback(phone_audio_call_state_cb_t callback, void *context);
+
 /** Initialize the terminal Bluetooth Classic phone-audio service. */
 esp_err_t phone_audio_init(void);
 /** Permanently tear down Bluetooth for this boot; it cannot be initialized again. */
@@ -62,6 +68,12 @@ esp_err_t phone_audio_forget_all_bonds(void);
 esp_err_t phone_audio_set_discoverable(bool discoverable);
 /** Emit the low-priority HFP audio statistics snapshot. */
 void phone_audio_log_stats(void);
+
+/** Local Bluetooth playback request (0..100). ESP_OK means accepted for asynchronous
+ * local gain and supported phone notification, not applied or acknowledged by phone. */
+esp_err_t phone_audio_set_volume(uint8_t percent);
+/** Latest requested effective Bluetooth gain; includes wire-level quantization. */
+uint8_t phone_audio_get_volume(void);
 
 esp_err_t phone_audio_play(void);
 esp_err_t phone_audio_pause(void);

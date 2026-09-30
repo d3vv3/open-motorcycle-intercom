@@ -377,10 +377,11 @@ void handle_audio_packet(const mesh_rx_item_t *rx)
     }
     xSemaphoreGive(s_peer_mutex);
 
-    jitter_buffer_insert(audio->data, opus_len, rx->header.src_id, rx->header.seq,
-                          (audio->audio_flags & MESH_AUDIO_FLAG_ACTIVE) |
-                          ((rx->header.flags & MESH_FLAG_RELAYED) ? MESH_AUDIO_FLAG_RELAYED : 0),
-                          rx->timestamp_us);
+    if (atomic_load(&s_local_audio_enabled))
+        jitter_buffer_insert(audio->data, opus_len, rx->header.src_id, rx->header.seq,
+                             (audio->audio_flags & MESH_AUDIO_FLAG_ACTIVE) |
+                             ((rx->header.flags & MESH_FLAG_RELAYED) ? MESH_AUDIO_FLAG_RELAYED : 0),
+                             rx->timestamp_us);
 
     if (rx->header.ttl > 0 && (rx->header.flags & MESH_FLAG_RELAY_REQUEST) != 0) {
         bool relay_allowed = false;
@@ -425,7 +426,8 @@ mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
         s_relay_tail = (uint8_t)((s_relay_tail + 1) % RELAY_RING_SIZE);
         STATS_INC(packets_dropped);
     }
-    bool local_pending = xQueuePeek(s_tx_queue, &tx_item, 0) == pdTRUE;
+    bool local_pending = atomic_load(&s_local_audio_enabled) &&
+                         xQueuePeek(s_tx_queue, &tx_item, 0) == pdTRUE;
     if (local_pending && !relay_queue_empty() && !s_mesh.relay_capacity_logged) {
         s_mesh.relay_capacity_logged = true;
         ESP_LOGW(TAG, "One audio TX per slot: alternating local/relay; full-rate both cannot fit");
@@ -454,7 +456,7 @@ mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
         }
         return relay_ret == ESP_OK ? MESH_TX_SLOT_SUBMITTED : MESH_TX_SLOT_ERROR;
     }
-    if (!local_pending) return MESH_TX_SLOT_EMPTY;
+    if (!local_pending || !atomic_load(&s_local_audio_enabled)) return MESH_TX_SLOT_EMPTY;
 
     uint8_t buffer[sizeof(mesh_header_t) + sizeof(mesh_audio_payload_t)];
     mesh_header_t *header = (mesh_header_t *)buffer;
@@ -494,6 +496,7 @@ mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
     if (pair_unicast_dest(remote_mac)) dest_mac = remote_mac;
 #endif
     int64_t send_start_us = esp_timer_get_time();
+    if (!atomic_load(&s_local_audio_enabled)) return MESH_TX_SLOT_EMPTY;
     esp_err_t ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){
         .dest_mac = dest_mac,
         .data = buffer,

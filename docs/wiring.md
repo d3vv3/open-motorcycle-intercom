@@ -162,9 +162,9 @@ For external-button gestures and voice prompts, see [Button controls](buttons.md
 
 1. With power disconnected, connect ground, ACK, SPI, WS, the three buttons, and the speaker as shown above.
 2. Use the separate-USB arrangement for flashing; leave the shared `3V3` wire disconnected.
-3. Flash matching S31 and nRF firmware with bridge protocol v5 and LC3 support.
+3. Flash matching S31 and nRF firmware with bridge protocol v6 and LC3 support.
 4. Let the XIAO boot, then reset the S31 so it can probe the bridge.
-5. Confirm the S31 log selects nRF ESB and reports bridge protocol 5, LC3, and 20 ms audio frames.
+5. Confirm the S31 log selects nRF ESB and reports bridge protocol 6, LC3, and 20 ms audio frames.
 6. Repeat for the second pair and confirm that the mesh reports a peer.
 7. Speak near each microphone in turn and check the opposite speaker.
 

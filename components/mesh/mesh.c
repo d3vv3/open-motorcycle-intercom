@@ -46,6 +46,7 @@ mesh_context_t s_mesh = {
     .control_queue_mux = portMUX_INITIALIZER_UNLOCKED,
     .transport_mux = portMUX_INITIALIZER_UNLOCKED,
     .last_tx_status = ESP_NOW_SEND_SUCCESS,
+    .local_audio_enabled = ATOMIC_VAR_INIT(true),
 };
 
 static bool lifecycle_owned_by_caller(void)
@@ -652,7 +653,7 @@ esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags
     taskENTER_CRITICAL(&s_transport_mux);
     bool stopping = s_stopping;
     taskEXIT_CRITICAL(&s_transport_mux);
-    if (stopping || s_state != MESH_STATE_ACTIVE) {
+    if (stopping || s_state != MESH_STATE_ACTIVE || !atomic_load(&s_local_audio_enabled)) {
         STATS_INC(tx_reject_state);
         xSemaphoreGive(s_audio_producer_mutex);
         return ESP_ERR_INVALID_STATE;
@@ -698,6 +699,33 @@ esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags
     taskEXIT_CRITICAL(&s_stats_mux);
     xSemaphoreGive(s_audio_producer_mutex);
     return ESP_OK;
+}
+
+esp_err_t mesh_set_local_audio_enabled(bool enabled)
+{
+    if (!s_initialized || xPortInIsrContext()) return ESP_ERR_INVALID_STATE;
+    /* Publish the gate first so an in-flight producer or slot dispatch sees it. */
+    atomic_store(&s_local_audio_enabled, enabled);
+    if (enabled) return ESP_OK;
+    xSemaphoreTake(s_audio_producer_mutex, portMAX_DELAY);
+    STATS_ADD(tx_purge, uxQueueMessagesWaiting(s_tx_queue));
+    xQueueReset(s_tx_queue);
+    taskENTER_CRITICAL(&s_speaker_mux);
+    s_mesh.local_voice_active = false;
+    s_mesh.local_voice_deadline_ms = 0;
+    taskEXIT_CRITICAL(&s_speaker_mux);
+    xSemaphoreGive(s_audio_producer_mutex);
+    xSemaphoreTake(s_jitter_mutex, portMAX_DELAY);
+    STATS_ADD(jitter_purge, s_jitter_buffer.count);
+    mesh_jitter_reset(&s_jitter_buffer);
+    STATS_SET(jitter_depth, 0);
+    xSemaphoreGive(s_jitter_mutex);
+    return ESP_OK;
+}
+
+void mesh_request_local_audio_pause(void)
+{
+    atomic_store(&s_local_audio_enabled, false);
 }
 
 esp_err_t mesh_register_audio_callback(mesh_audio_cb_t cb)

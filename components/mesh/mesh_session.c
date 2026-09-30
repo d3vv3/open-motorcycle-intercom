@@ -207,7 +207,9 @@ static void mesh_task_drain_active_rx_and_deliver_audio(void)
         uint8_t audio_flags;
         int64_t timestamp_us;
 
-        while (jitter_buffer_pop(audio_data, &audio_len, &src_id, &audio_flags, &timestamp_us)) {
+        while (atomic_load(&s_local_audio_enabled) &&
+               jitter_buffer_pop(audio_data, &audio_len, &src_id, &audio_flags, &timestamp_us)) {
+            if (!atomic_load(&s_local_audio_enabled)) break;
             STATS_INC(rx_deliver);
             int64_t cb_start_us = esp_timer_get_time();
             s_audio_cb(audio_data, audio_len, src_id, audio_flags, timestamp_us);

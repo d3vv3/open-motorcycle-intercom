@@ -805,6 +805,14 @@ static void write_playout_frame(bool notify_frame, bool notify_continues,
         *previous_notify_write_start_us = 0;
         return;
     }
+    if (audio_urgent_active(&g_audio.incoming_call)) {
+        memcpy(g_audio.urgent_base, g_audio.hw_output, sizeof(g_audio.hw_output));
+        uint32_t epoch = audio_urgent_mix(&g_audio.incoming_call,
+            audio_prompt_for_notification(AUDIO_NOTIFY_INCOMING_CALL),
+            g_audio.hw_output, AUDIO_HW_FRAME_SAMPLES, 1u, AUDIO_HW_SAMPLE_RATE);
+        if (epoch != 0u && !audio_urgent_epoch_valid(&g_audio.incoming_call, epoch))
+            memcpy(g_audio.hw_output, g_audio.urgent_base, sizeof(g_audio.hw_output));
+    }
     int32_t frame_peak = 0;
     for (size_t i = 0; i < AUDIO_HW_FRAME_SAMPLES; ++i) {
         int32_t sample = g_audio.hw_output[i];
@@ -905,6 +913,7 @@ void audio_playout_task(void *arg)
     bool stack_logged = false;
     int64_t previous_notify_work_start_us = 0;
     int64_t previous_notify_write_start_us = 0;
+    bool was_mesh_blocked = false;
     audio_output_window_t output_window = {0};
 
     opus_decoder_ctl(g_audio.loopback_decoder, OPUS_RESET_STATE);
@@ -940,7 +949,15 @@ void audio_playout_task(void *arg)
             (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
         }
         bool call_priority = atomic_load_explicit(&g_audio.call_priority_active,
-                                                  memory_order_acquire);
+                                                   memory_order_acquire);
+        bool mesh_blocked_at_render = audio_mesh_call_blocked();
+        if (mesh_blocked_at_render && !was_mesh_blocked &&
+            g_audio.config.mode == AUDIO_MODE_MESH) {
+            audio_sample_fifo_reset(&g_audio.voice_fifo);
+            audio_sample_fifo_reset(&g_audio.voice_presence_fifo);
+            (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
+        }
+        was_mesh_blocked = mesh_blocked_at_render;
         size_t base_present_samples = 0u;
         if (call_priority) {
             memset(g_audio.pcm_output, 0, sizeof(g_audio.pcm_output));
@@ -950,8 +967,13 @@ void audio_playout_task(void *arg)
                 base_present = render_loopback(&decode_time_sum);
             } else {
                 int64_t remote_span = cpu_profile_span_begin();
-                base_present = render_remote_sources((uint64_t)(esp_timer_get_time() / 1000),
-                                                     &decode_time_sum);
+                base_present = false;
+                if (!mesh_blocked_at_render) {
+                    base_present = render_remote_sources((uint64_t)(esp_timer_get_time() / 1000),
+                                                         &decode_time_sum);
+                } else {
+                    memset(g_audio.pcm_output, 0, sizeof(g_audio.pcm_output));
+                }
                 cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_REMOTE, remote_span);
             }
             base_present_samples = base_present ? AUDIO_FRAME_SAMPLES : 0u;
@@ -962,8 +984,11 @@ void audio_playout_task(void *arg)
                 g_audio.pcm_output, base_present_samples, 0u);
             bool request_consumed;
             int64_t mix_start_us = esp_timer_get_time();
-            size_t notification_samples = audio_notify_mix_frame(base_present_samples,
-                                                                  &request_consumed);
+            size_t notification_samples = 0u;
+            request_consumed = false;
+            if (!audio_urgent_active(&g_audio.incoming_call))
+                notification_samples = audio_notify_mix_frame(base_present_samples,
+                                                               &request_consumed);
             uint32_t mix_us = (uint32_t)(esp_timer_get_time() - mix_start_us);
             notify_frame = notify_frame || request_consumed || notification_samples != 0u ||
                            g_audio.notification.active;
@@ -1028,6 +1053,11 @@ void audio_playout_task(void *arg)
             if (g_audio.voice_presence_frame[i] != 0) voice_present = i + 1u;
         }
         if (!call_active) audio_route_mix_music_48k(voice_present);
+        if (!mesh_blocked_at_render && audio_mesh_call_blocked() && !call_active && !call_priority &&
+            g_audio.config.mode == AUDIO_MODE_MESH) {
+            /* A gate transition can race the earlier remote render. */
+            memset(g_audio.hw_output, 0, sizeof(g_audio.hw_output));
+        }
         audio_limit_cue_mix(&g_audio.volume_limit_cue, g_audio.hw_output,
                             AUDIO_HW_FRAME_SAMPLES, 1u, AUDIO_HW_SAMPLE_RATE);
         uint32_t work_us = (uint32_t)(esp_timer_get_time() - work_start_us);

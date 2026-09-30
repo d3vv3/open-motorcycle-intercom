@@ -26,6 +26,9 @@
 #include "audio.h"
 #include "button.h"
 #include "button_control.h"
+#include "call_policy.h"
+#include "call_cues.h"
+#include "call_privacy.h"
 #include "cpu_profile.h"
 #include "e2e_diag.h"
 #include "mesh.h"
@@ -64,6 +67,14 @@ static bool s_esp_enable_announcement_pending;
 static bool s_role_announced;
 static bool s_last_coordinator;
 static media_toggle_guard_t s_media_toggle_guard;
+static omi_call_policy_t s_call_policy;
+static omi_privacy_reconcile_t s_privacy;
+static atomic_uint s_end_beeps_pending = ATOMIC_VAR_INIT(0);
+static int64_t s_privacy_retry_ms;
+static unsigned s_privacy_failures;
+static bool s_bridge_was_ready;
+static uint32_t s_bridge_status_generation;
+static int64_t s_privacy_transition_ms;
 
 /*
  * Runtime transport selection: nRF52840 (ESB via SPI bridge) or ESP-NOW (WiFi).
@@ -146,22 +157,140 @@ static esp_err_t init_audio_with_test_flags(void)
 /**
  * @brief Callback from audio subsystem when encoded frame is ready
  */
-static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us)
+static void audio_tx_callback(const uint8_t *data, uint16_t len, bool active,
+                              int64_t timestamp_us, uint32_t mesh_epoch)
 {
-    if (atomic_load(&s_channel_transition)) return;
+    if (atomic_load(&s_channel_transition) || !audio_mesh_tx_epoch_allowed(mesh_epoch)) return;
     switch (s_active_transport) {
     case TRANSPORT_ESP_NOW:
         transport_espnow_send_audio(data, len, active);
         break;
 
     case TRANSPORT_NRF52840:
-        transport_nrf_send_audio(data, len, active, timestamp_us);
+        transport_nrf_send_audio(data, len, active, timestamp_us, mesh_epoch);
         break;
 
     default:
         /* No transport active */
         break;
     }
+}
+
+static void phone_call_callback(const phone_audio_call_state_t *state, void *context)
+{
+    (void)context;
+    omi_call_decision_t decision = omi_call_policy_step(&s_call_policy, state);
+    /* This is the only call-path operation that closes the local mesh gate;
+     * transport commands and decoder resets belong to the main owner task. */
+    audio_mesh_call_update(decision.privacy);
+    if (decision.privacy && s_active_transport == TRANSPORT_ESP_NOW)
+        mesh_request_local_audio_pause();
+    if (decision.announce) audio_set_incoming_call(true);
+    else if (!decision.current_incoming) audio_set_incoming_call(false);
+    if (decision.end_beep) atomic_fetch_add(&s_end_beeps_pending, 1u);
+}
+
+static void process_call_cues(void)
+{
+    unsigned pending = atomic_load(&s_end_beeps_pending);
+    if (pending != 0u) {
+        esp_err_t ret = audio_play_call_end();
+        if (omi_call_end_acknowledged(pending, ret == ESP_OK))
+            atomic_fetch_sub(&s_end_beeps_pending, 1u);
+    }
+}
+
+static void privacy_failed(const char *step, esp_err_t ret, int64_t now_ms)
+{
+    s_privacy_failures++;
+    s_privacy_retry_ms = now_ms + (s_privacy_failures < 3u ? 200 : 1000);
+    if (s_privacy_failures == 1u || s_privacy_failures == 3u || s_privacy_failures % 30u == 0u)
+        ESP_LOGW(TAG, "Call privacy %s pending: %s", step, esp_err_to_name(ret));
+}
+
+static void reconcile_call_privacy(int64_t now_ms)
+{
+    uint32_t epoch = audio_mesh_call_epoch();
+    bool active = audio_mesh_call_active();
+    bool blocked = audio_mesh_call_blocked();
+    if (epoch != s_privacy.epoch) {
+        s_privacy_retry_ms = 0;
+        s_privacy_failures = 0;
+        s_privacy_transition_ms = now_ms;
+    }
+    if (s_active_transport == TRANSPORT_NRF52840) {
+        uart_bridge_status_t status;
+        bool ready = uart_bridge_get_status(&status) == ESP_OK &&
+                     status.protocol_version == BRIDGE_PROTOCOL_VERSION;
+        if (!ready) {
+            if (s_bridge_was_ready) {
+                s_privacy.pause_acked = false;
+                s_privacy.resumed = false;
+            }
+            s_bridge_was_ready = false;
+        } else {
+            if (!s_bridge_was_ready ||
+                (status.continuity_lost && status.generation != s_bridge_status_generation)) {
+                if (blocked) s_privacy.pause_acked = false;
+                s_privacy.resumed = false;
+            }
+            s_bridge_was_ready = true;
+            s_bridge_status_generation = status.generation;
+        }
+        if (!ready) return;
+    }
+    omi_privacy_action_t action = omi_privacy_next(&s_privacy, epoch, active, blocked);
+    if (action == OMI_PRIVACY_NONE) {
+        /* A bridge restart can lose its local pause flag even after a prior
+         * successful resume; restore the unpaused state on the new session. */
+        if (s_active_transport == TRANSPORT_NRF52840 && !blocked && !s_privacy.resumed &&
+            s_privacy.epoch != 0u && now_ms >= s_privacy_retry_ms) {
+            esp_err_t ret = uart_bridge_mesh_audio_resume();
+            if (ret == ESP_OK) { s_privacy.resumed = true; s_privacy_failures = 0; }
+            else privacy_failed("restore resume", ret, now_ms);
+        }
+        return;
+    }
+    if (action == OMI_PRIVACY_RESUME &&
+        !omi_privacy_resume_settled(now_ms, s_privacy_transition_ms)) return;
+    if (now_ms < s_privacy_retry_ms) return;
+    esp_err_t ret = ESP_OK;
+    if (action == OMI_PRIVACY_PAUSE) {
+        if (s_active_transport == TRANSPORT_NRF52840) {
+            uart_bridge_discard_pending_audio();
+            transport_nrf_reset_tx_cache();
+            e2e_diag_reset_all_sources();
+            ret = uart_bridge_mesh_audio_pause();
+        } else if (s_active_transport == TRANSPORT_ESP_NOW) {
+            ret = mesh_set_local_audio_enabled(false);
+        }
+        if (ret == ESP_OK) ret = audio_reset_mesh_rx();
+        if (ret == ESP_OK && epoch == audio_mesh_call_epoch()) s_privacy.pause_acked = true;
+    } else {
+        if (s_active_transport == TRANSPORT_NRF52840) {
+            uart_bridge_discard_pending_audio();
+            transport_nrf_reset_tx_cache();
+            e2e_diag_reset_all_sources();
+        } else if (s_active_transport == TRANSPORT_ESP_NOW) {
+            /* Keep the producer disabled while the decoder and local stores flush. */
+            ret = mesh_set_local_audio_enabled(false);
+        }
+        if (ret == ESP_OK) ret = audio_reset_mesh_rx();
+        if (ret == ESP_OK && s_active_transport == TRANSPORT_NRF52840)
+            ret = uart_bridge_mesh_audio_resume();
+        if (ret == ESP_OK && epoch == audio_mesh_call_epoch() && !audio_mesh_call_active()) {
+            if (s_active_transport == TRANSPORT_ESP_NOW)
+                ret = mesh_set_local_audio_enabled(true);
+            if (ret == ESP_OK) {
+                bool reopened = audio_mesh_call_resume(epoch);
+                if (!reopened && s_active_transport == TRANSPORT_ESP_NOW)
+                    (void)mesh_set_local_audio_enabled(false);
+                if (reopened) s_privacy.resumed = true;
+            }
+        }
+    }
+    if (ret != ESP_OK) privacy_failed(action == OMI_PRIVACY_PAUSE ? "pause" : "resume", ret, now_ms);
+    else { s_privacy_failures = 0; s_privacy_retry_ms = 0; }
 }
 
 static void audio_tx_idle_callback(int64_t timestamp_us)
@@ -323,6 +452,7 @@ static void process_short_press(int64_t now_ms)
     switch (phone_state.call.phase) {
         case PHONE_AUDIO_CALL_PHASE_INCOMING:
             media_toggle_guard_reset(&s_media_toggle_guard);
+            audio_set_incoming_call(false);
             ret = phone_audio_answer_call();
             ESP_LOGI(TAG, "Center press: answer call (%s)", esp_err_to_name(ret));
             return;
@@ -336,6 +466,13 @@ static void process_short_press(int64_t now_ms)
             return;
         case PHONE_AUDIO_CALL_PHASE_IDLE:
             break;
+    }
+
+    if (audio_mesh_call_active()) {
+        media_toggle_guard_reset(&s_media_toggle_guard);
+        ret = phone_audio_reject_call();
+        ESP_LOGI(TAG, "Center press: end held call (%s)", esp_err_to_name(ret));
+        return;
     }
 
     if (phone_audio_get_call_state(&phone_state.call) != ESP_OK ||
@@ -430,8 +567,9 @@ static void process_button_action(button_action_t action, int64_t now_ms)
         if (ret != ESP_OK)
             ESP_LOGW(TAG, "Side hold state unavailable; action skipped: %s", esp_err_to_name(ret));
         command = omi_side_hold_action(command, ret == ESP_OK,
-                                       ret == ESP_OK && phone_state.media_streaming,
-                                       ret == ESP_OK && phone_state.call.phase == PHONE_AUDIO_CALL_PHASE_IDLE);
+                                        ret == ESP_OK && phone_state.media_streaming,
+                                        ret == ESP_OK && phone_state.call.phase == PHONE_AUDIO_CALL_PHASE_IDLE &&
+                                            !audio_mesh_call_active());
     }
     switch (command) {
         case OMI_ACTION_CALL_MEDIA: process_short_press(now_ms); break;
@@ -453,16 +591,19 @@ static void process_button_action(button_action_t action, int64_t now_ms)
         case OMI_ACTION_VOLUME_UP:
         case OMI_ACTION_BLUETOOTH_VOLUME_DOWN:
         case OMI_ACTION_BLUETOOTH_VOLUME_UP: {
-            omi_volume_target_t selected = omi_volume_action_target(command);
+            omi_volume_target_t selected = omi_call_volume_target(command, audio_mesh_call_active());
             audio_volume_target_t target = selected == OMI_VOLUME_BLUETOOTH ?
                 AUDIO_VOLUME_BLUETOOTH : AUDIO_VOLUME_MESH;
             int direction = omi_volume_action_direction(command);
-            uint8_t current = audio_get_volume(target);
+            uint8_t current = target == AUDIO_VOLUME_BLUETOOTH ?
+                phone_audio_get_volume() : audio_get_volume(target);
             uint8_t next = mesh_volume_step(current, direction);
-            esp_err_t ret = audio_set_volume(target, next);
+            esp_err_t ret = target == AUDIO_VOLUME_BLUETOOTH ?
+                phone_audio_set_volume(next) : audio_set_volume(target, next);
             if (ret != ESP_OK) {
                 ESP_LOGW(TAG, "Volume request failed: %s", esp_err_to_name(ret));
-            } else if (mesh_volume_at_limit(current, next, direction)) {
+            } else if (mesh_volume_at_limit(current, target == AUDIO_VOLUME_BLUETOOTH ?
+                                                    phone_audio_get_volume() : next, direction)) {
                 esp_err_t cue = audio_play_volume_limit();
                 if (cue != ESP_OK) ESP_LOGW(TAG, "Volume limit cue failed: %s", esp_err_to_name(cue));
             }
@@ -689,6 +830,7 @@ static esp_err_t initialize_application(int64_t boot_time)
     audio_register_tx_callback(audio_tx_callback);
     audio_register_tx_idle_callback(audio_tx_idle_callback);
     audio_register_activity_callback(audio_activity_callback);
+    phone_audio_set_call_state_callback(phone_call_callback, NULL);
 
     /* Reserve Classic Bluetooth controller memory before Wi-Fi pools and audio stacks. */
     ESP_LOGI(TAG, "Before phone_audio_init: internal free/largest=%lu/%lu bytes, PSRAM free=%lu bytes",
@@ -780,6 +922,8 @@ static void run_runtime_health_loop(int64_t boot_time)
         while (handled++ < 16 && xQueueReceive(s_button_actions, &action, 0) == pdTRUE)
             process_button_action(action, now_ms);
         process_media_toggle(false, now_ms);
+        process_call_cues();
+        reconcile_call_privacy(now_ms);
         unsigned dropped = atomic_exchange(&s_button_drops, 0);
         if (dropped) ESP_LOGW(TAG, "Button queue full; dropped %u newest actions", dropped);
 

@@ -78,6 +78,7 @@ static void clip_duration(const audio_prompt_clip_t *clip, uint32_t rate)
 
 int main(void)
 {
+    assert(AUDIO_NOTIFY_COUNT == 12);
     known_vectors();
     mix_headroom();
     for (int type = 0; type < AUDIO_NOTIFY_COUNT; ++type) {
@@ -90,6 +91,8 @@ int main(void)
         clip_duration(clip, 8000);
     }
     assert(audio_prompt_for_notification(AUDIO_NOTIFY_COUNT) == NULL);
+    assert(audio_prompt_for_notification(AUDIO_NOTIFY_INCOMING_CALL) ==
+           &audio_prompt_clips[11]);
     assert(audio_prompt_for_notification((audio_notify_t)-1) == NULL);
     puts("audio prompt tests passed");
     return 0;

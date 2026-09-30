@@ -1,4 +1,5 @@
 #include "phone_audio.h"
+#include "phone_audio_volume.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -25,6 +26,7 @@ static const char *TAG = "phone_audio";
 #define PAIRING_WINDOW_MS 120000
 #define CONTROL_QUEUE_LENGTH 8
 #define CONTROL_POLL_MS 100
+#define HFP_TEARDOWN_RETRY_MS 1000
 #define SCO_INTERVAL_US 7500
 #define SCO_PENDING_TIMEOUT_US 30000
 #define CONTROL_RETRY_LIMIT 80
@@ -131,6 +133,15 @@ typedef struct {
     uint8_t peer[ESP_BD_ADDR_LEN];
     uint8_t ct_peer[ESP_BD_ADDR_LEN];
     uint8_t tg_peer[ESP_BD_ADDR_LEN];
+    uint8_t hf_peer[ESP_BD_ADDR_LEN];
+    bool hf_peer_pending;
+    bool hf_peer_bound;
+    bool hf_teardown_requested;
+    uint32_t hf_connect_epoch;
+    TickType_t hf_teardown_next_tick;
+    /* A2DP bumps both; TG/HFP bump only their role so unrelated replies remain valid. */
+    atomic_uint media_peer_epoch;
+    atomic_uint call_peer_epoch;
     pending_sbc_config_t pending_sbc[MAX_PENDING_SBC_CONFIGS];
     bool ct_peer_pending;
     bool tg_peer_pending;
@@ -152,6 +163,8 @@ typedef struct {
     phone_audio_call_state_t call_state;
     phone_audio_call_indicators_t call_indicators;
     portMUX_TYPE call_state_lock;
+    phone_audio_call_state_cb_t call_state_callback;
+    void *call_state_context;
     atomic_uint pairing_deadline_tick;
     TimerHandle_t pairing_timer;
     StaticTimer_t pairing_timer_storage;
@@ -173,6 +186,9 @@ typedef struct {
     bool applied_mic_active;
     uint32_t applied_call_rate;
     portMUX_TYPE desired_lock;
+    portMUX_TYPE volume_lock;
+    phone_volume_policy_t volume;
+    uint32_t applied_volume_revision;
     atomic_bool shutdown_success;
     TickType_t route_failure_log_tick;
     bool route_failure_logged;
@@ -185,6 +201,7 @@ static phone_audio_context_t s_phone = {
     .peer_lock = portMUX_INITIALIZER_UNLOCKED,
     .call_state_lock = portMUX_INITIALIZER_UNLOCKED,
     .desired_lock = portMUX_INITIALIZER_UNLOCKED,
+    .volume_lock = portMUX_INITIALIZER_UNLOCKED,
 };
 static portMUX_TYPE s_lifecycle_init_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -212,6 +229,38 @@ static bool avrc_role_matches_locked(const uint8_t *bda, bool ct)
 {
     return (ct ? s_phone.ct_peer_pending : s_phone.tg_peer_pending) &&
            memcmp(ct ? s_phone.ct_peer : s_phone.tg_peer, bda, ESP_BD_ADDR_LEN) == 0;
+}
+
+static bool volume_peer_snapshot(phone_volume_profile_t profile, uint8_t *peer, uint32_t *epoch)
+{
+    portENTER_CRITICAL(&s_phone.peer_lock);
+    bool selected = atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed) &&
+        (profile == PHONE_VOLUME_MEDIA
+            ? atomic_load_explicit(&s_phone.avrc_tg_connected, memory_order_relaxed) &&
+              s_phone.tg_peer_pending && memcmp(s_phone.peer, s_phone.tg_peer, ESP_BD_ADDR_LEN) == 0
+            : atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_relaxed) &&
+              s_phone.hf_peer_bound && memcmp(s_phone.peer, s_phone.hf_peer, ESP_BD_ADDR_LEN) == 0);
+    if (selected) {
+        memcpy(peer, s_phone.peer, ESP_BD_ADDR_LEN);
+        *epoch = atomic_load_explicit(profile == PHONE_VOLUME_MEDIA ? &s_phone.media_peer_epoch :
+                                      &s_phone.call_peer_epoch, memory_order_relaxed);
+    }
+    portEXIT_CRITICAL(&s_phone.peer_lock);
+    return selected;
+}
+
+static bool volume_peer_current(phone_volume_profile_t profile, const uint8_t *peer, uint32_t epoch)
+{
+    uint8_t current[ESP_BD_ADDR_LEN];
+    uint32_t current_epoch;
+    return volume_peer_snapshot(profile, current, &current_epoch) && current_epoch == epoch &&
+           memcmp(peer, current, ESP_BD_ADDR_LEN) == 0;
+}
+
+static uint32_t volume_peer_epoch(phone_volume_profile_t profile)
+{
+    return atomic_load_explicit(profile == PHONE_VOLUME_MEDIA ? &s_phone.media_peer_epoch :
+                                &s_phone.call_peer_epoch, memory_order_acquire);
 }
 
 static bool allocate_command_label(uint8_t *label)
@@ -390,12 +439,92 @@ static void cache_pending_sbc(const uint8_t *bda, uint32_t rate, uint8_t channel
 static void query_capabilities_if_selected(void);
 static void queue_control(control_intent_t intent);
 
+static void wake_volume_worker(void)
+{
+    queue_control((control_intent_t){.kind = CONTROL_ACTIVE});
+}
+
+static void volume_profile_refresh(void)
+{
+    phone_audio_call_state_t call;
+    portENTER_CRITICAL(&s_phone.call_state_lock);
+    call = s_phone.call_state;
+    portEXIT_CRITICAL(&s_phone.call_state_lock);
+    phone_volume_profile_t profile = atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_acquire) &&
+        (call.phase != PHONE_AUDIO_CALL_PHASE_IDLE || call.audio_connected)
+        ? PHONE_VOLUME_CALL : PHONE_VOLUME_MEDIA;
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    phone_volume_profile(&s_phone.volume, profile);
+    portEXIT_CRITICAL(&s_phone.volume_lock);
+    wake_volume_worker();
+}
+
+static void volume_session_reset(void)
+{
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    phone_volume_disconnect(&s_phone.volume);
+    portEXIT_CRITICAL(&s_phone.volume_lock);
+    wake_volume_worker();
+}
+
+static void volume_session_invalidate(void)
+{
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    phone_volume_invalidate_session(&s_phone.volume);
+    portEXIT_CRITICAL(&s_phone.volume_lock);
+    wake_volume_worker();
+}
+
+static void volume_remote(phone_volume_profile_t profile, uint8_t wire)
+{
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    bool accepted = phone_volume_remote(&s_phone.volume, profile, wire);
+    portEXIT_CRITICAL(&s_phone.volume_lock);
+    if (accepted) wake_volume_worker();
+}
+
 static void set_call_indicator(uint8_t *indicator, uint8_t value)
 {
+    phone_audio_call_state_t snapshot;
+    phone_audio_call_state_cb_t callback;
+    void *context;
     portENTER_CRITICAL(&s_phone.call_state_lock);
     *indicator = value;
     phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
+    snapshot = s_phone.call_state;
+    callback = s_phone.call_state_callback;
+    context = s_phone.call_state_context;
     portEXIT_CRITICAL(&s_phone.call_state_lock);
+    volume_profile_refresh();
+    if (callback) callback(&snapshot, context);
+}
+
+void phone_audio_set_call_state_callback(phone_audio_call_state_cb_t callback, void *context)
+{
+    phone_audio_call_state_t snapshot;
+    portENTER_CRITICAL(&s_phone.call_state_lock);
+    s_phone.call_state_callback = callback;
+    s_phone.call_state_context = context;
+    snapshot = s_phone.call_state;
+    portEXIT_CRITICAL(&s_phone.call_state_lock);
+    if (callback) callback(&snapshot, context);
+}
+
+static void reset_call_indicators(bool slc_connected)
+{
+    phone_audio_call_state_t snapshot;
+    phone_audio_call_state_cb_t callback;
+    void *context;
+    portENTER_CRITICAL(&s_phone.call_state_lock);
+    memset(&s_phone.call_indicators, 0, sizeof(s_phone.call_indicators));
+    s_phone.call_indicators.slc_connected = slc_connected;
+    phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
+    snapshot = s_phone.call_state;
+    callback = s_phone.call_state_callback;
+    context = s_phone.call_state_context;
+    portEXIT_CRITICAL(&s_phone.call_state_lock);
+    volume_profile_refresh();
+    if (callback) callback(&snapshot, context);
 }
 
 static void reset_sco_pacing(void)
@@ -692,57 +821,118 @@ static void hfp_callback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
         return;
     }
     if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) return;
-    if (event == ESP_HF_CLIENT_CONNECTION_STATE_EVT && !peer_is_selected(param->conn_stat.remote_bda)) {
-        if (param->conn_stat.state != ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
-            (void)esp_hf_client_disconnect(param->conn_stat.remote_bda);
+    if (event == ESP_HF_CLIENT_CONNECTION_STATE_EVT) {
+        bool allowed;
+        portENTER_CRITICAL(&s_phone.peer_lock);
+        allowed = phone_audio_hfp_connection_allowed(
+            atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed), s_phone.peer,
+            s_phone.hf_peer_pending, s_phone.hf_peer_bound, s_phone.hf_teardown_requested,
+            s_phone.hf_peer, param->conn_stat.remote_bda,
+            param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED);
+        portEXIT_CRITICAL(&s_phone.peer_lock);
+        if (!allowed && param->conn_stat.state != ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
+            bool teardown_peer;
+            portENTER_CRITICAL(&s_phone.peer_lock);
+            teardown_peer = s_phone.hf_teardown_requested &&
+                (s_phone.hf_peer_pending || s_phone.hf_peer_bound) &&
+                memcmp(s_phone.hf_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) == 0;
+            if (teardown_peer) s_phone.hf_teardown_next_tick = 0;
+            portEXIT_CRITICAL(&s_phone.peer_lock);
+            if (teardown_peer) wake_volume_worker();
+            else (void)esp_hf_client_disconnect(param->conn_stat.remote_bda);
         }
-        return;
+        if (!allowed) return;
     }
-    if (event == ESP_HF_CLIENT_AUDIO_STATE_EVT && !peer_is_selected(param->audio_stat.remote_bda)) return;
-    if ((event == ESP_HF_CLIENT_CIND_CALL_EVT || event == ESP_HF_CLIENT_CIND_CALL_SETUP_EVT ||
-         event == ESP_HF_CLIENT_CIND_CALL_HELD_EVT || event == ESP_HF_CLIENT_RING_IND_EVT ||
-         event == ESP_HF_CLIENT_CLIP_EVT || event == ESP_HF_CLIENT_VOLUME_CONTROL_EVT ||
-         event == ESP_HF_CLIENT_AT_RESPONSE_EVT) &&
-        !atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_acquire)) return;
+    if (event == ESP_HF_CLIENT_AUDIO_STATE_EVT) {
+        bool bound;
+        portENTER_CRITICAL(&s_phone.peer_lock);
+        bound = s_phone.hf_peer_bound &&
+                memcmp(s_phone.hf_peer, param->audio_stat.remote_bda, ESP_BD_ADDR_LEN) == 0;
+        portEXIT_CRITICAL(&s_phone.peer_lock);
+        if (!bound) return;
+    }
+    if (event == ESP_HF_CLIENT_CIND_CALL_EVT || event == ESP_HF_CLIENT_CIND_CALL_SETUP_EVT ||
+          event == ESP_HF_CLIENT_CIND_CALL_HELD_EVT || event == ESP_HF_CLIENT_RING_IND_EVT ||
+          event == ESP_HF_CLIENT_CLIP_EVT || event == ESP_HF_CLIENT_VOLUME_CONTROL_EVT ||
+          event == ESP_HF_CLIENT_AT_RESPONSE_EVT) {
+        portENTER_CRITICAL(&s_phone.peer_lock);
+        bool bound_slc = s_phone.hf_peer_bound &&
+            atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_relaxed);
+        portEXIT_CRITICAL(&s_phone.peer_lock);
+        if (!bound_slc) return;
+    }
     switch (event) {
-    case ESP_HF_CLIENT_CONNECTION_STATE_EVT:
+    case ESP_HF_CLIENT_CONNECTION_STATE_EVT: {
+        portENTER_CRITICAL(&s_phone.peer_lock);
+        bool was_slc = atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_relaxed);
+        bool was_bound = s_phone.hf_peer_bound;
+        bool same_hf_peer = (was_bound || s_phone.hf_peer_pending) &&
+                            memcmp(s_phone.hf_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) == 0;
+        bool disconnected = param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED;
         if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
-            portENTER_CRITICAL(&s_phone.call_state_lock);
-            memset(&s_phone.call_indicators, 0, sizeof(s_phone.call_indicators));
-            portEXIT_CRITICAL(&s_phone.call_state_lock);
+            memcpy(s_phone.hf_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+            s_phone.hf_peer_pending = false;
+            s_phone.hf_peer_bound = true;
             atomic_store_explicit(&s_phone.hf_slc_connected, true, memory_order_release);
-            portENTER_CRITICAL(&s_phone.call_state_lock);
-            s_phone.call_indicators.slc_connected = true;
-            phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
-            portEXIT_CRITICAL(&s_phone.call_state_lock);
+        } else if (disconnected && same_hf_peer) {
+            s_phone.hf_peer_pending = false;
+            s_phone.hf_peer_bound = false;
+            s_phone.hf_teardown_requested = false;
+            s_phone.hf_teardown_next_tick = 0;
+            s_phone.hf_connect_epoch++;
+            atomic_store_explicit(&s_phone.hf_slc_connected, false, memory_order_release);
+        } else if (!same_hf_peer && !was_bound && !s_phone.hf_peer_pending) {
+            memcpy(s_phone.hf_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+            s_phone.hf_peer_pending = true;
+            s_phone.hf_connect_epoch++;
         }
-        atomic_store_explicit(&s_phone.hf_slc_connected,
-                              param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED,
-                              memory_order_release);
-        if (param->conn_stat.state != ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
-            portENTER_CRITICAL(&s_phone.call_state_lock);
-            memset(&s_phone.call_indicators, 0, sizeof(s_phone.call_indicators));
-            phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
-            portEXIT_CRITICAL(&s_phone.call_state_lock);
+        if (was_slc != atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_relaxed) ||
+            was_bound != s_phone.hf_peer_bound ||
+            (s_phone.hf_peer_bound && !same_hf_peer))
+            atomic_fetch_add_explicit(&s_phone.call_peer_epoch, 1u, memory_order_release);
+        portEXIT_CRITICAL(&s_phone.peer_lock);
+        if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED && !was_slc) {
+            reset_call_indicators(true);
         }
-        if (param->conn_stat.state != ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
+        if (disconnected && was_bound && same_hf_peer) {
+            reset_call_indicators(false);
+            portENTER_CRITICAL(&s_phone.volume_lock);
+            s_phone.volume.call_pending = false;
+            s_phone.volume.call_revision++;
+            portEXIT_CRITICAL(&s_phone.volume_lock);
+        }
+        if (disconnected && same_hf_peer) {
+            if (was_bound && !atomic_load_explicit(&s_phone.a2dp_connected, memory_order_acquire))
+                volume_session_reset();
             reset_sco_pacing();
+            request_call_route(false, 0u);
         }
-        if (!atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_acquire)) request_call_route(false, 0u);
         ESP_LOGI(TAG, "HFP connection state=%d", param->conn_stat.state);
         break;
+    }
     case ESP_HF_CLIENT_AUDIO_STATE_EVT: {
+        if (!atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_acquire)) break;
         bool connected = param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED ||
                          param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC;
         uint32_t rate = param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC ? 16000u : 8000u;
         atomic_store_explicit(&s_phone.sco_active, false, memory_order_release);
+        phone_audio_call_state_t snapshot;
+        phone_audio_call_state_cb_t callback;
+        void *context;
         portENTER_CRITICAL(&s_phone.call_state_lock);
         s_phone.call_indicators.audio_connected = connected;
         s_phone.call_indicators.wideband = param->audio_stat.state == ESP_HF_CLIENT_AUDIO_STATE_CONNECTED_MSBC;
         s_phone.call_indicators.sample_rate = connected ? rate : 0u;
         phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
+        snapshot = s_phone.call_state;
+        callback = s_phone.call_state_callback;
+        context = s_phone.call_state_context;
         portEXIT_CRITICAL(&s_phone.call_state_lock);
-        request_call_route(connected, connected ? rate : 0u);
+        volume_profile_refresh();
+        if (callback) callback(&snapshot, context);
+        request_call_route(connected && atomic_load_explicit(&s_phone.a2dp_connected,
+                                                              memory_order_acquire),
+                           connected ? rate : 0u);
         reset_sco_pacing();
         ESP_LOGI(TAG, "HFP audio state=%d rate=%lu", param->audio_stat.state, (unsigned long)rate);
         break;
@@ -766,7 +956,13 @@ static void hfp_callback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
         ESP_LOGI(TAG, "HFP caller ID received (redacted)");
         break;
     case ESP_HF_CLIENT_VOLUME_CONTROL_EVT:
-        ESP_LOGI(TAG, "HFP volume target=%d level=%d", param->volume_control.type, param->volume_control.volume);
+        if (param->volume_control.type == ESP_HF_VOLUME_CONTROL_TARGET_SPK &&
+            param->volume_control.volume >= 0 && param->volume_control.volume <= 15) {
+            uint8_t peer[ESP_BD_ADDR_LEN];
+            uint32_t epoch;
+            if (volume_peer_snapshot(PHONE_VOLUME_CALL, peer, &epoch))
+                volume_remote(PHONE_VOLUME_CALL, (uint8_t)param->volume_control.volume);
+        }
         break;
     case ESP_HF_CLIENT_AT_RESPONSE_EVT:
         ESP_LOGI(TAG, "HFP AT response=%d", param->at_response.code);
@@ -784,6 +980,95 @@ static void control_worker(void *arg)
     atomic_store_explicit(&s_phone.shutdown_success, false, memory_order_release);
     while (true) {
         bool terminal = atomic_load_explicit(&s_phone.terminal, memory_order_acquire);
+        if (!terminal) {
+            uint8_t teardown_peer[ESP_BD_ADDR_LEN];
+            uint32_t teardown_epoch = 0;
+            bool teardown_due = false;
+            TickType_t now = xTaskGetTickCount();
+            portENTER_CRITICAL(&s_phone.peer_lock);
+            if (s_phone.hf_teardown_requested &&
+                (s_phone.hf_peer_pending || s_phone.hf_peer_bound) &&
+                !atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed) &&
+                (s_phone.hf_teardown_next_tick == 0 ||
+                 (int32_t)(now - s_phone.hf_teardown_next_tick) >= 0)) {
+                memcpy(teardown_peer, s_phone.hf_peer, ESP_BD_ADDR_LEN);
+                teardown_epoch = s_phone.hf_connect_epoch;
+                s_phone.hf_teardown_next_tick = now + pdMS_TO_TICKS(HFP_TEARDOWN_RETRY_MS);
+                teardown_due = true;
+            }
+            portEXIT_CRITICAL(&s_phone.peer_lock);
+            if (teardown_due && s_phone.hf_ready &&
+                !atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) {
+                portENTER_CRITICAL(&s_phone.peer_lock);
+                bool current = s_phone.hf_teardown_requested &&
+                    (s_phone.hf_peer_pending || s_phone.hf_peer_bound) &&
+                    !atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed) &&
+                    s_phone.hf_connect_epoch == teardown_epoch &&
+                    memcmp(s_phone.hf_peer, teardown_peer, ESP_BD_ADDR_LEN) == 0;
+                portEXIT_CRITICAL(&s_phone.peer_lock);
+                if (current && !atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) {
+                    esp_err_t ret = esp_hf_client_disconnect(teardown_peer);
+                    if (ret != ESP_OK)
+                        ESP_LOGW(TAG, "HFP SLC disconnect request failed; will retry: %s",
+                                 esp_err_to_name(ret));
+                }
+            }
+            phone_volume_policy_t volume;
+            portENTER_CRITICAL(&s_phone.volume_lock);
+            volume = s_phone.volume;
+            portEXIT_CRITICAL(&s_phone.volume_lock);
+            if (s_phone.applied_volume_revision != volume.revision) {
+                if (audio_set_volume(AUDIO_VOLUME_BLUETOOTH, volume.percent) == ESP_OK) {
+                    /* A newer request remains pending even if this older write completed. */
+                    s_phone.applied_volume_revision = volume.revision;
+                }
+            }
+            uint8_t peer[ESP_BD_ADDR_LEN];
+            uint32_t epoch;
+            if (volume_peer_snapshot(PHONE_VOLUME_MEDIA, peer, &epoch)) {
+                phone_volume_tx_t tx = phone_volume_rn_tx(&volume, epoch);
+                bool eligible;
+                if (volume_peer_current(PHONE_VOLUME_MEDIA, peer, epoch)) {
+                    portENTER_CRITICAL(&s_phone.volume_lock);
+                    eligible = phone_volume_rn_eligible(&s_phone.volume, &tx,
+                        volume_peer_epoch(PHONE_VOLUME_MEDIA));
+                    portEXIT_CRITICAL(&s_phone.volume_lock);
+                } else eligible = false;
+                if (eligible && !atomic_load_explicit(&s_phone.terminal, memory_order_acquire) &&
+                    volume_peer_current(PHONE_VOLUME_MEDIA, peer, epoch)) {
+                    esp_avrc_rn_param_t param = {.volume = tx.wire};
+                    esp_avrc_rn_rsp_t rsp = tx.rn == PHONE_VOLUME_RN_INTERIM
+                        ? ESP_AVRC_RN_RSP_INTERIM : ESP_AVRC_RN_RSP_CHANGED;
+                    esp_err_t ret = esp_avrc_tg_send_rn_rsp(ESP_AVRC_RN_VOLUME_CHANGE, rsp, &param);
+                    bool current = !atomic_load_explicit(&s_phone.terminal, memory_order_acquire) &&
+                                   volume_peer_current(PHONE_VOLUME_MEDIA, peer, epoch);
+                    portENTER_CRITICAL(&s_phone.volume_lock);
+                    phone_volume_rn_result(&s_phone.volume, &tx,
+                        volume_peer_epoch(PHONE_VOLUME_MEDIA), ret == ESP_OK && current);
+                    portEXIT_CRITICAL(&s_phone.volume_lock);
+                }
+            }
+            if (volume_peer_snapshot(PHONE_VOLUME_CALL, peer, &epoch)) {
+                phone_volume_tx_t tx = phone_volume_call_tx(&volume, epoch);
+                bool eligible;
+                if (volume_peer_current(PHONE_VOLUME_CALL, peer, epoch)) {
+                    portENTER_CRITICAL(&s_phone.volume_lock);
+                    eligible = phone_volume_call_eligible(&s_phone.volume, &tx,
+                        volume_peer_epoch(PHONE_VOLUME_CALL));
+                    portEXIT_CRITICAL(&s_phone.volume_lock);
+                } else eligible = false;
+                if (eligible && !atomic_load_explicit(&s_phone.terminal, memory_order_acquire) &&
+                    volume_peer_current(PHONE_VOLUME_CALL, peer, epoch)) {
+                    esp_err_t ret = esp_hf_client_volume_update(ESP_HF_VOLUME_CONTROL_TARGET_SPK, tx.wire);
+                    bool current = !atomic_load_explicit(&s_phone.terminal, memory_order_acquire) &&
+                                   volume_peer_current(PHONE_VOLUME_CALL, peer, epoch);
+                    portENTER_CRITICAL(&s_phone.volume_lock);
+                    phone_volume_call_result(&s_phone.volume, &tx,
+                        volume_peer_epoch(PHONE_VOLUME_CALL), ret == ESP_OK && current);
+                    portEXIT_CRITICAL(&s_phone.volume_lock);
+                }
+            }
+        }
         bool generation_changed;
         portENTER_CRITICAL(&s_phone.desired_lock);
         generation_changed = atomic_load_explicit(&s_phone.desired_generation, memory_order_relaxed) !=
@@ -956,29 +1241,69 @@ static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) break;
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-            if (atomic_load_explicit(&s_phone.a2dp_connected, memory_order_acquire)) {
+            portENTER_CRITICAL(&s_phone.peer_lock);
+            bool can_select = phone_audio_a2dp_selection_allowed(
+                atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed),
+                s_phone.hf_peer_pending, s_phone.hf_peer_bound);
+            bool reject_ct = false;
+            bool reject_tg = false;
+            if (can_select) {
+                memcpy(s_phone.peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+                atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
+                atomic_fetch_add_explicit(&s_phone.call_peer_epoch, 1u, memory_order_release);
+                reject_ct = s_phone.ct_peer_pending &&
+                            memcmp(s_phone.ct_peer, s_phone.peer, ESP_BD_ADDR_LEN) != 0;
+                reject_tg = s_phone.tg_peer_pending &&
+                            memcmp(s_phone.tg_peer, s_phone.peer, ESP_BD_ADDR_LEN) != 0;
+                if (!reject_ct && !reject_tg)
+                    atomic_store_explicit(&s_phone.a2dp_connected, true, memory_order_release);
+            }
+            portEXIT_CRITICAL(&s_phone.peer_lock);
+            if (!can_select) {
+                ESP_LOGW(TAG, "A2DP selection rejected while current session or HFP teardown is pending");
                 (void)esp_a2d_sink_disconnect(param->conn_stat.remote_bda);
                 break;
             }
-            portENTER_CRITICAL(&s_phone.peer_lock);
-            memcpy(s_phone.peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
-            bool reject_ct = s_phone.ct_peer_pending &&
-                             memcmp(s_phone.ct_peer, s_phone.peer, ESP_BD_ADDR_LEN) != 0;
-            bool reject_tg = s_phone.tg_peer_pending &&
-                             memcmp(s_phone.tg_peer, s_phone.peer, ESP_BD_ADDR_LEN) != 0;
-            portEXIT_CRITICAL(&s_phone.peer_lock);
             if (reject_ct || reject_tg) {
                 ESP_LOGW(TAG, "Split-role AVRCP peer observed; resetting the selected A2DP session");
                 (void)esp_a2d_sink_disconnect(param->conn_stat.remote_bda);
                 break;
             }
-            atomic_store_explicit(&s_phone.a2dp_connected, true, memory_order_release);
+            volume_session_reset();
             atomic_store_explicit(&s_phone.first_pcm_logged, false, memory_order_release);
             atomic_store_explicit(&s_phone.inactive_pcm_logged, false, memory_order_release);
             log_a2dp_peer("connected", param->conn_stat.remote_bda);
             if (s_phone.hf_ready) {
-                esp_err_t hf_ret = esp_hf_client_connect(param->conn_stat.remote_bda);
-                if (hf_ret != ESP_OK) ESP_LOGW(TAG, "HFP SLC connect request failed: %s", esp_err_to_name(hf_ret));
+                uint32_t connect_epoch;
+                portENTER_CRITICAL(&s_phone.peer_lock);
+                bool still_selected = atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed) &&
+                    memcmp(s_phone.peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) == 0;
+                connect_epoch = s_phone.hf_connect_epoch;
+                if (still_selected && !s_phone.hf_peer_pending && !s_phone.hf_peer_bound) {
+                    memcpy(s_phone.hf_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN);
+                    s_phone.hf_peer_pending = true;
+                    s_phone.hf_teardown_requested = false;
+                    connect_epoch = ++s_phone.hf_connect_epoch;
+                } else {
+                    still_selected = false;
+                }
+                portEXIT_CRITICAL(&s_phone.peer_lock);
+                if (still_selected) {
+                    esp_err_t hf_ret = esp_hf_client_connect(param->conn_stat.remote_bda);
+                    if (hf_ret != ESP_OK) {
+                        ESP_LOGW(TAG, "HFP SLC connect request failed: %s", esp_err_to_name(hf_ret));
+                        portENTER_CRITICAL(&s_phone.peer_lock);
+                        if (s_phone.hf_peer_pending && !s_phone.hf_peer_bound &&
+                            s_phone.hf_connect_epoch == connect_epoch &&
+                            memcmp(s_phone.hf_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) == 0) {
+                            s_phone.hf_peer_pending = false;
+                            s_phone.hf_teardown_requested = false;
+                            s_phone.hf_teardown_next_tick = 0;
+                            s_phone.hf_connect_epoch++;
+                        }
+                        portEXIT_CRITICAL(&s_phone.peer_lock);
+                    }
+                }
             }
             atomic_store_explicit(&s_phone.avrc_ct_connected, false, memory_order_release);
             atomic_store_explicit(&s_phone.avrc_tg_connected, false, memory_order_release);
@@ -1009,32 +1334,40 @@ static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             if (have_pending) request_configure(pending_rate, pending_channels);
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED &&
                    peer_is_selected(param->conn_stat.remote_bda)) {
-            if (s_phone.hf_ready) (void)esp_hf_client_disconnect(param->conn_stat.remote_bda);
-            atomic_store_explicit(&s_phone.hf_slc_connected, false, memory_order_release);
-            atomic_store_explicit(&s_phone.sco_active, false, memory_order_release);
-            request_call_route(false, 0u);
-            request_active(false);
             portENTER_CRITICAL(&s_phone.peer_lock);
+            bool hf_occupied = s_phone.hf_peer_bound || s_phone.hf_peer_pending;
+            bool hf_slc = s_phone.hf_peer_bound &&
+                atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_relaxed);
+            if (hf_occupied) {
+                s_phone.hf_teardown_requested = true;
+                s_phone.hf_teardown_next_tick = 0;
+            }
             atomic_store_explicit(&s_phone.a2dp_connected, false, memory_order_release);
+            atomic_store_explicit(&s_phone.avrc_tg_connected, false, memory_order_release);
+            atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
+            atomic_fetch_add_explicit(&s_phone.call_peer_epoch, 1u, memory_order_release);
             atomic_store_explicit(&s_phone.first_pcm_logged, false, memory_order_release);
             atomic_store_explicit(&s_phone.inactive_pcm_logged, false, memory_order_release);
             clear_pending_sbc_locked(NULL);
             portEXIT_CRITICAL(&s_phone.peer_lock);
+            atomic_store_explicit(&s_phone.sco_active, false, memory_order_release);
+            request_call_route(false, 0u);
+            request_active(false);
             log_a2dp_peer("disconnected", param->conn_stat.remote_bda);
             atomic_store_explicit(&s_phone.avrc_ct_connected, false, memory_order_release);
-            atomic_store_explicit(&s_phone.avrc_tg_connected, false, memory_order_release);
+            if (hf_slc) volume_session_invalidate();
+            else volume_session_reset();
             atomic_store_explicit(&s_phone.ct_play_status_supported, false, memory_order_release);
             atomic_store_explicit(&s_phone.ct_track_supported, false, memory_order_release);
             request_unconfigure();
-            portENTER_CRITICAL(&s_phone.call_state_lock);
-            memset(&s_phone.call_indicators, 0, sizeof(s_phone.call_indicators));
-            phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
-            portEXIT_CRITICAL(&s_phone.call_state_lock);
             portENTER_CRITICAL(&s_phone.peer_lock);
             s_phone.ct_peer_pending = false;
             s_phone.tg_peer_pending = false;
+            atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
+            atomic_fetch_add_explicit(&s_phone.call_peer_epoch, 1u, memory_order_release);
             portEXIT_CRITICAL(&s_phone.peer_lock);
             (void)set_discoverable_internal(false);
+            if (hf_occupied) wake_volume_worker();
         } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             portENTER_CRITICAL(&s_phone.peer_lock);
             clear_pending_sbc_locked(param->conn_stat.remote_bda);
@@ -1205,9 +1538,12 @@ static void avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_
             else if (param->avrc_tg_init_stat.state == ESP_AVRC_DEINIT_SUCCESS) xEventGroupSetBits(s_phone.profile_events, PROFILE_TG_DEINIT);
         }
         break;
-    case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT: {
         if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) break;
         portENTER_CRITICAL(&s_phone.peer_lock);
+        bool was_tg_bound = s_phone.tg_peer_pending &&
+                            memcmp(s_phone.tg_peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) == 0;
+        bool was_tg_connected = atomic_load_explicit(&s_phone.avrc_tg_connected, memory_order_relaxed);
         if (param->conn_stat.connected) {
             if (atomic_load_explicit(&s_phone.a2dp_connected, memory_order_acquire) &&
                 memcmp(s_phone.peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) != 0) {
@@ -1215,6 +1551,7 @@ static void avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_
                 memcpy(selected_peer, s_phone.peer, ESP_BD_ADDR_LEN);
                 s_phone.tg_peer_pending = false;
                 atomic_store_explicit(&s_phone.avrc_tg_connected, false, memory_order_release);
+                atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
                 portEXIT_CRITICAL(&s_phone.peer_lock);
                 ESP_LOGW(TAG, "Split-role AVRCP TG peer observed; resetting the selected A2DP session");
                 (void)esp_a2d_sink_disconnect(selected_peer);
@@ -1227,12 +1564,48 @@ static void avrc_tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_
         }
         bool selected = atomic_load_explicit(&s_phone.a2dp_connected, memory_order_acquire) &&
                         memcmp(s_phone.peer, param->conn_stat.remote_bda, ESP_BD_ADDR_LEN) == 0;
-        portEXIT_CRITICAL(&s_phone.peer_lock);
         if (selected) atomic_store_explicit(&s_phone.avrc_tg_connected, param->conn_stat.connected, memory_order_release);
+        if (was_tg_bound != s_phone.tg_peer_pending ||
+            (selected && was_tg_connected != param->conn_stat.connected))
+            atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
+        portEXIT_CRITICAL(&s_phone.peer_lock);
+        if (selected && !param->conn_stat.connected) {
+            portENTER_CRITICAL(&s_phone.volume_lock);
+            s_phone.volume.registration++;
+            s_phone.volume.rn = PHONE_VOLUME_RN_NONE;
+            s_phone.volume.rn_changed = false;
+            portEXIT_CRITICAL(&s_phone.volume_lock);
+        }
         break;
+    }
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
         if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) break;
-        ESP_LOGD(TAG, "Ignoring AVRCP absolute volume request");
+        if (atomic_load_explicit(&s_phone.avrc_tg_connected, memory_order_acquire) &&
+            param->set_abs_vol.volume <= 127u) {
+            portENTER_CRITICAL(&s_phone.peer_lock);
+            bool selected = atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed) &&
+                            s_phone.tg_peer_pending &&
+                            memcmp(s_phone.peer, s_phone.tg_peer, ESP_BD_ADDR_LEN) == 0;
+            portEXIT_CRITICAL(&s_phone.peer_lock);
+            if (selected) volume_remote(PHONE_VOLUME_MEDIA, param->set_abs_vol.volume);
+        }
+        break;
+    case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+        if (!atomic_load_explicit(&s_phone.terminal, memory_order_acquire) &&
+            param->reg_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE &&
+            atomic_load_explicit(&s_phone.avrc_tg_connected, memory_order_acquire)) {
+            portENTER_CRITICAL(&s_phone.peer_lock);
+            bool selected = atomic_load_explicit(&s_phone.a2dp_connected, memory_order_relaxed) &&
+                            s_phone.tg_peer_pending &&
+                            memcmp(s_phone.peer, s_phone.tg_peer, ESP_BD_ADDR_LEN) == 0;
+            portEXIT_CRITICAL(&s_phone.peer_lock);
+            if (selected) {
+                portENTER_CRITICAL(&s_phone.volume_lock);
+                phone_volume_register(&s_phone.volume);
+                portEXIT_CRITICAL(&s_phone.volume_lock);
+                wake_volume_worker();
+            }
+        }
         break;
     default:
         break;
@@ -1313,6 +1686,11 @@ static esp_err_t phone_audio_cleanup_locked(void)
     portEXIT_CRITICAL(&s_phone.desired_lock);
     atomic_store_explicit(&s_phone.avrc_ct_connected, false, memory_order_release);
     atomic_store_explicit(&s_phone.avrc_tg_connected, false, memory_order_release);
+    portENTER_CRITICAL(&s_phone.peer_lock);
+    atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
+    atomic_fetch_add_explicit(&s_phone.call_peer_epoch, 1u, memory_order_release);
+    portEXIT_CRITICAL(&s_phone.peer_lock);
+    volume_session_reset();
     atomic_store_explicit(&s_phone.ct_play_status_supported, false, memory_order_release);
     atomic_store_explicit(&s_phone.ct_track_supported, false, memory_order_release);
 
@@ -1389,11 +1767,14 @@ static esp_err_t phone_audio_cleanup_locked(void)
         memset(s_phone.tg_peer, 0, sizeof(s_phone.tg_peer));
         s_phone.ct_peer_pending = false;
         s_phone.tg_peer_pending = false;
+        s_phone.hf_peer_bound = false;
+        s_phone.hf_peer_pending = false;
+        s_phone.hf_teardown_requested = false;
+        s_phone.hf_teardown_next_tick = 0;
+        atomic_fetch_add_explicit(&s_phone.media_peer_epoch, 1u, memory_order_release);
+        atomic_fetch_add_explicit(&s_phone.call_peer_epoch, 1u, memory_order_release);
         portEXIT_CRITICAL(&s_phone.peer_lock);
-        portENTER_CRITICAL(&s_phone.call_state_lock);
-        memset(&s_phone.call_indicators, 0, sizeof(s_phone.call_indicators));
-        phone_audio_call_state_reduce(&s_phone.call_indicators, &s_phone.call_state);
-        portEXIT_CRITICAL(&s_phone.call_state_lock);
+        reset_call_indicators(false);
         atomic_store_explicit(&s_phone.initialized, false, memory_order_release);
     }
     return first_error;
@@ -1419,6 +1800,10 @@ esp_err_t phone_audio_init(void)
         return ESP_ERR_INVALID_STATE;
     }
     atomic_store_explicit(&s_phone.initialized, true, memory_order_release);
+    uint8_t initial_volume = audio_get_volume(AUDIO_VOLUME_BLUETOOTH);
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    phone_volume_init(&s_phone.volume, initial_volume);
+    portEXIT_CRITICAL(&s_phone.volume_lock);
     esp_err_t ret = ESP_OK;
     if (s_phone.profile_events == NULL) s_phone.profile_events = xEventGroupCreateStatic(&s_phone.profile_event_storage);
     if (s_phone.control_done == NULL) s_phone.control_done = xSemaphoreCreateBinaryStatic(&s_phone.control_done_storage);
@@ -1484,6 +1869,7 @@ esp_err_t phone_audio_init(void)
     ret = wait_profile(PROFILE_TG_INIT);
     if (ret != ESP_OK) goto fail;
     esp_avrc_rn_evt_cap_mask_t capabilities = {0};
+    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &capabilities, ESP_AVRC_RN_VOLUME_CHANGE);
     ret = esp_avrc_tg_set_rn_evt_cap(&capabilities);
     if (ret != ESP_OK) goto fail;
     esp_avrc_psth_bit_mask_t commands = {0};
@@ -1567,7 +1953,7 @@ esp_err_t phone_audio_get_state(phone_audio_state_t *state)
     state->avrcp_connected = atomic_load_explicit(&s_phone.avrc_ct_connected, memory_order_acquire);
     state->discoverable = atomic_load_explicit(&s_phone.discoverable, memory_order_acquire);
     state->pairing_window_open = state->discoverable;
-    state->volume_control_limited = true;
+    state->volume_control_limited = false;
     state->sample_rate = atomic_load_explicit(&s_phone.sample_rate, memory_order_acquire);
     state->channels = atomic_load_explicit(&s_phone.channels, memory_order_acquire);
     portENTER_CRITICAL(&s_phone.call_state_lock);
@@ -1601,6 +1987,35 @@ esp_err_t phone_audio_get_call_state(phone_audio_call_state_t *state)
     portENTER_CRITICAL(&s_phone.call_state_lock);
     *state = s_phone.call_state;
     portEXIT_CRITICAL(&s_phone.call_state_lock);
+    return ESP_OK;
+}
+
+uint8_t phone_audio_get_volume(void)
+{
+    if (!atomic_load_explicit(&s_phone.initialized, memory_order_acquire) ||
+        atomic_load_explicit(&s_phone.terminal, memory_order_acquire))
+        return audio_get_volume(AUDIO_VOLUME_BLUETOOTH);
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    uint8_t percent = s_phone.volume.percent;
+    portEXIT_CRITICAL(&s_phone.volume_lock);
+    return percent;
+}
+
+esp_err_t phone_audio_set_volume(uint8_t percent)
+{
+    if (percent > 100u) return ESP_ERR_INVALID_ARG;
+    if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire))
+        return ESP_ERR_INVALID_STATE;
+    if (!atomic_load_explicit(&s_phone.initialized, memory_order_acquire))
+        return audio_set_volume(AUDIO_VOLUME_BLUETOOTH, percent);
+    portENTER_CRITICAL(&s_phone.volume_lock);
+    if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) {
+        portEXIT_CRITICAL(&s_phone.volume_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    (void)phone_volume_local(&s_phone.volume, percent);
+    portEXIT_CRITICAL(&s_phone.volume_lock);
+    wake_volume_worker();
     return ESP_OK;
 }
 

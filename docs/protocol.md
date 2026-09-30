@@ -1,6 +1,6 @@
-# Mesh and Bridge Protocol v5
+# Mesh v5 and Bridge v6
 
-The current LC3 firmware uses mesh version `0x05` and SPI bridge version `5`.
+The current LC3 firmware uses on-air mesh version `0x05` and SPI bridge version `6`.
 The name `AUDIO_V2` identifies a packet format; it does not mean protocol version 2.
 For routing, topology, membership, speaker grants, and handover behavior, see [adaptive mesh](mesh.md).
 
@@ -123,7 +123,7 @@ Receive timestamps are assigned locally; they are not included in this payload.
 
 ### Status and Compatibility
 
-The v5 STATUS payload is 10 bytes, in this order:
+The v6 STATUS payload is 10 bytes, in this order:
 
 ```text
 role | peer_count | node_id | version | mesh_state | slot_index |
@@ -131,7 +131,7 @@ coordinator_id | marker | audio_codec | audio_frame_ms
 ```
 
 Each field is one byte; `slot_index` is signed. The marker is `0xA5`.
-Startup selects nRF only after a fresh status advertises version 5, LC3, and 20 ms audio.
+Startup selects nRF only after a fresh status advertises version 6, LC3, and 20 ms audio.
 Audio transfer additionally requires an ACTIVE mesh and an assigned node ID.
 Older 3-byte and 8-byte statuses remain readable but do not establish LC3 compatibility.
 
@@ -139,7 +139,7 @@ Older 3-byte and 8-byte statuses remain readable but do not establish LC3 compat
 
 - **Audio admission:** The nRF pulses GPIO ACK for 20 µs after admitting audio to bounded RAM ingress or recognizing its admitted duplicate.
   The S31 retains and repeats unacknowledged SPI audio until ACK or a 50 ms timeout. ACK does not confirm RF delivery.
-- **Commands:** MESH_START and MESH_STOP carry a three-byte payload: command, generation, talk group (STOP ignores the group).
+- **Commands:** MESH_START (`0x01`), MESH_STOP (`0x02`), AUDIO_PAUSE (`0x04`), and AUDIO_RESUME (`0x05`) carry a three-byte payload: command, generation, talk group (all except START ignore the group). PAUSE and RESUME affect only this node's mesh audio origin and local playback; membership, control and third-party relay continue. PAUSE purges local audio at the nRF, while RESUME requires a fresh local flush first.
   A COMMAND_ACK event returns the command, matching generation, and signed result: zero for success, minus one for failure.
 
 ### SPI Flow Control

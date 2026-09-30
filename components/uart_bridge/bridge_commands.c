@@ -1,6 +1,6 @@
 /**
  * @file bridge_commands.c
- * @brief Probe and mesh start/stop command exchange with the nRF.
+ * @brief Probe and mesh command exchange with the nRF.
  *
  * Commands are generation-tagged and retried until the nRF acknowledges
  * application. Status alone cannot attest which talk group was selected.
@@ -130,4 +130,14 @@ esp_err_t uart_bridge_mesh_disable(void)
 {
     ESP_LOGI(TAG, "Requesting mesh disable from nRF52840");
     return send_mesh_command(BRIDGE_COMMAND_MESH_STOP, MESH_CHANNEL_DEFAULT);
+}
+
+esp_err_t uart_bridge_mesh_audio_pause(void)
+{
+    return send_mesh_command(BRIDGE_COMMAND_AUDIO_PAUSE, 0);
+}
+
+esp_err_t uart_bridge_mesh_audio_resume(void)
+{
+    return send_mesh_command(BRIDGE_COMMAND_AUDIO_RESUME, 0);
 }

@@ -100,6 +100,12 @@ jobs:
       - name: Run audio prompt tests
         run: python3 tools/encode_notifications.py --output /tmp/audio_prompts_data.c && cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_prompt.c /tmp/audio_prompts_data.c tests/c/audio_prompt_test.c -o /tmp/audio_prompt_test && /tmp/audio_prompt_test
 
+      - name: Run audio mesh call gate tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/audio_mesh_call.c tests/c/audio_mesh_call_test.c -o /tmp/audio_mesh_call_test && /tmp/audio_mesh_call_test
+
+      - name: Run urgent incoming call prompt tests
+        run: python3 tools/encode_notifications.py --output /tmp/audio_prompts_data.c && cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio -Icomponents/audio/include components/audio/audio_prompt.c components/audio/audio_urgent.c components/audio/audio_mesh_call.c /tmp/audio_prompts_data.c tests/c/audio_urgent_test.c -o /tmp/audio_urgent_test && /tmp/audio_urgent_test
+
       - name: Run audio volume and limit cue tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio components/audio/audio_volume_mix.c tests/c/audio_volume_mix_test.c -o /tmp/audio_volume_mix_test && /tmp/audio_volume_mix_test
 
@@ -149,6 +155,12 @@ jobs:
       - name: Run phone call state reducer tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/phone_audio/include components/phone_audio/phone_audio_call_state.c tests/c/phone_audio_call_state_test.c -o /tmp/phone_audio_call_state_test && /tmp/phone_audio_call_state_test
 
+      - name: Run phone volume policy tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared -Imain -Icomponents/phone_audio/include components/phone_audio/phone_audio_volume.c tests/c/phone_audio_volume_test.c -o /tmp/phone_audio_volume_test && /tmp/phone_audio_volume_test
+
+      - name: Run phone call policy tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared -Imain -Icomponents/phone_audio/include -Icomponents/button/include tests/c/call_policy_test.c -o /tmp/call_policy_test && /tmp/call_policy_test
+
       - name: Run button gesture tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/button_gesture_test && /tmp/button_gesture_test
 
@@ -169,6 +181,9 @@ jobs:
 
       - name: Run bridge audio capability tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/bridge_audio_capability_test.c -o /tmp/bridge_audio_capability_test && /tmp/bridge_audio_capability_test
+
+      - name: Run bridge audio command tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. tests/c/bridge_audio_command_test.c -o /tmp/bridge_audio_command_test && /tmp/bridge_audio_command_test
 
       - name: Run audio RX tracker tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/audio_rx_tracker_test && /tmp/audio_rx_tracker_test
@@ -203,6 +218,8 @@ jobs:
            cc $FLAGS $SAN -Icomponents/audio components/audio/audio_capture_fifo.c tests/c/audio_capture_fifo_test.c -o /tmp/san_audio_capture_fifo && /tmp/san_audio_capture_fifo
            cc $FLAGS $SAN -Icomponents/audio components/audio/audio_sample_fifo.c components/audio/audio_route.c tests/c/audio_sample_fifo_test.c -o /tmp/san_audio_sample_fifo && /tmp/san_audio_sample_fifo
             cc $FLAGS $SAN -Icomponents/phone_audio/include components/phone_audio/phone_audio_call_state.c tests/c/phone_audio_call_state_test.c -o /tmp/san_phone_audio_call_state && /tmp/san_phone_audio_call_state
+             cc $FLAGS $SAN -I. -Ishared -Imain -Icomponents/phone_audio/include components/phone_audio/phone_audio_volume.c tests/c/phone_audio_volume_test.c -o /tmp/san_phone_audio_volume && /tmp/san_phone_audio_volume
+            clang $FLAGS $SAN -I. -Ishared -Imain -Icomponents/phone_audio/include -Icomponents/button/include tests/c/call_policy_test.c -o /tmp/san_call_policy && /tmp/san_call_policy
            cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select

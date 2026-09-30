@@ -34,6 +34,12 @@ static inline omi_volume_target_t omi_volume_action_target(omi_action_t action)
     return OMI_VOLUME_NONE;
 }
 
+static inline omi_volume_target_t omi_call_volume_target(omi_action_t action, bool call_active)
+{
+    omi_volume_target_t target = omi_volume_action_target(action);
+    return call_active && target == OMI_VOLUME_MESH ? OMI_VOLUME_BLUETOOTH : target;
+}
+
 static inline int omi_volume_action_direction(omi_action_t action)
 {
     if (action == OMI_ACTION_VOLUME_DOWN || action == OMI_ACTION_BLUETOOTH_VOLUME_DOWN)

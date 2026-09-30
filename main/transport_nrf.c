@@ -99,13 +99,17 @@ void transport_nrf_reset_reconciliation(void)
 
 void transport_nrf_reset_tx_cache(void)
 {
+    xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
     audio_tx_cache_reset(&s_previous_audio);
+    xSemaphoreGive(s_membership_mutex);
 }
 
 void transport_nrf_skip_audio_frame(int64_t timestamp_us)
 {
     (void)timestamp_us;
+    xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
     e2e_diag_skip_tx_frame(&s_previous_audio);
+    xSemaphoreGive(s_membership_mutex);
 }
 
 void transport_nrf_cancel_enable_notification(void)
@@ -208,15 +212,23 @@ void transport_nrf_set_user_enabled(bool enabled)
     xSemaphoreGive(s_membership_mutex);
 }
 
-void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, int64_t timestamp_us)
+void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active,
+                              int64_t timestamp_us, uint32_t mesh_epoch)
 {
+    if (!audio_mesh_tx_epoch_allowed(mesh_epoch)) return;
+    xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
+    if (!audio_mesh_tx_epoch_allowed(mesh_epoch)) {
+        xSemaphoreGive(s_membership_mutex);
+        return;
+    }
     e2e_pipe_counters_t *pipe = e2e_diag_counters();
     uint16_t seq = e2e_diag_next_tx_seq();
     if (data == NULL || len != MESH_LC3_FRAME_BYTES) {
         pipe->spi_oversize++;
         audio_tx_cache_reset(&s_previous_audio);
         ESP_LOGW(TAG, "Rejecting non-LC3 audio frame: %u bytes (expected %u)", len,
-                 MESH_LC3_FRAME_BYTES);
+                  MESH_LC3_FRAME_BYTES);
+        xSemaphoreGive(s_membership_mutex);
         return;
     }
 
@@ -244,13 +256,16 @@ void transport_nrf_send_audio(const uint8_t *data, uint16_t len, bool active, in
     }
     bool bundle_encoded = audio_bundle_encode(&bundle, bundle_buf, sizeof(bundle_buf), &bundle_len);
 
+    if (!audio_mesh_tx_epoch_allowed(mesh_epoch)) {
+        xSemaphoreGive(s_membership_mutex);
+        return;
+    }
     audio_tx_cache_store(&s_previous_audio, data, len, active, seq, mesh_intent_enabled());
-
-    xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
     if (mesh_intent_enabled() && nrf_lc3_ready()) {
         pipe->spi_attempts++;
-        esp_err_t ret = bundle_encoded ? uart_bridge_send_audio_v2(bundle_buf, (uint16_t)bundle_len)
-                                       : ESP_ERR_INVALID_SIZE;
+        esp_err_t ret = bundle_encoded && audio_mesh_tx_epoch_allowed(mesh_epoch)
+                                        ? uart_bridge_send_audio_v2(bundle_buf, (uint16_t)bundle_len)
+                                        : ESP_ERR_INVALID_SIZE;
         if (ret == ESP_OK) {
             pipe->bundle_tx++;
             if (attach_previous1) {
@@ -341,9 +356,11 @@ static void offer_predecessor(const predecessor_offer_t *offer)
  * @brief Callback from SPI bridge when audio is received (nRF52840)
  */
 static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t len,
-                                  int64_t timestamp_us, bool redundant_bundle)
+                                   int64_t timestamp_us, bool redundant_bundle)
 {
     e2e_pipe_counters_t *pipe = e2e_diag_counters();
+
+    if (audio_mesh_call_blocked()) return;
 
     if (!mesh_intent_enabled() || !nrf_lc3_ready()) {
         pipe->spi_rx_invalid++;
@@ -526,7 +543,9 @@ static void bridge_event_callback(uart_bridge_event_t event, const uint8_t *data
     case BRIDGE_EVENT_MESH_STOPPED:
         ESP_LOGI(TAG, "nRF52840 mesh stopped");
         e2e_diag_reset_all_sources();
+        xSemaphoreTake(s_membership_mutex, portMAX_DELAY);
         audio_tx_cache_reset(&s_previous_audio);
+        xSemaphoreGive(s_membership_mutex);
         atomic_store(&g_mesh_active, false);
         atomic_store(&s_channel_confirmed, false);
         if (!mesh_intent_enabled()) atomic_store(&s_enable_notification_pending, false);

@@ -214,6 +214,9 @@ typedef struct {
 
     /* Ingress and command state. */
     bool audio_ingress_enabled;
+    atomic_t local_audio_enabled; /* call-state gate, independent of mesh membership */
+    int64_t local_audio_receive_cutoff_us; /* owner-only RF receipt boundary; boot defaults to 0 */
+    atomic_t local_audio_epoch;   /* invalidates producers waiting at ingress mutex */
     atomic_t pending_request; /* command | generation << 8 | talk_channel << 16; zero = none */
     atomic_t status_pending;
 } mesh_protocol_context_t;
@@ -262,6 +265,7 @@ bool mesh_protocol_membership_handle_coordinator_timeout(void);
 void mesh_protocol_audio_init(void);
 void mesh_protocol_audio_cancel_work(void);
 void mesh_protocol_audio_set_ingress_enabled(bool enabled, bool purge);
+void mesh_protocol_audio_set_local_enabled(bool enabled);
 void mesh_protocol_audio_purge_tx_ring(void);
 void mesh_protocol_audio_reset_rf_e2e_tracker(uint8_t node_id);
 void mesh_protocol_audio_reset_all_rf_e2e_trackers(void);

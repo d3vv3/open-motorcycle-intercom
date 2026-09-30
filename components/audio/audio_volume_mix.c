@@ -106,14 +106,45 @@ void audio_limit_cue_reset(audio_limit_cue_t *cue)
 {
     cue->position = 0u;
     cue->phase = 0u;
-    atomic_store_explicit(&cue->busy, false, memory_order_release);
+    atomic_store_explicit(&cue->state, AUDIO_CUE_IDLE, memory_order_release);
+}
+
+bool audio_limit_cue_busy(const audio_limit_cue_t *cue)
+{
+    return atomic_load_explicit(&cue->state, memory_order_acquire) != AUDIO_CUE_IDLE;
 }
 
 bool audio_limit_cue_request(audio_limit_cue_t *cue)
 {
-    bool expected = false;
-    return atomic_compare_exchange_strong_explicit(&cue->busy, &expected, true,
+    unsigned expected = AUDIO_CUE_IDLE;
+    return atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_LIMIT,
                                                    memory_order_acq_rel, memory_order_acquire);
+}
+
+bool audio_limit_cue_request_end(audio_limit_cue_t *cue)
+{
+    unsigned state = atomic_load_explicit(&cue->state, memory_order_acquire);
+    for (;;) {
+        if (state == AUDIO_CUE_END || state == AUDIO_CUE_LIMIT_WITH_PENDING_END) return true;
+        unsigned next = state == AUDIO_CUE_IDLE ? AUDIO_CUE_END :
+                        AUDIO_CUE_LIMIT_WITH_PENDING_END;
+        if (atomic_compare_exchange_weak_explicit(&cue->state, &state, next,
+                                                  memory_order_acq_rel, memory_order_acquire))
+            return true;
+    }
+}
+
+static void cue_finish(audio_limit_cue_t *cue)
+{
+    cue->position = 0u;
+    cue->phase = 0u;
+    unsigned state = atomic_load_explicit(&cue->state, memory_order_acquire);
+    for (;;) {
+        unsigned next = state == AUDIO_CUE_LIMIT_WITH_PENDING_END ? AUDIO_CUE_END : AUDIO_CUE_IDLE;
+        if (atomic_compare_exchange_weak_explicit(&cue->state, &state, next,
+                                                  memory_order_acq_rel, memory_order_acquire))
+            return;
+    }
 }
 
 static int16_t cue_wave(uint32_t phase)
@@ -129,19 +160,18 @@ static int16_t cue_wave(uint32_t phase)
 void audio_limit_cue_mix(audio_limit_cue_t *cue, int16_t *interleaved,
                          size_t frames, uint8_t channels, uint32_t rate)
 {
-    if (channels == 0u || rate == 0u ||
-        !atomic_load_explicit(&cue->busy, memory_order_acquire)) return;
+    if (channels == 0u || rate == 0u) return;
+    unsigned kind = atomic_load_explicit(&cue->state, memory_order_acquire);
+    if (kind == AUDIO_CUE_IDLE) return;
     const uint32_t on = rate * 80u / 1000u;
     const uint32_t gap = rate * 60u / 1000u;
-    const uint32_t end = on * 3u + gap * 2u;
+    const uint32_t end = kind == AUDIO_CUE_END ? on : on * 3u + gap * 2u;
     const uint32_t fade = rate / 200u;
     const uint32_t increment = (uint32_t)((880ull << 32) / rate);
     for (size_t frame = 0; frame < frames; ++frame) {
         uint32_t pos = cue->position;
         if (pos >= end) {
-            cue->position = 0u;
-            cue->phase = 0u;
-            atomic_store_explicit(&cue->busy, false, memory_order_release);
+            cue_finish(cue);
             break;
         }
         uint32_t burst = pos / (on + gap);
@@ -164,9 +194,7 @@ void audio_limit_cue_mix(audio_limit_cue_t *cue, int16_t *interleaved,
         }
         cue->position++;
         if (cue->position == end) {
-            cue->position = 0u;
-            cue->phase = 0u;
-            atomic_store_explicit(&cue->busy, false, memory_order_release);
+            cue_finish(cue);
             break;
         }
     }

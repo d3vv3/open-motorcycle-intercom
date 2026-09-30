@@ -37,4 +37,11 @@ typedef struct {
 void phone_audio_call_state_reduce(const phone_audio_call_indicators_t *indicators,
                                    phone_audio_call_state_t *state);
 
+/* HFP disconnect remains attributable to its bound peer after A2DP is gone. */
+bool phone_audio_hfp_connection_allowed(bool a2dp_selected, const uint8_t *a2dp_peer,
+                                        bool hf_pending, bool hf_bound, bool teardown_requested,
+                                        const uint8_t *hf_peer, const uint8_t *event_peer,
+                                        bool disconnected);
+bool phone_audio_a2dp_selection_allowed(bool a2dp_selected, bool hf_pending, bool hf_bound);
+
 #endif

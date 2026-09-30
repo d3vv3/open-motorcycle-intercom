@@ -10,12 +10,12 @@ import wave
 NAMES = (
     "startup", "peer_join", "peer_leave", "mesh_on", "mesh_off",
     "phone_pairing", "channel_green", "channel_red", "channel_blue",
-    "you_are_coordinator", "you_are_participant",
+    "you_are_coordinator", "you_are_participant", "incoming_phone_call",
 )
 IDS = (
     "STARTUP", "PEER_JOIN", "PEER_LEAVE", "MESH_ENABLED", "MESH_DISABLED",
     "BLUETOOTH_PAIRING", "CHANNEL_GREEN", "CHANNEL_RED", "CHANNEL_BLUE",
-    "ROLE_COORDINATOR", "ROLE_PARTICIPANT",
+    "ROLE_COORDINATOR", "ROLE_PARTICIPANT", "INCOMING_CALL",
 )
 STEPS = (
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41,

@@ -39,6 +39,7 @@
 #include "audio_rate_converter.h"
 #include "audio_sample_fifo.h"
 #include "audio_volume_mix.h"
+#include "audio_urgent.h"
 #include "opus.h"
 #if defined(AUDIO_S31_LC3_WIRE)
 #include "esp_lc3_codec.h"
@@ -142,6 +143,7 @@ typedef struct {
     audio_gain_ramp_t bluetooth_gain;
     audio_program_mix_t program_mix;
     audio_limit_cue_t volume_limit_cue;
+    audio_urgent_t incoming_call;
     audio_config_t config;
     SemaphoreHandle_t lifecycle_mutex;
     StaticSemaphore_t lifecycle_mutex_storage;
@@ -212,6 +214,7 @@ typedef struct {
     int16_t far_ref_shadows[I2S_DMA_BUFFER_COUNT][AUDIO_FRAME_SAMPLES];
     size_t far_ref_shadow_head;
     int16_t hw_output[AUDIO_HW_FRAME_SAMPLES];
+    int16_t urgent_base[AUDIO_HW_FRAME_SAMPLES];
     /* Software-only playback staging is allocated from PSRAM during init. */
     int16_t *playback_psram_storage;
     int16_t *voice_converted;
@@ -289,6 +292,8 @@ void audio_rx_reset_source_metadata(void);
 void audio_rx_reset_source_metadata_locked(void);
 void audio_rx_reset_codecs_and_resamplers(void);
 void audio_rx_service_reset_request(void);
+extern audio_mesh_call_state_t g_audio_mesh_call;
+extern atomic_uint g_audio_mesh_rx_cutoff_ms;
 
 /* audio_notify.c */
 size_t audio_notify_mix_frame(size_t base_present_samples, bool *request_consumed);

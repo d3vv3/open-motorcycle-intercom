@@ -252,6 +252,15 @@ static void command_work_handler(struct k_work *work)
                     mesh_protocol_stop();
                 }
                 uart_bridge_discard_pending_audio();
+            } else if (command == BRIDGE_COMMAND_AUDIO_PAUSE ||
+                       command == BRIDGE_COMMAND_AUDIO_RESUME) {
+                bool enabled = command == BRIDGE_COMMAND_AUDIO_RESUME;
+                if (enabled) {
+                    /* Flush bridge playback before reopening local SPI ingress. */
+                    uart_bridge_set_audio_delivery_enabled(false);
+                }
+                mesh_protocol_audio_set_local_enabled(enabled);
+                uart_bridge_set_audio_delivery_enabled(enabled);
             }
             uart_bridge_send_command_ack(command, generation, result);
             uart_bridge_send_status(s_state, s_role, mesh_protocol_membership_bridge_peer_count(),
@@ -278,6 +287,20 @@ void mesh_protocol_request_stop(uint8_t generation)
     k_work_submit(&s_command_work);
 }
 
+void mesh_protocol_request_audio_pause(uint8_t generation)
+{
+    atomic_set(&s_pending_request,
+               bridge_mesh_request_pack(BRIDGE_COMMAND_AUDIO_PAUSE, generation, 0));
+    k_work_submit(&s_command_work);
+}
+
+void mesh_protocol_request_audio_resume(uint8_t generation)
+{
+    atomic_set(&s_pending_request,
+               bridge_mesh_request_pack(BRIDGE_COMMAND_AUDIO_RESUME, generation, 0));
+    k_work_submit(&s_command_work);
+}
+
 void mesh_protocol_request_status(void)
 {
     atomic_set(&s_status_pending, 1);
@@ -295,6 +318,7 @@ int mesh_protocol_init(void)
     k_work_init(&s_command_work, command_work_handler);
     mesh_protocol_membership_bind_work(&s_scan_work, &s_join_work, &s_status_work);
     mesh_protocol_audio_init();
+    atomic_set(&C->local_audio_enabled, 1);
 
     /* Set callbacks */
     mesh_protocol_rx_init();

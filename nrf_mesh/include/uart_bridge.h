@@ -48,6 +48,9 @@ int uart_bridge_send_audio_v2(uint8_t src_id, const uint8_t *data, uint8_t len);
 /** Drop queued outbound audio at a mesh stop boundary. */
 void uart_bridge_discard_pending_audio(void);
 
+/** Drop queued playback and gate RF-to-local playback until resumed. */
+void uart_bridge_set_audio_delivery_enabled(bool enabled);
+
 /**
  * @brief Send mesh event to ESP32
  * @param event_type Event type
