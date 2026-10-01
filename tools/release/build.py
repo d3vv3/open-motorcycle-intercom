@@ -258,7 +258,7 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
         validate_identity(nrf_elf, version, sha)
         validate_identity(uf2_payload(uf2), version, sha)
     else:
-        identity = (version + "+" + sha).encode() + b"\0"
+        identity = f"*** Booting Zephyr OS build {version}+{sha} ***\n\0".encode()
         if identity not in nrf_elf or identity not in uf2_payload(uf2):
             raise ValueError("Legacy Zephyr build version/source SHA mismatch")
     wire = protocols(source)
@@ -290,6 +290,9 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
     driver_sha = required(provenance / "release-tools-source-sha.txt").decode().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", driver_sha):
         raise ValueError("Invalid release tools source SHA provenance")
+    idf_version = required(provenance / "idf-version.txt").decode().strip()
+    if not idf_version:
+        raise ValueError("Empty ESP-IDF version provenance")
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError("Output directory must be empty")
@@ -304,7 +307,7 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
                 "experimental": profile == "esp32s3", "classic_bluetooth": profile == "esp32s31",
                 "s31_lc3_interoperable": profile == "esp32s31", "source_patches": [],
                 "reproducibility": "Archived source and pinned builders; resolved dependencies captured, not a claim of historical bit reproducibility",
-                "provenance_archive": f"{stem}-debug.zip", "idf_version": description.get("idf_ver"),
+                "provenance_archive": f"{stem}-debug.zip", "idf_version": idf_version,
                 "assets": {p.name: {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size} for p in sorted(output.iterdir())}}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     assets = sorted(output.iterdir())
@@ -338,6 +341,8 @@ def docker(image: str, scratch: Path, script: str, env: dict | None = None) -> N
             "--entrypoint", "/bin/bash"]
     for key, value in (env or {}).items():
         args += ["--env", f"{key}={value}"]
+    # Disable image startup hooks before bash runs; initialize SDKs explicitly below.
+    args += ["--env", "BASH_ENV="]
     # NCS images have ENTRYPOINT ["/bin/bash", "-c"], which swallows a nested bash command.
     subprocess.run(args + [pinned(image), "-euc", script], check=True)
 
@@ -373,9 +378,12 @@ def build(scratch: Path, version: str, sha: str, profile: str, esp_image: str, n
     (scratch / "provenance/esp-build.sh").write_text(script)
     docker(esp_image, scratch, script, {"OMI_ESP_LC3_BENCH": "0" if legacy else "1"})
     nrf_defs = "-Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y"
-    if not legacy:
+    if legacy:
+        nrf_defs += " -Dnrf_mesh_CONFIG_NCS_BOOT_BANNER=n -Dnrf_mesh_CONFIG_BOOT_BANNER=y"
+    else:
         nrf_defs += f" -Dnrf_mesh_OMI_FIRMWARE_VERSION={q(version)} -Dnrf_mesh_OMI_GIT_SHA={q(sha)}"
-    script = "west init -l /work/ncs/release-manifest\n"
+    script = 'export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"\n. /opt/toolchain-env.sh\n'
+    script += "west init -l /work/ncs/release-manifest\n"
     script += "cd /work/ncs\nwest update --narrow -o=--depth=1\nwest zephyr-export\n"
     script += FREEZE_ACTIVE
     # west list defaults to active projects; --all would include uncloned private repos.
@@ -384,7 +392,7 @@ def build(scratch: Path, version: str, sha: str, profile: str, esp_image: str, n
     script += "while IFS= read -r project; do\n    if [ \"$project\" != manifest ]; then\n        west list -f '{name} {revision} {sha} {url}' \"$project\"\n    fi\ndone < /work/provenance/west-active-projects.txt > /work/provenance/west-resolved.txt\n"
     script += f"west build --sysbuild {'--cmake-only ' if legacy else ''}-b xiao_ble/nrf52840 /work/source/nrf_mesh -d /work/nrf -- {nrf_defs}\n"
     if legacy:
-        script += f"cmake -B /work/nrf/nrf_mesh -DBUILD_VERSION:STRING={q(version + '+' + sha)}\ncmake --build /work/nrf\n"
+        script += f"cmake -S /work/source/nrf_mesh -B /work/nrf/nrf_mesh -DBUILD_VERSION:STRING={q(version + '+' + sha)}\ncmake --build /work/nrf\n"
     script += "cp /work/nrf/nrf_mesh/zephyr/.config /work/provenance/nrf.config\ncp /work/nrf/nrf_mesh/CMakeCache.txt /work/provenance/nrf-CMakeCache.txt\n"
     (scratch / "provenance/nrf-build.sh").write_text(script)
     docker(ncs_image, scratch, script)

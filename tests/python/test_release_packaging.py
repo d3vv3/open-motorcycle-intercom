@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import struct
 import subprocess
 import zipfile
@@ -55,11 +56,12 @@ def inputs(tmp_path):
     (esp / "omi.elf").write_bytes(elf)
     (nrf / "zephyr.elf").write_bytes(elf)
     (nrf / "zephyr.uf2").write_bytes(uf2())
-    (esp / "project_description.json").write_text(json.dumps({"target": "esp32s31", "project_version": VERSION, "app_bin": "omi.bin", "idf_ver": "v6.1-dev"}))
+    (esp / "project_description.json").write_text(json.dumps({"target": "esp32s31", "project_version": VERSION, "app_bin": "omi.bin"}))
     (esp / "flasher_args.json").write_text(json.dumps({"extra_esptool_args": {"chip": "esp32s31", "before": "default_reset", "after": "hard_reset"}, "flash_settings": {"flash_mode": "dio", "flash_freq": "80m", "flash_size": "16MB"}, "flash_files": {"0x2000": "bootloader/bootloader.bin", "0x8000": "partition_table/partition-table.bin", "0xf000": "extra/phy.bin", "0x10000": "omi.bin"}, "bootloader": {"offset": "0x2000", "file": "bootloader/bootloader.bin"}, "partition-table": {"offset": "0x8000", "file": "partition_table/partition-table.bin"}, "app": {"offset": "0x10000", "file": "omi.bin"}}))
     for name in ("west-frozen.yml", "west-resolved.txt", "west-input.yml", "idf-commit.txt", "idf-version.txt", "sdkconfig", "dependencies.lock"):
         (provenance / name).write_text("captured\n")
     (provenance / "release-tools-source-sha.txt").write_text("c" * 40 + "\n")
+    (provenance / "idf-version.txt").write_text("ESP-IDF v6.1-dev\n")
     return source, esp, nrf, provenance
 
 
@@ -74,8 +76,9 @@ def legacy_inputs(inputs):
         (source / "shared" / f"{name}_protocol_defs.h").write_text(f"#define {name.upper()}_PROTOCOL_VERSION 2\n")
     description_path = esp / "project_description.json"
     description = json.loads(description_path.read_text())
-    description.update(target="esp32s3", project_version="0.1.0", idf_ver="v5.5.2")
+    description.update(target="esp32s3", project_version="0.1.0")
     description_path.write_text(json.dumps(description))
+    (provenance / "idf-version.txt").write_text("ESP-IDF v5.5.2\n")
     app = bytearray((esp / "omi.bin").read_bytes())
     app[48:80] = b"0.1.0".ljust(32, b"\0")
     (esp / "omi.bin").write_bytes(app)
@@ -87,7 +90,7 @@ def legacy_inputs(inputs):
     flasher["bootloader"]["offset"] = "0x0"
     flasher["flash_files"]["0x0"] = flasher["flash_files"].pop("0x2000")
     path.write_text(json.dumps(flasher))
-    identity = f"0.1.0+{SHA}".encode() + b"\0"
+    identity = f"*** Booting Zephyr OS build 0.1.0+{SHA} ***\n\0".encode()
     (nrf / "zephyr.elf").write_bytes(b"ELF\0" + identity)
     block = bytearray(uf2())
     block[32:288] = identity.ljust(256, b"\0")
@@ -101,15 +104,54 @@ def test_legacy_package_preserves_identity_and_experimental_status(legacy_inputs
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["version"] == "0.1.0"
     assert manifest["source_sha"] == SHA
+    assert manifest["idf_version"] == "ESP-IDF v5.5.2"
     assert manifest["experimental"] is True
     assert manifest["classic_bluetooth"] is False
     assert manifest["s31_lc3_interoperable"] is False
+
+
+def test_manifest_idf_version_uses_stripped_provenance_not_project_description(inputs, tmp_path):
+    path = inputs[1] / "project_description.json"
+    description = json.loads(path.read_text())
+    description["idf_ver"] = "stale-description-value"
+    path.write_text(json.dumps(description))
+    (inputs[3] / "idf-version.txt").write_text("  ESP-IDF v6.1-dev\n\n")
+    output = tmp_path / "release"
+    package(inputs, output)
+    assert json.loads((output / "manifest.json").read_text())["idf_version"] == "ESP-IDF v6.1-dev"
+
+
+def test_reject_whitespace_only_idf_version_provenance(inputs, tmp_path):
+    (inputs[3] / "idf-version.txt").write_text(" \n\n")
+    with pytest.raises(ValueError, match="Empty ESP-IDF version provenance"):
+        package(inputs, tmp_path / "release")
+    assert not (tmp_path / "release").exists()
 
 
 @pytest.mark.parametrize("name", ["zephyr.elf", "zephyr.uf2"])
 def test_legacy_rejects_identity_mismatch_in_elf_and_uf2(legacy_inputs, tmp_path, name):
     path = legacy_inputs[2] / name
     path.write_bytes(path.read_bytes().replace(SHA.encode(), b"b" * 40))
+    with pytest.raises(ValueError, match="Legacy Zephyr build version/source SHA mismatch"):
+        build.package(*legacy_inputs, tmp_path / "legacy", "0.1.0", SHA, "esp32s3", {})
+
+
+@pytest.mark.parametrize("name", ["zephyr.elf", "zephyr.uf2"])
+@pytest.mark.parametrize("replacement", [
+    f"0.1.0+{SHA}\0".encode(),
+    f"*** Booting Zephyr OS build 0.1.0+{SHA}x ***\n\0".encode(),
+    f"*** Booting Zephyr OS build 0.1.0+{SHA} ***\0".encode(),
+])
+def test_legacy_requires_complete_standard_banner(legacy_inputs, tmp_path, name, replacement):
+    banner = f"*** Booting Zephyr OS build 0.1.0+{SHA} ***\n\0".encode()
+    path = legacy_inputs[2] / name
+    # Keep the UF2 block length unchanged while replacing its embedded string.
+    if name.endswith(".uf2"):
+        data = bytearray(path.read_bytes())
+        data[32:288] = replacement.ljust(256, b"\0")
+        path.write_bytes(data)
+    else:
+        path.write_bytes(path.read_bytes().replace(banner, replacement))
     with pytest.raises(ValueError, match="Legacy Zephyr build version/source SHA mismatch"):
         build.package(*legacy_inputs, tmp_path / "legacy", "0.1.0", SHA, "esp32s3", {})
 
@@ -362,6 +404,7 @@ def test_build_commands_have_sysbuild_child_metadata_and_fresh_sdkconfig(tmp_pat
     assert calls[0][3]["OMI_ESP_LC3_BENCH"] == "1"
     assert "west update --narrow -o=--depth=1" in nrf_script
     assert "west init -l /work/ncs/release-manifest" in nrf_script
+    assert nrf_script.startswith('export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"\n. /opt/toolchain-env.sh\n')
     assert "west manifest --freeze --active-only" in nrf_script
     assert "west list -f '{name}'" in nrf_script
     assert 'if [ "$project" != manifest ]' in nrf_script
@@ -370,6 +413,8 @@ def test_build_commands_have_sysbuild_child_metadata_and_fresh_sdkconfig(tmp_pat
     assert f"-Dnrf_mesh_OMI_FIRMWARE_VERSION={VERSION}" in nrf_script
     assert f"-Dnrf_mesh_OMI_GIT_SHA={SHA}" in nrf_script
     assert "-Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y" in nrf_script
+    assert "CONFIG_NCS_BOOT_BANNER" not in nrf_script
+    assert "-Dnrf_mesh_CONFIG_BOOT_BANNER=y" not in nrf_script
     expected_manifest = (build.ROOT / "tools/release/ncs-v3.4.1.yml").read_bytes()
     assert (tmp_path / "ncs/release-manifest/west.yml").read_bytes() == expected_manifest
     assert (tmp_path / "provenance/west-input.yml").read_bytes() == expected_manifest
@@ -384,8 +429,9 @@ def test_legacy_commands_generate_metadata_without_source_patch(tmp_path, monkey
     assert "-DPROJECT_VER=0.1.0" in calls[0][2]
     assert "-DESP_LC3_BENCH=ON" not in calls[0][2]
     script = calls[1][2]
-    configure = "west build --sysbuild --cmake-only -b xiao_ble/nrf52840 /work/source/nrf_mesh -d /work/nrf -- -Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y"
-    reconfigure = f"cmake -B /work/nrf/nrf_mesh -DBUILD_VERSION:STRING=0.1.0+{build.LEGACY_SHA}"
+    assert script.index('export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"') < script.index(". /opt/toolchain-env.sh") < script.index("west init")
+    configure = "west build --sysbuild --cmake-only -b xiao_ble/nrf52840 /work/source/nrf_mesh -d /work/nrf -- -Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y -Dnrf_mesh_CONFIG_NCS_BOOT_BANNER=n -Dnrf_mesh_CONFIG_BOOT_BANNER=y"
+    reconfigure = f"cmake -S /work/source/nrf_mesh -B /work/nrf/nrf_mesh -DBUILD_VERSION:STRING=0.1.0+{build.LEGACY_SHA}"
     compile = "cmake --build /work/nrf"
     assert script.index(configure) < script.index(reconfigure) < script.index(compile)
     assert "nrf_mesh_BUILD_VERSION" not in script
@@ -404,6 +450,29 @@ def test_driver_manifest_is_used_even_when_archive_contains_different_input(tmp_
     monkeypatch.setattr(build, "run", lambda *args: "c" * 40)
     build.build(tmp_path, "0.1.0", build.LEGACY_SHA, "esp32s3", build.LEGACY_ESP_IMAGE, build.NCS_IMAGE)
     assert (tmp_path / "provenance/west-input.yml").read_bytes() == (build.ROOT / "tools/release/ncs-v2.7.0.yml").read_bytes()
+
+
+@pytest.mark.parametrize("profile,version,sha", [("esp32s31", VERSION, SHA), ("esp32s3", "0.1.0", build.LEGACY_SHA)])
+def test_generated_nrf_initialization_exposes_tools_with_unset_library_path(tmp_path, monkeypatch, profile, version, sha):
+    calls = []
+    monkeypatch.setattr(build, "docker", lambda *args: calls.append(args))
+    monkeypatch.setattr(build, "run", lambda *args: "c" * 40)
+    build.build(tmp_path, version, sha, profile, build.ESP_IMAGE, build.NCS_IMAGE)
+    prefix = calls[1][2].split("west init", 1)[0]
+    tools = tmp_path / "fixture-tools"
+    tools.mkdir()
+    west = tools / "west"
+    west.write_text("#!/bin/sh\nprintf '%s' fixture-west\n")
+    west.chmod(0o755)
+    setup = tmp_path / "toolchain-env.sh"
+    setup.write_text(f'test "${{LD_LIBRARY_PATH+x}}" = x\nexport LD_LIBRARY_PATH="${{LD_LIBRARY_PATH}}:/fixture/lib"\nexport PATH="{tools}:$PATH"\n')
+    # Substitute only the fixture location; execute the generated initialization itself.
+    script = prefix.replace("/opt/toolchain-env.sh", str(setup)) + "west --version"
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    env["BASH_ENV"] = ""
+    result = subprocess.run(["/bin/bash", "-euc", script], env=env, capture_output=True, text=True, check=True)
+    assert result.stdout == "fixture-west"
 
 
 def test_explicit_work_directory_is_retained_on_failure_and_not_reused(tmp_path):
@@ -439,10 +508,13 @@ def test_require_digest_pinned_builder(image):
 
 
 @pytest.fixture
-def ncs_docker_fixture(monkeypatch):
+def ncs_docker_fixture(monkeypatch, tmp_path):
     """Execute the effective shell argv using the reported NCS image entrypoint."""
     real_run = subprocess.run
     results = []
+    startup = tmp_path / "non-interactive-setup.sh"
+    startup.write_text("exit 24\n")
+    monkeypatch.setenv("BASH_ENV", str(startup))
 
     def fake_docker_run(args, **kwargs):
         assert args[:2] == ["docker", "run"]
@@ -452,7 +524,12 @@ def ncs_docker_fixture(monkeypatch):
         if "--entrypoint" in options:
             entrypoint = [options[options.index("--entrypoint") + 1]]
         # Do not generate a replacement script: execute the caller's actual argv.
-        result = real_run(entrypoint + command, capture_output=True, text=True)
+        env = os.environ.copy()
+        for index, option in enumerate(options):
+            if option == "--env":
+                key, value = options[index + 1].split("=", 1)
+                env[key] = value
+        result = real_run(entrypoint + command, env=env, capture_output=True, text=True)
         results.append(result)
         if kwargs.get("check"):
             result.check_returncode()
@@ -480,6 +557,7 @@ def test_esp_docker_uses_explicit_shell_entrypoint(tmp_path, monkeypatch, image)
     args, kwargs = calls[0]
     assert args[args.index("--entrypoint") + 1] == "/bin/bash"
     assert args[args.index(image) + 1:] == ["-euc", script]
+    assert any(args[index:index + 2] == ["--env", "BASH_ENV="] for index in range(len(args) - 1))
     assert kwargs["check"] is True
 
 
