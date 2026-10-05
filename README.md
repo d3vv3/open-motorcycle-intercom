@@ -1,5 +1,3 @@
-# OpenHelmet
-
 <p align="center">
     <img src="assets/logo.svg" alt="OpenHelmet Logo" width="200"/>
     <br/>
