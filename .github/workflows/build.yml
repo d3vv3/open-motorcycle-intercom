@@ -169,6 +169,9 @@ jobs:
       - name: Run audio TX cache tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/audio_tx_cache.c tests/c/audio_tx_cache_test.c -o /tmp/audio_tx_cache_test && /tmp/audio_tx_cache_test
 
+      - name: Run bridge status freshness tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -pthread -D_GNU_SOURCE -Itests/c/host_sdk -Icomponents/uart_bridge -Icomponents/uart_bridge/include -Icomponents/board/include -Ishared -I. tests/c/bridge_status_fresh_test.c components/uart_bridge/bridge_status.c -o /tmp/bridge_status_fresh_test && /tmp/bridge_status_fresh_test
+
       - name: Run bridge frame codec tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/bridge_frame_test && /tmp/bridge_frame_test
 

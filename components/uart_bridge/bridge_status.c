@@ -19,8 +19,9 @@ static const char *TAG = "spi_bridge";
 
 bool bridge_status_is_fresh_locked(int64_t now_us)
 {
+    /* Callers sample the clock before taking the lock; a status committed in
+     * between is newer than now_us, not stale. The timer is monotonic. */
     return g_bridge.connected && g_bridge.status.received_at_us > 0 &&
-           now_us >= g_bridge.status.received_at_us &&
            now_us - g_bridge.status.received_at_us <= BRIDGE_STATUS_STALE_TIMEOUT_US;
 }
 
