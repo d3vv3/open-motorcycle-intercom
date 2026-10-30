@@ -189,6 +189,13 @@ static esp_err_t record_push_result(audio_packet_store_push_result_t result, boo
     return ret;
 }
 
+/* Called by audio_mesh_call_rx_allowed only after its acquire load of the
+ * gate word: a reopened word then guarantees this load sees the resume's cutoff. */
+static uint32_t audio_mesh_load_rx_cutoff(void)
+{
+    return atomic_load_explicit(&g_audio_mesh_rx_cutoff_ms, memory_order_acquire);
+}
+
 static esp_err_t record_rx_reject(esp_err_t error, uint32_t *reason)
 {
     AUDIO_STATS_LOCK();
@@ -237,7 +244,7 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
     if (!g_audio.initialized || !atomic_load_explicit(&g_audio.running, memory_order_acquire) ||
         source_id == 0 || g_audio.config.mode != AUDIO_MODE_MESH ||
         !audio_mesh_call_rx_allowed(&g_audio_mesh_call, frame->timestamp_ms,
-           atomic_load_explicit(&g_audio_mesh_rx_cutoff_ms, memory_order_acquire))) {
+                                    audio_mesh_load_rx_cutoff)) {
         esp_err_t ret = record_rx_reject(ESP_ERR_INVALID_STATE, source_id == 0
                                     ? &g_audio.stats.rx_invalid : &g_audio.stats.rx_inactive);
         xSemaphoreGive(g_audio.rx_sources_mutex);

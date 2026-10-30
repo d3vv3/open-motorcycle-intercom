@@ -48,9 +48,12 @@ bool audio_mesh_call_state_tx_allowed(const audio_mesh_call_state_t *state, uint
 }
 
 bool audio_mesh_call_rx_allowed(const audio_mesh_call_state_t *state, int64_t timestamp_ms,
-                                uint32_t cutoff_ms)
+                                uint32_t (*load_cutoff)(void))
 {
+    /* Gate word first: resume publishes the cutoff before reopening it, so a
+     * reopened word guarantees the cutoff load below sees that resume. */
     if (audio_mesh_call_state_blocked(state)) return false;
+    uint32_t cutoff_ms = load_cutoff();
     /* Unknown timestamps cannot establish that a frame arrived after resume. */
     if (cutoff_ms != 0u && (timestamp_ms <= 0 ||
         (int32_t)((uint32_t)timestamp_ms - cutoff_ms) <= 0)) return false;

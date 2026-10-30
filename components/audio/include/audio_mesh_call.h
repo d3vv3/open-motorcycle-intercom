@@ -14,8 +14,11 @@ uint32_t audio_mesh_call_state_epoch(const audio_mesh_call_state_t *state);
 bool audio_mesh_call_state_active(const audio_mesh_call_state_t *state);
 bool audio_mesh_call_state_blocked(const audio_mesh_call_state_t *state);
 bool audio_mesh_call_state_tx_allowed(const audio_mesh_call_state_t *state, uint32_t epoch);
-/* timestamp_ms is local receive time, not a sender/capture timestamp. */
+/* timestamp_ms is local receive time, not a sender/capture timestamp.
+ * load_cutoff (acquire load of the RX cutoff) runs only after the gate word
+ * is loaded, so a frame racing a resume never pairs the old cutoff with the
+ * reopened word. */
 bool audio_mesh_call_rx_allowed(const audio_mesh_call_state_t *state, int64_t timestamp_ms,
-                                uint32_t cutoff_ms);
+                                uint32_t (*load_cutoff)(void));
 
 #endif
