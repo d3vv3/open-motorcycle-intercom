@@ -72,6 +72,7 @@ static bool s_is_deep_sleep_wake = false;
 
 static void update_state_time(power_state_t old_state);
 static esp_err_t configure_wifi_power_save(bool aggressive);
+static esp_err_t transition_state(bool conditional, power_state_t from, power_state_t state);
 
 /* ============================================================================
  * Power State Names
@@ -186,20 +187,31 @@ esp_err_t power_deinit(void)
 
 esp_err_t power_set_state(power_state_t state)
 {
+    return transition_state(false, state, state);
+}
+
+/* Validate, then recheck the current state under the mutex: a check outside
+ * it (as voice start/end did) could act on a state another task had already
+ * changed. With conditional set, transition only when the state is `from`. */
+static esp_err_t transition_state(bool conditional, power_state_t from, power_state_t state)
+{
     if (!s_initialized) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    if (state == s_state) {
-        return ESP_OK; /* Already in this state */
+    if ((unsigned)state >= sizeof(s_state_names) / sizeof(s_state_names[0])) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
 
     power_state_t old_state = s_state;
+    if (state == old_state || (conditional && old_state != from)) {
+        xSemaphoreGive(s_state_mutex);
+        return ESP_OK;
+    }
     update_state_time(old_state);
 
-    ESP_LOGI(TAG, "State transition: %s -> %s", s_state_names[old_state], s_state_names[state]);
+    ESP_LOGI(TAG, "State transition: %s -> %s", power_state_str(old_state), power_state_str(state));
 
     s_state = state;
     s_state_enter_time_ms = esp_timer_get_time() / 1000;
@@ -240,7 +252,7 @@ power_state_t power_get_state(void)
 
 const char *power_state_str(power_state_t state)
 {
-    if (state < sizeof(s_state_names) / sizeof(s_state_names[0])) {
+    if ((unsigned)state < sizeof(s_state_names) / sizeof(s_state_names[0])) {
         return s_state_names[state];
     }
     return "UNKNOWN";
@@ -258,9 +270,7 @@ void power_notify_voice_start(void)
 
     power_activity_ping();
 
-    if (s_state == POWER_STATE_MESH_IDLE) {
-        power_set_state(POWER_STATE_ACTIVE_VOICE);
-    }
+    transition_state(true, POWER_STATE_MESH_IDLE, POWER_STATE_ACTIVE_VOICE);
 
     ESP_LOGD(TAG, "Voice started");
 }
@@ -271,9 +281,7 @@ void power_notify_voice_end(void)
         return;
     }
 
-    if (s_state == POWER_STATE_ACTIVE_VOICE) {
-        power_set_state(POWER_STATE_MESH_IDLE);
-    }
+    transition_state(true, POWER_STATE_ACTIVE_VOICE, POWER_STATE_MESH_IDLE);
 
     ESP_LOGD(TAG, "Voice ended");
 }

@@ -11,4 +11,5 @@ BaseType_t xSemaphoreTakeRecursive(SemaphoreHandle_t sem, TickType_t wait);
 BaseType_t xSemaphoreGiveRecursive(SemaphoreHandle_t sem);
 BaseType_t xSemaphoreGiveFromISR(SemaphoreHandle_t sem, BaseType_t *woke);
 UBaseType_t uxSemaphoreGetCount(SemaphoreHandle_t sem);
+void vSemaphoreDelete(SemaphoreHandle_t sem);
 #endif

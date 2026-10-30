@@ -179,6 +179,9 @@ jobs:
           test -s /tmp/bridge_tx_enqueue/bridge_tx_enqueue.inc
           cc -std=c11 -Wall -Wextra -Werror -pedantic -I/tmp/bridge_tx_enqueue tests/c/bridge_tx_enqueue_test.c -o /tmp/bridge_tx_enqueue_test && /tmp/bridge_tx_enqueue_test
 
+      - name: Run power state tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -pthread -D_GNU_SOURCE -Itests/c/power_sdk -Itests/c/host_sdk -Icomponents/power/include components/power/power.c tests/c/power_state_test.c -o /tmp/power_state_test && /tmp/power_state_test
+
       - name: Run bridge frame codec tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/bridge_frame_test && /tmp/bridge_frame_test
 
