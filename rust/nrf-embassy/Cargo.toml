@@ -1,0 +1,18 @@
+[package]
+name = "nrf-embassy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95.0"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+audio-accounting-trace = []
+same-slot-audio-refit = []
+detached-bridge-transfer = []
+
+[dependencies]
+openhelmet-mesh = { version = "=0.1.0", path = "../openhelmet-mesh" }
+openhelmet-wire = { version = "=0.1.0", path = "../openhelmet-wire" }

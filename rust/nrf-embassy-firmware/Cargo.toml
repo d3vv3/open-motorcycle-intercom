@@ -1,0 +1,61 @@
+[package]
+name = "nrf-embassy-firmware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+publish = false
+build = "build.rs"
+
+[features]
+default = ["pipeline-trace", "legacy-rtc-timing", "guarded-completion-retention", "nonblocking-bridge-delivery", "rx-blocking-trace", "unmasked-bridge-owner", "reset-diagnostics", "admission-headroom"]
+admission-headroom = []
+sync-trace = []
+pipeline-trace = ["sync-trace", "slot-entry-trace", "nrf-embassy/audio-accounting-trace", "reset-diagnostics"]
+reset-diagnostics = []
+slot-entry-trace = []
+rx-blocking-trace = ["embassy-nrf-esb/rx-blocking-trace"]
+legacy-rtc-timing = []
+guarded-completion-retention = []
+early-timing-service = []
+same-slot-audio-refit = ["nrf-embassy/same-slot-audio-refit"]
+nonblocking-bridge-delivery = ["nrf-embassy/detached-bridge-transfer"]
+unmasked-bridge-owner = ["nonblocking-bridge-delivery"]
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+pin-project-lite = "=0.2.16"
+nrf-embassy = { version = "=0.1.0", path = "../nrf-embassy" }
+openhelmet-wire = { version = "=0.1.0", path = "../openhelmet-wire" }
+critical-section = "=1.2.0"
+
+[dev-dependencies]
+openhelmet-mesh = { version = "=0.1.0", path = "../openhelmet-mesh" }
+critical-section = { version = "=1.2.0", features = ["std"] }
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+embassy-nrf-esb = { version = "=0.1.0", path = "../vendor/embassy-nrf-esb", default-features = false, features = ["nrf52840", "fast-ru"] }
+embassy-nrf = { version = "=0.10.0", default-features = false, features = ["nrf52840", "gpiote", "rt", "time-driver-rtc1", "reset-pin-as-gpio", "unstable-pac"] }
+embassy-executor = { version = "=0.10.0", default-features = false, features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { version = "=0.5.1", default-features = false }
+embassy-usb = { version = "=0.6.0", default-features = false }
+embassy-usb-driver = "=0.2.0"
+embassy-sync = "=0.8.0"
+static_cell = "=2.1.1"
+cortex-m = { version = "=0.7.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "=0.7.5", features = ["set-sp", "set-vtor"] }
+panic-halt = "=1.0.0"
+
+[[bin]]
+name = "nrf-embassy-firmware"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = 2
+panic = "abort"
