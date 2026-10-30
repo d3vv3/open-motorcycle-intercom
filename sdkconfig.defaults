@@ -32,6 +32,10 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 
+# RTC fast RAM is ~6-20x slower; as heap it silently received the 12 KB audio
+# task stacks, halving playout speed. Keep task stacks in main SRAM.
+CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP=n
+
 # Bluetooth Classic A2DP sink and AVRCP phone controls
 CONFIG_BT_ENABLED=y
 CONFIG_BT_CONTROLLER_ENABLED=y
