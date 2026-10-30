@@ -13,7 +13,6 @@ idf_component_register(
         phone_audio
         mesh
         uart_bridge
-        hwtest
         power
         button
         esp_timer
