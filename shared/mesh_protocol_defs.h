@@ -2,9 +2,10 @@
  * @file mesh_protocol_defs.h
  * @brief Single source of truth for the OMI on-air mesh protocol.
  *
- * These definitions are shared verbatim by both transports:
+ * These definitions are shared by both transports:
  *   - ESP-NOW build  (components/mesh/include/mesh.h)
- *   - nRF52840/ESB   (nrf_mesh/include/mesh_protocol.h)
+ *   - nRF52840/ESB   (Rust port in rust/nrf-embassy and rust/openhelmet-wire;
+ *                     keep it byte-identical when changing this file)
  *
  * Only definitions that MUST be byte-identical on the wire live here. Anything
  * that legitimately differs per transport (e.g. the coordinator/peer address

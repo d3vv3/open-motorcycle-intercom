@@ -1,5 +1,4 @@
 #include "shared/mesh_adaptive.h"
-#include "shared/mesh_membership.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -261,12 +260,6 @@ static void test_routes_and_election(void)
     assert(mesh_adaptive_apply_membership(&s, 2, &new_term));
     assert(s.membership_revision_seen && s.membership_revision == 1);
     assert(!mesh_adaptive_tick(&s, 45, 14320));
-
-    mesh_membership_snapshot_t member = {.state = MESH_STATE_ACTIVE,
-        .role = MESH_ROLE_COORDINATOR, .node_id = 1, .coordinator_id = 1, .slot_index = 0};
-    assert(mesh_membership_apply_handover(&member, 1, 2, 2));
-    assert(member.role == MESH_ROLE_PARTICIPANT && member.slot_index == 0 && member.node_id == 1);
-    assert(!mesh_membership_apply_handover(&member, 2, 1, 2));
 }
 
 static void test_partition_and_silence(void)

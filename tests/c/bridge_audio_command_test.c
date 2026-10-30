@@ -1,5 +1,4 @@
 #include "shared/bridge_protocol_defs.h"
-#include "nrf_mesh/include/mesh_audio_delivery.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -60,24 +59,10 @@ static void test_local_audio_boundary(void)
     assert(bridge_audio_epoch_accept(epoch, epoch, enabled));
 }
 
-static void test_rf_receipt_cutoff(void)
-{
-    /* The stale frame stays in the RF RX ring until after resume, but its
-     * ISR timestamp precedes the new playback boundary. */
-    const int64_t stale_received_us = 1000;
-    const int64_t resume_cutoff_us = 3000;
-    assert(mesh_audio_delivery_allowed(true, stale_received_us, 0));
-    assert(!mesh_audio_delivery_allowed(false, 2000, 2000));
-    assert(!mesh_audio_delivery_allowed(true, stale_received_us, resume_cutoff_us));
-    assert(mesh_audio_delivery_allowed(true, resume_cutoff_us, resume_cutoff_us));
-    assert(mesh_audio_delivery_allowed(true, 3001, resume_cutoff_us));
-}
-
 int main(void)
 {
     test_commands();
     test_local_audio_boundary();
-    test_rf_receipt_cutoff();
     puts("bridge_audio_command_test: PASS");
     return 0;
 }
