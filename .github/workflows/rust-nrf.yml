@@ -1,0 +1,275 @@
+name: Rust nRF52840 firmware
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'rust/**'
+      - 'shared/**'
+      - 'components/mesh/include/**'
+      - 'tools/migration/nrf_proof.py'
+      - 'tools/release/build.py'
+      - 'tests/python/test_nrf_proof.py'
+      - 'tests/python/test_release_packaging.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/rust-nrf.yml'
+  pull_request:
+    branches: ['**']
+    paths:
+      - 'rust/**'
+      - 'shared/**'
+      - 'components/mesh/include/**'
+      - 'tools/migration/nrf_proof.py'
+      - 'tools/release/build.py'
+      - 'tests/python/test_nrf_proof.py'
+      - 'tests/python/test_release_packaging.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/rust-nrf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wire:
+    name: no_std wire codec
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target thumbv7em-none-eabihf
+
+      - name: Test wire codec against C
+        run: cargo +1.95.0 test --locked --manifest-path rust/openhelmet-wire/Cargo.toml
+
+      - name: Check no_std ARM library
+        run: cargo +1.95.0 check --locked --manifest-path rust/openhelmet-wire/Cargo.toml --target thumbv7em-none-eabihf --lib
+
+      - name: Check wire formatting
+        run: cargo +1.95.0 fmt --manifest-path rust/openhelmet-wire/Cargo.toml -- --check
+
+      - name: Lint wire codec and host tests
+        run: cargo +1.95.0 clippy --locked --manifest-path rust/openhelmet-wire/Cargo.toml --all-targets -- -D warnings
+
+  mesh-core:
+    name: Rust mesh owners (openhelmet-mesh)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target thumbv7em-none-eabihf
+
+      - name: Test Rust mesh contracts
+        run: cargo +1.95.0 test --locked --manifest-path rust/openhelmet-mesh/Cargo.toml -- --test-threads=1
+
+      - name: Check no_std ARM mesh library
+        run: cargo +1.95.0 check --locked --manifest-path rust/openhelmet-mesh/Cargo.toml --target thumbv7em-none-eabihf --lib
+
+      - name: Check mesh formatting
+        run: cargo +1.95.0 fmt --manifest-path rust/openhelmet-mesh/Cargo.toml -- --check
+
+      - name: Lint mesh core and host tests
+        run: cargo +1.95.0 clippy --locked --manifest-path rust/openhelmet-mesh/Cargo.toml --all-targets -- -D warnings
+
+  esb-noack:
+    name: Owning ESB NoAck software proof
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target thumbv7em-none-eabihf
+
+      - name: Test ESB library
+        run: cargo +1.95.0 test --locked --manifest-path rust/vendor/embassy-nrf-esb/Cargo.toml --lib
+
+      - name: Check no_std ARM ESB library
+        run: cargo +1.95.0 check --locked --manifest-path rust/vendor/embassy-nrf-esb/Cargo.toml --target thumbv7em-none-eabihf --lib
+
+      - name: Check ESB formatting
+        run: cargo +1.95.0 fmt --manifest-path rust/vendor/embassy-nrf-esb/Cargo.toml -- --check
+
+      - name: Lint ESB library and host tests
+        run: cargo +1.95.0 clippy --locked --manifest-path rust/vendor/embassy-nrf-esb/Cargo.toml --lib --tests -- -D warnings
+
+      - name: Test ESB documentation
+        run: cargo +1.95.0 test --locked --manifest-path rust/vendor/embassy-nrf-esb/Cargo.toml --doc
+
+  nrf-runtime-kernel:
+    name: nRF runtime actor kernel (no hardware or firmware-link proof)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target thumbv7em-none-eabihf
+
+      - name: Test runtime actor kernel
+        run: cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy/Cargo.toml --lib --tests
+
+      - name: Test runtime actor ownership documentation
+        run: cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy/Cargo.toml --doc
+
+      - name: Check no_std ARM runtime actor library
+        run: cargo +1.95.0 check --locked --manifest-path rust/nrf-embassy/Cargo.toml --lib --target thumbv7em-none-eabihf
+
+      - name: Check runtime actor formatting
+        run: cargo +1.95.0 fmt --manifest-path rust/nrf-embassy/Cargo.toml -- --check
+
+      - name: Lint runtime actor kernel and host tests
+        run: cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy/Cargo.toml --all-targets -- -D warnings
+
+  nrf-spi-integration:
+    name: nRF52840 Embassy firmware (ELF, UF2, feature matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.2
+
+      - name: Install Rust 1.95.0
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target thumbv7em-none-eabihf
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Test SPI integration host library
+        run: cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib
+
+      - name: Test SPI integration sync trace host library
+        run: cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features sync-trace
+
+      - name: Test SPI integration pipeline trace host library
+        run: |
+          cargo +1.95.0 test --locked \
+            --manifest-path rust/nrf-embassy-firmware/Cargo.toml \
+            --lib --features pipeline-trace
+
+      - name: Test SPI integration pipeline trace with legacy RTC timing and guarded completion retention
+        run: |
+          cargo +1.95.0 test --locked \
+            --manifest-path rust/nrf-embassy-firmware/Cargo.toml \
+            --lib --features pipeline-trace,legacy-rtc-timing,guarded-completion-retention
+
+      - name: Check SPI integration formatting
+        run: cargo +1.95.0 fmt --manifest-path rust/nrf-embassy-firmware/Cargo.toml -- --check
+
+      - name: Lint SPI integration host library and tests
+        run: cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests -- -D warnings
+
+      - name: Lint SPI integration sync trace host library and tests
+        run: cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features sync-trace -- -D warnings
+
+      - name: Build experimental SPI integration ARM ELF
+        run: cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf
+
+      - name: Lint SPI integration ARM binary
+        run: cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware -- -D warnings
+
+      # Structural checks only; not boot, hardware, or mesh qualification.
+      - name: Validate ELF and convert experimental SPI integration UF2
+        run: |
+          python3 tools/migration/nrf_proof.py \
+            rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware \
+            rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware.uf2
+
+      - name: Validate SPI integration UF2 with existing validator
+        run: |
+          uv run --frozen python - <<'PY'
+          from pathlib import Path
+          from tools.release.build import validate_uf2
+
+          uf2 = Path("rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware.uf2")
+          print(validate_uf2(uf2.read_bytes()))
+          PY
+
+      - name: Upload experimental SPI integration artifacts
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: live-protocol-hardware-unqualified
+          path: |
+            rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware
+            rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware.uf2
+          retention-days: 7
+          if-no-files-found: error
+
+      # Keep the uploaded default ELF/UF2 together; feature output is separate.
+      - name: Build experimental SPI integration sync trace ARM ELF
+        run: cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --features sync-trace --target-dir rust/nrf-embassy-firmware/target-sync-trace
+
+      - name: Lint SPI integration sync trace ARM binary
+        run: cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features sync-trace --target-dir rust/nrf-embassy-firmware/target-sync-trace -- -D warnings
+
+      # Static legacy timing experiments stay separate from uploaded default artifacts.
+      - name: Check SPI integration legacy RTC timing
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-legacy-rtc-timing
+        run: |
+          cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features legacy-rtc-timing
+          cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features legacy-rtc-timing -- -D warnings
+          cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features legacy-rtc-timing
+          cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features legacy-rtc-timing -- -D warnings
+
+      - name: Check SPI integration legacy RTC timing with sync trace
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-legacy-rtc-timing-sync-trace
+        run: |
+          cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features legacy-rtc-timing,sync-trace
+          cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features legacy-rtc-timing,sync-trace -- -D warnings
+          cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features legacy-rtc-timing,sync-trace
+          cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features legacy-rtc-timing,sync-trace -- -D warnings
+
+      # Retention experiments cover every trace/timing combination in isolated output.
+      - name: Check SPI integration guarded completion retention
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-guarded-completion-retention
+        run: |
+          cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features guarded-completion-retention
+          cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features guarded-completion-retention -- -D warnings
+          cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention
+          cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention -- -D warnings
+
+      - name: Check SPI integration guarded completion retention with sync trace
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-guarded-completion-retention-sync-trace
+        run: |
+          cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features guarded-completion-retention,sync-trace
+          cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features guarded-completion-retention,sync-trace -- -D warnings
+          cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention,sync-trace
+          cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention,sync-trace -- -D warnings
+
+      - name: Check SPI integration guarded completion retention with legacy RTC timing
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-guarded-completion-retention-legacy-rtc-timing
+        run: |
+          cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features guarded-completion-retention,legacy-rtc-timing
+          cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features guarded-completion-retention,legacy-rtc-timing -- -D warnings
+          cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention,legacy-rtc-timing
+          cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention,legacy-rtc-timing -- -D warnings
+
+      - name: Check SPI integration guarded completion retention with legacy RTC timing and sync trace
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-guarded-completion-retention-legacy-rtc-timing-sync-trace
+        run: |
+          cargo +1.95.0 test --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --features guarded-completion-retention,legacy-rtc-timing,sync-trace
+          cargo +1.95.0 clippy --locked --manifest-path rust/nrf-embassy-firmware/Cargo.toml --lib --tests --features guarded-completion-retention,legacy-rtc-timing,sync-trace -- -D warnings
+          cargo +1.95.0 build --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention,legacy-rtc-timing,sync-trace
+          cargo +1.95.0 clippy --locked --release --manifest-path rust/nrf-embassy-firmware/Cargo.toml --target thumbv7em-none-eabihf --bin nrf-embassy-firmware --features guarded-completion-retention,legacy-rtc-timing,sync-trace -- -D warnings
+
+      - name: Build SPI integration pipeline trace ARM ELF with legacy RTC timing and guarded completion retention
+        env:
+          CARGO_TARGET_DIR: rust/nrf-embassy-firmware/target-pipeline-trace-legacy-rtc-timing-guarded-completion-retention
+        run: |
+          cargo +1.95.0 build --locked --release \
+            --manifest-path rust/nrf-embassy-firmware/Cargo.toml \
+            --target thumbv7em-none-eabihf \
+            --features pipeline-trace,legacy-rtc-timing,guarded-completion-retention

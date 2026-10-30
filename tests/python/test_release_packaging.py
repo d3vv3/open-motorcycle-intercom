@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-import os
+from pathlib import Path
 import struct
 import subprocess
 import zipfile
@@ -14,13 +14,14 @@ from tools.release import build
 
 VERSION = "0.2.0-alpha.1"
 SHA = "a" * 40
+# build.rs rows rendered into .integration_metadata from OMI_FIRMWARE_VERSION/OMI_GIT_SHA.
+NRF_IDENTITY = f"version={VERSION}\nsource_sha={SHA}\n".encode()
 
 
 def uf2(address=0x27000, size=256, family=0xADA52840, number=0, total=1):
     block = bytearray(512)
     struct.pack_into("<8I", block, 0, 0x0A324655, 0x9E5D5157, 0x2000, address, size, number, total, family)
-    block[32:32 + len(VERSION) + 1] = VERSION.encode() + b"\0"
-    block[96:137] = SHA.encode() + b"\0"
+    block[32:32 + len(NRF_IDENTITY)] = NRF_IDENTITY
     struct.pack_into("<I", block, 508, 0x0AB16F30)
     return bytes(block)
 
@@ -54,11 +55,11 @@ def inputs(tmp_path):
     (esp / "sdkconfig").write_text('CONFIG_IDF_TARGET="esp32s31"\nCONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x2000\nCONFIG_PARTITION_TABLE_OFFSET=0x8000\nCONFIG_ESPTOOLPY_FLASHSIZE="16MB"\n')
     elf = b"ELF\0" + VERSION.encode() + b"\0" + SHA.encode() + b"\0"
     (esp / "omi.elf").write_bytes(elf)
-    (nrf / "zephyr.elf").write_bytes(elf)
+    (nrf / "zephyr.elf").write_bytes(b"ELF\0" + NRF_IDENTITY)
     (nrf / "zephyr.uf2").write_bytes(uf2())
     (esp / "project_description.json").write_text(json.dumps({"target": "esp32s31", "project_version": VERSION, "app_bin": "omi.bin"}))
     (esp / "flasher_args.json").write_text(json.dumps({"extra_esptool_args": {"chip": "esp32s31", "before": "default_reset", "after": "hard_reset"}, "flash_settings": {"flash_mode": "dio", "flash_freq": "80m", "flash_size": "16MB"}, "flash_files": {"0x2000": "bootloader/bootloader.bin", "0x8000": "partition_table/partition-table.bin", "0xf000": "extra/phy.bin", "0x10000": "omi.bin"}, "bootloader": {"offset": "0x2000", "file": "bootloader/bootloader.bin"}, "partition-table": {"offset": "0x8000", "file": "partition_table/partition-table.bin"}, "app": {"offset": "0x10000", "file": "omi.bin"}}))
-    for name in ("west-frozen.yml", "west-resolved.txt", "west-input.yml", "idf-commit.txt", "idf-version.txt", "sdkconfig", "dependencies.lock"):
+    for name in ("rustc-version.txt", "Cargo.lock", "nrf-build-argv.json", "idf-commit.txt", "idf-version.txt", "sdkconfig", "dependencies.lock"):
         (provenance / name).write_text("captured\n")
     (provenance / "release-tools-source-sha.txt").write_text("c" * 40 + "\n")
     (provenance / "idf-version.txt").write_text("ESP-IDF v6.1-dev\n")
@@ -66,48 +67,202 @@ def inputs(tmp_path):
 
 
 def package(inputs, output):
-    return build.package(*inputs, output, VERSION, SHA, "esp32s31", {"esp": build.ESP_IMAGE, "nrf": build.NCS_IMAGE})
+    return build.package(*inputs, output, VERSION, SHA, "esp32s31", {"esp": build.ESP_IMAGE})
 
 
-@pytest.fixture
-def legacy_inputs(inputs):
+def uf2_with_policy_field(field, clock=True):
+    """Put the policy key itself across two contiguous 256-byte payloads."""
+    first = bytearray(uf2(total=2))
+    second = bytearray(uf2(number=1, total=2, address=0x27100))
+    second[32:288] = b"\0" * 256
+    prefix = b"identity clock_origin=shared-timer0 " if clock else b"identity "
+    row = prefix + field + b"\n"
+    start = 248 - len(prefix)
+    # Pad short implicit-policy rows to preserve the complete UF2 block.
+    first[32 + start:288] = row[:256 - start].ljust(256 - start, b"\0")
+    tail = row[256 - start:]
+    second[32:32 + len(tail)] = tail
+    # Reverse transport order to exercise address-based reconstruction too.
+    return bytes(second + first)
+
+
+@pytest.mark.parametrize("clock", [False, True])
+@pytest.mark.parametrize("policy", [b"RetainGuardedCompletion", b"FutureExperimentalPolicy"])
+def test_package_gates_reconstructed_nrf_policy(inputs, tmp_path, clock, policy):
+    field = b"completion_policy=" + policy
+    data = uf2_with_policy_field(field, clock)
+    assert field not in data
+    assert field in build.uf2_payload(data)
+    (inputs[2] / "zephyr.uf2").write_bytes(data)
+    output = tmp_path / "release"
+    if clock and policy == b"FutureExperimentalPolicy":
+        with pytest.raises(ValueError, match="^experimental nRF completion policy is not release-qualified$"):
+            package(inputs, output)
+        assert not output.exists()
+    else:
+        package(inputs, output)
+
+
+@pytest.mark.parametrize("field", [
+    b"completion_policy=StrictSoftwareDeadline",
+    b"firmware_version=RetainGuardedCompletion completion_policy=StrictSoftwareDeadline",
+    b"",  # Historical identity with implicit policy.
+    b"RetainGuardedCompletion",  # An enum name is not a policy field.
+])
+def test_package_accepts_strict_or_implicit_nrf_policy(inputs, tmp_path, field):
+    (inputs[2] / "zephyr.uf2").write_bytes(uf2_with_policy_field(field))
+    # Debug ELF strings do not describe the executing image's policy.
+    with (inputs[2] / "zephyr.elf").open("ab") as elf:
+        elf.write(b"\0completion_policy=RetainGuardedCompletion\nRetainGuardedCompletion\0")
+    package(inputs, tmp_path / "release")
+
+
+def test_prebuilt_packages_bench_artifacts_without_source_identity(inputs, tmp_path):
+    """Bench images keep their own identity rows; Zephyr/IDF provenance is not required."""
     source, esp, nrf, provenance = inputs
-    for name in ("bridge", "mesh"):
-        (source / "shared" / f"{name}_protocol_defs.h").write_text(f"#define {name.upper()}_PROTOCOL_VERSION 2\n")
-    description_path = esp / "project_description.json"
-    description = json.loads(description_path.read_text())
-    description.update(target="esp32s3", project_version="0.1.0")
-    description_path.write_text(json.dumps(description))
-    (provenance / "idf-version.txt").write_text("ESP-IDF v5.5.2\n")
-    app = bytearray((esp / "omi.bin").read_bytes())
-    app[48:80] = b"0.1.0".ljust(32, b"\0")
-    (esp / "omi.bin").write_bytes(app)
-    (esp / "sdkconfig").write_text('CONFIG_IDF_TARGET="esp32s3"\nCONFIG_BOOTLOADER_OFFSET_IN_FLASH=0x0\nCONFIG_PARTITION_TABLE_OFFSET=0x8000\nCONFIG_ESPTOOLPY_FLASHSIZE="8MB"\n')
-    path = esp / "flasher_args.json"
-    flasher = json.loads(path.read_text())
-    flasher["extra_esptool_args"]["chip"] = "esp32s3"
-    flasher["flash_settings"]["flash_size"] = "8MB"
-    flasher["bootloader"]["offset"] = "0x0"
-    flasher["flash_files"]["0x0"] = flasher["flash_files"].pop("0x2000")
-    path.write_text(json.dumps(flasher))
-    identity = f"*** Booting Zephyr OS build 0.1.0+{SHA} ***\n\0".encode()
-    (nrf / "zephyr.elf").write_bytes(b"ELF\0" + identity)
-    block = bytearray(uf2())
-    block[32:288] = identity.ljust(256, b"\0")
-    (nrf / "zephyr.uf2").write_bytes(block)
-    return inputs
+    for name in ("omi.bin", "omi.elf"):
+        (esp / name).write_bytes((esp / name).read_bytes().replace(SHA.encode(), b"9" * 40))
+    (nrf / "zephyr.elf").write_bytes(b"ELF\0version=0.1.0 source_HEAD=unavailable\0")
+    (nrf / "zephyr.uf2").write_bytes(uf2_with_policy_field(b"completion_policy=RetainGuardedCompletion"))
+    for path in provenance.iterdir():
+        if path.name != "release-tools-source-sha.txt":
+            path.unlink()
+    with pytest.raises(ValueError, match="^nRF firmware version/source SHA mismatch$"):
+        package(inputs, tmp_path / "strict")
+    prebuilt = {"esp": esp, "nrf": nrf}
+    build.package(*inputs, tmp_path / "release", VERSION, SHA, "esp32s31", {}, prebuilt)
+    manifest = json.loads((tmp_path / "release/manifest.json").read_text())
+    assert manifest["prebuilt"] == {"esp": str(esp), "nrf": str(nrf)}
+    assert manifest["nrf_toolchain"] is None and manifest["idf_version"] == "prebuilt"
+    assert manifest["reproducibility"].startswith("Prebuilt bench artifacts")
+    assert (tmp_path / "release" / f"omi-{VERSION}-nrf52840.uf2").read_bytes() == (nrf / "zephyr.uf2").read_bytes()
+    # Experimental gates still apply to prebuilt images.
+    (nrf / "zephyr.uf2").write_bytes(uf2_with_policy_field(b"completion_policy=FutureExperimentalPolicy"))
+    with pytest.raises(ValueError, match="^experimental nRF completion policy is not release-qualified$"):
+        build.package(*inputs, tmp_path / "rejected", VERSION, SHA, "esp32s31", {}, prebuilt)
 
 
-def test_legacy_package_preserves_identity_and_experimental_status(legacy_inputs, tmp_path):
-    output = tmp_path / "legacy"
-    build.package(*legacy_inputs, output, "0.1.0", SHA, "esp32s3", {"esp": build.LEGACY_ESP_IMAGE})
-    manifest = json.loads((output / "manifest.json").read_text())
-    assert manifest["version"] == "0.1.0"
-    assert manifest["source_sha"] == SHA
-    assert manifest["idf_version"] == "ESP-IDF v5.5.2"
-    assert manifest["experimental"] is True
-    assert manifest["classic_bluetooth"] is False
-    assert manifest["s31_lc3_interoperable"] is False
+@pytest.mark.parametrize("kwargs,message", [
+    ({"family": 0}, "family flash blocks"),
+    ({"address": 0x26FFF}, "application boundary"),
+    ({"total": 3}, "sequence"),
+])
+def test_uf2_validation_precedes_completion_policy_gate(inputs, tmp_path, kwargs, message):
+    data = bytearray(uf2_with_policy_field(b"completion_policy=FutureExperimentalPolicy"))
+    for name, value in kwargs.items():
+        offset = {"family": 28, "address": 12, "total": 24}[name]
+        struct.pack_into("<I", data, offset, value)
+    (inputs[2] / "zephyr.uf2").write_bytes(data)
+    with pytest.raises(ValueError, match=message):
+        package(inputs, tmp_path / "release")
+    assert not (tmp_path / "release").exists()
+
+
+EARLY_TIMING_FIELD = b"early_timing_service=EarlyTimingServiceExperimental"
+SAME_SLOT_REFIT_FIELD = b"same_slot_audio_refit=SameSlotAudioRefitExperimental"
+NONBLOCKING_BRIDGE_FIELD = b"nonblocking_bridge_delivery=NonblockingBridgeDeliveryExperimental"
+UNMASKED_BRIDGE_FIELD = b"unmasked_bridge_owner=UnmaskedBridgeOwnerExperimental"
+ADMISSION_HEADROOM_FIELD = b"admission_headroom=AdmissionHeadroomExperimental"
+STRICT_COMPLETION_ROW = b"clock_origin=shared-timer0 completion_policy=StrictSoftwareDeadline\n"
+
+
+def uf2_with_experimental_field(field, split=False):
+    if split:
+        data = bytearray(uf2_with_policy_field(field))
+        first = 512  # The lower-address block is last in transport order.
+    else:
+        data = bytearray(uf2())
+        first = 0
+        assert len(field) + 1 <= 256 - 184
+        data[32 + 184:32 + 184 + len(field) + 1] = field + b"\n"
+    data[first + 32 + 112:first + 32 + 112 + len(STRICT_COMPLETION_ROW)] = STRICT_COMPLETION_ROW
+    return bytes(data)
+
+
+@pytest.mark.parametrize("location,split", [
+    ("elf", False), ("payload", False), ("both", False),
+    ("payload", True), ("both", True),
+])
+@pytest.mark.parametrize("marker,message", [
+    (EARLY_TIMING_FIELD, "early timing service"),
+    (SAME_SLOT_REFIT_FIELD, "same-slot audio refit"),
+])
+def test_package_rejects_experimental_marker_with_strict_completion(inputs, tmp_path, location, split, marker, message):
+    elf = inputs[2] / "zephyr.elf"
+    elf.write_bytes(elf.read_bytes() + STRICT_COMPLETION_ROW
+                    + (marker + b"\n" if location in ("elf", "both") else b""))
+    field = marker if location in ("payload", "both") else b""
+    data = uf2_with_experimental_field(field, split)
+    if split:
+        assert marker not in data
+        assert marker in build.uf2_payload(data)
+    (inputs[2] / "zephyr.uf2").write_bytes(data)
+    output = tmp_path / "release"
+    with pytest.raises(ValueError, match=f"^experimental nRF {message} is not release-qualified$"):
+        package(inputs, output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("field", [
+    b"",  # Default OFF: strict completion without the experimental marker.
+    NONBLOCKING_BRIDGE_FIELD,  # Bench-proven; release-qualified.
+    UNMASKED_BRIDGE_FIELD,
+    ADMISSION_HEADROOM_FIELD,
+    b"EarlyTimingServiceExperimental",  # A debug enum name is not a field.
+    b"other=EarlyTimingServiceExperimental",
+    b"other=" + EARLY_TIMING_FIELD,
+    b"prefix_" + EARLY_TIMING_FIELD,
+    EARLY_TIMING_FIELD + b"Suffix",
+    EARLY_TIMING_FIELD[:-1],
+    b"SameSlotAudioRefitExperimental",
+    b"other=SameSlotAudioRefitExperimental",
+    b"other=" + SAME_SLOT_REFIT_FIELD,
+    b"prefix_" + SAME_SLOT_REFIT_FIELD,
+    SAME_SLOT_REFIT_FIELD + b"Suffix",
+    SAME_SLOT_REFIT_FIELD[:-1],
+    b"NonblockingBridgeDeliveryExperimental",
+    b"other=NonblockingBridgeDeliveryExperimental",
+    b"other=" + NONBLOCKING_BRIDGE_FIELD,
+    b"prefix_" + NONBLOCKING_BRIDGE_FIELD,
+    NONBLOCKING_BRIDGE_FIELD + b"Suffix",
+    NONBLOCKING_BRIDGE_FIELD[:-1],
+    b"UnmaskedBridgeOwnerExperimental",
+    b"other=UnmaskedBridgeOwnerExperimental",
+    b"other=" + UNMASKED_BRIDGE_FIELD,
+    b"prefix_" + UNMASKED_BRIDGE_FIELD,
+    UNMASKED_BRIDGE_FIELD + b"Suffix",
+    UNMASKED_BRIDGE_FIELD[:-1],
+    b"AdmissionHeadroomExperimental",
+    b"other=AdmissionHeadroomExperimental",
+    b"other=" + ADMISSION_HEADROOM_FIELD,
+    b"prefix_" + ADMISSION_HEADROOM_FIELD,
+    ADMISSION_HEADROOM_FIELD + b"Suffix",
+    ADMISSION_HEADROOM_FIELD[:-1],
+])
+def test_package_accepts_strict_completion_without_exact_experimental_marker(inputs, tmp_path, field):
+    elf = inputs[2] / "zephyr.elf"
+    elf.write_bytes(elf.read_bytes() + STRICT_COMPLETION_ROW + field + b"\n")
+    (inputs[2] / "zephyr.uf2").write_bytes(uf2_with_experimental_field(field, split=True))
+    assert len(package(inputs, tmp_path / "release")) == 5
+
+
+@pytest.mark.parametrize("marker", [EARLY_TIMING_FIELD, SAME_SLOT_REFIT_FIELD])
+def test_experimental_marker_is_not_joined_across_flash_address_gap(inputs, tmp_path, marker):
+    data = bytearray(uf2_with_experimental_field(marker, split=True))
+    struct.pack_into("<I", data, 12, 0x27200)
+    assert marker not in build.uf2_payload(data)
+    (inputs[2] / "zephyr.uf2").write_bytes(data)
+    package(inputs, tmp_path / "release")
+
+
+def test_policy_field_is_not_joined_across_flash_address_gap(inputs, tmp_path):
+    data = bytearray(uf2_with_policy_field(b"completion_policy=FutureExperimentalPolicy", clock=False))
+    # The first transport block is the higher-address payload. Leave a flash gap
+    # where the policy key was split, so it is no longer a complete field.
+    struct.pack_into("<I", data, 12, 0x27200)
+    assert b"completion_policy=FutureExperimentalPolicy" not in build.uf2_payload(data)
+    (inputs[2] / "zephyr.uf2").write_bytes(data)
+    package(inputs, tmp_path / "release")
 
 
 def test_manifest_idf_version_uses_stripped_provenance_not_project_description(inputs, tmp_path):
@@ -126,34 +281,6 @@ def test_reject_whitespace_only_idf_version_provenance(inputs, tmp_path):
     with pytest.raises(ValueError, match="Empty ESP-IDF version provenance"):
         package(inputs, tmp_path / "release")
     assert not (tmp_path / "release").exists()
-
-
-@pytest.mark.parametrize("name", ["zephyr.elf", "zephyr.uf2"])
-def test_legacy_rejects_identity_mismatch_in_elf_and_uf2(legacy_inputs, tmp_path, name):
-    path = legacy_inputs[2] / name
-    path.write_bytes(path.read_bytes().replace(SHA.encode(), b"b" * 40))
-    with pytest.raises(ValueError, match="Legacy Zephyr build version/source SHA mismatch"):
-        build.package(*legacy_inputs, tmp_path / "legacy", "0.1.0", SHA, "esp32s3", {})
-
-
-@pytest.mark.parametrize("name", ["zephyr.elf", "zephyr.uf2"])
-@pytest.mark.parametrize("replacement", [
-    f"0.1.0+{SHA}\0".encode(),
-    f"*** Booting Zephyr OS build 0.1.0+{SHA}x ***\n\0".encode(),
-    f"*** Booting Zephyr OS build 0.1.0+{SHA} ***\0".encode(),
-])
-def test_legacy_requires_complete_standard_banner(legacy_inputs, tmp_path, name, replacement):
-    banner = f"*** Booting Zephyr OS build 0.1.0+{SHA} ***\n\0".encode()
-    path = legacy_inputs[2] / name
-    # Keep the UF2 block length unchanged while replacing its embedded string.
-    if name.endswith(".uf2"):
-        data = bytearray(path.read_bytes())
-        data[32:288] = replacement.ljust(256, b"\0")
-        path.write_bytes(data)
-    else:
-        path.write_bytes(path.read_bytes().replace(banner, replacement))
-    with pytest.raises(ValueError, match="Legacy Zephyr build version/source SHA mismatch"):
-        build.package(*legacy_inputs, tmp_path / "legacy", "0.1.0", SHA, "esp32s3", {})
 
 
 @pytest.mark.parametrize("role", ["bootloader", "partition-table", "app"])
@@ -247,13 +374,14 @@ def test_package_preserves_all_flash_paths_offsets_provenance_and_hashes(inputs,
     with zipfile.ZipFile(output / f"omi-{VERSION}-debug.zip") as archive:
         assert archive.read("nrf/zephyr.elf")
         assert archive.read("esp/omi.elf")
-        assert archive.read("provenance/west-frozen.yml")
+        assert archive.read("provenance/Cargo.lock")
         assert archive.read("provenance/dependencies.lock")
-        assert archive.read("provenance/west-input.yml") == (inputs[3] / "west-input.yml").read_bytes()
+        assert archive.read("provenance/rustc-version.txt") == (inputs[3] / "rustc-version.txt").read_bytes()
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["source_sha"] == SHA
     assert manifest["release_tools_source_sha"] == "c" * 40
-    assert manifest["ncs_input_manifest"]["sha256"] == hashlib.sha256((inputs[3] / "west-input.yml").read_bytes()).hexdigest()
+    assert manifest["esp_identity"] == "app-descriptor-version-only"
+    assert manifest["nrf_toolchain"]["sha256"] == hashlib.sha256((inputs[3] / "rustc-version.txt").read_bytes()).hexdigest()
     assert manifest["protocol_versions"] == {"bridge": 6, "mesh": 5}
     for name, metadata in manifest["assets"].items():
         assert metadata["sha256"] == hashlib.sha256((output / name).read_bytes()).hexdigest()
@@ -308,13 +436,13 @@ def test_uf2_identity_spanning_transport_blocks():
     first = bytearray(uf2(total=2))
     second = bytearray(uf2(number=1, total=2, address=0x27100))
     identity = SHA.encode() + b"\0"
-    first[96:137] = b"\0" * 41
-    second[96:137] = b"\0" * 41
+    first[32:32 + len(NRF_IDENTITY)] = (VERSION.encode() + b"\0").ljust(len(NRF_IDENTITY), b"\0")
     first[32 + 240:32 + 256] = identity[:16]
     second[32:32 + 25] = identity[16:]
     data = bytes(second + first)
     build.validate_uf2(data)
-    build.validate_identity(build.uf2_payload(data), VERSION, SHA)
+    payload = build.uf2_payload(data)
+    assert VERSION.encode() + b"\0" in payload and identity in payload
 
 
 @pytest.mark.parametrize("offset", [0, 4, 508])
@@ -350,12 +478,25 @@ def test_wrong_binary_version(inputs, tmp_path):
         package(inputs, tmp_path / "release")
 
 
-@pytest.mark.parametrize("index,name", [(1, "omi.elf"), (2, "zephyr.elf"), (2, "zephyr.uf2")])
+@pytest.mark.parametrize("index,name", [(2, "zephyr.elf"), (2, "zephyr.uf2")])
 def test_wrong_current_source_sha(inputs, tmp_path, index, name):
     path = inputs[index] / name
     path.write_bytes(path.read_bytes().replace(SHA.encode(), b"b" * 40))
     with pytest.raises(ValueError, match="source SHA mismatch"):
         package(inputs, tmp_path / "release")
+
+
+def test_c_esp_image_needs_no_embedded_source_sha(inputs, tmp_path):
+    """The pure-C S31 image carries only the app-descriptor version."""
+    for name in ("omi.bin", "omi.elf"):
+        path = inputs[1] / name
+        path.write_bytes(path.read_bytes().replace(SHA.encode(), b"\0" * 40))
+    package(inputs, tmp_path / "release")
+
+
+def test_reject_unsupported_profile(inputs, tmp_path):
+    with pytest.raises(ValueError, match="Unsupported release profile"):
+        build.package(*inputs, tmp_path / "release", VERSION, SHA, "esp32s3", {})
 
 
 def test_missing_provenance(inputs, tmp_path):
@@ -386,93 +527,64 @@ def test_snapshot_excludes_dirty_and_ignored_inputs(tmp_path):
     assert not (source / "untracked").exists()
 
 
-def test_build_commands_have_sysbuild_child_metadata_and_fresh_sdkconfig(tmp_path, monkeypatch):
-    calls = []
+def test_build_commands_have_fresh_sdkconfig_and_host_cargo_nrf(tmp_path, monkeypatch):
+    calls, cargo = [], []
     monkeypatch.setattr(build, "docker", lambda *args: calls.append(args))
     monkeypatch.setattr(build, "run", lambda *args: "c" * 40)
-    build.build(tmp_path, VERSION, SHA, "esp32s31", build.ESP_IMAGE, build.NCS_IMAGE)
-    esp_script, nrf_script = calls[0][2], calls[1][2]
+    monkeypatch.setattr(build, "cargo_nrf", lambda *args: cargo.append(args))
+    build.build(tmp_path, VERSION, SHA, build.ESP_IMAGE)
+    assert len(calls) == 1
+    esp_script = calls[0][2]
     assert esp_script.startswith('. "${IDF_PATH:-/opt/esp/idf}/export.sh"\n')
     assert "-DSDKCONFIG=/work/esp-sdkconfig" in esp_script
-    assert "sdkconfig.release.esp32s31.defaults" in esp_script
+    assert "-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults " in esp_script
+    assert "-DIDF_TARGET=esp32s31" in esp_script and "idf.py --preview " in esp_script
+    assert "OMI_GIT_SHA" not in esp_script and "rust_embassy" not in esp_script
     for name in build.ON_OPTIONS:
         assert f"-D{name}=ON" in esp_script
     for name in build.OFF_OPTIONS:
         assert f"-D{name}=OFF" in esp_script
-    for name in ("S31_TASK_CPU_PROFILE", "S31_MESH_COEX_PREFER_WIFI", "S31_MESH_PAIR_UNICAST"):
+    for name in ("ESP_LC3_BENCH", "S31_LC3_WIRE", "S31_LC3_SELFTEST", "S31_LC3_SERIALIZE",
+                 "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER"):
+        assert f"-D{name}=ON" in esp_script
+    for name in ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_TASK_CPU_PROFILE",
+                 "S31_MESH_COEX_PREFER_WIFI", "S31_MESH_PAIR_UNICAST"):
         assert f"-D{name}=OFF" in esp_script
     assert calls[0][3]["OMI_ESP_LC3_BENCH"] == "1"
-    assert "west update --narrow -o=--depth=1" in nrf_script
-    assert "west init -l /work/ncs/release-manifest" in nrf_script
-    assert nrf_script.startswith('export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"\n. /opt/toolchain-env.sh\n')
-    assert "west manifest --freeze --active-only" in nrf_script
-    assert "west list -f '{name}'" in nrf_script
-    assert 'if [ "$project" != manifest ]' in nrf_script
-    assert "west list --all" not in nrf_script
-    assert "west build --sysbuild -b xiao_ble/nrf52840" in nrf_script
-    assert f"-Dnrf_mesh_OMI_FIRMWARE_VERSION={VERSION}" in nrf_script
-    assert f"-Dnrf_mesh_OMI_GIT_SHA={SHA}" in nrf_script
-    assert "-Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y" in nrf_script
-    assert "CONFIG_NCS_BOOT_BANNER" not in nrf_script
-    assert "-Dnrf_mesh_CONFIG_BOOT_BANNER=y" not in nrf_script
-    expected_manifest = (build.ROOT / "tools/release/ncs-v3.4.1.yml").read_bytes()
-    assert (tmp_path / "ncs/release-manifest/west.yml").read_bytes() == expected_manifest
-    assert (tmp_path / "provenance/west-input.yml").read_bytes() == expected_manifest
+    assert cargo == [(tmp_path, VERSION, SHA)]
     assert (tmp_path / "provenance/release-tools-source-sha.txt").read_text() == "c" * 40 + "\n"
 
 
-def test_legacy_commands_generate_metadata_without_source_patch(tmp_path, monkeypatch):
-    calls = []
-    monkeypatch.setattr(build, "docker", lambda *args: calls.append(args))
-    monkeypatch.setattr(build, "run", lambda *args: "c" * 40)
-    build.build(tmp_path, "0.1.0", build.LEGACY_SHA, "esp32s3", build.ESP_IMAGE, build.NCS_IMAGE)
-    assert "-DPROJECT_VER=0.1.0" in calls[0][2]
-    assert "-DESP_LC3_BENCH=ON" not in calls[0][2]
-    script = calls[1][2]
-    assert script.index('export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"') < script.index(". /opt/toolchain-env.sh") < script.index("west init")
-    configure = "west build --sysbuild --cmake-only -b xiao_ble/nrf52840 /work/source/nrf_mesh -d /work/nrf -- -Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y -Dnrf_mesh_CONFIG_NCS_BOOT_BANNER=n -Dnrf_mesh_CONFIG_BOOT_BANNER=y"
-    reconfigure = f"cmake -S /work/source/nrf_mesh -B /work/nrf/nrf_mesh -DBUILD_VERSION:STRING=0.1.0+{build.LEGACY_SHA}"
-    compile = "cmake --build /work/nrf"
-    assert script.index(configure) < script.index(reconfigure) < script.index(compile)
-    assert "nrf_mesh_BUILD_VERSION" not in script
-    assert "CONFIG_BUILD_VERSION" not in script
-    assert not (tmp_path / "extra.conf").exists()
-    expected_manifest = (build.ROOT / "tools/release/ncs-v2.7.0.yml").read_bytes()
-    assert (tmp_path / "ncs/release-manifest/west.yml").read_bytes() == expected_manifest
-    assert (tmp_path / "provenance/west-input.yml").read_bytes() == expected_manifest
+def test_cargo_nrf_builds_archived_crate_with_release_identity_and_records_provenance(tmp_path, monkeypatch):
+    crate = tmp_path / "source" / build.NRF_FIRMWARE
+    crate.mkdir(parents=True)
+    (crate / "Cargo.lock").write_text("locked\n")
+    (tmp_path / "provenance").mkdir()
+    runs = []
 
+    def fake_run(argv, **kwargs):
+        runs.append((argv, kwargs))
+        if argv[0] == "cargo":
+            out = Path(kwargs["env"]["CARGO_TARGET_DIR"]) / build.NRF_TARGET / "release"
+            out.mkdir(parents=True)
+            (out / "nrf-embassy-firmware").write_bytes(b"ELF\0" + NRF_IDENTITY)
+            return None
+        return subprocess.CompletedProcess(argv, 0, stdout="rustc 1.95.0\n")
 
-def test_driver_manifest_is_used_even_when_archive_contains_different_input(tmp_path, monkeypatch):
-    archived_manifest = tmp_path / "source/tools/release/ncs-v2.7.0.yml"
-    archived_manifest.parent.mkdir(parents=True)
-    archived_manifest.write_text("not a release-driver input\n")
-    monkeypatch.setattr(build, "docker", lambda *args: None)
-    monkeypatch.setattr(build, "run", lambda *args: "c" * 40)
-    build.build(tmp_path, "0.1.0", build.LEGACY_SHA, "esp32s3", build.LEGACY_ESP_IMAGE, build.NCS_IMAGE)
-    assert (tmp_path / "provenance/west-input.yml").read_bytes() == (build.ROOT / "tools/release/ncs-v2.7.0.yml").read_bytes()
-
-
-@pytest.mark.parametrize("profile,version,sha", [("esp32s31", VERSION, SHA), ("esp32s3", "0.1.0", build.LEGACY_SHA)])
-def test_generated_nrf_initialization_exposes_tools_with_unset_library_path(tmp_path, monkeypatch, profile, version, sha):
-    calls = []
-    monkeypatch.setattr(build, "docker", lambda *args: calls.append(args))
-    monkeypatch.setattr(build, "run", lambda *args: "c" * 40)
-    build.build(tmp_path, version, sha, profile, build.ESP_IMAGE, build.NCS_IMAGE)
-    prefix = calls[1][2].split("west init", 1)[0]
-    tools = tmp_path / "fixture-tools"
-    tools.mkdir()
-    west = tools / "west"
-    west.write_text("#!/bin/sh\nprintf '%s' fixture-west\n")
-    west.chmod(0o755)
-    setup = tmp_path / "toolchain-env.sh"
-    setup.write_text(f'test "${{LD_LIBRARY_PATH+x}}" = x\nexport LD_LIBRARY_PATH="${{LD_LIBRARY_PATH}}:/fixture/lib"\nexport PATH="{tools}:$PATH"\n')
-    # Substitute only the fixture location; execute the generated initialization itself.
-    script = prefix.replace("/opt/toolchain-env.sh", str(setup)) + "west --version"
-    env = os.environ.copy()
-    env.pop("LD_LIBRARY_PATH", None)
-    env["BASH_ENV"] = ""
-    result = subprocess.run(["/bin/bash", "-euc", script], env=env, capture_output=True, text=True, check=True)
-    assert result.stdout == "fixture-west"
+    monkeypatch.setattr(build.subprocess, "run", fake_run)
+    monkeypatch.setattr(build.nrf_proof, "elf_to_uf2", lambda elf: b"uf2:" + elf)
+    build.cargo_nrf(tmp_path, VERSION, SHA)
+    cargo_argv, cargo_kwargs = runs[0]
+    assert cargo_argv == ["cargo", "build", "--locked", "--release", "--target", build.NRF_TARGET]
+    assert cargo_kwargs["cwd"] == crate and cargo_kwargs["check"]
+    assert cargo_kwargs["env"]["OMI_FIRMWARE_VERSION"] == VERSION and cargo_kwargs["env"]["OMI_GIT_SHA"] == SHA
+    assert cargo_kwargs["env"]["CARGO_TARGET_DIR"] == str(tmp_path / "nrf-target")
+    assert runs[1][0] == ["rustc", "-vV"] and runs[1][1]["cwd"] == crate
+    assert (tmp_path / "nrf/zephyr.elf").read_bytes() == b"ELF\0" + NRF_IDENTITY
+    assert (tmp_path / "nrf/zephyr.uf2").read_bytes() == b"uf2:ELF\0" + NRF_IDENTITY
+    assert (tmp_path / "provenance/rustc-version.txt").read_text() == "rustc 1.95.0\n"
+    assert (tmp_path / "provenance/Cargo.lock").read_text() == "locked\n"
+    assert json.loads((tmp_path / "provenance/nrf-build-argv.json").read_text()) == cargo_argv
 
 
 def test_explicit_work_directory_is_retained_on_failure_and_not_reused(tmp_path):
@@ -493,7 +605,7 @@ def test_default_scratch_is_removed(tmp_path):
     assert not scratch.exists()
 
 
-@pytest.mark.parametrize("name", ["west-input.yml", "release-tools-source-sha.txt"])
+@pytest.mark.parametrize("name", ["rustc-version.txt", "release-tools-source-sha.txt"])
 def test_missing_driver_provenance_fails_before_packaging(inputs, tmp_path, name):
     (inputs[3] / name).unlink()
     with pytest.raises(ValueError, match="Missing or empty"):
@@ -507,49 +619,8 @@ def test_require_digest_pinned_builder(image):
         build.pinned(image)
 
 
-@pytest.fixture
-def ncs_docker_fixture(monkeypatch, tmp_path):
-    """Execute the effective shell argv using the reported NCS image entrypoint."""
-    real_run = subprocess.run
-    results = []
-    startup = tmp_path / "non-interactive-setup.sh"
-    startup.write_text("exit 24\n")
-    monkeypatch.setenv("BASH_ENV", str(startup))
-
-    def fake_docker_run(args, **kwargs):
-        assert args[:2] == ["docker", "run"]
-        image_index = next(i for i, arg in enumerate(args) if "@sha256:" in arg)
-        options, command = args[2:image_index], args[image_index + 1:]
-        entrypoint = ["/bin/bash", "-c"]
-        if "--entrypoint" in options:
-            entrypoint = [options[options.index("--entrypoint") + 1]]
-        # Do not generate a replacement script: execute the caller's actual argv.
-        env = os.environ.copy()
-        for index, option in enumerate(options):
-            if option == "--env":
-                key, value = options[index + 1].split("=", 1)
-                env[key] = value
-        result = real_run(entrypoint + command, env=env, capture_output=True, text=True)
-        results.append(result)
-        if kwargs.get("check"):
-            result.check_returncode()
-        return result
-
-    monkeypatch.setattr(build.subprocess, "run", fake_docker_run)
-    return results
-
-
-@pytest.mark.parametrize("image", [build.NCS_IMAGE, f"ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.7.0@sha256:{build.LEGACY_NCS_DIGEST}"])
-def test_ncs_docker_executes_script_and_propagates_failure(tmp_path, ncs_docker_fixture, image):
-    build.docker(image, tmp_path, "printf '%s' release-script-executed")
-    assert ncs_docker_fixture[-1].stdout == "release-script-executed"
-    with pytest.raises(subprocess.CalledProcessError) as failure:
-        build.docker(image, tmp_path, "exit 23")
-    assert failure.value.returncode == 23
-
-
-@pytest.mark.parametrize("image", [build.ESP_IMAGE, build.LEGACY_ESP_IMAGE])
-def test_esp_docker_uses_explicit_shell_entrypoint(tmp_path, monkeypatch, image):
+def test_esp_docker_uses_explicit_shell_entrypoint(tmp_path, monkeypatch):
+    image = build.ESP_IMAGE
     calls = []
     monkeypatch.setattr(build.subprocess, "run", lambda args, **kwargs: calls.append((args, kwargs)))
     script = '. "${IDF_PATH:-/opt/esp/idf}/export.sh"\nidf.py --version'
@@ -561,28 +632,24 @@ def test_esp_docker_uses_explicit_shell_entrypoint(tmp_path, monkeypatch, image)
     assert kwargs["check"] is True
 
 
-@pytest.mark.parametrize("override", [None, build.ESP_IMAGE])
-def test_legacy_cli_defaults_to_verified_idf_pin_and_allows_override(tmp_path, monkeypatch, override):
+@pytest.mark.parametrize("override", [None, "espressif/idf@sha256:" + "0" * 64])
+def test_cli_defaults_to_pinned_idf_and_allows_override(tmp_path, monkeypatch, override):
     class BuildReached(Exception):
         pass
 
     def fake_run(args, **kwargs):
-        if "rev-parse" in args:
-            return build.LEGACY_SHA
-        assert "show" in args
-        return f"image: ghcr.io/nrfconnect/sdk-nrf-toolchain:v2.7.0@sha256:{build.LEGACY_NCS_DIGEST}"
+        assert "rev-parse" in args
+        return SHA
 
-    def fake_build(scratch, version, sha, profile, esp_image, ncs_image):
-        assert esp_image == (override or build.LEGACY_ESP_IMAGE)
-        assert profile == "esp32s3"
-        assert version == "0.1.0"
-        assert sha == build.LEGACY_SHA
+    def fake_build(scratch, version, sha, esp_image):
+        assert esp_image == (override or build.ESP_IMAGE)
+        assert version == VERSION and sha == SHA
         raise BuildReached
 
     monkeypatch.setattr(build, "run", fake_run)
     monkeypatch.setattr(build, "snapshot", lambda repo, sha, scratch: scratch / "source")
     monkeypatch.setattr(build, "build", fake_build)
-    args = ["--version", "0.1.0", "--source-sha", build.LEGACY_SHA, "--profile", "esp32s3", "--output-dir", str(tmp_path / "release")]
+    args = ["--version", VERSION, "--source-sha", SHA, "--output-dir", str(tmp_path / "release")]
     if override:
         args += ["--esp-image", override]
     with pytest.raises(BuildReached):

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build paired firmware from a git archive; never flash, tag, or publish."""
+"""Build paired firmware from a git archive; never flash, tag, or publish.
+
+The ESP32-S31 image is a pure C ESP-IDF build with the LC3 wire options on; the
+nRF52840 image is the Rust Embassy firmware built with cargo."""
 
 from __future__ import annotations
 
@@ -14,42 +17,27 @@ import shlex
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from tools.migration import nrf_proof
 
 ROOT = Path(__file__).resolve().parents[2]
-LEGACY_SHA = "9b3376b11009f66f74fd34a01f65635a117dd591"
 ESP_IMAGE = "espressif/idf@sha256:8ac794c57fd4cac246cb8d2ada4002fa26337ac7df683047b5b83743dbedb6b7"
-LEGACY_ESP_IMAGE = "espressif/idf@sha256:88a65f412e730fdbe134cd7427dd840eb1a6923479499c9c233699f804a3096b"
-NCS_IMAGE = "ghcr.io/nrfconnect/sdk-nrf-toolchain:v3.4.1@sha256:45b97cad97a9967c52d77d1d1a0f7dd8fe027edd17c05c3eda2eeadc23729418"
-LEGACY_NCS_DIGEST = "b481467f39ed524a2cb23fed8b9dcdc1e4f60972988b913c386538953c929247"
-ON_OPTIONS = ("ESP_LC3_BENCH", "S31_LC3_WIRE", "S31_LC3_SELFTEST", "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER")
-OFF_OPTIONS = ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_TASK_CPU_PROFILE", "S31_MESH_COEX_PREFER_WIFI", "S31_MESH_PAIR_UNICAST")
-FREEZE_ACTIVE = """if west manifest --help | grep -q -- --active-only; then
-    west manifest --freeze --active-only > /work/provenance/west-frozen.yml
-else
-    python3 - <<'PY'
-from pathlib import Path
-import yaml
-from west.manifest import Manifest, ManifestProject
-
-manifest = Manifest.from_topdir()
-resolved = manifest.as_dict()
-active = {project.name: project for project in manifest.projects
-          if not isinstance(project, ManifestProject) and manifest.is_active(project)}
-projects = []
-for entry in resolved['manifest']['projects']:
-    project = active.get(entry['name'])
-    if project is not None:
-        entry['revision'] = project.sha('manifest-rev')
-        projects.append(entry)
-resolved['manifest']['projects'] = projects
-Path('/work/provenance/west-frozen.yml').write_text(yaml.safe_dump(resolved, sort_keys=False))
-PY
-fi
-"""
+NRF_FIRMWARE = "rust/nrf-embassy-firmware"
+NRF_TARGET = "thumbv7em-none-eabihf"
+PROFILE = "esp32s31"
+# The documented pure-C S31 build (docs/getting_started.md): LC3 on the wire,
+# serialized single-owner codec with internal buffers.
+ON_OPTIONS = ("ESP_LC3_BENCH", "S31_LC3_WIRE", "S31_LC3_SELFTEST",
+              "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER")
+OFF_OPTIONS = ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_TASK_CPU_PROFILE",
+               "S31_MESH_COEX_PREFER_WIFI", "S31_MESH_PAIR_UNICAST")
 
 
 def run(args: list[str], **kwargs) -> str:
@@ -132,7 +120,7 @@ def factory_partition(data: bytes, table_offset: int, capacity: int) -> tuple[tu
     return factories[0], partitions
 
 
-def validate_esp(build: Path, profile: str, version: str, sha: str) -> tuple[dict, dict]:
+def validate_esp(build: Path, profile: str, version: str) -> tuple[dict, dict]:
     description = json.loads(required(build / "project_description.json"))
     if description.get("target") != profile or description.get("project_version") != version:
         raise ValueError("ESP target/version metadata mismatch")
@@ -201,15 +189,9 @@ def validate_esp(build: Path, profile: str, version: str, sha: str) -> tuple[dic
         raise ValueError("ESP app descriptor missing")
     if app[48:80].split(b"\0", 1)[0].decode() != version:
         raise ValueError("ESP application binary version mismatch")
-    if profile == "esp32s31":
-        validate_identity(required(build / "omi.elf"), version, sha)
-        validate_identity(app, version, sha)
+    # The C S31 image carries only the app-descriptor version checked above; it does
+    # not embed the source SHA, which is pinned by building from `git archive <sha>`.
     return description, flasher
-
-
-def validate_identity(data: bytes, version: str, sha: str) -> None:
-    if version.encode() + b"\0" not in data or sha.encode() + b"\0" not in data:
-        raise ValueError("Firmware version/source SHA mismatch")
 
 
 def uf2_payload(data: bytes) -> bytes:
@@ -226,6 +208,31 @@ def uf2_payload(data: bytes) -> bytes:
         result.extend(payload)
         end = address + len(payload)
     return bytes(result)
+
+
+# Release-qualified on the paired bench (2-node mesh, multi-day captures): the guarded
+# completion policy plus admission headroom, unmasked bridge owner and nonblocking
+# bridge delivery. Everything else stays experimental.
+RELEASE_COMPLETION_POLICIES = (b"completion_policy=StrictSoftwareDeadline",
+                               b"completion_policy=RetainGuardedCompletion")
+
+
+def validate_nrf_completion_policy(payload: bytes) -> None:
+    """Gate embedded policy fields, not debug enum names or feature attestation."""
+    for row in re.split(rb"[\n\0]", payload):
+        fields = row.split()
+        policies = [field for field in fields if field.startswith(b"completion_policy=")]
+        # Only the Rust identity row (clock_origin) declares the executing policy.
+        if b"clock_origin=shared-timer0" in fields and any(policy not in RELEASE_COMPLETION_POLICIES for policy in policies):
+            raise ValueError("experimental nRF completion policy is not release-qualified")
+
+
+def validate_nrf_experimental_features(data: bytes) -> None:
+    """Reject exact experimental metadata fields independently of policy."""
+    if b"early_timing_service=EarlyTimingServiceExperimental" in re.split(rb"[\s\0]+", data):
+        raise ValueError("experimental nRF early timing service is not release-qualified")
+    if b"same_slot_audio_refit=SameSlotAudioRefitExperimental" in re.split(rb"[\s\0]+", data):
+        raise ValueError("experimental nRF same-slot audio refit is not release-qualified")
 
 
 def protocols(source: Path) -> dict:
@@ -249,21 +256,28 @@ def write_zip(path: Path, entries: dict[str, bytes]) -> None:
 
 
 def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
-            version: str, sha: str, profile: str, images: dict) -> list[Path]:
-    description, flasher = validate_esp(esp, profile, version, sha)
+            version: str, sha: str, profile: str, images: dict, prebuilt: dict | None = None) -> list[Path]:
+    """prebuilt: {"esp": dir, "nrf": dir} of bench-verified artifacts packaged by content hash.
+
+    Prebuilt images carry their own identity rows, so the in-binary nRF version/SHA
+    assertion and the cargo/IDF provenance files are skipped and the manifest says so."""
+    if profile != PROFILE:
+        raise ValueError(f"Unsupported release profile: {profile}")
+    description, flasher = validate_esp(esp, profile, version)
     uf2 = required(nrf / "zephyr.uf2")
     uf2_info = validate_uf2(uf2)
+    nrf_payload = uf2_payload(uf2)
     nrf_elf = required(nrf / "zephyr.elf")
-    if profile == "esp32s31":
-        validate_identity(nrf_elf, version, sha)
-        validate_identity(uf2_payload(uf2), version, sha)
-    else:
-        identity = f"*** Booting Zephyr OS build {version}+{sha} ***\n\0".encode()
-        if identity not in nrf_elf or identity not in uf2_payload(uf2):
-            raise ValueError("Legacy Zephyr build version/source SHA mismatch")
+    if not prebuilt:
+        # build.rs renders these rows into .integration_metadata from OMI_FIRMWARE_VERSION/OMI_GIT_SHA.
+        identity = f"version={version}\nsource_sha={sha}\n".encode()
+        if identity not in nrf_elf or identity not in nrf_payload:
+            raise ValueError("nRF firmware version/source SHA mismatch")
+    validate_nrf_experimental_features(nrf_elf)
+    validate_nrf_experimental_features(nrf_payload)
+    validate_nrf_completion_policy(nrf_payload)
     wire = protocols(source)
-    expected = {"bridge": 6, "mesh": 5} if profile == "esp32s31" else {"bridge": 2, "mesh": 2}
-    if wire != expected:
+    if wire != {"bridge": 6, "mesh": 5}:
         raise ValueError(f"Unexpected source protocol versions: {wire}")
     files = {name: required(flash_path(esp, name)) for name in flasher["flash_files"].values()}
     files["flasher_args.json"] = required(esp / "flasher_args.json")
@@ -273,11 +287,8 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
     extra = flasher["extra_esptool_args"]
     reset = " ".join(f"--{key} {shlex.quote(str(extra[key]))}" for key in ("before", "after") if key in extra)
     readme = f"# OMI {version} ({profile})\n\nFrom this extracted directory, using the matching ESP-IDF tools:\n\n```sh\npython -m esptool --chip {profile} --port PORT {reset} write_flash {options} {pairs}\n```\n\nNo erase_flash is required.\n"
-    if profile == "esp32s31":
-        openocd = "; ".join(f"program_esp {shlex.quote(name)} {address} verify" for address, name in sorted(flasher["flash_files"].items(), key=lambda item: int(item[0], 0)))
-        readme += f"\nESP32-S31 built-in USB JTAG (matching preview IDF OpenOCD):\n\n```sh\nopenocd -f board/esp32s31-builtin.cfg -c '{openocd}; reset run; shutdown'\n```\n"
-    else:
-        readme += "\nExperimental legacy ESP32-S3: no Classic Bluetooth and no ESP32-S31 LC3 interoperability.\n"
+    openocd = "; ".join(f"program_esp {shlex.quote(name)} {address} verify" for address, name in sorted(flasher["flash_files"].items(), key=lambda item: int(item[0], 0)))
+    readme += f"\nESP32-S31 built-in USB JTAG (matching preview IDF OpenOCD):\n\n```sh\nopenocd -f board/esp32s31-builtin.cfg -c '{openocd}; reset run; shutdown'\n```\n"
     readme += "\nCopy the paired application UF2 to the XIAO bootloader drive. Do not erase or replace the nRF bootloader.\n"
     files["README.md"] = readme.encode()
     debug = {"esp/omi.elf": required(esp / "omi.elf"), "nrf/zephyr.elf": nrf_elf,
@@ -285,12 +296,13 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
     for path in sorted(provenance.rglob("*")):
         if path.is_file():
             debug["provenance/" + path.relative_to(provenance).as_posix()] = required(path)
-    for name in ("west-frozen.yml", "west-resolved.txt", "west-input.yml", "release-tools-source-sha.txt", "idf-commit.txt", "idf-version.txt", "sdkconfig", "dependencies.lock"):
+    nrf_provenance = ("rustc-version.txt", "Cargo.lock", "nrf-build-argv.json")
+    for name in () if prebuilt else nrf_provenance + ("idf-commit.txt", "idf-version.txt", "sdkconfig", "dependencies.lock"):
         required(provenance / name)
     driver_sha = required(provenance / "release-tools-source-sha.txt").decode().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", driver_sha):
         raise ValueError("Invalid release tools source SHA provenance")
-    idf_version = required(provenance / "idf-version.txt").decode().strip()
+    idf_version = "prebuilt" if prebuilt else required(provenance / "idf-version.txt").decode().strip()
     if not idf_version:
         raise ValueError("Empty ESP-IDF version provenance")
     output.mkdir(parents=True, exist_ok=True)
@@ -302,11 +314,12 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
     write_zip(output / f"{stem}-debug.zip", debug)
     manifest = {"schema_version": 1, "version": version, "source_sha": sha, "profile": profile,
                 "release_tools_source_sha": driver_sha,
-                "ncs_input_manifest": {"archive_path": "provenance/west-input.yml", "sha256": hashlib.sha256(required(provenance / "west-input.yml")).hexdigest()},
+                "nrf_toolchain": None if prebuilt else {"archive_path": "provenance/rustc-version.txt", "sha256": hashlib.sha256(required(provenance / "rustc-version.txt")).hexdigest()},
                 "protocol_versions": wire, "builder_images": images, "uf2": uf2_info,
-                "experimental": profile == "esp32s3", "classic_bluetooth": profile == "esp32s31",
-                "s31_lc3_interoperable": profile == "esp32s31", "source_patches": [],
-                "reproducibility": "Archived source and pinned builders; resolved dependencies captured, not a claim of historical bit reproducibility",
+                "esp_identity": "app-descriptor-version-only",
+                "classic_bluetooth": True, "s31_lc3_interoperable": True, "source_patches": [],
+                "reproducibility": "Prebuilt bench artifacts packaged by content hash; in-binary identity is the bench build's own, not this version/SHA" if prebuilt else "Archived source and pinned builders; resolved dependencies captured, not a claim of historical bit reproducibility",
+                "prebuilt": prebuilt and {name: str(path) for name, path in prebuilt.items()},
                 "provenance_archive": f"{stem}-debug.zip", "idf_version": idf_version,
                 "assets": {p.name: {"sha256": hashlib.sha256(p.read_bytes()).hexdigest(), "size": p.stat().st_size} for p in sorted(output.iterdir())}}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -343,63 +356,48 @@ def docker(image: str, scratch: Path, script: str, env: dict | None = None) -> N
         args += ["--env", f"{key}={value}"]
     # Disable image startup hooks before bash runs; initialize SDKs explicitly below.
     args += ["--env", "BASH_ENV="]
-    # NCS images have ENTRYPOINT ["/bin/bash", "-c"], which swallows a nested bash command.
     subprocess.run(args + [pinned(image), "-euc", script], check=True)
 
 
-def build(scratch: Path, version: str, sha: str, profile: str, esp_image: str, ncs_image: str) -> None:
-    legacy = profile == "esp32s3"
+def cargo_nrf(scratch: Path, version: str, sha: str) -> None:
+    """Build the Embassy nRF firmware from the archived source with the host rustup toolchain
+    pinned by rust/nrf-embassy-firmware/rust-toolchain.toml; outputs keep the zephyr.* names."""
+    crate = scratch / "source" / NRF_FIRMWARE
+    env = {**os.environ, "OMI_FIRMWARE_VERSION": version, "OMI_GIT_SHA": sha, "CARGO_TARGET_DIR": str(scratch / "nrf-target")}
+    argv = ["cargo", "build", "--locked", "--release", "--target", NRF_TARGET]
+    (scratch / "provenance/nrf-build-argv.json").write_text(json.dumps(argv) + "\n")
+    subprocess.run(argv, cwd=crate, env=env, check=True)
+    rustc = subprocess.run(["rustc", "-vV"], cwd=crate, env=env, check=True, capture_output=True, text=True).stdout
+    (scratch / "provenance/rustc-version.txt").write_text(rustc)
+    shutil.copyfile(crate / "Cargo.lock", scratch / "provenance/Cargo.lock")
+    elf = required(scratch / "nrf-target" / NRF_TARGET / "release/nrf-embassy-firmware")
+    (scratch / "nrf").mkdir()
+    (scratch / "nrf/zephyr.elf").write_bytes(elf)
+    (scratch / "nrf/zephyr.uf2").write_bytes(nrf_proof.elf_to_uf2(elf))
+
+
+def build(scratch: Path, version: str, sha: str, esp_image: str) -> None:
     for name in ("home", "provenance"):
         (scratch / name).mkdir()
-    sdk = "v2.7.0" if legacy else "v3.4.1"
-    # Release-driver inputs are intentionally separate from the archived firmware source.
-    sdk_manifest = required(ROOT / "tools/release" / f"ncs-{sdk}.yml")
-    manifest_dir = scratch / "ncs/release-manifest"
-    manifest_dir.mkdir(parents=True)
-    (manifest_dir / "west.yml").write_bytes(sdk_manifest)
-    (scratch / "provenance/west-input.yml").write_bytes(sdk_manifest)
     driver_sha = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"])
     (scratch / "provenance/release-tools-source-sha.txt").write_text(driver_sha + "\n")
     q = shlex.quote
-    definitions = [f"-DPROJECT_VER={version}", f"-DIDF_TARGET={profile}", "-DSDKCONFIG=/work/esp-sdkconfig"]
-    if not legacy:
-        definitions += [f"-DOMI_FIRMWARE_VERSION={version}", f"-DOMI_GIT_SHA={sha}", "-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults;/work/source/sdkconfig.release.esp32s31.defaults"]
-        definitions += [f"-D{key}=ON" for key in ON_OPTIONS] + [f"-D{key}=OFF" for key in OFF_OPTIONS]
-    else:
-        definitions += ["-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults"]
+    definitions = [f"-DPROJECT_VER={version}", f"-DIDF_TARGET={PROFILE}", "-DSDKCONFIG=/work/esp-sdkconfig",
+                   "-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults"]
+    definitions += [f"-D{key}=ON" for key in ON_OPTIONS] + [f"-D{key}=OFF" for key in OFF_OPTIONS]
     command = " ".join(q(arg) for arg in definitions)
     # Explicitly initialize IDF because docker() bypasses the image's entrypoint.
     script = '. "${IDF_PATH:-/opt/esp/idf}/export.sh"\n'
     script += 'idf.py --version > /work/provenance/idf-version.txt\ngit -C "$IDF_PATH" rev-parse HEAD > /work/provenance/idf-commit.txt\n'
-    if legacy:
-        script += "grep -Eq '^ESP-IDF v5\\.5\\.2($|[^0-9])' /work/provenance/idf-version.txt\n"
-    script += f"idf.py {'--preview ' if not legacy else ''}-C /work/source -B /work/esp {command} build\n"
+    script += f"idf.py --preview -C /work/source -B /work/esp {command} build\n"
     script += "cp /work/esp-sdkconfig /work/provenance/sdkconfig\ncp /work/esp-sdkconfig /work/esp/sdkconfig\ncp /work/source/dependencies.lock /work/provenance/dependencies.lock\ncp /work/esp/CMakeCache.txt /work/provenance/esp-CMakeCache.txt\n"
     (scratch / "provenance/esp-build.sh").write_text(script)
-    docker(esp_image, scratch, script, {"OMI_ESP_LC3_BENCH": "0" if legacy else "1"})
-    nrf_defs = "-Dnrf_mesh_CONFIG_BUILD_OUTPUT_UF2=y"
-    if legacy:
-        nrf_defs += " -Dnrf_mesh_CONFIG_NCS_BOOT_BANNER=n -Dnrf_mesh_CONFIG_BOOT_BANNER=y"
-    else:
-        nrf_defs += f" -Dnrf_mesh_OMI_FIRMWARE_VERSION={q(version)} -Dnrf_mesh_OMI_GIT_SHA={q(sha)}"
-    script = 'export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"\n. /opt/toolchain-env.sh\n'
-    script += "west init -l /work/ncs/release-manifest\n"
-    script += "cd /work/ncs\nwest update --narrow -o=--depth=1\nwest zephyr-export\n"
-    script += FREEZE_ACTIVE
-    # west list defaults to active projects; --all would include uncloned private repos.
-    script += "west list -f '{name}' > /work/provenance/west-active-projects.txt\n"
-    # The copied wrapper is not a git repository, so do not ask west for its SHA.
-    script += "while IFS= read -r project; do\n    if [ \"$project\" != manifest ]; then\n        west list -f '{name} {revision} {sha} {url}' \"$project\"\n    fi\ndone < /work/provenance/west-active-projects.txt > /work/provenance/west-resolved.txt\n"
-    script += f"west build --sysbuild {'--cmake-only ' if legacy else ''}-b xiao_ble/nrf52840 /work/source/nrf_mesh -d /work/nrf -- {nrf_defs}\n"
-    if legacy:
-        script += f"cmake -S /work/source/nrf_mesh -B /work/nrf/nrf_mesh -DBUILD_VERSION:STRING={q(version + '+' + sha)}\ncmake --build /work/nrf\n"
-    script += "cp /work/nrf/nrf_mesh/zephyr/.config /work/provenance/nrf.config\ncp /work/nrf/nrf_mesh/CMakeCache.txt /work/provenance/nrf-CMakeCache.txt\n"
-    (scratch / "provenance/nrf-build.sh").write_text(script)
-    docker(ncs_image, scratch, script)
-    for name in ("sdkconfig.defaults", "sdkconfig.release.esp32s31.defaults"):
-        path = scratch / "source" / name
-        if path.is_file():
-            shutil.copyfile(path, scratch / "provenance" / name)
+    # The esp_lc3_bench component pulls esp_audio_codec only when this is set.
+    docker(esp_image, scratch, script, {"OMI_ESP_LC3_BENCH": "1"})
+    defaults = scratch / "source/sdkconfig.defaults"
+    if defaults.is_file():
+        shutil.copyfile(defaults, scratch / "provenance/sdkconfig.defaults")
+    cargo_nrf(scratch, version, sha)
 
 
 @contextmanager
@@ -419,11 +417,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Firmware SemVer, without leading v")
     parser.add_argument("--source-sha", required=True, help="Full git commit SHA")
-    parser.add_argument("--profile", choices=("esp32s31", "esp32s3"), default="esp32s31")
     parser.add_argument("--output-dir", type=Path, default=Path("dist/release"))
-    parser.add_argument("--esp-image", help="Override the profile's digest-pinned ESP-IDF image")
+    parser.add_argument("--esp-image", help="Override the digest-pinned ESP-IDF image")
     parser.add_argument("--work-dir", type=Path, help="Empty scratch directory to retain after success or failure; no automatic reuse")
+    parser.add_argument("--prebuilt-esp", type=Path, help="Verified ESP-IDF build directory to package instead of building (with --prebuilt-nrf)")
+    parser.add_argument("--prebuilt-nrf", type=Path, help="Directory holding the verified nRF zephyr.elf and zephyr.uf2 to package instead of building")
     args = parser.parse_args(argv)
+    if bool(args.prebuilt_esp) != bool(args.prebuilt_nrf):
+        parser.error("--prebuilt-esp and --prebuilt-nrf go together")
     try:
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", args.version) or len(args.version.encode()) > 31:
             raise ValueError("Version must be a SemVer fitting ESP's 31-byte metadata field")
@@ -432,17 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         resolved = run(["git", "-C", str(ROOT), "rev-parse", f"{args.source_sha}^{{commit}}"])
         if resolved != args.source_sha:
             raise ValueError("Source commit mismatch")
-        legacy = args.profile == "esp32s3"
-        if legacy and (args.source_sha != LEGACY_SHA or args.version != "0.1.0"):
-            raise ValueError("Legacy requires version 0.1.0 and the historical SHA")
-        esp_image = pinned(args.esp_image or (LEGACY_ESP_IMAGE if legacy else ESP_IMAGE))
-        ncs_image = NCS_IMAGE
-        if legacy:
-            workflow = run(["git", "-C", str(ROOT), "show", f"{args.source_sha}:.github/workflows/build.yml"])
-            match = re.search(r"image:\s*(\S+@sha256:" + LEGACY_NCS_DIGEST + r")", workflow)
-            if not match:
-                raise ValueError("Historical NCS image pin not found")
-            ncs_image = pinned(match[1])
+        esp_image = pinned(args.esp_image or ESP_IMAGE)
         output = args.output_dir.resolve()
         if output.exists() and (not output.is_dir() or any(output.iterdir())):
             raise ValueError("Output directory must be absent or empty")
@@ -452,10 +443,20 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("Work and output directories must be separate, not nested")
         with scratch_directory(args.work_dir) as scratch:
             source = snapshot(ROOT, args.source_sha, scratch)
-            build(scratch, args.version, args.source_sha, args.profile, esp_image, ncs_image)
+            prebuilt = None
+            if args.prebuilt_esp:
+                prebuilt = {"esp": args.prebuilt_esp.resolve(), "nrf": args.prebuilt_nrf.resolve()}
+                (scratch / "provenance").mkdir()
+                (scratch / "provenance/release-tools-source-sha.txt").write_text(run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]) + "\n")
+                esp_dir, nrf_dir, images = prebuilt["esp"], prebuilt["nrf"], {}
+            else:
+                build(scratch, args.version, args.source_sha, esp_image)
+                esp_dir = scratch / "esp"
+                nrf_dir = scratch / "nrf"
+                images = {"esp": esp_image}
             staging = scratch / "assets"
-            package(source, scratch / "esp", scratch / "nrf/nrf_mesh/zephyr", scratch / "provenance", staging,
-                    args.version, args.source_sha, args.profile, {"esp": esp_image, "nrf": ncs_image})
+            package(source, esp_dir, nrf_dir, scratch / "provenance", staging,
+                    args.version, args.source_sha, PROFILE, images, prebuilt)
             output.parent.mkdir(parents=True, exist_ok=True)
             if output.exists():
                 output.rmdir()
