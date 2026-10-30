@@ -12,9 +12,6 @@
 #include "audio_internal.h"
 #include "audio_opus_stage_profile.h"
 #include "cpu_profile.h"
-#if defined(AUDIO_LC3_BENCH)
-#include "lc3_bench.h"
-#endif
 #if defined(AUDIO_ESP_LC3_BENCH)
 #include "esp_lc3_bench.h"
 #endif
@@ -484,9 +481,6 @@ void audio_capture_task(void *arg)
 #endif
 
     audio_opus_stage_profile_reset();
-#if defined(AUDIO_LC3_BENCH)
-    lc3_bench_reset();
-#endif
 #if defined(AUDIO_ESP_LC3_BENCH) && !defined(AUDIO_S31_LC3_WIRE)
     esp_lc3_bench_init();
 #endif
@@ -580,11 +574,6 @@ void audio_capture_task(void *arg)
             continue;
         }
 
-#if defined(AUDIO_LC3_BENCH)
-#if !defined(AUDIO_S31_LC3_WIRE)
-        lc3_bench_capture_frame(g_audio.pcm_input);
-#endif
-#endif
 #if defined(AUDIO_ESP_LC3_BENCH)
 #if !defined(AUDIO_S31_LC3_WIRE)
         esp_lc3_bench_capture_frame(g_audio.pcm_input);
@@ -615,9 +604,6 @@ void audio_capture_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Capture task stopped");
-#if defined(AUDIO_LC3_BENCH)
-    lc3_bench_reset();
-#endif
 #if defined(AUDIO_ESP_LC3_BENCH) && !defined(AUDIO_S31_LC3_WIRE)
     esp_lc3_bench_deinit();
 #endif

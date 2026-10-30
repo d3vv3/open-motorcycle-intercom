@@ -56,7 +56,6 @@ idf_component_register(
            cpu_profile
           esp_psram
           speex_resampler
-          lc3_bench
           esp_lc3_bench
 )
 
@@ -108,8 +107,4 @@ endif()
 
 if(S31_LC3_SPLIT_CORES AND S31_LC3_WIRE AND IDF_TARGET STREQUAL "esp32s31")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_S31_LC3_SPLIT_CORES=1)
-endif()
-
-if(LC3_SOURCE_DIR AND IDF_TARGET STREQUAL "esp32s31")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_LC3_BENCH=1)
 endif()
