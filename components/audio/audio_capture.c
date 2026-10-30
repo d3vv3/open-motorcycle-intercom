@@ -115,23 +115,10 @@ static void apply_voice_cleanup(void)
 #if AUDIO_ENABLE_AEC_NS
     if (g_audio.config.mode == AUDIO_MODE_MESH) {
         int64_t cleanup_span = cpu_profile_span_begin();
-        int16_t far_reference[AUDIO_FRAME_SAMPLES];
-        portENTER_CRITICAL(&g_audio_far_ref_lock);
-        memcpy(far_reference, g_audio.far_ref_frame, sizeof(far_reference));
-        portEXIT_CRITICAL(&g_audio_far_ref_lock);
-        /* TODO: Calibrate the physical playback-to-microphone correlation delay. */
-        int64_t aec_start_us = esp_timer_get_time();
-        bool aec_active = audio_aec_process(&g_audio.aec, g_audio.pcm_input, far_reference,
-                                            AUDIO_FRAME_SAMPLES);
-        if (!aec_active) {
-            voice_cleanup_process(&g_audio.voice_cleanup, g_audio.pcm_input, AUDIO_FRAME_SAMPLES);
-        }
-        record_capture_timing(CAPTURE_AEC_TIMING, esp_timer_get_time() - aec_start_us);
-        AUDIO_STATS_LOCK();
-        g_audio.stats.aec_chunks_processed = g_audio.aec.reblock.chunks_processed;
-        g_audio.stats.aec_startup_delay_frames = g_audio.aec.reblock.startup_delay_frames;
-        g_audio.stats.aec_startup_fallback_frames = g_audio.stats.aec_startup_delay_frames;
-        AUDIO_STATS_UNLOCK();
+        /* The "aec" capture timing slot measures this noise-only cleanup step. */
+        int64_t cleanup_start_us = esp_timer_get_time();
+        voice_cleanup_process(&g_audio.voice_cleanup, g_audio.pcm_input, AUDIO_FRAME_SAMPLES);
+        record_capture_timing(CAPTURE_AEC_TIMING, esp_timer_get_time() - cleanup_start_us);
         cpu_profile_span_end(CPU_PROFILE_SPAN_CAP_CLEANUP, cleanup_span);
     }
 #endif
@@ -505,17 +492,7 @@ void audio_capture_task(void *arg)
         return;
     }
 #endif
-    bool aec_enabled = audio_aec_init(
-        &g_audio.aec, AUDIO_ENABLE_ESP_SR_AEC && g_audio.config.mode == AUDIO_MODE_MESH);
-    if (!AUDIO_ENABLE_ESP_SR_AEC) {
-        ESP_LOGI(TAG, "ESP-SR AEC trial disabled (122 ms per 20 ms capture frame on S31); "
-                       "noise-only voice cleanup active, HFP call echo unqualified");
-    }
-    AUDIO_STATS_LOCK();
-    g_audio.stats.aec_available = aec_enabled;
-    g_audio.stats.aec_active = aec_enabled;
-    g_audio.stats.aec_chunk_size = aec_enabled ? (uint16_t)g_audio.aec.reblock.chunk_size : 0u;
-    AUDIO_STATS_UNLOCK();
+    ESP_LOGI(TAG, "No AEC: noise-only voice cleanup active, HFP call echo unqualified");
     atomic_store_explicit(&g_audio.capture_ready, true, memory_order_release);
     xSemaphoreGive(g_audio.capture_started);
     ESP_LOGI(TAG, "Capture task started on core %d", xPortGetCoreID());
@@ -607,11 +584,5 @@ void audio_capture_task(void *arg)
 #if defined(AUDIO_ESP_LC3_BENCH) && !defined(AUDIO_S31_LC3_WIRE)
     esp_lc3_bench_deinit();
 #endif
-    audio_aec_deinit(&g_audio.aec);
-    AUDIO_STATS_LOCK();
-    g_audio.stats.aec_available = false;
-    g_audio.stats.aec_active = false;
-    g_audio.stats.aec_chunk_size = 0u;
-    AUDIO_STATS_UNLOCK();
     capture_task_finish();
 }

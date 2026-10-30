@@ -50,8 +50,6 @@ bool audio_route_init(void)
     g_audio.bluetooth_mic_rate = 16000u;
     audio_sample_fifo_init(&g_audio.music_fifo, g_audio.music_fifo_storage,
                            AUDIO_PLAYBACK_FIFO_CAPACITY);
-    audio_sample_fifo_init(&g_audio.far_fifo, g_audio.far_fifo_storage,
-                           AUDIO_FAR_FIFO_CAPACITY);
     audio_sample_fifo_init(&g_audio.voice_fifo, g_audio.voice_fifo_storage,
                            AUDIO_PLAYBACK_FIFO_CAPACITY);
     audio_sample_fifo_init(&g_audio.voice_presence_fifo, g_audio.voice_presence_fifo_storage,

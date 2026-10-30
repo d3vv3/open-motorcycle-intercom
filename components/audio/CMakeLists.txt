@@ -39,7 +39,7 @@ endif()
 idf_component_register(
     SRCS "audio.c" "audio_hw.c" "audio_capture.c" "audio_opus_stage_profile.c" "audio_playout.c" "audio_rx.c"
            "audio_notify.c" "audio_prompt.c" "audio_mesh_call.c" "audio_urgent.c" "audio_volume_mix.c" "${CMAKE_CURRENT_BINARY_DIR}/audio_prompts_data.c" "vox.c" "voice_cleanup.c" "audio_packet_store.c"
-             "audio_pcm_resampler.c" "audio_rate_converter.c" "audio_capture_fifo.c" "audio_sample_fifo.c" "audio_rx_source_select.c" "audio_reblock.c" "audio_aec.c"
+             "audio_pcm_resampler.c" "audio_rate_converter.c" "audio_capture_fifo.c" "audio_sample_fifo.c" "audio_rx_source_select.c"
          "audio_route.c" "audio_route_runtime.c"
     INCLUDE_DIRS "include"
     REQUIRES 
@@ -51,7 +51,6 @@ idf_component_register(
         freertos
         log
         78__esp-opus
-        esp-sr
     PRIV_REQUIRES
            cpu_profile
           esp_psram

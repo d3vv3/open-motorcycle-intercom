@@ -310,12 +310,6 @@ typedef struct {
     uint32_t bluetooth_playout_route_lock_misses;       /**< Playout lock misses */
     uint32_t bluetooth_mic_capture_write_route_lock_misses; /**< Capture-write lock misses */
     uint32_t bluetooth_mic_read_route_lock_misses;         /**< Mic-read lock misses */
-    bool aec_available;                                    /**< ESP-SR AEC initialized */
-    bool aec_active;                                       /**< ESP-SR AEC processing */
-    uint16_t aec_chunk_size;                               /**< ESP-SR processing chunk */
-    uint32_t aec_chunks_processed;                         /**< AEC chunks processed */
-    uint32_t aec_startup_delay_frames;                     /**< Frames emitted as startup silence */
-    uint32_t aec_startup_fallback_frames;                 /**< Deprecated compatibility alias */
 } audio_stats_t;
 
 /**

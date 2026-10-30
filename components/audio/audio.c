@@ -44,7 +44,6 @@ bool audio_mesh_call_resume(uint32_t expected_epoch)
 }
 portMUX_TYPE g_audio_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE g_audio_task_lock = portMUX_INITIALIZER_UNLOCKED;
-portMUX_TYPE g_audio_far_ref_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_audio_lifecycle_init_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE s_audio_route_handle_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_audio_route_users;
@@ -120,17 +119,13 @@ static void free_audio_route_storage(void)
     g_audio.music_input = NULL;
     g_audio.music_converted = NULL;
     g_audio.music_fifo_storage = NULL;
-    g_audio.far_fifo_storage = NULL;
-    g_audio.far_converted = NULL;
-    g_audio.far_pending_frame = NULL;
 }
 
 static esp_err_t allocate_playback_psram_storage(void)
 {
     const size_t playback_samples =
         4u * AUDIO_PLAYBACK_CONVERTED_CAPACITY + AUDIO_HW_FRAME_SAMPLES +
-        2u * AUDIO_PLAYBACK_FIFO_CAPACITY + AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES +
-        AUDIO_FAR_FIFO_CAPACITY + 2u * AUDIO_FRAME_SAMPLES;
+        2u * AUDIO_PLAYBACK_FIFO_CAPACITY + AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES;
     int16_t *storage = heap_caps_calloc(playback_samples, sizeof(*storage),
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (storage == NULL) {
@@ -151,9 +146,6 @@ static esp_err_t allocate_playback_psram_storage(void)
     ASSIGN_PLAYBACK_BUFFER(music_converted, AUDIO_PLAYBACK_CONVERTED_CAPACITY);
     ASSIGN_PLAYBACK_BUFFER(music_fifo_storage, AUDIO_PLAYBACK_FIFO_CAPACITY);
     ASSIGN_PLAYBACK_BUFFER(music_input, AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES);
-    ASSIGN_PLAYBACK_BUFFER(far_fifo_storage, AUDIO_FAR_FIFO_CAPACITY);
-    ASSIGN_PLAYBACK_BUFFER(far_converted, AUDIO_FRAME_SAMPLES);
-    ASSIGN_PLAYBACK_BUFFER(far_pending_frame, AUDIO_FRAME_SAMPLES);
 #undef ASSIGN_PLAYBACK_BUFFER
     configASSERT(offset == playback_samples);
     ESP_LOGI(TAG, "Playback staging: PSRAM allocated=%u bytes; internal free=%u largest=%u",
@@ -362,13 +354,10 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
                                     g_audio.config.sample_rate) != 0 ||
         audio_rate_converter_create(&g_audio.voice_playback_converter, g_audio.config.sample_rate,
                                     AUDIO_HW_SAMPLE_RATE) != 0 ||
-        audio_rate_converter_create(&g_audio.far_reference_converter, AUDIO_HW_SAMPLE_RATE,
-                                    g_audio.config.sample_rate) != 0 ||
         !audio_capture_fifo_init(&g_audio.capture_fifo, g_audio.capture_fifo_storage,
                                  AUDIO_CAPTURE_FIFO_CAPACITY)) {
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ESP_ERR_NO_MEM;
     }
 
@@ -376,7 +365,6 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
     if (ret != ESP_OK) {
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ret;
     }
     ret = allocate_audio_route_storage();
@@ -384,7 +372,6 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         free_audio_route_storage();
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ret;
     }
     ret = audio_hw_i2s_init(&g_audio.config);
@@ -392,7 +379,6 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         free_audio_route_storage();
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ret;
     }
     ret = audio_hw_codec_init(&g_audio.config);
@@ -402,7 +388,6 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         free_audio_route_storage();
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ret;
     }
     ret = audio_hw_opus_init(&g_audio.config);
@@ -414,7 +399,6 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         free_audio_route_storage();
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ret;
     }
     ret = create_sync_resources();
@@ -426,7 +410,6 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         free_audio_route_storage();
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ret;
     }
 
@@ -459,10 +442,8 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         free_audio_route_storage();
         audio_rate_converter_close(&g_audio.capture_rate_converter);
         audio_rate_converter_close(&g_audio.voice_playback_converter);
-        audio_rate_converter_close(&g_audio.far_reference_converter);
         return ESP_ERR_NO_MEM;
     }
-    audio_playout_reset_far_reference();
     audio_capture_init_dsp();
     audio_rx_reset_source_metadata();
     g_audio.initialized = true;
@@ -493,7 +474,6 @@ static void audio_unwind_locked(void)
     audio_hw_i2c_deinit();
     audio_rate_converter_close(&g_audio.capture_rate_converter);
     audio_rate_converter_close(&g_audio.voice_playback_converter);
-    audio_rate_converter_close(&g_audio.far_reference_converter);
     if (g_audio.music_playback_mutex != NULL &&
         xSemaphoreTake(g_audio.music_playback_mutex, portMAX_DELAY) == pdTRUE) {
         audio_rate_converter_close(&g_audio.music_playback_converter);
@@ -589,7 +569,6 @@ static esp_err_t audio_stop_locked(void)
     audio_hw_codec_stop();
     (void)audio_rate_converter_reset(g_audio.capture_rate_converter);
     (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
-    (void)audio_rate_converter_reset(g_audio.far_reference_converter);
     AUDIO_STATS_LOCK();
     g_audio.stats.capture_fifo_discard_samples += (uint32_t)g_audio.capture_fifo.depth;
     AUDIO_STATS_UNLOCK();
@@ -599,10 +578,8 @@ static esp_err_t audio_stop_locked(void)
     xQueueReset(g_audio.notification_queue);
     memset(&g_audio.notification, 0, sizeof(g_audio.notification));
     audio_route_reset_streams();
-    audio_sample_fifo_reset(&g_audio.far_fifo);
     audio_sample_fifo_reset(&g_audio.voice_fifo);
     audio_sample_fifo_reset(&g_audio.voice_presence_fifo);
-    audio_playout_reset_far_reference();
     AUDIO_STATS_LOCK();
     g_audio.stats.asrc_correction_ppm = 0;
     g_audio.stats.asrc_recovery_active = false;
@@ -647,7 +624,6 @@ esp_err_t audio_deinit(void)
     audio_hw_i2c_deinit();
     audio_rate_converter_close(&g_audio.capture_rate_converter);
     audio_rate_converter_close(&g_audio.voice_playback_converter);
-    audio_rate_converter_close(&g_audio.far_reference_converter);
     if (g_audio.music_playback_mutex != NULL &&
         xSemaphoreTake(g_audio.music_playback_mutex, portMAX_DELAY) == pdTRUE) {
         audio_rate_converter_close(&g_audio.music_playback_converter);
@@ -680,12 +656,9 @@ static esp_err_t audio_start_locked(void)
     if (audio_rate_converter_reset(g_audio.capture_rate_converter) != 0) {
         return ESP_FAIL;
     }
-    if (audio_rate_converter_reset(g_audio.voice_playback_converter) != 0 ||
-        audio_rate_converter_reset(g_audio.far_reference_converter) != 0) return ESP_FAIL;
-    audio_sample_fifo_reset(&g_audio.far_fifo);
+    if (audio_rate_converter_reset(g_audio.voice_playback_converter) != 0) return ESP_FAIL;
     audio_sample_fifo_reset(&g_audio.voice_fifo);
     audio_sample_fifo_reset(&g_audio.music_fifo);
-    audio_playout_reset_far_reference();
     if (g_audio.music_playback_converter != NULL &&
         audio_rate_converter_reset(g_audio.music_playback_converter) != 0) return ESP_FAIL;
     AUDIO_STATS_LOCK();

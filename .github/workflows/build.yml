@@ -133,9 +133,6 @@ jobs:
       - name: Run voice cleanup tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/voice_cleanup_test && /tmp/voice_cleanup_test
 
-      - name: Run audio reblock tests
-        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio -Icomponents/audio/include components/audio/audio_reblock.c tests/c/audio_reblock_test.c -o /tmp/audio_reblock_test && /tmp/audio_reblock_test
-
       - name: Run audio capture FIFO tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/audio components/audio/audio_capture_fifo.c tests/c/audio_capture_fifo_test.c -o /tmp/audio_capture_fifo_test && /tmp/audio_capture_fifo_test
 
@@ -217,7 +214,6 @@ jobs:
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/san_packet_store && /tmp/san_packet_store
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
            cc $FLAGS $SAN -Wno-sign-compare -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/san_audio_rate_converter && /tmp/san_audio_rate_converter
-            cc $FLAGS $SAN -Icomponents/audio -Icomponents/audio/include components/audio/audio_reblock.c tests/c/audio_reblock_test.c -o /tmp/san_reblock && /tmp/san_reblock
            cc $FLAGS $SAN -Icomponents/audio components/audio/audio_capture_fifo.c tests/c/audio_capture_fifo_test.c -o /tmp/san_audio_capture_fifo && /tmp/san_audio_capture_fifo
            cc $FLAGS $SAN -Icomponents/audio components/audio/audio_sample_fifo.c components/audio/audio_route.c tests/c/audio_sample_fifo_test.c -o /tmp/san_audio_sample_fifo && /tmp/san_audio_sample_fifo
             cc $FLAGS $SAN -Icomponents/phone_audio/include components/phone_audio/phone_audio_call_state.c tests/c/phone_audio_call_state_test.c -o /tmp/san_phone_audio_call_state && /tmp/san_phone_audio_call_state

@@ -144,54 +144,6 @@ typedef struct {
     audio_packet_t packet;
 } audio_playout_event_t;
 
-void audio_playout_reset_far_reference(void)
-{
-    portENTER_CRITICAL(&g_audio_far_ref_lock);
-    memset(g_audio.far_ref_frame, 0, sizeof(g_audio.far_ref_frame));
-    memset(g_audio.far_ref_shadows, 0, sizeof(g_audio.far_ref_shadows));
-    g_audio.far_ref_shadow_head = 0u;
-    portEXIT_CRITICAL(&g_audio_far_ref_lock);
-}
-
-/*
- * Each shadow follows one preloaded/submitted DMA descriptor. A successful
- * blocking write means the oldest descriptor completed and can become the AEC
- * reference; the new final mix takes its place in that descriptor's shadow.
- */
-static void advance_far_reference_after_write(void)
-{
-#if AUDIO_ENABLE_AEC_NS && AUDIO_ENABLE_ESP_SR_AEC
-    /* No reference conversion is needed when AEC is compiled out. */
-    for (size_t offset = 0u; offset < AUDIO_HW_FRAME_SAMPLES;
-         offset += AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES) {
-        size_t converted = 0u;
-        if (audio_rate_converter_process(g_audio.far_reference_converter,
-                                         &g_audio.hw_output[offset],
-                                         AUDIO_RATE_CONVERTER_MAX_INPUT_FRAMES,
-                                         g_audio.far_converted, AUDIO_FRAME_SAMPLES,
-                                         &converted) != 0 ||
-            audio_sample_fifo_write(&g_audio.far_fifo, g_audio.far_converted, converted) != converted) {
-            audio_playout_reset_far_reference();
-            (void)audio_rate_converter_reset(g_audio.far_reference_converter);
-            audio_sample_fifo_reset(&g_audio.far_fifo);
-            return;
-        }
-    }
-    memset(g_audio.far_pending_frame, 0, AUDIO_FRAME_SAMPLES * sizeof(int16_t));
-    (void)audio_sample_fifo_read(&g_audio.far_fifo, g_audio.far_pending_frame,
-                                 AUDIO_FRAME_SAMPLES);
-    portENTER_CRITICAL(&g_audio_far_ref_lock);
-    memcpy(g_audio.far_converted, g_audio.far_pending_frame,
-           AUDIO_FRAME_SAMPLES * sizeof(int16_t));
-    memcpy(g_audio.far_ref_frame, g_audio.far_ref_shadows[g_audio.far_ref_shadow_head],
-           sizeof(g_audio.far_ref_frame));
-    memcpy(g_audio.far_ref_shadows[g_audio.far_ref_shadow_head], g_audio.far_converted,
-           sizeof(g_audio.far_ref_shadows[g_audio.far_ref_shadow_head]));
-    g_audio.far_ref_shadow_head = (g_audio.far_ref_shadow_head + 1u) % I2S_DMA_BUFFER_COUNT;
-    portEXIT_CRITICAL(&g_audio_far_ref_lock);
-#endif
-}
-
 static void record_decode_result(int samples, int64_t decode_time_us, int64_t *decode_time_sum)
 {
     if (samples != AUDIO_FRAME_SAMPLES) {
@@ -645,9 +597,6 @@ void audio_log_stats(void)
              stats.bluetooth_playout_route_lock_misses, stats.bluetooth_mic_overflows,
               stats.bluetooth_mic_underruns, stats.bluetooth_mic_capture_write_route_lock_misses,
               stats.bluetooth_mic_read_route_lock_misses);
-     ESP_LOGI(TAG, "  AEC: available=%u active=%u chunk=%u chunks=%lu startup_delay=%lu",
-              stats.aec_available ? 1u : 0u, stats.aec_active ? 1u : 0u, stats.aec_chunk_size,
-              stats.aec_chunks_processed, stats.aec_startup_delay_frames);
       ESP_LOGI(TAG,
               "audio_log_stats music_converter_fail=%lu music_fifo_overflow=%lu music_render_us_avg=%lu music_render_us_max=%lu playout_work_us_avg=%lu playout_work_us_max=%lu capture_ok=%lu capture_err=%lu",
                stats.bluetooth_music_converter_failures,
@@ -856,14 +805,11 @@ static void write_playout_frame(bool notify_frame, bool notify_continues,
         g_audio.stats.i2s_write_incomplete++;
         g_audio.stats.glitches_detected++;
         AUDIO_STATS_UNLOCK();
-        audio_playout_reset_far_reference();
-        audio_sample_fifo_reset(&g_audio.far_fifo);
-        (void)audio_rate_converter_reset(g_audio.far_reference_converter);
         ESP_LOGW(TAG, "Codec playback write failed: %d", ret);
     } else {
         output_window->successful++;
+        /* The retained far-reference profile span is empty. */
         int64_t far_span = cpu_profile_span_begin();
-        advance_far_reference_after_write();
         cpu_profile_span_end(CPU_PROFILE_SPAN_PLAY_FAR_REFERENCE, far_span);
         AUDIO_STATS_LOCK();
         g_audio.stats.playback_frames++;
@@ -919,12 +865,9 @@ void audio_playout_task(void *arg)
     opus_decoder_ctl(g_audio.loopback_decoder, OPUS_RESET_STATE);
     audio_rx_reset_codecs_and_resamplers();
     (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
-    (void)audio_rate_converter_reset(g_audio.far_reference_converter);
     audio_sample_fifo_reset(&g_audio.music_fifo);
-    audio_sample_fifo_reset(&g_audio.far_fifo);
     audio_sample_fifo_reset(&g_audio.voice_fifo);
     audio_sample_fifo_reset(&g_audio.voice_presence_fifo);
-    audio_playout_reset_far_reference();
     atomic_store_explicit(&g_audio.playout_ready, true, memory_order_release);
     xSemaphoreGive(g_audio.playout_started);
     ESP_LOGI(TAG, "Playout task started on core %d", xPortGetCoreID());
@@ -1018,11 +961,7 @@ void audio_playout_task(void *arg)
                                     converted) != converted) {
             audio_sample_fifo_reset(&g_audio.voice_fifo);
             audio_sample_fifo_reset(&g_audio.voice_presence_fifo);
-            audio_sample_fifo_reset(&g_audio.far_fifo);
-            audio_playout_reset_far_reference();
             (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
-            (void)audio_rate_converter_reset(g_audio.far_reference_converter);
-            audio_playout_reset_far_reference();
             AUDIO_STATS_LOCK();
             g_audio.stats.pcm_fifo_overflows++;
             g_audio.stats.glitches_detected++;

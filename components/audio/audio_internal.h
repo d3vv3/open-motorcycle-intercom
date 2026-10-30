@@ -34,7 +34,6 @@
 #include "audio_packet_store.h"
 #include "audio_pcm_resampler.h"
 #include "audio_route.h"
-#include "audio_aec.h"
 #include "audio_capture_fifo.h"
 #include "audio_rate_converter.h"
 #include "audio_sample_fifo.h"
@@ -54,9 +53,6 @@
 #define AUDIO_TASK_CORE               1
 
 #define AUDIO_ENABLE_AEC_NS         1
-/* Trial only: ESP-SR took 122 ms per 20 ms capture frame on S31, so it is not
- * qualified for the 50 fps capture deadline. Keep scalar voice cleanup active. */
-#define AUDIO_ENABLE_ESP_SR_AEC      0
 
 /* Each DMA descriptor holds one 20 ms hardware frame at 48 kHz. */
 #define I2S_DMA_BUFFER_COUNT 2
@@ -69,7 +65,6 @@
 #define AUDIO_CAPTURE_FIFO_CAPACITY 640
 #define AUDIO_PLAYBACK_CONVERTED_CAPACITY (AUDIO_HW_FRAME_SAMPLES * 2u)
 #define AUDIO_PLAYBACK_FIFO_CAPACITY      (AUDIO_HW_FRAME_SAMPLES * 2u)
-#define AUDIO_FAR_FIFO_CAPACITY           (AUDIO_FRAME_SAMPLES * 2u)
 
 #define MAX_OPUS_PACKET_SIZE      64
 #define OPUS_DTX_FRAME_MAX_BYTES  2
@@ -200,10 +195,8 @@ typedef struct {
     audio_hpf_state_t hpf;
     vox_state_t vox;
     voice_cleanup_state_t voice_cleanup;
-    audio_aec_t aec;
     audio_rate_converter_t *capture_rate_converter;
     audio_rate_converter_t *voice_playback_converter;
-    audio_rate_converter_t *far_reference_converter;
     audio_rate_converter_t *music_playback_converter;
     audio_capture_fifo_t capture_fifo;
     int16_t capture_fifo_storage[AUDIO_CAPTURE_FIFO_CAPACITY];
@@ -212,9 +205,6 @@ typedef struct {
     int16_t pcm_input[AUDIO_FRAME_SAMPLES];
     uint8_t opus_buffer[MAX_OPUS_PACKET_SIZE];
     int16_t pcm_output[AUDIO_FRAME_SAMPLES];
-    int16_t far_ref_frame[AUDIO_FRAME_SAMPLES];
-    int16_t far_ref_shadows[I2S_DMA_BUFFER_COUNT][AUDIO_FRAME_SAMPLES];
-    size_t far_ref_shadow_head;
     int16_t hw_output[AUDIO_HW_FRAME_SAMPLES];
     int16_t urgent_base[AUDIO_HW_FRAME_SAMPLES];
     /* Software-only playback staging is allocated from PSRAM during init. */
@@ -230,10 +220,6 @@ typedef struct {
     int16_t *music_converted;
     int16_t *music_fifo_storage;
     audio_sample_fifo_t music_fifo;
-    int16_t *far_converted;
-    int16_t *far_pending_frame;
-    int16_t *far_fifo_storage;
-    audio_sample_fifo_t far_fifo;
     int32_t mix_frame[AUDIO_FRAME_SAMPLES];
 
     /* RX sources and queues */
@@ -257,7 +243,6 @@ typedef struct {
 extern audio_context_t g_audio;
 extern portMUX_TYPE g_audio_stats_lock;
 extern portMUX_TYPE g_audio_task_lock;
-extern portMUX_TYPE g_audio_far_ref_lock;
 
 #define AUDIO_STATS_LOCK()   portENTER_CRITICAL(&g_audio_stats_lock)
 #define AUDIO_STATS_UNLOCK() portEXIT_CRITICAL(&g_audio_stats_lock)
@@ -287,7 +272,6 @@ void audio_capture_init_dsp(void);
 
 /* audio_playout.c */
 void audio_playout_task(void *arg);
-void audio_playout_reset_far_reference(void);
 
 /* audio_rx.c */
 void audio_rx_reset_source_metadata(void);
