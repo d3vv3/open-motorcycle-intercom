@@ -230,7 +230,7 @@ esp_err_t audio_put_rx_frame(const audio_frame_t *frame, uint8_t source_id)
         xSemaphoreGive(lifecycle_mutex);
         return ret;
     }
-    if (xSemaphoreTake(g_audio.rx_sources_mutex, pdMS_TO_TICKS(RX_ENQUEUE_LOCK_WAIT_MS)) !=
+    if (xSemaphoreTake(g_audio.rx_sources_mutex, RX_ENQUEUE_LOCK_WAIT_TICKS) !=
         pdTRUE) {
         AUDIO_STATS_LOCK();
         g_audio.stats.frames_dropped++;

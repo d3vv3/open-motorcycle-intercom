@@ -79,6 +79,8 @@
 /* Runtime route callbacks wait at most this long while holding route_mutex. */
 #define AUDIO_ROUTE_LOCK_WAIT_MS 1
 #define RX_ENQUEUE_LOCK_WAIT_MS 1
+/* +1 tick: an N-tick wait expires at the N-th tick edge, so N ticks guarantee only N-1 ms. */
+#define RX_ENQUEUE_LOCK_WAIT_TICKS (pdMS_TO_TICKS(RX_ENQUEUE_LOCK_WAIT_MS) + 1)
 
 #define LOOPBACK_QUEUE_SIZE       8
 #define NOTIFICATION_QUEUE_SIZE   4
