@@ -40,7 +40,6 @@
 #include "omi_board_pins.h"
 #include "power.h"
 #include "phone_audio.h"
-#include "rtt_probe.h"
 #include "transport_espnow.h"
 #include "transport_nrf.h"
 #include "uart_bridge.h"
@@ -54,8 +53,8 @@ static const char *TAG = "omi";
  * 0 = normal VOX behavior (DTX silence suppression active), 1 = force continuous TX. */
 #define FORCE_TX_ALWAYS_FOR_TEST 0
 
-/* RTT log cadence while using nRF transport */
-#define RTT_LOG_INTERVAL_MS 10000
+/* Pipe diagnostics log cadence while using nRF transport */
+#define PIPE_LOG_INTERVAL_MS 10000
 
 _Atomic bool g_mesh_active = false;
 typedef struct { button_id_t id; button_event_t event; } button_action_t;
@@ -664,14 +663,6 @@ static void log_quick_stats(void)
              transport_str, mesh_stats.audio_frames_tx, mesh_stats.audio_frames_rx,
              mesh_stats.audio_frames_lost, loss_pct, audio_stats.frames_encoded,
              audio_stats.frames_decoded, mesh_stats.jitter_depth);
-
-    if (s_active_transport == TRANSPORT_NRF52840) {
-        rtt_probe_stats_t rtt = {0};
-        rtt_probe_get_stats(&rtt);
-        ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums", rtt.sent,
-                 rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max, rtt.jitter_ms_avg,
-                 rtt.jitter_ms_max);
-    }
 }
 
 static void log_system_health(int64_t now_ms, int64_t boot_time)
@@ -763,8 +754,6 @@ static void select_transport(void)
 
 static esp_err_t initialize_application(int64_t boot_time)
 {
-    rtt_probe_init();
-
     ESP_LOGI(TAG, "OMI - Open Motorcycle Intercom");
     ESP_LOGI(TAG, "Firmware version: %s", OMI_FIRMWARE_VERSION);
     ESP_LOGI(TAG, "Git SHA: %s", OMI_GIT_SHA);
@@ -968,7 +957,7 @@ static void run_runtime_health_loop(int64_t boot_time)
         }
 
         if (s_active_transport == TRANSPORT_NRF52840) {
-            static int64_t last_rtt_log_ms = 0;
+            static int64_t last_pipe_log_ms = 0;
             static int64_t last_flush_retry_ms;
 
             if (atomic_load(&s_channel_transition) && now_ms - last_flush_retry_ms >= 2000) {
@@ -976,21 +965,11 @@ static void run_runtime_health_loop(int64_t boot_time)
                 if (audio_reset_mesh_rx() == ESP_OK) atomic_store(&s_channel_transition, false);
             }
             if (!atomic_load(&s_channel_transition)) transport_nrf_tick(now_ms);
-#if !defined(APP_S31_LC3_WIRE)
-            /* LC3 nRF firmware does not ACK legacy BRIDGE_PKT_AUDIO RTT probes. */
-            rtt_probe_tick(now_ms, g_mesh_active, uart_bridge_is_connected());
-#endif
 
-            if ((now_ms - last_rtt_log_ms) >= RTT_LOG_INTERVAL_MS) {
-                rtt_probe_stats_t rtt = {0};
-                rtt_probe_get_stats(&rtt);
-
-                ESP_LOGI(TAG, "[RTT] sent=%lu recv=%lu lost=%lu rtt=%lums/%lums jit=%lums/%lums",
-                         rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
-                         rtt.jitter_ms_avg, rtt.jitter_ms_max);
+            if ((now_ms - last_pipe_log_ms) >= PIPE_LOG_INTERVAL_MS) {
                 e2e_diag_log(transport_nrf_node_id());
                 uart_bridge_log_audio_pipe_stats();
-                last_rtt_log_ms = now_ms;
+                last_pipe_log_ms = now_ms;
             }
         }
         announce_active_role();

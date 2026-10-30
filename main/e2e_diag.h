@@ -29,7 +29,6 @@ typedef struct {
     uint32_t spi_rx;
     uint32_t spi_rx_invalid;
     uint32_t spi_rx_self;
-    uint32_t probe_rx;
     uint32_t play_queue_ok;
     uint32_t play_queue_drop;
     uint32_t bundle_tx;

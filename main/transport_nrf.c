@@ -22,7 +22,6 @@
 #include "e2e_diag.h"
 #include "mesh.h"
 #include "mesh_intent.h"
-#include "rtt_probe.h"
 #include "runtime_channel_control.h"
 #include "transport_nrf_reconcile.h"
 #include "uart_bridge.h"
@@ -381,11 +380,8 @@ static void bridge_audio_callback(uint8_t src_id, const uint8_t *data, uint16_t 
     }
 
     if (!redundant_bundle) {
-        if (len < 2 || !rtt_probe_handle_packet(src_id, data + 1, (uint16_t)(len - 1))) {
-            pipe->spi_rx_invalid++;
-        } else {
-            pipe->probe_rx++;
-        }
+        /* Legacy BRIDGE_PKT_AUDIO frames carry no audio bundle. */
+        pipe->spi_rx_invalid++;
         return;
     }
 

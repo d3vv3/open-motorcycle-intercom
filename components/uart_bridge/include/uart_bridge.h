@@ -91,14 +91,6 @@ esp_err_t uart_bridge_init(void);
 void uart_bridge_deinit(void);
 
 /**
- * @brief Send audio packet to mesh via nRF52840
- * @param data Opus encoded audio data
- * @param len Length of data
- * @return ESP_OK on success
- */
-esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len);
-
-/**
  * @brief Send a redundant audio bundle to the mesh via nRF52840
  */
 esp_err_t uart_bridge_send_audio_v2(const uint8_t *data, uint16_t len);

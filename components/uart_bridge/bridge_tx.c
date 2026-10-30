@@ -351,11 +351,6 @@ static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t l
     return ESP_OK;
 }
 
-esp_err_t uart_bridge_send_audio(const uint8_t *data, uint16_t len)
-{
-    return send_audio_packet(BRIDGE_PKT_AUDIO, data, len);
-}
-
 esp_err_t uart_bridge_send_audio_v2(const uint8_t *data, uint16_t len)
 {
     audio_bundle_view_t bundle;
