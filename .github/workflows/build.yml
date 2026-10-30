@@ -172,6 +172,13 @@ jobs:
       - name: Run bridge status freshness tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -pthread -D_GNU_SOURCE -Itests/c/host_sdk -Icomponents/uart_bridge -Icomponents/uart_bridge/include -Icomponents/board/include -Ishared -I. tests/c/bridge_status_fresh_test.c components/uart_bridge/bridge_status.c -o /tmp/bridge_status_fresh_test && /tmp/bridge_status_fresh_test
 
+      - name: Run bridge TX enqueue tests
+        run: |
+          mkdir -p /tmp/bridge_tx_enqueue
+          awk '/^static esp_err_t send_audio_packet\(/,/^}/' components/uart_bridge/bridge_tx.c > /tmp/bridge_tx_enqueue/bridge_tx_enqueue.inc
+          test -s /tmp/bridge_tx_enqueue/bridge_tx_enqueue.inc
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -I/tmp/bridge_tx_enqueue tests/c/bridge_tx_enqueue_test.c -o /tmp/bridge_tx_enqueue_test && /tmp/bridge_tx_enqueue_test
+
       - name: Run bridge frame codec tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/bridge_frame_test && /tmp/bridge_frame_test
 

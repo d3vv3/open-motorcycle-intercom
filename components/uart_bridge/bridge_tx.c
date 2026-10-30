@@ -258,8 +258,10 @@ esp_err_t bridge_tx_queue_control(uint8_t type, const uint8_t *payload, uint16_t
     return ESP_OK;
 }
 
-static void log_audio_pipe_stats(void)
+void uart_bridge_log_audio_pipe_stats(void)
 {
+    if (!g_bridge.initialized) return;
+    bridge_status_log_telemetry(esp_timer_get_time());
     static int64_t last_log = 0;
     int64_t now = esp_timer_get_time();
     if (now - last_log <= 5000000) {
@@ -277,10 +279,12 @@ static void log_audio_pipe_stats(void)
              g_bridge.ack_timeout_count, g_bridge.waiting_ack ? 1 : 0);
     ESP_LOGI(TAG,
              "PIPE v=1 dev=esp stage=spi tx_q_ok=%lu tx_q_timeout=%lu tx_size_drop=%lu "
-             "tx_stale_drop=%lu tx_wait_avg_us=%lu tx_wait_max_us=%lu rx_ok=%lu crc_drop=%lu "
-             "sync_drop=%lu len_drop=%lu trunc_drop=%lu seq_gap=%lu ack_timeout=%lu q_depth=%u",
+             "tx_q_full=%lu tx_q_mutex=%lu tx_stale_drop=%lu tx_wait_avg_us=%lu tx_wait_max_us=%lu "
+             "rx_ok=%lu crc_drop=%lu sync_drop=%lu len_drop=%lu trunc_drop=%lu seq_gap=%lu "
+             "ack_timeout=%lu q_depth=%u",
              g_bridge.audio_tx_queued, g_bridge.audio_tx_enqueue_timeout,
-             g_bridge.audio_tx_invalid_size, g_bridge.audio_tx_stale_drop,
+             g_bridge.audio_tx_invalid_size, g_bridge.audio_tx_enqueue_full,
+             g_bridge.audio_tx_enqueue_mutex, g_bridge.audio_tx_stale_drop,
              g_bridge.audio_tx_wait_count
                  ? (uint32_t)(g_bridge.audio_tx_wait_sum_us / g_bridge.audio_tx_wait_count)
                  : 0,
@@ -307,12 +311,16 @@ static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t l
 
     if (xSemaphoreTake(g_bridge.audio_slots_free, 0) != pdTRUE) {
         g_bridge.audio_tx_enqueue_timeout++;
+        g_bridge.audio_tx_enqueue_full++;
         return ESP_ERR_TIMEOUT;
     }
 
-    if (xSemaphoreTake(g_bridge.tx_mutex, 0) != pdTRUE) {
+    /* One tick: the SPI task holds tx_mutex only briefly; a 0-tick try lost
+     * frames to that contention. */
+    if (xSemaphoreTake(g_bridge.tx_mutex, 1) != pdTRUE) {
         xSemaphoreGive(g_bridge.audio_slots_free);
         g_bridge.audio_tx_enqueue_timeout++;
+        g_bridge.audio_tx_enqueue_mutex++;
         return ESP_ERR_TIMEOUT;
     }
 
@@ -339,7 +347,7 @@ static esp_err_t send_audio_packet(uint8_t type, const uint8_t *data, uint16_t l
     g_bridge.audio_tx_queued++;
     xSemaphoreGive(g_bridge.tx_mutex);
 
-    log_audio_pipe_stats();
+    /* No logging on this audio-task path; see uart_bridge_log_audio_pipe_stats. */
     return ESP_OK;
 }
 

@@ -989,6 +989,7 @@ static void run_runtime_health_loop(int64_t boot_time)
                          rtt.sent, rtt.recv, rtt.lost, rtt.rtt_ms_avg, rtt.rtt_ms_max,
                          rtt.jitter_ms_avg, rtt.jitter_ms_max);
                 e2e_diag_log(transport_nrf_node_id());
+                uart_bridge_log_audio_pipe_stats();
                 last_rtt_log_ms = now_ms;
             }
         }

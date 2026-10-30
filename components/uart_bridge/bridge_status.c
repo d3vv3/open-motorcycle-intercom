@@ -196,38 +196,32 @@ esp_err_t uart_bridge_get_status(uart_bridge_status_t *status)
         return ESP_ERR_INVALID_ARG;
     }
 
+    /* Called from the audio TX path (uart_bridge_is_mesh_ready): no logging
+     * here. Telemetry is printed by uart_bridge_log_audio_pipe_stats. */
     bool expired = false;
     uint32_t expired_generation = 0;
-    uint8_t expired_state = BRIDGE_MESH_STATE_IDLE;
-    uint32_t expired_age_ms = 0;
     int64_t now_us = esp_timer_get_time();
     portENTER_CRITICAL(&g_bridge_status_lock);
     update_status_age_locked(now_us);
     if (!bridge_status_is_fresh_locked(now_us)) {
         expired = g_bridge.connected;
         expired_generation = g_bridge.status.generation;
-        expired_state = g_bridge.status.mesh_state;
-        expired_age_ms = g_bridge.status_age_current_ms;
         if (expired) {
             g_bridge.status_expiration_count++;
             g_bridge.status_expired_generation = expired_generation;
-            g_bridge.status_expired_state = expired_state;
+            g_bridge.status_expired_state = g_bridge.status.mesh_state;
             g_bridge.status_expired = true;
         }
         g_bridge.connected = false;
         portEXIT_CRITICAL(&g_bridge_status_lock);
         if (expired) {
-            ESP_LOGW(TAG, "Status expired: age_ms=%lu generation=%lu state=%u", expired_age_ms,
-                     expired_generation, expired_state);
             bridge_tx_discard_for_expired_status(expired_generation);
         }
-        bridge_status_log_telemetry(now_us);
         return ESP_ERR_NOT_FOUND;
     }
 
     memcpy(status, &g_bridge.status, sizeof(uart_bridge_status_t));
     portEXIT_CRITICAL(&g_bridge_status_lock);
-    bridge_status_log_telemetry(now_us);
     return ESP_OK;
 }
 

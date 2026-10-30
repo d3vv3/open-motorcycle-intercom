@@ -106,6 +106,9 @@ esp_err_t uart_bridge_send_audio_v2(const uint8_t *data, uint16_t len);
 /** Drop queued/inflight audio on a mesh stop or lost bridge session. */
 void uart_bridge_discard_pending_audio(void);
 
+/** Print bridge diagnostics from the main 10-second health loop, never an audio task. */
+void uart_bridge_log_audio_pipe_stats(void);
+
 /**
  * @brief Register callback for received audio
  * @param cb Callback function

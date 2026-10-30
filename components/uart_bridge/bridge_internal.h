@@ -118,6 +118,8 @@ typedef struct {
     uint32_t audio_tx_queued;
     uint32_t audio_tx_overwrite;
     uint32_t audio_tx_enqueue_timeout;
+    uint32_t audio_tx_enqueue_full;
+    uint32_t audio_tx_enqueue_mutex;
     uint32_t audio_tx_invalid_size;
     uint32_t audio_tx_stale_drop;
     uint32_t audio_tx_wait_count;
