@@ -22,6 +22,16 @@ static inline bool omi_privacy_resume_settled(int64_t now_ms, int64_t transition
     return now_ms - transition_ms >= 200;
 }
 
+/* With no privacy action pending, re-send RESUME once per bridge session on
+ * the nRF transport. The nRF may still be paused across an S31 reboot, where
+ * the gate epoch restarts at zero, so epoch zero must not skip the restore. */
+static inline bool omi_privacy_restore_resume_due(const omi_privacy_reconcile_t *state,
+                                                  bool nrf_transport, bool blocked,
+                                                  int64_t now_ms, int64_t retry_ms)
+{
+    return nrf_transport && !blocked && !state->resumed && now_ms >= retry_ms;
+}
+
 static inline omi_privacy_action_t omi_privacy_next(omi_privacy_reconcile_t *state,
                                                     uint32_t epoch, bool active, bool blocked)
 {

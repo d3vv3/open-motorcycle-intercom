@@ -105,6 +105,17 @@ int main(void)
     assert(omi_privacy_next(&privacy, 4, false, true) == OMI_PRIVACY_PAUSE);
     privacy.pause_acked = true;
     assert(omi_privacy_next(&privacy, 4, false, true) == OMI_PRIVACY_RESUME);
+
+    /* After an S31 reboot the gate epoch is zero but the nRF may still be
+     * paused from before: the restore RESUME must still be sent. */
+    omi_privacy_reconcile_t rebooted = {0};
+    assert(omi_privacy_next(&rebooted, 0, false, false) == OMI_PRIVACY_NONE);
+    assert(omi_privacy_restore_resume_due(&rebooted, true, false, 0, 0));
+    assert(!omi_privacy_restore_resume_due(&rebooted, false, false, 0, 0)); /* ESP-NOW */
+    assert(!omi_privacy_restore_resume_due(&rebooted, true, true, 0, 0));   /* gate closed */
+    assert(!omi_privacy_restore_resume_due(&rebooted, true, false, 999, 1000)); /* backoff */
+    rebooted.resumed = true; /* latched until the next bridge session */
+    assert(!omi_privacy_restore_resume_due(&rebooted, true, false, 0, 0));
     assert(omi_call_volume_target(OMI_ACTION_VOLUME_UP, false) == OMI_VOLUME_MESH);
     assert(omi_call_volume_target(OMI_ACTION_VOLUME_UP, true) == OMI_VOLUME_BLUETOOTH);
     assert(omi_call_volume_target(OMI_ACTION_BLUETOOTH_VOLUME_DOWN, false) == OMI_VOLUME_BLUETOOTH);

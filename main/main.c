@@ -241,10 +241,10 @@ static void reconcile_call_privacy(int64_t now_ms)
     }
     omi_privacy_action_t action = omi_privacy_next(&s_privacy, epoch, active, blocked);
     if (action == OMI_PRIVACY_NONE) {
-        /* A bridge restart can lose its local pause flag even after a prior
-         * successful resume; restore the unpaused state on the new session. */
-        if (s_active_transport == TRANSPORT_NRF52840 && !blocked && !s_privacy.resumed &&
-            s_privacy.epoch != 0u && now_ms >= s_privacy_retry_ms) {
+        /* The nRF may still be paused across an S31 reboot (epoch zero).
+         * A successful restore is latched until the next bridge session. */
+        if (omi_privacy_restore_resume_due(&s_privacy, s_active_transport == TRANSPORT_NRF52840,
+                                           blocked, now_ms, s_privacy_retry_ms)) {
             esp_err_t ret = uart_bridge_mesh_audio_resume();
             if (ret == ESP_OK) { s_privacy.resumed = true; s_privacy_failures = 0; }
             else privacy_failed("restore resume", ret, now_ms);
