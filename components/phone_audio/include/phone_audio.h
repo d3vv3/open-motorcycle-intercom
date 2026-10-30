@@ -30,6 +30,10 @@ typedef struct {
     bool volume_control_limited;
     uint32_t sample_rate;
     uint8_t channels;
+    /** HFP service-level connection is up. */
+    bool hfp_connected;
+    /** Successful fresh pairings (new link keys) this boot; bonded reconnects do not count. */
+    uint32_t new_bonds;
     phone_audio_call_state_t call;
 } phone_audio_state_t;
 

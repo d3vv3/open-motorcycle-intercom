@@ -166,6 +166,11 @@ typedef struct {
     phone_audio_call_state_cb_t call_state_callback;
     void *call_state_context;
     atomic_uint pairing_deadline_tick;
+    /* Bonds created by a fresh pairing this boot; reconnects never bump it. */
+    atomic_uint new_bonds;
+    /* GAP-callback-only: the peer whose pairing request we accepted. */
+    uint8_t pairing_peer[ESP_BD_ADDR_LEN];
+    bool pairing_peer_pending;
     TimerHandle_t pairing_timer;
     StaticTimer_t pairing_timer_storage;
     bool controller_ready;
@@ -340,22 +345,44 @@ static bool pairing_allowed(const uint8_t *bda)
             peer_is_selected(bda));
 }
 
+/* Pairing bookkeeping runs only on the Bluedroid GAP callback task. */
+static void note_pairing_request(const uint8_t *bda, bool allowed)
+{
+    s_phone.pairing_peer_pending = allowed;
+    if (allowed) memcpy(s_phone.pairing_peer, bda, ESP_BD_ADDR_LEN);
+}
+
 static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
     switch (event) {
-    case ESP_BT_GAP_CFM_REQ_EVT:
-        (void)esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, pairing_allowed(param->cfm_req.bda));
+    case ESP_BT_GAP_CFM_REQ_EVT: {
+        bool allowed = pairing_allowed(param->cfm_req.bda);
+        note_pairing_request(param->cfm_req.bda, allowed);
+        (void)esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, allowed);
         break;
+    }
     case ESP_BT_GAP_PIN_REQ_EVT: {
         esp_bt_pin_code_t pin = {'0', '0', '0', '0'};
         bool allowed = !param->pin_req.min_16_digit && pairing_allowed(param->pin_req.bda);
+        note_pairing_request(param->pin_req.bda, allowed);
         (void)esp_bt_gap_pin_reply(param->pin_req.bda, allowed, allowed ? 4 : 0, pin);
         break;
     }
-    case ESP_BT_GAP_AUTH_CMPL_EVT:
-        ESP_LOGI(TAG, "Bluetooth authentication %s",
-                 param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS ? "succeeded" : "failed");
+    case ESP_BT_GAP_AUTH_CMPL_EVT: {
+        bool success = param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS;
+        /* Bluedroid reports a successful AUTH_CMPL only when a new link key was
+         * generated and stored; a bonded phone reconnecting with its stored key
+         * gets no SSP/PIN request and no AUTH_CMPL. Also requiring the pairing
+         * request we accepted for this peer keeps reconnects out. */
+        bool requested = s_phone.pairing_peer_pending &&
+            memcmp(s_phone.pairing_peer, param->auth_cmpl.bda, ESP_BD_ADDR_LEN) == 0;
+        if (requested) s_phone.pairing_peer_pending = false;
+        bool fresh = success && requested;
+        if (fresh) atomic_fetch_add_explicit(&s_phone.new_bonds, 1u, memory_order_release);
+        ESP_LOGI(TAG, "Bluetooth authentication %s%s", success ? "succeeded" : "failed",
+                 fresh ? " (new bond)" : "");
         break;
+    }
     default:
         break;
     }
@@ -1956,6 +1983,8 @@ esp_err_t phone_audio_get_state(phone_audio_state_t *state)
     state->volume_control_limited = false;
     state->sample_rate = atomic_load_explicit(&s_phone.sample_rate, memory_order_acquire);
     state->channels = atomic_load_explicit(&s_phone.channels, memory_order_acquire);
+    state->hfp_connected = atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_acquire);
+    state->new_bonds = atomic_load_explicit(&s_phone.new_bonds, memory_order_acquire);
     portENTER_CRITICAL(&s_phone.call_state_lock);
     state->call = s_phone.call_state;
     portEXIT_CRITICAL(&s_phone.call_state_lock);

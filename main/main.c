@@ -69,6 +69,7 @@ static media_toggle_guard_t s_media_toggle_guard;
 static omi_call_policy_t s_call_policy;
 static omi_privacy_reconcile_t s_privacy;
 static atomic_uint s_end_beeps_pending = ATOMIC_VAR_INIT(0);
+static uint32_t s_phone_bonds_announced;
 static int64_t s_privacy_retry_ms;
 static unsigned s_privacy_failures;
 static bool s_bridge_was_ready;
@@ -196,6 +197,23 @@ static void process_call_cues(void)
         esp_err_t ret = audio_play_call_end();
         if (omi_call_end_acknowledged(pending, ret == ESP_OK))
             atomic_fetch_sub(&s_end_beeps_pending, 1u);
+    }
+}
+
+/* Phone-link prompts come from polled phone state on this task, never from the
+ * Bluedroid callbacks. */
+static void process_phone_cues(void)
+{
+    phone_audio_state_t phone_state;
+    if (phone_audio_get_state(&phone_state) != ESP_OK || !phone_state.initialized) return;
+    if (phone_state.new_bonds != s_phone_bonds_announced) {
+        esp_err_t ret = audio_play_notification(AUDIO_NOTIFY_PHONE_PAIRED);
+        /* A full prompt queue drains; retry on the next loop. */
+        if (ret != ESP_ERR_NO_MEM) {
+            s_phone_bonds_announced = phone_state.new_bonds;
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "Phone paired prompt failed: %s", esp_err_to_name(ret));
+        }
     }
 }
 
@@ -914,6 +932,7 @@ static void run_runtime_health_loop(int64_t boot_time)
             process_button_action(action, now_ms);
         process_media_toggle(false, now_ms);
         process_call_cues();
+        process_phone_cues();
         reconcile_call_privacy(now_ms);
         unsigned dropped = atomic_exchange(&s_button_drops, 0);
         if (dropped) ESP_LOGW(TAG, "Button queue full; dropped %u newest actions", dropped);

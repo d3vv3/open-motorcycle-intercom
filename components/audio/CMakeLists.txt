@@ -43,7 +43,7 @@ idf_component_register(
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(AUDIO_PROMPT_WAVS
     startup peer_join peer_leave mesh_on mesh_off phone_pairing channel_green channel_red
-    channel_blue you_are_coordinator you_are_participant incoming_phone_call)
+    channel_blue you_are_coordinator you_are_participant incoming_phone_call phone_paired)
 list(TRANSFORM AUDIO_PROMPT_WAVS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/../../audios/")
 list(TRANSFORM AUDIO_PROMPT_WAVS APPEND ".wav")
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/audio_prompts_data.c"
