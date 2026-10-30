@@ -937,7 +937,9 @@ esp_err_t audio_record_tx_pipeline_latency_us(uint32_t latency_us)
     AUDIO_STATS_LOCK();
     g_audio.tx_pipe_count++;
     g_audio.tx_pipe_sum_us += latency_us;
-    g_audio.stats.tx_pipe_us_avg = (uint32_t)(g_audio.tx_pipe_sum_us / g_audio.tx_pipe_count);
+    /* The u32 count wraps to zero after 2^32 frames; keep the last average. */
+    if (g_audio.tx_pipe_count != 0u)
+        g_audio.stats.tx_pipe_us_avg = (uint32_t)(g_audio.tx_pipe_sum_us / g_audio.tx_pipe_count);
     if (latency_us > g_audio.stats.tx_pipe_us_max) {
         g_audio.stats.tx_pipe_us_max = latency_us;
     }
