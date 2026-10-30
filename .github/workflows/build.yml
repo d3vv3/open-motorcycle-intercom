@@ -210,6 +210,10 @@ jobs:
           cc $FLAGS $SAN -I. shared/bridge_frame.c tests/c/bridge_frame_test.c -o /tmp/san_bridge_frame && /tmp/san_bridge_frame
           cc $FLAGS $SAN -I. shared/audio_rx_tracker.c tests/c/audio_rx_tracker_test.c -o /tmp/san_audio_rx_tracker && /tmp/san_audio_rx_tracker
           cc $FLAGS $SAN -I. -Ishared shared/mesh_adaptive.c tests/c/mesh_adaptive_test.c -o /tmp/san_mesh_adaptive && /tmp/san_mesh_adaptive
+          cc $FLAGS $SAN -pthread -D_GNU_SOURCE -Itests/c/host_sdk -Icomponents/uart_bridge -Icomponents/uart_bridge/include -Icomponents/board/include -Ishared -I. tests/c/bridge_status_fresh_test.c components/uart_bridge/bridge_status.c -o /tmp/san_bridge_status_fresh && /tmp/san_bridge_status_fresh
+          cc $FLAGS $SAN -I/tmp/bridge_tx_enqueue tests/c/bridge_tx_enqueue_test.c -o /tmp/san_bridge_tx_enqueue && /tmp/san_bridge_tx_enqueue
+          cc $FLAGS $SAN -pthread -D_GNU_SOURCE -Itests/c/power_sdk -Itests/c/host_sdk -Icomponents/power/include components/power/power.c tests/c/power_state_test.c -o /tmp/san_power_state && /tmp/san_power_state
+          cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_mesh_call.c tests/c/audio_mesh_call_test.c -o /tmp/san_audio_mesh_call && /tmp/san_audio_mesh_call
           cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_packet_store.c tests/c/audio_packet_store_test.c -o /tmp/san_packet_store && /tmp/san_packet_store
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_pcm_resampler.c tests/c/audio_pcm_resampler_test.c -o /tmp/san_resampler && /tmp/san_resampler
            cc $FLAGS $SAN -Wno-sign-compare -DAUDIO_RATE_CONVERTER_HOST_TEST -DOUTSIDE_SPEEX -DFIXED_POINT -DRANDOM_PREFIX=omi_speex -Icomponents/audio -Icomponents/speex_resampler -Itests/c components/audio/audio_rate_converter.c components/speex_resampler/resample.c tests/c/audio_rate_converter_test.c -lm -o /tmp/san_audio_rate_converter && /tmp/san_audio_rate_converter
