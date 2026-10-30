@@ -547,9 +547,10 @@ def test_build_commands_have_fresh_sdkconfig_and_host_cargo_nrf(tmp_path, monkey
     for name in ("ESP_LC3_BENCH", "S31_LC3_WIRE", "S31_LC3_SELFTEST", "S31_LC3_SERIALIZE",
                  "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER"):
         assert f"-D{name}=ON" in esp_script
-    for name in ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_TASK_CPU_PROFILE",
-                 "S31_MESH_COEX_PREFER_WIFI", "S31_MESH_PAIR_UNICAST"):
-        assert f"-D{name}=OFF" in esp_script
+    assert "-DS31_TASK_CPU_PROFILE=OFF" in esp_script
+    for name in ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_MESH_COEX_PREFER_WIFI",
+                 "S31_MESH_PAIR_UNICAST"):
+        assert name not in esp_script
     assert calls[0][3]["OMI_ESP_LC3_BENCH"] == "1"
     assert cargo == [(tmp_path, VERSION, SHA)]
     assert (tmp_path / "provenance/release-tools-source-sha.txt").read_text() == "c" * 40 + "\n"

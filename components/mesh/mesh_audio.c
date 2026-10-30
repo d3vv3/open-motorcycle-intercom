@@ -9,39 +9,6 @@
 #include "mesh_internal.h"
 #include "power.h"
 
-#ifdef MESH_S31_PAIR_UNICAST
-static bool pair_unicast_dest(uint8_t remote_mac[6])
-{
-    if (s_peer_mutex == NULL || xSemaphoreTake(s_peer_mutex, 0) != pdTRUE) return false;
-
-    bool eligible = false;
-    if (s_state == MESH_STATE_ACTIVE &&
-        (s_role == MESH_ROLE_COORDINATOR || s_role == MESH_ROLE_PARTICIPANT) &&
-        s_node_id != 0 && s_node_id <= MESH_MAX_NODES) {
-        /* Match mesh_get_node_count() under the same peer-table lock. */
-        uint8_t total = (uint8_t)__builtin_popcount((unsigned)s_mesh.adaptive.members);
-        if (total == 2) {
-            unsigned remotes = 0;
-            bool valid_remote = false;
-            for (int i = 0; i < MESH_MAX_NODES; i++) {
-                const mesh_peer_info_t *peer = &s_peers[i].info;
-                if (!peer->active ||
-                    memcmp(peer->mac_addr, s_local_mac, sizeof(peer->mac_addr)) == 0) continue;
-                remotes++;
-                if (remotes == 1) {
-                    valid_remote = peer->node_id != 0 && peer->node_id <= MESH_MAX_NODES;
-                    memcpy(remote_mac, peer->mac_addr, sizeof(peer->mac_addr));
-                }
-            }
-            eligible = remotes == 1 && valid_remote;
-        }
-    }
-    xSemaphoreGive(s_peer_mutex);
-
-    return eligible && esp_now_is_peer_exist(remote_mac);
-}
-#endif
-
 bool relay_queue_empty(void)
 {
     return s_relay_head == s_relay_tail;
@@ -491,10 +458,6 @@ mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
     memcpy(audio->data, tx_item.data, tx_item.len);
 
     const uint8_t *dest_mac = s_broadcast_mac;
-#ifdef MESH_S31_PAIR_UNICAST
-    uint8_t remote_mac[6];
-    if (pair_unicast_dest(remote_mac)) dest_mac = remote_mac;
-#endif
     int64_t send_start_us = esp_timer_get_time();
     if (!atomic_load(&s_local_audio_enabled)) return MESH_TX_SLOT_EMPTY;
     esp_err_t ret = tracked_esp_now_send(&(tracked_esp_now_send_request_t){

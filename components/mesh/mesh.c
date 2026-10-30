@@ -10,31 +10,12 @@
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_wifi.h"
-#ifdef MESH_S31_COEX_PREFER_WIFI
-#include "esp_coexist.h"
-#endif
 
 #include "mesh_internal.h"
 
 const char *const TAG = "mesh";
 const uint8_t s_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static atomic_bool s_init_in_progress = ATOMIC_VAR_INIT(false);
-
-#ifdef MESH_S31_COEX_PREFER_WIFI
-static bool s_coex_restore_pending;
-
-static void restore_coex_preference(void)
-{
-    if (!s_coex_restore_pending) return;
-    esp_err_t ret = esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-    if (ret == ESP_OK) {
-        s_coex_restore_pending = false;
-        ESP_LOGI(TAG, "Coexistence preference BALANCE: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGE(TAG, "Coexistence preference BALANCE: %s", esp_err_to_name(ret));
-    }
-}
-#endif
 
 mesh_context_t s_mesh = {
     .config = MESH_CONFIG_DEFAULT(),
@@ -201,9 +182,6 @@ esp_err_t mesh_deinit(void)
         ESP_LOGE(TAG, "Cannot deinitialize while mesh task or callbacks are active");
         return result == ESP_OK ? ESP_ERR_TIMEOUT : result;
     }
-#ifdef MESH_S31_COEX_PREFER_WIFI
-    restore_coex_preference();
-#endif
 
     if (s_frame_timer) {
         esp_timer_delete(s_frame_timer);
@@ -339,17 +317,6 @@ esp_err_t mesh_start(void)
         }
     }
 
-#ifdef MESH_S31_COEX_PREFER_WIFI
-    /* Temporary RF experiment: more Wi-Fi opportunity may degrade Bluetooth audio. */
-    esp_err_t coex_ret = esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
-    if (coex_ret == ESP_OK) {
-        s_coex_restore_pending = true;
-        ESP_LOGI(TAG, "Coexistence preference WIFI: %s", esp_err_to_name(coex_ret));
-    } else {
-        ESP_LOGE(TAG, "Coexistence preference WIFI: %s", esp_err_to_name(coex_ret));
-    }
-#endif
-
     taskENTER_CRITICAL(&s_transport_mux);
     s_mesh.quiesced = false;
     s_stopping = false;
@@ -377,9 +344,6 @@ esp_err_t mesh_start(void)
         uint32_t generation = ++s_mesh.lifecycle_generation;
         s_mesh.quiesced = true;
         taskEXIT_CRITICAL(&s_transport_mux);
-#ifdef MESH_S31_COEX_PREFER_WIFI
-        restore_coex_preference();
-#endif
         mesh_state_cb_t cb = s_state_cb;
         xSemaphoreGive(s_stop_mutex);
         notify_idle_if_current(cb, MESH_STATE_SCANNING, generation);
@@ -425,9 +389,6 @@ esp_err_t mesh_stop(void)
 
     xSemaphoreTake(s_stop_mutex, portMAX_DELAY);
     if (s_state == MESH_STATE_IDLE && mesh_is_quiesced()) {
-#ifdef MESH_S31_COEX_PREFER_WIFI
-        restore_coex_preference();
-#endif
         xSemaphoreGive(s_stop_mutex);
         return ESP_OK;
     }
@@ -536,9 +497,6 @@ esp_err_t mesh_stop(void)
     s_mesh.discovery_relay_ms = 0;
     s_mesh.forward_sync_last_tx_ms = 0;
 
-#ifdef MESH_S31_COEX_PREFER_WIFI
-    restore_coex_preference();
-#endif
     mesh_state_t old_state = s_state;
     taskENTER_CRITICAL(&s_transport_mux);
     s_state = MESH_STATE_IDLE;

@@ -1,19 +1,9 @@
 option(ESP_LC3_BENCH "Enable the Espressif LC3 capture benchmark on ESP32-S31" OFF)
 option(S31_LC3_WIRE "Use LC3 for ESP32-S31 mesh audio" OFF)
-option(S31_LC3_SKIP_RX "Bypass ESP32-S31 mesh LC3 playout decoding for diagnostics" OFF)
 option(S31_LC3_SELFTEST "Run the ESP32-S31 LC3 encode/decode startup self-test" OFF)
-option(S31_LC3_SPLIT_CORES "Pin ESP32-S31 mesh LC3 playout to core 0" OFF)
 
 if(S31_LC3_WIRE AND NOT ESP_LC3_BENCH)
     message(FATAL_ERROR "S31_LC3_WIRE requires ESP_LC3_BENCH=ON")
-endif()
-
-if(S31_LC3_SKIP_RX AND NOT S31_LC3_WIRE)
-    message(FATAL_ERROR "S31_LC3_SKIP_RX requires S31_LC3_WIRE=ON")
-endif()
-
-if(S31_LC3_SKIP_RX AND NOT IDF_TARGET STREQUAL "esp32s31")
-    message(FATAL_ERROR "S31_LC3_SKIP_RX is only valid for IDF_TARGET=esp32s31")
 endif()
 
 if(S31_LC3_SELFTEST AND NOT S31_LC3_WIRE)
@@ -26,14 +16,6 @@ endif()
 
 if(S31_LC3_SELFTEST AND NOT ESP_LC3_BENCH)
     message(FATAL_ERROR "S31_LC3_SELFTEST requires ESP_LC3_BENCH=ON")
-endif()
-
-if(S31_LC3_SPLIT_CORES AND NOT S31_LC3_WIRE)
-    message(FATAL_ERROR "S31_LC3_SPLIT_CORES requires S31_LC3_WIRE=ON")
-endif()
-
-if(S31_LC3_SPLIT_CORES AND NOT IDF_TARGET STREQUAL "esp32s31")
-    message(FATAL_ERROR "S31_LC3_SPLIT_CORES is only valid for IDF_TARGET=esp32s31")
 endif()
 
 idf_component_register(
@@ -98,12 +80,4 @@ endif()
 
 if(S31_LC3_SELFTEST AND S31_LC3_WIRE AND IDF_TARGET STREQUAL "esp32s31")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_S31_LC3_SELFTEST=1)
-endif()
-
-if(S31_LC3_SKIP_RX AND S31_LC3_WIRE AND IDF_TARGET STREQUAL "esp32s31")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_S31_LC3_SKIP_RX=1)
-endif()
-
-if(S31_LC3_SPLIT_CORES AND S31_LC3_WIRE AND IDF_TARGET STREQUAL "esp32s31")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_S31_LC3_SPLIT_CORES=1)
 endif()

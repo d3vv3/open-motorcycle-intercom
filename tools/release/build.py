@@ -36,8 +36,7 @@ PROFILE = "esp32s31"
 # serialized single-owner codec with internal buffers.
 ON_OPTIONS = ("ESP_LC3_BENCH", "S31_LC3_WIRE", "S31_LC3_SELFTEST",
               "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER")
-OFF_OPTIONS = ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_TASK_CPU_PROFILE",
-               "S31_MESH_COEX_PREFER_WIFI", "S31_MESH_PAIR_UNICAST")
+OFF_OPTIONS = ("S31_TASK_CPU_PROFILE",)
 
 
 def run(args: list[str], **kwargs) -> str:

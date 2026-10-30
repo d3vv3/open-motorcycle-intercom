@@ -696,22 +696,10 @@ static esp_err_t audio_start_locked(void)
              (unsigned)heap_caps_get_free_size(caps),
              (unsigned)heap_caps_get_largest_free_block(caps));
 #endif
-    BaseType_t playout_core = AUDIO_TASK_CORE;
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    if (g_audio.config.mode == AUDIO_MODE_MESH) {
-        playout_core = 0;
-    }
-    ESP_LOGI(TAG, "LC3 split cores=1 mode=%d requested playout_core=%d capture_core=%d caller_core=%d",
-             (int)g_audio.config.mode, (int)playout_core, (int)AUDIO_TASK_CORE,
-             (int)xPortGetCoreID());
-#endif
     log_audio_worker_memory("audio_playout task");
     BaseType_t created = xTaskCreatePinnedToCore(
         audio_playout_task, "audio_playout", playout_stack, NULL,
-        AUDIO_PLAYOUT_TASK_PRIORITY, &g_audio.playout_task, playout_core);
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    ESP_LOGI(TAG, "LC3 split cores=1 playout create result=%d", (int)created);
-#endif
+        AUDIO_PLAYOUT_TASK_PRIORITY, &g_audio.playout_task, AUDIO_TASK_CORE);
     if (created != pdPASS) {
         ESP_LOGE(TAG, "audio_playout task create failed: requested stack=%u bytes",
                  (unsigned)playout_stack);
@@ -732,9 +720,6 @@ static esp_err_t audio_start_locked(void)
     created = xTaskCreatePinnedToCore(
         audio_capture_task, "audio_capture", capture_stack, NULL,
         AUDIO_CAPTURE_TASK_PRIORITY, &g_audio.capture_task, AUDIO_TASK_CORE);
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    ESP_LOGI(TAG, "LC3 split cores=1 capture create result=%d", (int)created);
-#endif
     if (created != pdPASS) {
         ESP_LOGE(TAG, "audio_capture task create failed: requested stack=%u bytes",
                  (unsigned)capture_stack);

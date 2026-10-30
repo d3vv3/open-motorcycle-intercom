@@ -310,21 +310,7 @@ static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout
     int64_t decode_start = esp_timer_get_time();
 #if defined(AUDIO_S31_LC3_WIRE)
     bool lc3_wire = g_audio.config.mode == AUDIO_MODE_MESH;
-    int samples;
-#if defined(AUDIO_S31_LC3_SKIP_RX)
-    if (lc3_wire) {
-        memset(decoded, 0, sizeof(decoded));
-        samples = AUDIO_FRAME_SAMPLES;
-    } else {
-        samples = packet_event
-                      ? opus_decode(source->decoder, event->packet.data,
-                                    (opus_int32)event->packet.length, decoded,
-                                    AUDIO_FRAME_SAMPLES, 0)
-                      : opus_decode(source->decoder, NULL, 0, decoded,
-                                    AUDIO_FRAME_SAMPLES, 0);
-    }
-#else
-    samples = lc3_wire
+    int samples = lc3_wire
                       ? esp_lc3_codec_decode20(source->lc3_decoder,
                                                packet_event ? event->packet.data : NULL,
                                                !packet_event, decoded)
@@ -334,7 +320,6 @@ static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout
                                            AUDIO_FRAME_SAMPLES, 0)
                              : opus_decode(source->decoder, NULL, 0, decoded,
                                            AUDIO_FRAME_SAMPLES, 0));
-#endif
 #else
     int samples =
         packet_event
@@ -346,14 +331,7 @@ static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout
 
     if (packet_event) {
         record_rx_pipe_latency(&event->packet, decode_start);
-#if defined(AUDIO_S31_LC3_SKIP_RX)
-        if (!lc3_wire) {
-            record_decode_result(samples, decode_time, decode_time_sum);
-        }
-#else
         record_decode_result(samples, decode_time, decode_time_sum);
-#endif
-#if !defined(AUDIO_S31_LC3_SKIP_RX)
         if (samples == AUDIO_FRAME_SAMPLES && successful_remote_decodes < 100u) {
             successful_remote_decodes++;
             if (successful_remote_decodes == 1u || successful_remote_decodes == 100u) {
@@ -363,7 +341,6 @@ static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout
                          (unsigned)uxTaskGetStackHighWaterMark(NULL));
             }
         }
-#endif
     } else if (samples != AUDIO_FRAME_SAMPLES) {
         AUDIO_STATS_LOCK();
         g_audio.stats.decode_errors++;
@@ -819,17 +796,10 @@ static void write_playout_frame(bool notify_frame, bool notify_continues,
 
 void audio_playout_task(void *arg)
 {
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    ESP_LOGI(TAG, "LC3 split cores=1 playout entry mode=%d actual_core=%d affinity_core=%d",
-             (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
-#endif
     (void)arg;
     successful_remote_decodes = 0u;
 #if defined(AUDIO_S31_LC3_WIRE)
     if (g_audio.config.mode == AUDIO_MODE_MESH) {
-#if defined(AUDIO_S31_LC3_SKIP_RX)
-        ESP_LOGW(TAG, "Diagnostic mode: LC3 decoder is bypassed; remote audio is silent");
-#endif
         for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
             if (esp_lc3_codec_reset(g_audio.rx_sources[i].lc3_decoder) != 0) {
                 ESP_LOGE(TAG, "LC3 decoder reset failed for source %zu", i);
@@ -841,10 +811,6 @@ void audio_playout_task(void *arg)
         }
 #if defined(AUDIO_S31_LC3_SELFTEST)
         bool selftest_ok = run_lc3_startup_selftest();
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-        ESP_LOGI(TAG, "LC3 split cores=1 playout after selftest mode=%d actual_core=%d affinity_core=%d",
-                 (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
-#endif
         if (!selftest_ok) {
             atomic_store_explicit(&g_audio.playout_ready, false, memory_order_release);
             xSemaphoreGive(g_audio.playout_started);

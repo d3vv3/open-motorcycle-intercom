@@ -449,10 +449,6 @@ static bool read_codec_frame(uint32_t *consecutive_hard_errors, int64_t *last_er
 
 void audio_capture_task(void *arg)
 {
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    ESP_LOGI(TAG, "LC3 split cores=1 capture entry mode=%d actual_core=%d affinity_core=%d",
-             (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
-#endif
     (void)arg;
     static int16_t silence_frame[AUDIO_FRAME_SAMPLES];
     int64_t encode_time_sum = 0;
@@ -471,18 +467,10 @@ void audio_capture_task(void *arg)
 #if defined(AUDIO_ESP_LC3_BENCH) && !defined(AUDIO_S31_LC3_WIRE)
     esp_lc3_bench_init();
 #endif
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    ESP_LOGI(TAG, "LC3 split cores=1 capture before encoder reset mode=%d actual_core=%d affinity_core=%d",
-             (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
-#endif
     opus_encoder_ctl(g_audio.opus_encoder, OPUS_RESET_STATE);
 #if defined(AUDIO_S31_LC3_WIRE)
     int lc3_reset = g_audio.config.mode == AUDIO_MODE_MESH
                         ? esp_lc3_codec_reset(g_audio.lc3_encoder) : 0;
-#endif
-#if defined(AUDIO_S31_LC3_SPLIT_CORES)
-    ESP_LOGI(TAG, "LC3 split cores=1 capture after encoder reset mode=%d actual_core=%d affinity_core=%d",
-             (int)g_audio.config.mode, (int)xPortGetCoreID(), (int)xTaskGetCoreID(NULL));
 #endif
 #if defined(AUDIO_S31_LC3_WIRE)
     if (lc3_reset != 0) {
