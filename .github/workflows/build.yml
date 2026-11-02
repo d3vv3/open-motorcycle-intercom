@@ -28,11 +28,25 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           idf.py --preview set-target esp32s31
 
-      - name: Build ESP32-S31 firmware
+      # No -D options: LC3 is unconditional and the S31_LC3_* options default
+      # to the release values (tools/release/build.py ON_OPTIONS/OFF_OPTIONS).
+      - name: Build ESP32-S31 firmware (release LC3 configuration)
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
           idf.py -C "$GITHUB_WORKSPACE" build
+
+      - name: Verify LC3-only release codec configuration
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          for name in S31_LC3_SERIALIZE S31_LC3_INTERNAL_BUFFERS S31_LC3_SINGLE_OWNER; do
+            grep -Fx "$name:BOOL=ON" "$GITHUB_WORKSPACE/build/CMakeCache.txt"
+          done
+          syms="$(riscv32-esp-elf-nm --defined-only "$GITHUB_WORKSPACE/build/omi.elf")"
+          grep -E '[[:space:]]T[[:space:]]esp_lc3_codec_encode20$' <<< "$syms" > /dev/null
+          grep -E '[[:space:]]t[[:space:]]codec_worker$' <<< "$syms" > /dev/null
+          ! grep -E '[[:space:]](opus_encode|opus_decode|silk_Encode|celt_encode_with_ec)' <<< "$syms"
 
       - name: Verify mesh control packet symbol
         shell: bash
