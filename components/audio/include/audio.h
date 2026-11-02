@@ -4,7 +4,7 @@
  *
  * This component handles:
  * - Microphone capture and speaker output through the onboard ES8311 codec
- * - Opus encode/decode
+ * - LC3 encode/decode
  * - VOX detection
  * - Packet-store and adaptive PCM playout
  * - Voice notifications
@@ -111,11 +111,11 @@ typedef void (*audio_activity_cb_t)(bool active);
 /**
  * @brief Callback for encoded audio frames (TX)
  *
- * Called when an Opus-encoded frame is ready to be transmitted.
+ * Called when an LC3-encoded frame is ready to be transmitted.
  * The callback should queue the frame for mesh transmission.
  *
- * @param data Opus-encoded audio data
- * @param len Length of encoded data (typically 20-40 bytes)
+ * @param data LC3-encoded audio data
+ * @param len Length of encoded data (one 48-byte 20 ms LC3 frame)
  * @param active true when VOX marks the frame as active speech
  * @param timestamp_us Capture timestamp in microseconds
  * @param mesh_epoch Local call-gate epoch; check with audio_mesh_tx_epoch_allowed()
@@ -143,7 +143,6 @@ typedef struct {
     uint8_t channels;              /**< Number of channels (default: 1) */
     uint8_t bits_per_sample;       /**< Bits per sample (default: 16) */
     uint16_t frame_size_ms;        /**< Frame size in ms (default: 20) */
-    uint32_t opus_bitrate;         /**< Opus bitrate in bps (default: 12000) */
     audio_i2s_pins_t i2s_pins;     /**< I2S GPIO pin configuration */
     audio_vox_config_t vox_config; /**< VOX detection configuration */
     bool enable_hpf;               /**< Enable high-pass filter */
@@ -158,17 +157,17 @@ typedef struct {
 #define AUDIO_CONFIG_DEFAULT()                                                                     \
     {                                                                                              \
         .sample_rate = 16000, .channels = 1, .bits_per_sample = 16, .frame_size_ms = 20,           \
-        .opus_bitrate = 12000, .i2s_pins = AUDIO_I2S_PINS_DEFAULT(),                               \
+        .i2s_pins = AUDIO_I2S_PINS_DEFAULT(),                                                      \
         .vox_config = AUDIO_VOX_CONFIG_DEFAULT(),                                                  \
         .enable_hpf = true, .hpf_cutoff_hz = 80.0f, .force_tx_always = false,                      \
         .mode = AUDIO_MODE_LOOPBACK,                                                               \
     }
 
 /**
- * @brief Audio frame (one Opus frame)
+ * @brief Audio frame (one encoded frame)
  */
 typedef struct {
-    uint8_t data[64];     /**< Encoded Opus data (max ~40 bytes typical) */
+    uint8_t data[64];     /**< Encoded data (LC3: 48 bytes; sized to MESH_MAX_OPUS_BYTES) */
     uint16_t len;         /**< Actual length of encoded data */
     int64_t timestamp_ms; /**< Capture timestamp */
     bool active;          /**< Sender VOX active (speech) vs intentional silence/comfort frame */
@@ -243,9 +242,9 @@ typedef struct {
     uint8_t rx_q_depth_avg;          /**< Average observed RX queue depth */
     uint8_t rx_q_depth_max;          /**< Maximum observed RX queue depth */
     uint32_t task_loops;             /**< Audio task loop count (health indicator) */
-    uint32_t tx_dtx_suppressed;      /**< Silence frames dropped before transmit (DTX) */
-    uint32_t encode_errors;          /**< Opus encode failures */
-    uint32_t decode_errors;          /**< Opus decode and PLC failures */
+    uint32_t tx_dtx_suppressed;      /**< Always 0 (Opus DTX is gone; idle LC3 frames count as vox_suppressed_frames) */
+    uint32_t encode_errors;          /**< LC3 encode failures */
+    uint32_t decode_errors;          /**< LC3 decode and PLC failures */
     uint32_t rx_queue_overflows;     /**< Frames rejected because the playback queue was full */
     uint32_t rx_lock_drops;          /**< Frames rejected because the source lock was unavailable */
     uint32_t rx_source_rejections;   /**< Frames rejected because all source slots are occupied */

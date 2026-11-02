@@ -150,7 +150,7 @@ static void record_decode_result(int samples, int64_t decode_time_us, int64_t *d
         AUDIO_STATS_LOCK();
         g_audio.stats.decode_errors++;
         AUDIO_STATS_UNLOCK();
-        ESP_LOGW(TAG, "Opus decode failed: %d", samples);
+        ESP_LOGW(TAG, "LC3 decode failed: %d", samples);
         return;
     }
     if (decode_time_us > 0) {
@@ -233,15 +233,7 @@ static bool refresh_source_assignment(audio_rx_source_t *source, uint64_t now_ms
     xSemaphoreGive(g_audio.rx_sources_mutex);
 
     if (reset_decoder) {
-        bool reset_ok = true;
-#if defined(AUDIO_S31_LC3_WIRE)
-        if (g_audio.config.mode == AUDIO_MODE_MESH) {
-            reset_ok = esp_lc3_codec_reset(source->lc3_decoder) == 0;
-        } else
-#endif
-        {
-            opus_decoder_ctl(source->decoder, OPUS_RESET_STATE);
-        }
+        bool reset_ok = esp_lc3_codec_reset(source->lc3_decoder) == 0;
         audio_pcm_resampler_reset(&source->resampler);
         source->decoded_active = false;
         if (!reset_ok && was_pending) {
@@ -308,25 +300,9 @@ static void decode_event_into_resampler(audio_rx_source_t *source, audio_playout
 
     int16_t decoded[AUDIO_FRAME_SAMPLES];
     int64_t decode_start = esp_timer_get_time();
-#if defined(AUDIO_S31_LC3_WIRE)
-    bool lc3_wire = g_audio.config.mode == AUDIO_MODE_MESH;
-    int samples = lc3_wire
-                      ? esp_lc3_codec_decode20(source->lc3_decoder,
-                                               packet_event ? event->packet.data : NULL,
-                                               !packet_event, decoded)
-                      : (packet_event
-                             ? opus_decode(source->decoder, event->packet.data,
-                                           (opus_int32)event->packet.length, decoded,
-                                           AUDIO_FRAME_SAMPLES, 0)
-                             : opus_decode(source->decoder, NULL, 0, decoded,
-                                           AUDIO_FRAME_SAMPLES, 0));
-#else
-    int samples =
-        packet_event
-            ? opus_decode(source->decoder, event->packet.data, (opus_int32)event->packet.length,
-                          decoded, AUDIO_FRAME_SAMPLES, 0)
-            : opus_decode(source->decoder, NULL, 0, decoded, AUDIO_FRAME_SAMPLES, 0);
-#endif
+    int samples = esp_lc3_codec_decode20(source->lc3_decoder,
+                                         packet_event ? event->packet.data : NULL,
+                                         !packet_event, decoded);
     int64_t decode_time = esp_timer_get_time() - decode_start;
 
     if (packet_event) {
@@ -470,8 +446,11 @@ static bool render_loopback(int64_t *decode_time_sum)
         return false;
     }
     int64_t decode_start = esp_timer_get_time();
-    int samples = opus_decode(g_audio.loopback_decoder, item.data, item.length, g_audio.pcm_output,
-                              AUDIO_FRAME_SAMPLES, 0);
+    /* No remote source is admitted in loopback mode, so source decoder 0 is free. */
+    int samples = item.length == AUDIO_LC3_FRAME_BYTES
+                      ? esp_lc3_codec_decode20(g_audio.rx_sources[0].lc3_decoder, item.data,
+                                               false, g_audio.pcm_output)
+                      : -1;
     int64_t decode_time = esp_timer_get_time() - decode_start;
     record_decode_result(samples, decode_time, decode_time_sum);
     if (samples != AUDIO_FRAME_SAMPLES) {
@@ -798,7 +777,6 @@ void audio_playout_task(void *arg)
 {
     (void)arg;
     successful_remote_decodes = 0u;
-#if defined(AUDIO_S31_LC3_WIRE)
     if (g_audio.config.mode == AUDIO_MODE_MESH) {
         for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
             if (esp_lc3_codec_reset(g_audio.rx_sources[i].lc3_decoder) != 0) {
@@ -819,7 +797,6 @@ void audio_playout_task(void *arg)
         }
 #endif
     }
-#endif
     int64_t decode_time_sum = 0;
     uint32_t frame_loops = 0;
     bool stack_logged = false;
@@ -828,7 +805,7 @@ void audio_playout_task(void *arg)
     bool was_mesh_blocked = false;
     audio_output_window_t output_window = {0};
 
-    opus_decoder_ctl(g_audio.loopback_decoder, OPUS_RESET_STATE);
+    /* Also resets source decoder 0, which loopback mode decodes on. */
     audio_rx_reset_codecs_and_resamplers();
     (void)audio_rate_converter_reset(g_audio.voice_playback_converter);
     audio_sample_fifo_reset(&g_audio.music_fifo);

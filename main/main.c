@@ -748,7 +748,6 @@ static void select_transport(void)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Detecting mesh transport...");
 
-#if defined(APP_S31_LC3_WIRE)
     /* Try the nRF SPI bridge first. */
     esp_err_t ret = uart_bridge_init();
     bool probed = ret == ESP_OK && uart_bridge_probe(2000);
@@ -776,10 +775,6 @@ static void select_transport(void)
         transport_nrf_reset_tx_cache();
         s_active_transport = TRANSPORT_ESP_NOW;
     }
-#else
-    s_active_transport = TRANSPORT_ESP_NOW;
-    ESP_LOGI(TAG, "Using ESP-NOW: nRF LC3 transport requires S31_LC3_WIRE=ON");
-#endif
 }
 
 static esp_err_t initialize_application(int64_t boot_time)

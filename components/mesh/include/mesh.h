@@ -206,7 +206,7 @@ typedef struct {
 /**
  * @brief Callback for received audio frames
  *
- * @param data Opus-encoded audio data
+ * @param data LC3-encoded audio data
  * @param len Length of audio data
  * @param src_id Source node ID
  * @param audio_flags Per-frame audio activity flags
@@ -341,9 +341,10 @@ esp_err_t mesh_get_peer_info(uint8_t node_id, mesh_peer_info_t *info);
  * Called by audio subsystem when a frame is ready to send.
  * Frame will be transmitted in the node's assigned TDMA slot.
  *
- * @param data Opus encoded audio data
- * @param len Data length (typically 20-40 bytes)
- * @return ESP_OK on success, ESP_ERR_NO_MEM if queue full
+ * @param data LC3-encoded audio data
+ * @param len Data length (must be MESH_LC3_FRAME_BYTES)
+ * @return ESP_OK on success, ESP_ERR_INVALID_SIZE for any other length,
+ *         ESP_ERR_NO_MEM if queue full
  */
 esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags);
 

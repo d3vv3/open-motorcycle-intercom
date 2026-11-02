@@ -32,10 +32,10 @@ ESP_IMAGE = "espressif/idf@sha256:8ac794c57fd4cac246cb8d2ada4002fa26337ac7df6830
 NRF_FIRMWARE = "rust/nrf-embassy-firmware"
 NRF_TARGET = "thumbv7em-none-eabihf"
 PROFILE = "esp32s31"
-# The documented pure-C S31 build (docs/getting_started.md): LC3 on the wire,
-# serialized single-owner codec with internal buffers.
-ON_OPTIONS = ("ESP_LC3_BENCH", "S31_LC3_WIRE", "S31_LC3_SELFTEST",
-              "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER")
+# The pure-C S31 build: LC3 is unconditional; serialized single-owner codec
+# with internal buffers.
+ON_OPTIONS = ("S31_LC3_SELFTEST", "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS",
+              "S31_LC3_SINGLE_OWNER")
 OFF_OPTIONS = ("S31_TASK_CPU_PROFILE",)
 
 
@@ -391,8 +391,7 @@ def build(scratch: Path, version: str, sha: str, esp_image: str) -> None:
     script += f"idf.py --preview -C /work/source -B /work/esp {command} build\n"
     script += "cp /work/esp-sdkconfig /work/provenance/sdkconfig\ncp /work/esp-sdkconfig /work/esp/sdkconfig\ncp /work/source/dependencies.lock /work/provenance/dependencies.lock\ncp /work/esp/CMakeCache.txt /work/provenance/esp-CMakeCache.txt\n"
     (scratch / "provenance/esp-build.sh").write_text(script)
-    # The esp_lc3_bench component pulls esp_audio_codec only when this is set.
-    docker(esp_image, scratch, script, {"OMI_ESP_LC3_BENCH": "1"})
+    docker(esp_image, scratch, script)
     defaults = scratch / "source/sdkconfig.defaults"
     if defaults.is_file():
         shutil.copyfile(defaults, scratch / "provenance/sdkconfig.defaults")

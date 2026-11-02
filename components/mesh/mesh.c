@@ -617,19 +617,12 @@ esp_err_t mesh_send_audio(const uint8_t *data, uint16_t len, uint8_t audio_flags
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (len > MESH_MAX_OPUS_BYTES) {
-        STATS_INC(tx_reject_invalid);
-        xSemaphoreGive(s_audio_producer_mutex);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-#ifdef MESH_S31_LC3_WIRE
+    /* Mesh audio is always one LC3 frame (MESH_LC3_FRAME_BYTES <= MESH_MAX_OPUS_BYTES). */
     if (len != MESH_LC3_FRAME_BYTES) {
         STATS_INC(tx_reject_invalid);
         xSemaphoreGive(s_audio_producer_mutex);
         return ESP_ERR_INVALID_SIZE;
     }
-#endif
 
     mesh_tx_item_t item;
     memcpy(item.data, data, len);

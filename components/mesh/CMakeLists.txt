@@ -1,7 +1,6 @@
 # Mesh component - ESP-NOW transport for when nRF52840 is not available
 # Always build - runtime detection determines if it's used
-
-option(S31_LC3_WIRE "Use LC3 frames for ESP32-S31 legacy mesh audio" OFF)
+# Mesh audio frames are always LC3.
 
 idf_component_register(
     SRCS
@@ -20,7 +19,3 @@ idf_component_register(
         esp_event
         power
 )
-
-if(S31_LC3_WIRE AND IDF_TARGET STREQUAL "esp32s31")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE MESH_S31_LC3_WIRE=1)
-endif()

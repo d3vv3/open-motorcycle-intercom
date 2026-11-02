@@ -4,7 +4,7 @@
  *
  * Module ownership:
  * - audio.c: lifecycle, configuration, public API guards, stats snapshots.
- * - audio_hw.c: ES8311, I2C, I2S, and Opus codec resources.
+ * - audio_hw.c: ES8311, I2C, I2S, and LC3 codec resources.
  * - audio_capture.c: capture task, DSP chain, encode, TX callback.
  * - audio_playout.c: playout task, decode, mixing, and I2S writes.
  * - audio_rx.c: RX packet admission and source reset handshakes.
@@ -39,10 +39,7 @@
 #include "audio_sample_fifo.h"
 #include "audio_volume_mix.h"
 #include "audio_urgent.h"
-#include "opus.h"
-#if defined(AUDIO_S31_LC3_WIRE)
 #include "esp_lc3_codec.h"
-#endif
 #include "voice_cleanup.h"
 #include "vox.h"
 
@@ -66,9 +63,8 @@
 #define AUDIO_PLAYBACK_CONVERTED_CAPACITY (AUDIO_HW_FRAME_SAMPLES * 2u)
 #define AUDIO_PLAYBACK_FIFO_CAPACITY      (AUDIO_HW_FRAME_SAMPLES * 2u)
 
-#define MAX_OPUS_PACKET_SIZE      64
-#define OPUS_DTX_FRAME_MAX_BYTES  2
-#define OPUS_EXPECTED_LOSS_PERC   5
+/* One 20 ms LC3 frame at 16 kHz mono (esp_lc3_codec encode20/decode20). */
+#define AUDIO_LC3_FRAME_BYTES     48
 #define RX_SOURCE_IDLE_TIMEOUT_MS 1000
 /* RX_SOURCE_EVICT_SILENCE_MS lives in audio_rx_source_select.h. */
 /* Runtime route callbacks wait at most this long while holding route_mutex. */
@@ -94,16 +90,14 @@ typedef struct {
     uint64_t last_active_ms;
     bool decoder_reset_pending;
     bool decoded_active;
-    OpusDecoder *decoder;
-#if defined(AUDIO_S31_LC3_WIRE)
     esp_lc3_codec_t *lc3_decoder;
-#endif
     audio_packet_store_t packet_store;
     audio_pcm_resampler_t resampler;
 } audio_rx_source_t;
 
+/* Loopback bench mode: one LC3 frame from capture to playout. */
 typedef struct {
-    uint8_t data[MAX_OPUS_PACKET_SIZE];
+    uint8_t data[AUDIO_LC3_FRAME_BYTES];
     uint16_t length;
     int64_t timestamp_us;
 } audio_loopback_item_t;
@@ -186,12 +180,9 @@ typedef struct {
     SemaphoreHandle_t route_mutex;
     SemaphoreHandle_t music_playback_mutex;
 
-    /* Codecs and DSP */
-    OpusEncoder *opus_encoder;
-    OpusDecoder *loopback_decoder;
-#if defined(AUDIO_S31_LC3_WIRE)
+    /* Codecs and DSP. Loopback bench mode decodes on source decoder 0
+     * (no remote source is admitted in that mode). */
     esp_lc3_codec_t *lc3_encoder;
-#endif
     audio_hpf_state_t hpf;
     vox_state_t vox;
     voice_cleanup_state_t voice_cleanup;
@@ -203,7 +194,7 @@ typedef struct {
     /* Frame buffers */
     int16_t capture_hw_frame[AUDIO_HW_FRAME_SAMPLES];
     int16_t pcm_input[AUDIO_FRAME_SAMPLES];
-    uint8_t opus_buffer[MAX_OPUS_PACKET_SIZE];
+    uint8_t encoded_frame[AUDIO_LC3_FRAME_BYTES];
     int16_t pcm_output[AUDIO_FRAME_SAMPLES];
     int16_t hw_output[AUDIO_HW_FRAME_SAMPLES];
     int16_t urgent_base[AUDIO_HW_FRAME_SAMPLES];
@@ -263,8 +254,8 @@ esp_err_t audio_hw_codec_start(const audio_config_t *config);
 void audio_hw_codec_stop(void);
 void audio_hw_i2c_deinit(void);
 void audio_hw_log_output_state(void);
-esp_err_t audio_hw_opus_init(const audio_config_t *config);
-void audio_hw_opus_deinit(void);
+esp_err_t audio_hw_lc3_init(void);
+void audio_hw_lc3_deinit(void);
 
 /* audio_capture.c */
 void audio_capture_task(void *arg);

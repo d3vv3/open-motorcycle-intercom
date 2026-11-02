@@ -1,6 +1,6 @@
 /**
  * @file audio_capture.c
- * @brief Capture task: codec read, DSP chain, VOX, encode, TX handoff.
+ * @brief Capture task: codec read, DSP chain, VOX, LC3 encode, TX handoff.
  */
 
 #include <math.h>
@@ -10,11 +10,7 @@
 #include "esp_timer.h"
 
 #include "audio_internal.h"
-#include "audio_opus_stage_profile.h"
 #include "cpu_profile.h"
-#if defined(AUDIO_ESP_LC3_BENCH)
-#include "esp_lc3_bench.h"
-#endif
 static const char *TAG = "audio";
 
 #define AUDIO_CAPTURE_ERROR_BACKOFF_MS 20
@@ -22,19 +18,6 @@ static const char *TAG = "audio";
 
 typedef enum { CAPTURE_READ_TIMING, CAPTURE_CONVERT_TIMING, CAPTURE_AEC_TIMING,
                CAPTURE_LOOP_TIMING, CAPTURE_TIMING_COUNT } capture_timing_t;
-
-typedef struct {
-    uint32_t count;
-    uint64_t time_sum_us;
-    uint32_t time_max_us;
-} encode_size_profile_t;
-
-typedef struct {
-    encode_size_profile_t buckets[3];
-    uint32_t successful_encodes;
-} encode_profile_t;
-
-#define ENCODE_PROFILE_LOG_INTERVAL 250u
 
 static uint64_t *const capture_timing_sums[CAPTURE_TIMING_COUNT] = {
     &g_audio.capture_read_us_sum, &g_audio.capture_convert_us_sum,
@@ -159,82 +142,18 @@ static bool detect_voice_activity(void)
     return vox_active;
 }
 
-static void record_encode_profile(encode_profile_t *profile, int encoded, int64_t encode_time_us)
-{
-    if (profile->successful_encodes == UINT32_MAX) return;
-    size_t bucket = encoded <= 2 ? 0u : (encoded <= 16 ? 1u : 2u);
-    encode_size_profile_t *stats = &profile->buckets[bucket];
-    uint32_t elapsed = encode_time_us > UINT32_MAX ? UINT32_MAX : (uint32_t)encode_time_us;
-    if (stats->count != UINT32_MAX) {
-        stats->count++;
-    }
-    stats->time_sum_us = UINT64_MAX - stats->time_sum_us < elapsed
-                             ? UINT64_MAX
-                             : stats->time_sum_us + elapsed;
-    if (elapsed > stats->time_max_us) {
-        stats->time_max_us = elapsed;
-    }
-    profile->successful_encodes++;
-    if (profile->successful_encodes % ENCODE_PROFILE_LOG_INTERVAL == 0u) {
-        audio_opus_stage_snapshot_t stages = audio_opus_stage_profile_snapshot();
-        ESP_LOGI(TAG, "Opus encode profile (%lu successful): <=2B count=%lu avg=%llu us max=%lu us, "
-                      "3-16B count=%lu avg=%llu us max=%lu us, >16B count=%lu avg=%llu us max=%lu us",
-                 (unsigned long)profile->successful_encodes,
-                 (unsigned long)profile->buckets[0].count,
-                 (unsigned long long)(profile->buckets[0].count == 0u ? 0u :
-                     profile->buckets[0].time_sum_us / profile->buckets[0].count),
-                 (unsigned long)profile->buckets[0].time_max_us,
-                 (unsigned long)profile->buckets[1].count,
-                 (unsigned long long)(profile->buckets[1].count == 0u ? 0u :
-                     profile->buckets[1].time_sum_us / profile->buckets[1].count),
-                 (unsigned long)profile->buckets[1].time_max_us,
-                 (unsigned long)profile->buckets[2].count,
-                 (unsigned long long)(profile->buckets[2].count == 0u ? 0u :
-                     profile->buckets[2].time_sum_us / profile->buckets[2].count),
-                 (unsigned long)profile->buckets[2].time_max_us);
-        ESP_LOGI(TAG, "Opus stages: SILK count=%lu avg=%llu us max=%lu us, "
-                      "CELT count=%lu avg=%llu us max=%lu us",
-                 (unsigned long)stages.silk.count,
-                 (unsigned long long)(stages.silk.count == 0u ? 0u :
-                     stages.silk.time_sum_us / stages.silk.count),
-                 (unsigned long)stages.silk.time_max_us,
-                 (unsigned long)stages.celt.count,
-                 (unsigned long long)(stages.celt.count == 0u ? 0u :
-                     stages.celt.time_sum_us / stages.celt.count),
-                 (unsigned long)stages.celt.time_max_us);
-    }
-}
-
-static int encode_frame(const int16_t *input, int64_t *encode_time_sum, uint32_t *encoded_frames,
-                        encode_profile_t *profile)
+static int encode_frame(const int16_t *input, int64_t *encode_time_sum, uint32_t *encoded_frames)
 {
     int64_t encode_start = esp_timer_get_time();
-#if defined(AUDIO_S31_LC3_WIRE)
-    bool lc3_wire = g_audio.config.mode == AUDIO_MODE_MESH;
-    int encoded = lc3_wire
-                      ? esp_lc3_codec_encode20(g_audio.lc3_encoder, input, g_audio.opus_buffer)
-                      : opus_encode(g_audio.opus_encoder, input, AUDIO_FRAME_SAMPLES,
-                                    g_audio.opus_buffer, sizeof(g_audio.opus_buffer));
-#else
-    int encoded = opus_encode(g_audio.opus_encoder, input, AUDIO_FRAME_SAMPLES, g_audio.opus_buffer,
-                              sizeof(g_audio.opus_buffer));
-#endif
+    int encoded = esp_lc3_codec_encode20(g_audio.lc3_encoder, input, g_audio.encoded_frame);
     int64_t encode_time = esp_timer_get_time() - encode_start;
     if (encoded <= 0) {
         AUDIO_STATS_LOCK();
         g_audio.stats.encode_errors++;
         AUDIO_STATS_UNLOCK();
-#if defined(AUDIO_S31_LC3_WIRE)
-        if (g_audio.config.mode == AUDIO_MODE_MESH) ESP_LOGW(TAG, "LC3 encode failed");
-        else
-#endif
-        ESP_LOGW(TAG, "Opus encode failed: %s", opus_strerror(encoded));
+        ESP_LOGW(TAG, "LC3 encode failed");
         return encoded;
     }
-#if defined(AUDIO_S31_LC3_WIRE)
-    if (g_audio.config.mode != AUDIO_MODE_MESH)
-#endif
-    record_encode_profile(profile, encoded, encode_time);
     *encode_time_sum += encode_time;
     AUDIO_STATS_LOCK();
     g_audio.stats.frames_encoded++;
@@ -247,7 +166,6 @@ static int encode_frame(const int16_t *input, int64_t *encode_time_sum, uint32_t
     return encoded;
 }
 
-#if defined(AUDIO_S31_LC3_WIRE)
 static void skip_idle_lc3_frame(int64_t frame_start_us, uint32_t mesh_epoch)
 {
     if (!audio_mesh_tx_epoch_allowed(mesh_epoch)) return;
@@ -263,41 +181,29 @@ static void skip_idle_lc3_frame(int64_t frame_start_us, uint32_t mesh_epoch)
         callback(frame_start_us);
     }
 }
-#endif
 
 static void deliver_encoded_frame(int encoded, bool tx_active, int64_t frame_start_us,
                                   uint32_t mesh_epoch)
 {
     if (g_audio.config.mode == AUDIO_MODE_MESH && !audio_mesh_tx_epoch_allowed(mesh_epoch)) return;
-#if defined(AUDIO_S31_LC3_WIRE)
-    bool lc3_wire = g_audio.config.mode == AUDIO_MODE_MESH;
-    if (lc3_wire && !tx_active) {
-        skip_idle_lc3_frame(frame_start_us, mesh_epoch);
-        return;
-    }
-    bool comfort_update = encoded > OPUS_DTX_FRAME_MAX_BYTES;
-#else
-    bool comfort_update = encoded > OPUS_DTX_FRAME_MAX_BYTES;
-#endif
     if (g_audio.config.mode == AUDIO_MODE_MESH) {
-        if (tx_active || comfort_update) {
-            portENTER_CRITICAL(&g_audio_task_lock);
-            audio_tx_cb_t tx_callback = g_audio.tx_callback;
-            portEXIT_CRITICAL(&g_audio_task_lock);
-            if (tx_callback != NULL && audio_mesh_tx_epoch_allowed(mesh_epoch)) {
-                AUDIO_STATS_LOCK();
-                g_audio.stats.tx_handoff++;
-                AUDIO_STATS_UNLOCK();
-                tx_callback(g_audio.opus_buffer, (uint16_t)encoded, tx_active, frame_start_us,
-                            mesh_epoch);
-            } else {
-                AUDIO_STATS_LOCK();
-                g_audio.stats.tx_no_cb++;
-                AUDIO_STATS_UNLOCK();
-            }
+        /* Idle mesh frames are never encoded LC3 payloads; they go to the idle callback. */
+        if (!tx_active) {
+            skip_idle_lc3_frame(frame_start_us, mesh_epoch);
+            return;
+        }
+        portENTER_CRITICAL(&g_audio_task_lock);
+        audio_tx_cb_t tx_callback = g_audio.tx_callback;
+        portEXIT_CRITICAL(&g_audio_task_lock);
+        if (tx_callback != NULL && audio_mesh_tx_epoch_allowed(mesh_epoch)) {
+            AUDIO_STATS_LOCK();
+            g_audio.stats.tx_handoff++;
+            AUDIO_STATS_UNLOCK();
+            tx_callback(g_audio.encoded_frame, (uint16_t)encoded, tx_active, frame_start_us,
+                        mesh_epoch);
         } else {
             AUDIO_STATS_LOCK();
-            g_audio.stats.tx_dtx_suppressed++;
+            g_audio.stats.tx_no_cb++;
             AUDIO_STATS_UNLOCK();
         }
         return;
@@ -306,7 +212,7 @@ static void deliver_encoded_frame(int encoded, bool tx_active, int64_t frame_sta
         .length = (uint16_t)encoded,
         .timestamp_us = frame_start_us,
     };
-    memcpy(item.data, g_audio.opus_buffer, (size_t)encoded);
+    memcpy(item.data, g_audio.encoded_frame, (size_t)encoded);
     if (xQueueSend(g_audio.loopback_queue, &item, 0) != pdTRUE) {
         AUDIO_STATS_LOCK();
         g_audio.stats.frames_dropped++;
@@ -452,34 +358,21 @@ void audio_capture_task(void *arg)
     (void)arg;
     static int16_t silence_frame[AUDIO_FRAME_SAMPLES];
     int64_t encode_time_sum = 0;
-    encode_profile_t encode_profile = {0};
     int64_t latency_sum = 0;
     uint32_t consecutive_hard_errors = 0;
     int64_t last_error_log_us = 0;
     int64_t converter_retry_after_us = 0;
     uint32_t frame_loops = 0;
     bool stack_logged = false;
-#if defined(AUDIO_S31_LC3_WIRE)
     bool last_tx_active = g_audio.config.force_tx_always;
-#endif
 
-    audio_opus_stage_profile_reset();
-#if defined(AUDIO_ESP_LC3_BENCH) && !defined(AUDIO_S31_LC3_WIRE)
-    esp_lc3_bench_init();
-#endif
-    opus_encoder_ctl(g_audio.opus_encoder, OPUS_RESET_STATE);
-#if defined(AUDIO_S31_LC3_WIRE)
-    int lc3_reset = g_audio.config.mode == AUDIO_MODE_MESH
-                        ? esp_lc3_codec_reset(g_audio.lc3_encoder) : 0;
-#endif
-#if defined(AUDIO_S31_LC3_WIRE)
-    if (lc3_reset != 0) {
+    /* Mesh and loopback both encode LC3, so both reset the encoder. */
+    if (esp_lc3_codec_reset(g_audio.lc3_encoder) != 0) {
         atomic_store_explicit(&g_audio.capture_ready, false, memory_order_release);
         xSemaphoreGive(g_audio.capture_started);
         capture_task_finish();
         return;
     }
-#endif
     ESP_LOGI(TAG, "No AEC: noise-only voice cleanup active, HFP call echo unqualified");
     atomic_store_explicit(&g_audio.capture_ready, true, memory_order_release);
     xSemaphoreGive(g_audio.capture_started);
@@ -504,15 +397,11 @@ void audio_capture_task(void *arg)
         if (!read_codec_frame(&consecutive_hard_errors, &last_error_log_us,
                               &converter_retry_after_us, &emit_silence)) {
             if (emit_silence && atomic_load_explicit(&g_audio.running, memory_order_acquire)) {
-#if defined(AUDIO_S31_LC3_WIRE)
                 if (g_audio.config.mode == AUDIO_MODE_MESH && !last_tx_active) {
                      skip_idle_lc3_frame(frame_start_us, mesh_epoch);
-                } else
-#endif
-                {
+                } else {
                     uint32_t encoded_frames = 0;
-                    int encoded = encode_frame(silence_frame, &encode_time_sum, &encoded_frames,
-                                               &encode_profile);
+                    int encoded = encode_frame(silence_frame, &encode_time_sum, &encoded_frames);
                     if (encoded > 0) {
                          deliver_encoded_frame(encoded, true, frame_start_us, mesh_epoch);
                         record_frame_latency(frame_start_us, &latency_sum, encoded_frames);
@@ -539,26 +428,17 @@ void audio_capture_task(void *arg)
             continue;
         }
 
-#if defined(AUDIO_ESP_LC3_BENCH)
-#if !defined(AUDIO_S31_LC3_WIRE)
-        esp_lc3_bench_capture_frame(g_audio.pcm_input);
-#endif
-#endif
-
         bool vox_active = detect_voice_activity();
         bool tx_active = vox_active || g_audio.config.force_tx_always;
-#if defined(AUDIO_S31_LC3_WIRE)
         last_tx_active = tx_active;
         if (g_audio.config.mode == AUDIO_MODE_MESH && !tx_active) {
              skip_idle_lc3_frame(frame_start_us, mesh_epoch);
             record_capture_timing(CAPTURE_LOOP_TIMING, esp_timer_get_time() - frame_start_us);
             continue;
         }
-#endif
         const int16_t *encode_input = tx_active ? g_audio.pcm_input : silence_frame;
         uint32_t encoded_frames = 0;
-        int encoded = encode_frame(encode_input, &encode_time_sum, &encoded_frames,
-                                   &encode_profile);
+        int encoded = encode_frame(encode_input, &encode_time_sum, &encoded_frames);
         if (encoded <= 0) {
             record_capture_timing(CAPTURE_LOOP_TIMING, esp_timer_get_time() - frame_start_us);
             continue;
@@ -569,8 +449,5 @@ void audio_capture_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Capture task stopped");
-#if defined(AUDIO_ESP_LC3_BENCH) && !defined(AUDIO_S31_LC3_WIRE)
-    esp_lc3_bench_deinit();
-#endif
     capture_task_finish();
 }

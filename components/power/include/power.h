@@ -32,7 +32,7 @@ extern "C" {
  *   DEEP_SLEEP:   <10 µA (RTC only)
  *   STANDBY:      3-10 mW (beacon listening)
  *   MESH_IDLE:    30-50 mW (TDMA sync, VOX monitoring)
- *   ACTIVE_VOICE: 120-180 mW (Opus + Radio TX)
+ *   ACTIVE_VOICE: 120-180 mW (LC3 + Radio TX)
  */
 typedef enum {
     POWER_STATE_DEEP_SLEEP,   /**< Lowest power, RTC wake only */

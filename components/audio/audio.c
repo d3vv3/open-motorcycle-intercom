@@ -405,9 +405,9 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
         audio_rate_converter_close(&g_audio.voice_playback_converter);
         return ret;
     }
-    ret = audio_hw_opus_init(&g_audio.config);
+    ret = audio_hw_lc3_init();
     if (ret != ESP_OK) {
-        audio_hw_opus_deinit();
+        audio_hw_lc3_deinit();
         audio_hw_codec_deinit();
         audio_hw_i2s_deinit();
         audio_hw_i2c_deinit();
@@ -418,7 +418,7 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
     }
     ret = create_sync_resources();
     if (ret != ESP_OK) {
-        audio_hw_opus_deinit();
+        audio_hw_lc3_deinit();
         audio_hw_codec_deinit();
         audio_hw_i2s_deinit();
         audio_hw_i2c_deinit();
@@ -450,7 +450,7 @@ static esp_err_t audio_init_with_config_locked(const audio_config_t *config)
     memset(&g_audio.notification, 0, sizeof(g_audio.notification));
     if (!audio_route_init()) {
         delete_sync_resources();
-        audio_hw_opus_deinit();
+        audio_hw_lc3_deinit();
         audio_hw_codec_deinit();
         audio_hw_i2s_deinit();
         audio_hw_i2c_deinit();
@@ -483,7 +483,7 @@ static void audio_unwind_locked(void)
     AUDIO_STATS_UNLOCK();
     audio_capture_fifo_reset(&g_audio.capture_fifo);
     audio_rx_reset_source_metadata();
-    audio_hw_opus_deinit();
+    audio_hw_lc3_deinit();
     audio_hw_codec_deinit();
     audio_hw_i2s_deinit();
     audio_hw_i2c_deinit();
@@ -633,7 +633,7 @@ esp_err_t audio_deinit(void)
         return ret;
     }
     audio_rx_reset_source_metadata();
-    audio_hw_opus_deinit();
+    audio_hw_lc3_deinit();
     audio_hw_codec_deinit();
     audio_hw_i2s_deinit();
     audio_hw_i2c_deinit();

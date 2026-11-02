@@ -276,14 +276,11 @@ void handle_audio_packet(const mesh_rx_item_t *rx)
     }
 
     const mesh_audio_payload_t *audio = (const mesh_audio_payload_t *)rx->payload;
-    uint16_t opus_len = rx->header.payload_len - 4;
+    uint16_t data_len = rx->header.payload_len - 4;
 
-#ifdef MESH_S31_LC3_WIRE
-    const uint8_t local_codec = MESH_AUDIO_CODEC_LC3;
-#else
-    const uint8_t local_codec = MESH_AUDIO_CODEC_OPUS;
-#endif
-    if (!mesh_audio_wire_payload_valid(audio->codec, audio->frame_ms, opus_len, local_codec)) {
+    /* Non-LC3 (including Opus) frames are rejected. */
+    if (!mesh_audio_wire_payload_valid(audio->codec, audio->frame_ms, data_len,
+                                       MESH_AUDIO_CODEC_LC3)) {
         STATS_INC(rx_audio_invalid);
         return;
     }
@@ -345,7 +342,7 @@ void handle_audio_packet(const mesh_rx_item_t *rx)
     xSemaphoreGive(s_peer_mutex);
 
     if (atomic_load(&s_local_audio_enabled))
-        jitter_buffer_insert(audio->data, opus_len, rx->header.src_id, rx->header.seq,
+        jitter_buffer_insert(audio->data, data_len, rx->header.src_id, rx->header.seq,
                              (audio->audio_flags & MESH_AUDIO_FLAG_ACTIVE) |
                              ((rx->header.flags & MESH_FLAG_RELAYED) ? MESH_AUDIO_FLAG_RELAYED : 0),
                              rx->timestamp_us);
@@ -447,11 +444,7 @@ mesh_tx_slot_send_result_t send_audio_in_slot(int64_t deadline_us)
         }
     }
 
-#ifdef MESH_S31_LC3_WIRE
     audio->codec = MESH_AUDIO_CODEC_LC3;
-#else
-    audio->codec = MESH_AUDIO_CODEC_OPUS;
-#endif
     audio->frame_ms = MESH_FRAME_MS;
     audio->stream_id = s_node_id;
     audio->audio_flags = tx_item.audio_flags;

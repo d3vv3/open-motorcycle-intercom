@@ -39,11 +39,8 @@ void audio_rx_reset_source_metadata(void)
 void audio_rx_reset_codecs_and_resamplers(void)
 {
     for (size_t i = 0; i < AUDIO_MAX_RX_SOURCES; ++i) {
-        opus_decoder_ctl(g_audio.rx_sources[i].decoder, OPUS_RESET_STATE);
-#if defined(AUDIO_S31_LC3_WIRE)
         if (g_audio.rx_sources[i].lc3_decoder != NULL)
             (void)esp_lc3_codec_reset(g_audio.rx_sources[i].lc3_decoder);
-#endif
         audio_pcm_resampler_reset(&g_audio.rx_sources[i].resampler);
         g_audio.rx_sources[i].decoded_active = false;
     }
