@@ -20,6 +20,15 @@ if(NOT DEFINED OMI_GIT_SHA)
     endif()
 endif()
 
+# ESP32-S31 LC3 codec options, read by components/esp_lc3_bench and
+# components/audio. They default ON so a plain build is the release
+# configuration, and live here so every component sees them regardless of
+# the order in which component CMakeLists.txt files are processed. OFF is a
+# diagnostic variant only.
+option(S31_LC3_SERIALIZE "Serialize ESP32-S31 LC3 vendor calls" ON)
+option(S31_LC3_INTERNAL_BUFFERS "Use shared internal DRAM buffers for S31 LC3 decode" ON)
+option(S31_LC3_SINGLE_OWNER "Run S31 LC3 vendor calls on one pinned task" ON)
+
 # Include component directories
 set(EXTRA_COMPONENT_DIRS 
     ${CMAKE_CURRENT_SOURCE_DIR}/components

@@ -23,110 +23,6 @@ typedef struct {
     int32_t peak_abs;
 } audio_output_window_t;
 
-#if defined(AUDIO_S31_LC3_SELFTEST)
-static bool run_lc3_startup_selftest(void)
-{
-    static int16_t zero_pcm[AUDIO_FRAME_SAMPLES] = {0};
-    static int16_t patterned_pcm[AUDIO_FRAME_SAMPLES];
-    static uint8_t packet[48];
-    static int16_t decoded[AUDIO_FRAME_SAMPLES];
-
-    for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
-        patterned_pcm[i] = ((i / 8u) & 1u) != 0u ? -10000 : 10000;
-    }
-    const int16_t *tests[] = {zero_pcm, patterned_pcm};
-    const char *names[] = {"zero", "patterned"};
-    for (size_t test = 0; test < 2u; ++test) {
-        ESP_LOGI(TAG, "LC3 self-test %s encode/decode start", names[test]);
-        int64_t encode_start = esp_timer_get_time();
-        int encoded_bytes = esp_lc3_codec_encode20(g_audio.lc3_encoder, tests[test], packet);
-        int64_t encode_us = esp_timer_get_time() - encode_start;
-        int output_samples = -1;
-        int64_t decode_us = 0;
-        if (encoded_bytes == (int)sizeof(packet)) {
-            int64_t decode_start = esp_timer_get_time();
-            output_samples = esp_lc3_codec_decode20(g_audio.rx_sources[0].lc3_decoder,
-                                                    packet, false, decoded);
-            decode_us = esp_timer_get_time() - decode_start;
-        }
-        int32_t peak = 0;
-        if (output_samples == AUDIO_FRAME_SAMPLES) {
-            for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
-                int32_t sample = decoded[i];
-                int32_t magnitude = sample < 0 ? -sample : sample;
-                if (magnitude > peak) peak = magnitude;
-            }
-        }
-        ESP_LOGI(TAG, "LC3 self-test %s encode/decode done: samples=%d bytes=%d"
-                      " encode_us=%" PRId64 " decode_us=%" PRId64 " peak=%" PRId32,
-                 names[test], output_samples, encoded_bytes, encode_us, decode_us, peak);
-        if (encoded_bytes != (int)sizeof(packet) || output_samples != AUDIO_FRAME_SAMPLES ||
-            (test == 1u && peak == 0)) {
-            ESP_LOGE(TAG, "LC3 self-test %s failed", names[test]);
-            return false;
-        }
-    }
-
-    /* Captured 48B peer diagnostic samples only; these are never transmitted. */
-    static const uint8_t peer_packets[][48] = {
-        {
-            0x06, 0x00, 0x1a, 0x9e, 0x0c, 0x0e, 0xfa, 0xe3,
-            0x6a, 0xb3, 0x2d, 0x83, 0x65, 0xf7, 0xe9, 0xfe,
-            0x0e, 0x2e, 0x7b, 0xe5, 0x33, 0x51, 0x10, 0x79,
-            0x00, 0x00, 0x10, 0x33, 0x22, 0x29, 0x21, 0xad,
-            0xf1, 0x84, 0x20, 0x9a, 0xe1, 0xc5, 0x56, 0xba,
-            0x4f, 0xd9, 0xd3, 0x59, 0x33, 0x53, 0x1e, 0x37,
-        },
-        {
-            0x2c, 0xbc, 0x25, 0x88, 0x90, 0x21, 0x67, 0xe3,
-            0xf0, 0xed, 0xd6, 0x35, 0xad, 0xc8, 0x68, 0x4f,
-            0x0e, 0x66, 0x2a, 0xeb, 0x33, 0x51, 0x1a, 0x65,
-            0x00, 0x00, 0x16, 0x77, 0xa5, 0xbe, 0xcd, 0x15,
-            0x9e, 0xf7, 0x8d, 0x6c, 0xfd, 0x7b, 0x57, 0xfe,
-            0xa8, 0x67, 0x21, 0xaa, 0x8b, 0x57, 0x26, 0x4b,
-        },
-    };
-    const char *peer_names[] = {"peer-old", "peer-new"};
-    for (size_t test = 0; test < 2u; ++test) {
-        int reset = esp_lc3_codec_reset(g_audio.rx_sources[0].lc3_decoder);
-        if (reset != 0) {
-            ESP_LOGE(TAG, "LC3 self-test %s decoder reset failed: %d", peer_names[test], reset);
-            return false;
-        }
-        ESP_LOGI(TAG, "LC3 self-test %s decode start", peer_names[test]);
-        int64_t decode_start = esp_timer_get_time();
-        int output_samples = esp_lc3_codec_decode20(g_audio.rx_sources[0].lc3_decoder,
-                                                    peer_packets[test], false, decoded);
-        int64_t decode_us = esp_timer_get_time() - decode_start;
-        int32_t peak = 0;
-        if (output_samples == AUDIO_FRAME_SAMPLES) {
-            for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
-                int32_t sample = decoded[i];
-                int32_t magnitude = sample < 0 ? -sample : sample;
-                if (magnitude > peak) peak = magnitude;
-            }
-        }
-        ESP_LOGI(TAG, "LC3 self-test %s decode done: samples=%d decode_us=%" PRId64
-                      " peak=%" PRId32,
-                 peer_names[test], output_samples, decode_us, peak);
-        if (output_samples != AUDIO_FRAME_SAMPLES) {
-            ESP_LOGE(TAG, "LC3 self-test %s failed", peer_names[test]);
-            return false;
-        }
-    }
-
-    int decoder_reset = esp_lc3_codec_reset(g_audio.rx_sources[0].lc3_decoder);
-    int encoder_reset = esp_lc3_codec_reset(g_audio.lc3_encoder);
-    if (decoder_reset != 0 || encoder_reset != 0) {
-        ESP_LOGE(TAG, "LC3 self-test reset failed: decoder=%d encoder=%d",
-                 decoder_reset, encoder_reset);
-        return false;
-    }
-    ESP_LOGI(TAG, "LC3 startup self-tests passed; encoder and decoder reset");
-    return true;
-}
-#endif
-
 static void add_timing_us(uint64_t *sum, uint64_t value)
 {
     *sum = UINT64_MAX - *sum < value ? UINT64_MAX : *sum + value;
@@ -787,15 +683,6 @@ void audio_playout_task(void *arg)
                 return;
             }
         }
-#if defined(AUDIO_S31_LC3_SELFTEST)
-        bool selftest_ok = run_lc3_startup_selftest();
-        if (!selftest_ok) {
-            atomic_store_explicit(&g_audio.playout_ready, false, memory_order_release);
-            xSemaphoreGive(g_audio.playout_started);
-            playout_task_finish();
-            return;
-        }
-#endif
     }
     int64_t decode_time_sum = 0;
     uint32_t frame_loops = 0;

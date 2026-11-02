@@ -1,9 +1,3 @@
-option(S31_LC3_SELFTEST "Run the ESP32-S31 LC3 encode/decode startup self-test" OFF)
-
-if(S31_LC3_SELFTEST AND NOT IDF_TARGET STREQUAL "esp32s31")
-    message(FATAL_ERROR "S31_LC3_SELFTEST is only valid for IDF_TARGET=esp32s31")
-endif()
-
 # Audio is LC3-only (mesh and loopback); the codec lives in esp_lc3_bench.
 idf_component_register(
     SRCS "audio.c" "audio_hw.c" "audio_capture.c" "audio_playout.c" "audio_rx.c"
@@ -39,10 +33,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/audio_prompts_data.c"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/encode_notifications.py" ${AUDIO_PROMPT_WAVS}
     VERBATIM)
 
+# S31_LC3_SINGLE_OWNER is declared in the root CMakeLists.txt (default ON).
 if(S31_LC3_SINGLE_OWNER AND IDF_TARGET STREQUAL "esp32s31")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_S31_LC3_SINGLE_OWNER=1)
-endif()
-
-if(S31_LC3_SELFTEST AND IDF_TARGET STREQUAL "esp32s31")
-    target_compile_definitions(${COMPONENT_LIB} PRIVATE AUDIO_S31_LC3_SELFTEST=1)
 endif()

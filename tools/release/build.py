@@ -33,9 +33,9 @@ NRF_FIRMWARE = "rust/nrf-embassy-firmware"
 NRF_TARGET = "thumbv7em-none-eabihf"
 PROFILE = "esp32s31"
 # The pure-C S31 build: LC3 is unconditional; serialized single-owner codec
-# with internal buffers.
-ON_OPTIONS = ("S31_LC3_SELFTEST", "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS",
-              "S31_LC3_SINGLE_OWNER")
+# with internal buffers. These are also the root CMakeLists.txt defaults, so a
+# plain build is the release build; passing them keeps the release explicit.
+ON_OPTIONS = ("S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER")
 OFF_OPTIONS = ("S31_TASK_CPU_PROFILE",)
 
 

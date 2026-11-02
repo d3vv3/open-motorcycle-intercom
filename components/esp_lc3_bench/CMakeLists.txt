@@ -1,7 +1,5 @@
-option(S31_LC3_SERIALIZE "Serialize experimental ESP32-S31 LC3 vendor calls" OFF)
-option(S31_LC3_INTERNAL_BUFFERS "Use shared internal DRAM buffers for S31 LC3 decode" OFF)
-option(S31_LC3_SINGLE_OWNER "Run S31 LC3 vendor calls on one pinned task" OFF)
-
+# S31_LC3_SERIALIZE/INTERNAL_BUFFERS/SINGLE_OWNER are declared in the root
+# CMakeLists.txt (default ON, the release configuration).
 if(S31_LC3_INTERNAL_BUFFERS AND NOT S31_LC3_SERIALIZE)
     message(FATAL_ERROR "S31_LC3_INTERNAL_BUFFERS requires S31_LC3_SERIALIZE=ON")
 endif()

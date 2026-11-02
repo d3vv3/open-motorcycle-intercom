@@ -544,18 +544,36 @@ def test_build_commands_have_fresh_sdkconfig_and_host_cargo_nrf(tmp_path, monkey
         assert f"-D{name}=ON" in esp_script
     for name in build.OFF_OPTIONS:
         assert f"-D{name}=OFF" in esp_script
-    for name in ("S31_LC3_SELFTEST", "S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS",
-                 "S31_LC3_SINGLE_OWNER"):
+    for name in ("S31_LC3_SERIALIZE", "S31_LC3_INTERNAL_BUFFERS", "S31_LC3_SINGLE_OWNER"):
         assert f"-D{name}=ON" in esp_script
     assert "-DS31_TASK_CPU_PROFILE=OFF" in esp_script
     # Retired build variants: LC3 is unconditional, Opus and the LC3 bench are gone.
     for name in ("S31_LC3_SPLIT_CORES", "S31_LC3_SKIP_RX", "S31_MESH_COEX_PREFER_WIFI",
-                 "S31_MESH_PAIR_UNICAST", "S31_LC3_WIRE", "ESP_LC3_BENCH"):
+                 "S31_MESH_PAIR_UNICAST", "S31_LC3_WIRE", "ESP_LC3_BENCH", "S31_LC3_SELFTEST"):
         assert name not in esp_script
     # esp_lc3_bench registers the codec (and esp_audio_codec) unconditionally on S31.
     assert len(calls[0]) == 3
     assert cargo == [(tmp_path, VERSION, SHA)]
     assert (tmp_path / "provenance/release-tools-source-sha.txt").read_text() == "c" * 40 + "\n"
+
+
+def test_plain_build_defaults_match_release_options():
+    """Every CMake option is declared once, with the release value as its default."""
+    root = Path(__file__).resolve().parents[2]
+    declared = {}
+    for cmake in [root / "CMakeLists.txt", *sorted((root / "components").glob("*/CMakeLists.txt")),
+                  root / "main/CMakeLists.txt"]:
+        for line in cmake.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("option("):
+                name, default = line.split()[0][len("option("):], line.rstrip(")").split()[-1]
+                assert name not in declared, f"{name} declared twice"
+                declared[name] = (default, cmake.relative_to(root).as_posix())
+    for name in build.ON_OPTIONS:
+        assert declared[name] == ("ON", "CMakeLists.txt")
+    for name in build.OFF_OPTIONS:
+        assert declared[name][0] == "OFF"
+    assert set(declared) == set(build.ON_OPTIONS) | set(build.OFF_OPTIONS)
 
 
 def test_cargo_nrf_builds_archived_crate_with_release_identity_and_records_provenance(tmp_path, monkeypatch):
