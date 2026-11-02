@@ -372,12 +372,14 @@ static void gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *par
         bool success = param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS;
         /* Bluedroid reports a successful AUTH_CMPL only when a new link key was
          * generated and stored; a bonded phone reconnecting with its stored key
-         * gets no SSP/PIN request and no AUTH_CMPL. Also requiring the pairing
-         * request we accepted for this peer keeps reconnects out. */
+         * gets no AUTH_CMPL. With IO cap NONE, just-works SSP is auto-accepted
+         * inside Bluedroid without a CFM/PIN request, so a success while the
+         * pairing window is open also counts as a new bond. */
         bool requested = s_phone.pairing_peer_pending &&
             memcmp(s_phone.pairing_peer, param->auth_cmpl.bda, ESP_BD_ADDR_LEN) == 0;
         if (requested) s_phone.pairing_peer_pending = false;
-        bool fresh = success && requested;
+        bool window_open = atomic_load_explicit(&s_phone.discoverable, memory_order_acquire);
+        bool fresh = success && (requested || window_open);
         if (fresh) atomic_fetch_add_explicit(&s_phone.new_bonds, 1u, memory_order_release);
         ESP_LOGI(TAG, "Bluetooth authentication %s%s", success ? "succeeded" : "failed",
                  fresh ? " (new bond)" : "");
