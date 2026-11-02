@@ -99,6 +99,21 @@ esp_err_t audio_play_call_end(void)
     return accepted ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
+esp_err_t audio_play_phone_connected(void)
+{
+    SemaphoreHandle_t mutex = audio_lifecycle_mutex_get();
+    if (mutex == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t ret = ESP_OK;
+    if (!g_audio.initialized || g_audio.stopping || g_audio.deinitializing ||
+        !atomic_load_explicit(&g_audio.running, memory_order_acquire))
+        ret = ESP_ERR_INVALID_STATE;
+    else if (!audio_limit_cue_request_connect(&g_audio.volume_limit_cue))
+        ret = ESP_ERR_TIMEOUT;
+    xSemaphoreGive(mutex);
+    return ret;
+}
+
 static void free_audio_route_storage(void)
 {
     int16_t *storage[] = {g_audio.bluetooth_music.samples, g_audio.bluetooth_call.samples,

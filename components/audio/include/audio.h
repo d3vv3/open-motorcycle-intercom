@@ -426,6 +426,10 @@ esp_err_t audio_play_volume_limit(void);
 /** One 80 ms beep on final output, independent of mesh/Bluetooth gain. A call-end
  * request during a volume cue coalesces into one beep after that cue finishes. */
 esp_err_t audio_play_call_end(void);
+/** One 120 ms phone-connected beep on final output. ESP_ERR_TIMEOUT: another cue or
+ * the lifecycle lock is busy, retry; ESP_ERR_INVALID_STATE: audio is not running.
+ * An incoming-call prompt cancels it. */
+esp_err_t audio_play_phone_connected(void);
 
 /**
  * @brief Register callback for encoded TX frames (mesh mode)

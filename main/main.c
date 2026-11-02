@@ -28,6 +28,7 @@
 #include "button_control.h"
 #include "call_policy.h"
 #include "call_cues.h"
+#include "phone_link_cue.h"
 #include "call_privacy.h"
 #include "cpu_profile.h"
 #include "e2e_diag.h"
@@ -70,6 +71,7 @@ static omi_call_policy_t s_call_policy;
 static omi_privacy_reconcile_t s_privacy;
 static atomic_uint s_end_beeps_pending = ATOMIC_VAR_INIT(0);
 static uint32_t s_phone_bonds_announced;
+static omi_phone_link_cue_t s_phone_link_cue;
 static int64_t s_privacy_retry_ms;
 static unsigned s_privacy_failures;
 static bool s_bridge_was_ready;
@@ -214,6 +216,16 @@ static void process_phone_cues(void)
             if (ret != ESP_OK)
                 ESP_LOGW(TAG, "Phone paired prompt failed: %s", esp_err_to_name(ret));
         }
+    }
+    if (omi_phone_link_cue_step(&s_phone_link_cue, phone_state.a2dp_connected,
+                                phone_state.hfp_connected)) {
+        const phone_audio_call_state_t *call = &phone_state.call;
+        /* A ringing or live call owns the speaker; skip rather than beep late. */
+        bool call_activity = call->slc_connected &&
+            (call->call != 0u || call->call_setup != 0u || call->call_held != 0u);
+        esp_err_t ret = call_activity ? ESP_ERR_INVALID_STATE : audio_play_phone_connected();
+        /* ESP_ERR_TIMEOUT: another cue or the lock is busy; retry next loop. */
+        if (ret != ESP_ERR_TIMEOUT) omi_phone_link_cue_done(&s_phone_link_cue);
     }
 }
 

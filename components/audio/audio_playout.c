@@ -963,6 +963,9 @@ void audio_playout_task(void *arg)
             /* A gate transition can race the earlier remote render. */
             memset(g_audio.hw_output, 0, sizeof(g_audio.hw_output));
         }
+        /* The connect beep never plays over an incoming-call prompt. */
+        if (audio_urgent_active(&g_audio.incoming_call))
+            audio_limit_cue_cancel_connect(&g_audio.volume_limit_cue);
         audio_limit_cue_mix(&g_audio.volume_limit_cue, g_audio.hw_output,
                             AUDIO_HW_FRAME_SAMPLES, 1u, AUDIO_HW_SAMPLE_RATE);
         uint32_t work_us = (uint32_t)(esp_timer_get_time() - work_start_us);

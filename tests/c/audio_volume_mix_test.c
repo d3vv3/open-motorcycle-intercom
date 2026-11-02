@@ -301,6 +301,58 @@ static void test_pending_end_transition(uint32_t rate, uint8_t channels)
     assert(atomic_load(&cue.state) == AUDIO_CUE_IDLE);
 }
 
+static void test_connect(uint32_t rate, uint8_t channels, size_t chunk)
+{
+    audio_limit_cue_t cue = {0};
+    audio_limit_cue_reset(&cue);
+    assert(audio_limit_cue_request_connect(&cue));
+    assert(atomic_load(&cue.state) == AUDIO_CUE_CONNECT);
+    /* Nothing else starts or coalesces into the connect beep. */
+    assert(!audio_limit_cue_request_connect(&cue));
+    assert(!audio_limit_cue_request(&cue));
+    assert(!audio_limit_cue_request_end(&cue));
+    assert(atomic_load(&cue.state) == AUDIO_CUE_CONNECT);
+    const uint32_t end = rate * 120u / 1000u;
+    const uint32_t fade = rate / 200u;
+    int16_t frame[997 * 2];
+    int32_t peak = 0;
+    for (size_t start = 0; start < end + chunk; start += chunk) {
+        for (size_t i = 0; i < chunk * channels; ++i) frame[i] = 0;
+        audio_limit_cue_mix(&cue, frame, chunk, channels, rate);
+        for (size_t i = 0; i < chunk; ++i) {
+            size_t pos = start + i;
+            int32_t value = frame[i * channels];
+            int32_t magnitude = value < 0 ? -value : value;
+            if (pos >= end) assert(value == 0);
+            /* The fade keeps both edges near zero: no click. */
+            if (pos == 0u || pos == end - 1u) assert(magnitude == 0);
+            if (pos < fade / 4u || (pos < end && end - pos <= fade / 4u))
+                assert(magnitude <= 4096 / 4 + 1);
+            if (magnitude > peak) peak = magnitude;
+            for (uint8_t c = 1; c < channels; ++c)
+                assert(frame[i * channels + c] == frame[i * channels]);
+        }
+    }
+    assert(peak > 3500 && peak <= 4096); /* Same level as the limit/end beeps. */
+    assert(!audio_limit_cue_busy(&cue) && cue.position == 0u && cue.phase == 0u);
+    /* A busy cue refuses the connect beep; the caller retries. */
+    assert(audio_limit_cue_request(&cue));
+    assert(!audio_limit_cue_request_connect(&cue));
+    audio_limit_cue_reset(&cue);
+    assert(audio_limit_cue_request_end(&cue));
+    assert(!audio_limit_cue_request_connect(&cue));
+    /* Cancel only drops a connect beep, mid-tone included. */
+    audio_limit_cue_cancel_connect(&cue);
+    assert(atomic_load(&cue.state) == AUDIO_CUE_END);
+    audio_limit_cue_reset(&cue);
+    assert(audio_limit_cue_request_connect(&cue));
+    audio_limit_cue_mix(&cue, frame, chunk < end / 2u ? chunk : end / 2u, channels, rate);
+    assert(cue.position != 0u);
+    audio_limit_cue_cancel_connect(&cue);
+    assert(!audio_limit_cue_busy(&cue) && cue.position == 0u && cue.phase == 0u);
+    assert(audio_limit_cue_request(&cue));
+}
+
 int main(void)
 {
     test_gains();
@@ -314,6 +366,9 @@ int main(void)
     test_call_end(48000u, 2u, 997u);
     test_pending_end_transition(16000u, 1u);
     test_pending_end_transition(48000u, 2u);
+    test_connect(16000u, 1u, 137u);
+    test_connect(48000u, 1u, 960u);
+    test_connect(48000u, 2u, 997u);
     puts("audio volume mix tests passed");
     return 0;
 }

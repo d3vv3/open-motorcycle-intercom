@@ -126,12 +126,20 @@ bool audio_limit_cue_request_end(audio_limit_cue_t *cue)
     unsigned state = atomic_load_explicit(&cue->state, memory_order_acquire);
     for (;;) {
         if (state == AUDIO_CUE_END || state == AUDIO_CUE_LIMIT_WITH_PENDING_END) return true;
+        if (state == AUDIO_CUE_CONNECT) return false; /* Retried after the beep. */
         unsigned next = state == AUDIO_CUE_IDLE ? AUDIO_CUE_END :
                         AUDIO_CUE_LIMIT_WITH_PENDING_END;
         if (atomic_compare_exchange_weak_explicit(&cue->state, &state, next,
                                                   memory_order_acq_rel, memory_order_acquire))
             return true;
     }
+}
+
+bool audio_limit_cue_request_connect(audio_limit_cue_t *cue)
+{
+    unsigned expected = AUDIO_CUE_IDLE;
+    return atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_CONNECT,
+                                                   memory_order_acq_rel, memory_order_acquire);
 }
 
 static void cue_finish(audio_limit_cue_t *cue)
@@ -144,6 +152,16 @@ static void cue_finish(audio_limit_cue_t *cue)
         if (atomic_compare_exchange_weak_explicit(&cue->state, &state, next,
                                                   memory_order_acq_rel, memory_order_acquire))
             return;
+    }
+}
+
+void audio_limit_cue_cancel_connect(audio_limit_cue_t *cue)
+{
+    unsigned expected = AUDIO_CUE_CONNECT;
+    if (atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_IDLE,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        cue->position = 0u;
+        cue->phase = 0u;
     }
 }
 
@@ -163,9 +181,10 @@ void audio_limit_cue_mix(audio_limit_cue_t *cue, int16_t *interleaved,
     if (channels == 0u || rate == 0u) return;
     unsigned kind = atomic_load_explicit(&cue->state, memory_order_acquire);
     if (kind == AUDIO_CUE_IDLE) return;
-    const uint32_t on = rate * 80u / 1000u;
+    const uint32_t on = rate * (kind == AUDIO_CUE_CONNECT ? 120u : 80u) / 1000u;
     const uint32_t gap = rate * 60u / 1000u;
-    const uint32_t end = kind == AUDIO_CUE_END ? on : on * 3u + gap * 2u;
+    const uint32_t end = kind == AUDIO_CUE_END || kind == AUDIO_CUE_CONNECT ? on :
+                         on * 3u + gap * 2u;
     const uint32_t fade = rate / 200u;
     const uint32_t increment = (uint32_t)((880ull << 32) / rate);
     for (size_t frame = 0; frame < frames; ++frame) {
