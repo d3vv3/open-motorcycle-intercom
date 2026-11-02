@@ -32,6 +32,14 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 
+# Keep task stacks out of RTC fast RAM. As heap it is much slower and hands the
+# SPI/audio tasks slow stacks: bench 2026-11-03 with =y saw ~40% S31 bridge RX
+# loss (spi_gap) on mesh audio while BT A2DP streamed; with =n music+mesh was
+# clean (~12% spi_gap, recovered by redundancy). Phase 1/2 (with Opus) hit
+# ESP_ERR_NO_MEM in esp_wifi_init with =n; dropping Opus freed ~70 KB internal
+# RAM, so ESP-NOW now boots with ~67 KB internal free after audio start.
+CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP=n
+
 # Bluetooth Classic A2DP sink and AVRCP phone controls
 CONFIG_BT_ENABLED=y
 CONFIG_BT_CONTROLLER_ENABLED=y

@@ -903,6 +903,11 @@ static esp_err_t initialize_application(int64_t boot_time)
     if (s_active_transport == TRANSPORT_NRF52840) {
         atomic_store(&g_mesh_active, false);
     }
+    /* Headroom check: RTC fast RAM is not heap, so watch for drift toward NO_MEM. */
+    ESP_LOGI(TAG, "Internal heap after mesh/audio init: free/largest/min=%lu/%lu/%lu bytes",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     ESP_LOGI(TAG, "Mesh networking ready (desired state: %s)",
              mesh_intent_enabled() ? "enabled" : "disabled");
     ESP_LOGI(TAG, "");
