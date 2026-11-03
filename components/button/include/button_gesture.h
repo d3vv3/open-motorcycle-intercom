@@ -31,13 +31,25 @@ typedef enum {
     BUTTON_EVENT_SHORT_PRESS = 0,
     BUTTON_EVENT_LONG_PRESS,
     BUTTON_EVENT_EXTRA_LONG_PRESS,
-    BUTTON_EVENT_MODIFIED_PRESS
+    BUTTON_EVENT_MODIFIED_PRESS,
+    BUTTON_EVENT_HOLD_LONG,       /* Still held: crossed the long-press threshold. */
+    BUTTON_EVENT_HOLD_EXTRA_LONG, /* Center still held: crossed the pairing threshold. */
 } button_event_t;
 
-/* Release-only events: center 50/2000/6000 ms; sides 50/1000 ms.
+/* Release events: center 50/2000/6000 ms; sides 50/1000 ms.
  * Sides never emit EXTRA_LONG_PRESS, including holds of 6000 ms or more.
  * A debounced center + one-side overlap emits MODIFIED_PRESS for the side
- * on release (once, for any hold >= 50 ms), and consumes the center press. */
+ * on release (once, for any hold >= 50 ms), and consumes the center press.
+ *
+ * Hold events (opt-in, button_state_enable_hold_events): while a key is
+ * still held, HOLD_LONG fires once when the hold reaches the threshold of the
+ * LONG_PRESS release (center 2000 ms, sides 1000 ms) and, for the center only,
+ * HOLD_EXTRA_LONG once at 6000 ms. They follow the same gating as releases
+ * (no chord, no consumed center, no center-modified side) and never change
+ * release classification. Each LONG_PRESS/EXTRA_LONG_PRESS release is
+ * preceded, in the same press, by the matching hold event: if no poll fell
+ * between the threshold and the release, it is emitted just before the
+ * release. Short presses never emit hold events. */
 
 /* Short aliases for consumers using the event rather than gesture terminology. */
 #define BUTTON_EVENT_SHORT BUTTON_EVENT_SHORT_PRESS
@@ -58,14 +70,19 @@ typedef struct {
     bool center_used;
     bool side_modified[BUTTON_COUNT];
     bool side_suppressed[BUTTON_COUNT];
-    button_id_t pending_ids[BUTTON_COUNT];
-    button_event_t pending_events[BUTTON_COUNT];
+    bool hold_events;                  /* Emit HOLD_* events (off after init). */
+    uint8_t hold_stage[BUTTON_COUNT];  /* 0 none, 1 HOLD_LONG, 2 HOLD_EXTRA_LONG sent. */
+    button_id_t pending_ids[BUTTON_COUNT * 2];
+    button_event_t pending_events[BUTTON_COUNT * 2];
     unsigned pending_count;
 } button_state_t;
 
 /** Start with all gestures gated until all three keys have been stably released. */
 void button_state_init(button_state_t *state, uint32_t now_ms,
                        const bool pressed[BUTTON_COUNT]);
+
+/** Enable or disable the while-held HOLD_* events. */
+void button_state_enable_hold_events(button_state_t *state, bool enabled);
 
 /** Sample all keys together. Returns one event at a time; call again with the
  * same sample to drain any additional release events before the next poll. */

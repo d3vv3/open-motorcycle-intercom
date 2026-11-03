@@ -22,7 +22,8 @@ typedef void (*button_callback_t)(button_id_t id, button_event_t event, void *co
 esp_err_t button_init(void);
 /** Stop polling, wait for callbacks to finish, and release driver resources. */
 void button_deinit(void);
-/** Register a callback invoked from the low-priority button task on release. */
+/** Register a callback invoked from the low-priority button task on release,
+ * and on the while-held HOLD_LONG / HOLD_EXTRA_LONG thresholds. */
 void button_register_callback(button_callback_t callback, void *context);
 
 #ifdef __cplusplus

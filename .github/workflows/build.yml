@@ -171,6 +171,9 @@ jobs:
       - name: Run button gesture tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/button_gesture_test && /tmp/button_gesture_test
 
+      - name: Run hold preview mapping and prompt suppression tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared -Imain -Icomponents/button/include tests/c/hold_preview_test.c -o /tmp/hold_preview_test && /tmp/hold_preview_test
+
       - name: Run BOOT media toggle guard tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Imain main/media_toggle_guard.c tests/c/media_toggle_guard_test.c -o /tmp/media_toggle_guard_test && /tmp/media_toggle_guard_test
 
@@ -238,6 +241,7 @@ jobs:
             cc $FLAGS $SAN -Imain tests/c/phone_link_cue_test.c -o /tmp/san_phone_link_cue && /tmp/san_phone_link_cue
             cc $FLAGS $SAN -Imain tests/c/radio_policy_test.c -o /tmp/san_radio_policy && /tmp/san_radio_policy
            cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
+           cc $FLAGS $SAN -I. -Ishared -Imain -Icomponents/button/include tests/c/hold_preview_test.c -o /tmp/san_hold_preview && /tmp/san_hold_preview
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select
            cc $FLAGS $SAN -Icomponents/audio components/audio/audio_volume_mix.c tests/c/audio_volume_mix_test.c -o /tmp/san_audio_volume_mix && /tmp/san_audio_volume_mix

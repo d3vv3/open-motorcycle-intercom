@@ -32,6 +32,7 @@ static void button_task(void *arg)
     bool pressed[BUTTON_COUNT];
     read_buttons(pressed);
     button_state_init(&state, (uint32_t)(esp_timer_get_time() / 1000), pressed);
+    button_state_enable_hold_events(&state, true);
 
     for (;;) {
         if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(BUTTON_POLL_MS)) != 0) {

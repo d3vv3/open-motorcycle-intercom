@@ -30,6 +30,36 @@ void button_state_init(button_state_t *state, uint32_t now_ms,
     }
 }
 
+void button_state_enable_hold_events(button_state_t *state, bool enabled)
+{
+    state->hold_events = enabled;
+}
+
+/* Hold stage a key has reached: 1 = LONG threshold, 2 = center pairing threshold. */
+static uint8_t hold_stage_for(int id, uint32_t held_ms)
+{
+    if (id == BUTTON_CENTER)
+        return held_ms >= BUTTON_PAIRING_GESTURE_MS ? 2u : held_ms >= BUTTON_MESH_GESTURE_MS ? 1u : 0u;
+    return held_ms >= BUTTON_SIDE_HOLD_MS ? 1u : 0u;
+}
+
+static void push_event(button_state_t *state, int id, button_event_t event)
+{
+    if (state->pending_count < BUTTON_COUNT * 2) {
+        unsigned n = state->pending_count++;
+        state->pending_ids[n] = (button_id_t)id;
+        state->pending_events[n] = event;
+    }
+}
+
+/* Emit the hold event for the latest stage reached, once per stage. */
+static void push_hold(button_state_t *state, int id, uint8_t stage)
+{
+    if (!state->hold_events || stage <= state->hold_stage[id]) return;
+    state->hold_stage[id] = stage;
+    push_event(state, id, stage == 2u ? BUTTON_EVENT_HOLD_EXTRA_LONG : BUTTON_EVENT_HOLD_LONG);
+}
+
 bool button_state_sample(button_state_t *state, uint32_t now_ms,
                           const bool pressed[BUTTON_COUNT],
                           button_id_t *id, button_event_t *event)
@@ -81,6 +111,7 @@ bool button_state_sample(button_state_t *state, uint32_t now_ms,
             key->stable_pressed = key->raw_pressed;
             if (key->stable_pressed) {
                 key->press_since_ms = key->raw_since_ms;
+                state->hold_stage[i] = 0u;
             } else {
                 released[i] = true;
             }
@@ -101,8 +132,16 @@ bool button_state_sample(button_state_t *state, uint32_t now_ms,
 
     if (state->ready && !state->chord) {
         for (int i = 0; i < BUTTON_COUNT; ++i) {
-            if (!released[i]) continue;
             button_key_state_t *key = &state->keys[i];
+            if (!released[i]) {
+                /* Still held (raw and debounced): the release can only be at
+                 * or past the threshold, so the hold event never contradicts it. */
+                if (key->stable_pressed && pressed[i] &&
+                    !(i == BUTTON_CENTER ? state->center_used :
+                      state->side_suppressed[i] || state->side_modified[i]))
+                    push_hold(state, i, hold_stage_for(i, now_ms - key->press_since_ms));
+                continue;
+            }
             uint32_t duration = key->raw_since_ms - key->press_since_ms;
             if (duration < BUTTON_SHORT_PRESS_MIN_MS ||
                 (i == BUTTON_CENTER ? state->center_used :
@@ -112,11 +151,9 @@ bool button_state_sample(button_state_t *state, uint32_t now_ms,
                    duration >= BUTTON_MESH_GESTURE_MS ? BUTTON_EVENT_LONG_PRESS : BUTTON_EVENT_SHORT_PRESS)
                 : (state->side_modified[i] ? BUTTON_EVENT_MODIFIED_PRESS :
                    duration >= BUTTON_SIDE_HOLD_MS ? BUTTON_EVENT_LONG_PRESS : BUTTON_EVENT_SHORT_PRESS);
-            if (state->pending_count < BUTTON_COUNT) {
-                unsigned n = state->pending_count++;
-                state->pending_ids[n] = (button_id_t)i;
-                state->pending_events[n] = kind;
-            }
+            /* No poll fell between the threshold and the release: catch up. */
+            if (kind != BUTTON_EVENT_MODIFIED_PRESS) push_hold(state, i, hold_stage_for(i, duration));
+            push_event(state, i, kind);
         }
     }
 

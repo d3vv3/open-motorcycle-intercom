@@ -26,6 +26,7 @@
 #include "audio.h"
 #include "button.h"
 #include "button_control.h"
+#include "hold_preview.h"
 #include "call_policy.h"
 #include "call_cues.h"
 #include "phone_link_cue.h"
@@ -74,6 +75,10 @@ static atomic_uint s_end_beeps_pending = ATOMIC_VAR_INIT(0);
 static uint32_t s_phone_bonds_announced;
 static omi_phone_link_cue_t s_phone_link_cue;
 static omi_mesh_on_seq_t s_mesh_on_seq;
+static omi_preview_memo_t s_preview_memo; /* Hold preview played per button this press. */
+/* "Mesh On" already said by the hold preview of the pending mesh start. */
+static omi_preview_t s_mesh_on_preview;
+static const omi_preview_t k_no_preview = {OMI_PREVIEW_NONE, 0u};
 static int64_t s_privacy_retry_ms;
 static unsigned s_privacy_failures;
 static bool s_bridge_was_ready;
@@ -362,12 +367,15 @@ static audio_notify_t radio_prompt_voice(omi_radio_prompt_t prompt)
     return AUDIO_NOTIFY_BLUETOOTH_PAIRING;
 }
 
-/* Queue the plan's prompts in order; the pairing prompt only if the window opened. */
-static void play_radio_prompts(const omi_radio_plan_t *plan, bool pairing_opened)
+/* Queue the plan's prompts in order; the pairing prompt only if the window
+ * opened. The prompt the hold preview already said is not repeated. */
+static void play_radio_prompts(const omi_radio_plan_t *plan, bool pairing_opened,
+                               omi_preview_t previewed)
 {
-    for (uint8_t i = 0; i < plan->prompt_count; ++i) {
-        if (plan->prompts[i] == OMI_RADIO_PROMPT_PHONE_PAIRING && !pairing_opened) continue;
-        (void)audio_play_notification(radio_prompt_voice(plan->prompts[i]));
+    omi_radio_plan_t remaining = omi_radio_plan_after_preview(*plan, previewed);
+    for (uint8_t i = 0; i < remaining.prompt_count; ++i) {
+        if (remaining.prompts[i] == OMI_RADIO_PROMPT_PHONE_PAIRING && !pairing_opened) continue;
+        (void)audio_play_notification(radio_prompt_voice(remaining.prompts[i]));
     }
 }
 
@@ -428,6 +436,8 @@ static void enable_mesh_from_button(void)
 {
     ESP_LOGI(TAG, "Enabling mesh networking...");
     atomic_store(&g_mesh_active, false);
+    omi_preview_t previewed = s_mesh_on_preview;
+    s_mesh_on_preview = k_no_preview;
 
     esp_err_t ret = ESP_OK;
     if (s_active_transport == TRANSPORT_ESP_NOW) {
@@ -443,7 +453,7 @@ static void enable_mesh_from_button(void)
             atomic_store(&g_mesh_active, true);
             transport_nrf_cancel_enable_notification();
             /* Bluetooth went off before the start; announce both now, in order. */
-            play_radio_prompts(&result, false);
+            play_radio_prompts(&result, false, previewed);
         }
         ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
         return;
@@ -461,8 +471,10 @@ static void enable_mesh_from_button(void)
     atomic_store(&g_mesh_active, false);
     ESP_LOGE(TAG, "Failed to start mesh: %s; mesh intent rolled back off%s",
              esp_err_to_name(ret), result.bluetooth_on ? ", restoring Bluetooth" : "");
+    if (previewed.kind == OMI_PREVIEW_MESH_ON)
+        ESP_LOGW(TAG, "Hold preview already said Mesh On; mesh start failed (no error cue)");
     apply_bluetooth_switch(&result);
-    play_radio_prompts(&result, false);
+    play_radio_prompts(&result, false, k_no_preview);
 }
 
 /** Enqueue release events without blocking the button task. */
@@ -482,7 +494,10 @@ static bool persist_mesh_intent(bool requested_enabled)
     }
     transport_nrf_set_user_enabled(requested_enabled);
     transport_nrf_reset_reconciliation();
-    if (!requested_enabled) s_esp_enable_announcement_pending = false;
+    if (!requested_enabled) {
+        s_esp_enable_announcement_pending = false;
+        s_mesh_on_preview = k_no_preview;
+    }
     return true;
 }
 
@@ -512,10 +527,43 @@ static void process_mesh_on_sequence(int64_t now_ms)
     enable_mesh_from_button();
 }
 
-static void process_mesh_toggle(void)
+static const char *preview_name(omi_preview_t preview)
+{
+    switch (preview.kind) {
+    case OMI_PREVIEW_MESH_ON: return "Mesh On";
+    case OMI_PREVIEW_MESH_OFF: return "Mesh Off";
+    case OMI_PREVIEW_PHONE_PAIRING: return "Phone Pairing";
+    case OMI_PREVIEW_CHANNEL: return "Channel";
+    case OMI_PREVIEW_NONE: break;
+    }
+    return "none";
+}
+
+/* The state changed between the hold preview and the release (rare): the
+ * release follows the actual state, and its own prompt plays. */
+static void log_preview_mismatch(omi_preview_t previewed, omi_preview_t actual)
+{
+    if (!omi_preview_mismatch(previewed, actual)) return;
+    ESP_LOGW(TAG, "Hold preview said %s %u, release now does %s %u (state changed)",
+             preview_name(previewed), previewed.channel, preview_name(actual), actual.channel);
+}
+
+static void process_mesh_toggle(omi_preview_t previewed)
 {
     bool requested_enabled = !mesh_intent_enabled();
-    if (!persist_mesh_intent(requested_enabled)) return;
+    log_preview_mismatch(previewed, omi_action_preview(OMI_ACTION_MESH_TOGGLE, !requested_enabled, 0u));
+    if (!persist_mesh_intent(requested_enabled)) {
+        if (previewed.kind != OMI_PREVIEW_NONE)
+            ESP_LOGW(TAG, "Hold preview already said %s; mesh toggle failed (no error cue)",
+                     preview_name(previewed));
+        return;
+    }
+    if (requested_enabled && previewed.kind == OMI_PREVIEW_MESH_ON) {
+        /* Owed by whichever path finally starts the mesh. */
+        s_mesh_on_preview = previewed;
+        /* nRF: the transport announces Mesh On once the bridge is ready. */
+        transport_nrf_cancel_enable_notification();
+    }
     if (!requested_enabled && omi_mesh_on_cancel(&s_mesh_on_seq))
         ESP_LOGI(TAG, "Mesh off before the pending mesh start");
 
@@ -544,30 +592,41 @@ static void process_mesh_toggle(void)
         omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_OFF, radio_esp_now(), true,
                                                remembered_phone());
         apply_bluetooth_switch(&plan);
-        play_radio_prompts(&plan, false);
+        play_radio_prompts(&plan, false, previewed);
+    } else if (previewed.kind == OMI_PREVIEW_MESH_OFF) {
+        ESP_LOGW(TAG, "Hold preview already said Mesh Off; mesh stop failed (no error cue)");
     }
 }
 
-static void process_pairing_request(void)
+static void process_pairing_request(omi_preview_t previewed)
 {
+    bool said_pairing = previewed.kind == OMI_PREVIEW_PHONE_PAIRING;
     omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_PAIRING, radio_esp_now(),
                                            mesh_intent_enabled(), false);
     if (plan.stop_mesh) {
         /* Same as the mesh-off toggle, but Bluetooth comes back for pairing. */
-        if (!persist_mesh_intent(false)) return;
+        if (!persist_mesh_intent(false)) {
+            if (said_pairing)
+                ESP_LOGW(TAG, "Hold preview already said Phone Pairing; pairing failed (no error cue)");
+            return;
+        }
         (void)omi_mesh_on_cancel(&s_mesh_on_seq);
         if (!disable_mesh_from_button()) {
-            ESP_LOGW(TAG, "Center pairing skipped: mesh is still running");
+            ESP_LOGW(TAG, "Center pairing skipped: mesh is still running%s",
+                     said_pairing ? " (Phone Pairing was previewed; no error cue)" : "");
             return;
         }
     }
     apply_bluetooth_switch(&plan);
     esp_err_t ret = phone_audio_set_discoverable(true);
-    play_radio_prompts(&plan, ret == ESP_OK);
+    /* "Phone Pairing" was the preview; "Mesh Off" (ESP-NOW, mesh was on)
+     * is what the release just did, so it follows the preview. */
+    play_radio_prompts(&plan, ret == ESP_OK, previewed);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "Center hold opened Bluetooth pairing window for 120 seconds");
     } else {
-        ESP_LOGW(TAG, "Center pairing unavailable: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Center pairing unavailable: %s%s", esp_err_to_name(ret),
+                 said_pairing ? " (Phone Pairing was previewed; no error cue)" : "");
     }
 }
 
@@ -666,24 +725,30 @@ static void apply_pending_esp_channel(void)
     if (s_esp_enable_announcement_pending && mesh_intent_enabled()) {
         /* Bluetooth was already switched off when the toggle was accepted. */
         omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
-        play_radio_prompts(&plan, false);
+        play_radio_prompts(&plan, false, s_mesh_on_preview);
     }
     s_esp_enable_announcement_pending = false;
+    s_mesh_on_preview = k_no_preview;
     ESP_LOGI(TAG, "Talk channel %u active on ESP-NOW RF %u", target, mesh_channel_espnow_rf(target));
 }
 
-static void process_channel_selection(int direction)
+static void process_channel_selection(int direction, omi_preview_t previewed)
 {
-    uint8_t target = mesh_channel_cycle(mesh_channel_pref_selected(), direction);
+    uint8_t selected = mesh_channel_pref_selected();
+    uint8_t target = mesh_channel_cycle(selected, direction);
+    log_preview_mismatch(previewed, omi_action_preview(
+        direction < 0 ? OMI_ACTION_CHANNEL_PREVIOUS : OMI_ACTION_CHANNEL_NEXT, false, selected));
     esp_err_t ret = mesh_channel_pref_persist(target);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Talk channel %u not selected (NVS commit failed): %s", target,
-                 esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Talk channel %u not selected (NVS commit failed): %s%s", target,
+                 esp_err_to_name(ret),
+                 previewed.kind == OMI_PREVIEW_CHANNEL ? " (channel was previewed; no error cue)" : "");
         return;
     }
     esp_err_t led = board_set_channel_indicator(target);
     if (led != ESP_OK) ESP_LOGW(TAG, "Talk channel indicator unavailable: %s", esp_err_to_name(led));
-    (void)audio_play_notification(channel_voice(target));
+    if (omi_channel_prompt_after_preview(previewed, target))
+        (void)audio_play_notification(channel_voice(target));
     ESP_LOGI(TAG, "Selected talk channel %u; radio may still be pending", target);
     atomic_store(&s_channel_transition, true);
     atomic_store(&g_mesh_active, false);
@@ -721,25 +786,72 @@ static void process_channel_selection(int direction)
     else atomic_store(&s_channel_transition, false); /* nRF gates through confirmed ACK. */
 }
 
+/* Side holds become track control while media streams, or nothing while
+ * the media state is unknown; used identically by preview and release. */
+static omi_action_t resolve_side_hold(omi_action_t command)
+{
+    if (command != OMI_ACTION_CHANNEL_PREVIOUS && command != OMI_ACTION_CHANNEL_NEXT) return command;
+    phone_audio_state_t phone_state = {0};
+    esp_err_t ret = phone_audio_get_state(&phone_state);
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "Side hold state unavailable; action skipped: %s", esp_err_to_name(ret));
+    return omi_side_hold_action(command, ret == ESP_OK,
+                                ret == ESP_OK && phone_state.media_streaming,
+                                ret == ESP_OK && phone_state.call.phase == PHONE_AUDIO_CALL_PHASE_IDLE &&
+                                    !audio_mesh_call_active());
+}
+
+static audio_notify_t preview_voice(omi_preview_t preview)
+{
+    switch (preview.kind) {
+    case OMI_PREVIEW_MESH_ON: return AUDIO_NOTIFY_MESH_ENABLED;
+    case OMI_PREVIEW_MESH_OFF: return AUDIO_NOTIFY_MESH_DISABLED;
+    case OMI_PREVIEW_PHONE_PAIRING: return AUDIO_NOTIFY_BLUETOOTH_PAIRING;
+    case OMI_PREVIEW_CHANNEL: return channel_voice(preview.channel);
+    case OMI_PREVIEW_NONE: break;
+    }
+    return AUDIO_NOTIFY_COUNT;
+}
+
+/* Still held past a threshold: say what releasing now would do, from the
+ * state right now. The release skips this prompt (s_preview_memo). */
+static void process_hold_preview(button_action_t action)
+{
+    omi_action_t command = resolve_side_hold(omi_button_hold_action(action.id, action.event));
+    omi_preview_t preview = omi_action_preview(command, mesh_intent_enabled(),
+                                               mesh_channel_pref_selected());
+    bool played = false;
+    if (preview.kind != OMI_PREVIEW_NONE) {
+        esp_err_t ret = audio_play_notification(preview_voice(preview));
+        played = ret == ESP_OK;
+        if (played)
+            ESP_LOGI(TAG, "Hold preview (button %d): %s %u", (int)action.id,
+                     preview_name(preview), preview.channel);
+        else
+            ESP_LOGW(TAG, "Hold preview %s not queued: %s; release will announce",
+                     preview_name(preview), esp_err_to_name(ret));
+    }
+    omi_preview_memo_hold(&s_preview_memo, action.id, preview, played);
+}
+
 static void process_button_action(button_action_t action, int64_t now_ms)
 {
-    omi_action_t command = omi_button_action(action.id, action.event);
-    if (command == OMI_ACTION_CHANNEL_PREVIOUS || command == OMI_ACTION_CHANNEL_NEXT) {
-        phone_audio_state_t phone_state = {0};
-        esp_err_t ret = phone_audio_get_state(&phone_state);
-        if (ret != ESP_OK)
-            ESP_LOGW(TAG, "Side hold state unavailable; action skipped: %s", esp_err_to_name(ret));
-        command = omi_side_hold_action(command, ret == ESP_OK,
-                                        ret == ESP_OK && phone_state.media_streaming,
-                                        ret == ESP_OK && phone_state.call.phase == PHONE_AUDIO_CALL_PHASE_IDLE &&
-                                            !audio_mesh_call_active());
+    if (action.event == BUTTON_EVENT_HOLD_LONG || action.event == BUTTON_EVENT_HOLD_EXTRA_LONG) {
+        process_hold_preview(action);
+        return;
     }
+    omi_preview_t previewed = omi_preview_memo_release(&s_preview_memo, action.id);
+    omi_action_t command = resolve_side_hold(omi_button_action(action.id, action.event));
+    if (previewed.kind == OMI_PREVIEW_CHANNEL && command != OMI_ACTION_CHANNEL_PREVIOUS &&
+        command != OMI_ACTION_CHANNEL_NEXT)
+        ESP_LOGW(TAG, "Hold preview said channel %u; release runs action %d instead",
+                 previewed.channel, (int)command);
     switch (command) {
         case OMI_ACTION_CALL_MEDIA: process_short_press(now_ms); break;
-        case OMI_ACTION_MESH_TOGGLE: process_mesh_toggle(); break;
-        case OMI_ACTION_PAIRING: process_pairing_request(); break;
-        case OMI_ACTION_CHANNEL_PREVIOUS: process_channel_selection(-1); break;
-        case OMI_ACTION_CHANNEL_NEXT: process_channel_selection(1); break;
+        case OMI_ACTION_MESH_TOGGLE: process_mesh_toggle(previewed); break;
+        case OMI_ACTION_PAIRING: process_pairing_request(previewed); break;
+        case OMI_ACTION_CHANNEL_PREVIOUS: process_channel_selection(-1, previewed); break;
+        case OMI_ACTION_CHANNEL_NEXT: process_channel_selection(1, previewed); break;
         case OMI_ACTION_PREVIOUS_TRACK:
         case OMI_ACTION_NEXT_TRACK: {
             esp_err_t ret = command == OMI_ACTION_NEXT_TRACK ? phone_audio_next() : phone_audio_previous();
