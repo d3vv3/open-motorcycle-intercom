@@ -263,6 +263,9 @@ esp_err_t mesh_deinit(void);
  * 2. If found, send JOIN request
  * 3. If not found after timeout, become coordinator
  *
+ * Allocates nothing: the mesh task, its stack and its TCB are reserved by
+ * mesh_init and the task parks between sessions.
+ *
  * @return ESP_OK on success
  */
 esp_err_t mesh_start(void);

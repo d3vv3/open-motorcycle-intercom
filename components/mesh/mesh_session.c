@@ -311,13 +311,9 @@ static void mesh_task_dispatch_timer_event(void)
     }
 }
 
-void mesh_task(void *arg)
+/* One session, from a committed mesh_start until mesh_stop sets s_stopping. */
+static void mesh_task_run_session(void)
 {
-    ESP_LOGI(TAG, "Mesh task started");
-
-    /* The creator has committed startup before releasing this gate. Stop also
-     * wakes us so a cancelled startup can exit without emitting SCANNING. */
-    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     taskENTER_CRITICAL(&s_transport_mux);
     bool announce_scanning = !s_stopping && s_state == MESH_STATE_SCANNING;
     taskEXIT_CRITICAL(&s_transport_mux);
@@ -379,10 +375,21 @@ void mesh_task(void *arg)
             break;
         }
     }
+}
 
-    s_mesh_task = NULL;
-    xSemaphoreGive(s_task_stopped_semaphore);
-    vTaskDelete(NULL);
+/* Created once by mesh_init and never self-deleted: between sessions it parks
+ * on the start gate, so start/stop cycles never allocate a stack or TCB. */
+void mesh_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        /* mesh_start commits the session before releasing this gate. A stop
+         * right after start is seen below, before SCANNING is announced. */
+        (void)xSemaphoreTake(s_task_start_semaphore, portMAX_DELAY);
+        ESP_LOGI(TAG, "Mesh task started");
+        mesh_task_run_session();
+        xSemaphoreGive(s_task_stopped_semaphore);
+    }
 }
 
 static bool handle_speaker_grant_packet(const mesh_rx_item_t *rx)

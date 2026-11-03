@@ -17,6 +17,39 @@ const char *const TAG = "mesh";
 const uint8_t s_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static atomic_bool s_init_in_progress = ATOMIC_VAR_INIT(false);
 
+/* The mesh task is created once per mesh_init and parks between sessions, so
+ * mesh_start allocates nothing. Its stack and TCB are reserved on the first
+ * init and reused for the rest of the boot (task stacks stay internal). */
+static StackType_t *s_mesh_task_stack;
+static StaticTask_t *s_mesh_task_tcb;
+
+static esp_err_t create_parked_mesh_task(void)
+{
+    if (s_mesh_task_stack == NULL)
+        s_mesh_task_stack = heap_caps_malloc(MESH_TASK_STACK_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_mesh_task_tcb == NULL)
+        s_mesh_task_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_mesh_task_stack == NULL || s_mesh_task_tcb == NULL) return ESP_ERR_NO_MEM;
+    s_mesh_task = xTaskCreateStaticPinnedToCore(mesh_task, "mesh", MESH_TASK_STACK_SIZE, NULL,
+                                                MESH_TASK_PRIORITY, s_mesh_task_stack,
+                                                s_mesh_task_tcb, MESH_TASK_CORE);
+    return s_mesh_task != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+/* Deletes the parked task so a later mesh_init can reuse its storage. A task
+ * that is not running is freed at once; a running one would only be queued for
+ * the idle task, so wait (bounded) until it blocks on the start gate. */
+static bool delete_parked_mesh_task(void)
+{
+    if (s_mesh_task == NULL) return true;
+    for (int i = 0; i < 100 && eTaskGetState(s_mesh_task) != eBlocked; ++i)
+        vTaskDelay(pdMS_TO_TICKS(1));
+    if (eTaskGetState(s_mesh_task) != eBlocked) return false;
+    vTaskDelete(s_mesh_task);
+    s_mesh_task = NULL;
+    return true;
+}
+
 mesh_context_t s_mesh = {
     .config = MESH_CONFIG_DEFAULT(),
     .slot_index = -1,
@@ -74,6 +107,7 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     s_control_semaphore = xSemaphoreCreateBinary();
     s_tx_done_semaphore = xSemaphoreCreateBinary();
     s_task_stopped_semaphore = xSemaphoreCreateBinary();
+    s_task_start_semaphore = xSemaphoreCreateBinary();
     s_audio_producer_mutex = xSemaphoreCreateMutex();
     s_stop_mutex = xSemaphoreCreateMutex();
     s_frame_timer_mutex = xSemaphoreCreateMutex();
@@ -81,7 +115,8 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
     s_timer_queue_set = xQueueCreateSet(3);
 
     if (!s_peer_mutex || !s_jitter_mutex || !s_slot_semaphore || !s_control_semaphore ||
-        !s_tx_done_semaphore || !s_task_stopped_semaphore || !s_audio_producer_mutex ||
+        !s_tx_done_semaphore || !s_task_stopped_semaphore || !s_task_start_semaphore ||
+        !s_audio_producer_mutex ||
         !s_stop_mutex || !s_frame_timer_mutex || !s_frame_event_queue || !s_timer_queue_set) {
         ESP_LOGE(TAG, "Failed to create semaphores");
         atomic_store(&s_init_in_progress, false);
@@ -96,6 +131,13 @@ esp_err_t mesh_init_with_config(const mesh_config_t *config)
 
     if (!s_tx_queue || !s_rx_queue) {
         ESP_LOGE(TAG, "Failed to create queues");
+        atomic_store(&s_init_in_progress, false);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Parked on the start gate until mesh_start; nothing else runs in it yet. */
+    if (create_parked_mesh_task() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to reserve the mesh task");
         atomic_store(&s_init_in_progress, false);
         return ESP_ERR_NO_MEM;
     }
@@ -182,6 +224,10 @@ esp_err_t mesh_deinit(void)
         ESP_LOGE(TAG, "Cannot deinitialize while mesh task or callbacks are active");
         return result == ESP_OK ? ESP_ERR_TIMEOUT : result;
     }
+    if (!delete_parked_mesh_task()) {
+        ESP_LOGE(TAG, "Cannot deinitialize before the mesh task parks");
+        return ESP_ERR_TIMEOUT;
+    }
 
     if (s_frame_timer) {
         esp_timer_delete(s_frame_timer);
@@ -244,6 +290,10 @@ esp_err_t mesh_deinit(void)
     if (s_task_stopped_semaphore) {
         vSemaphoreDelete(s_task_stopped_semaphore);
         s_task_stopped_semaphore = NULL;
+    }
+    if (s_task_start_semaphore) {
+        vSemaphoreDelete(s_task_start_semaphore);
+        s_task_start_semaphore = NULL;
     }
     if (s_audio_producer_mutex) {
         vSemaphoreDelete(s_audio_producer_mutex);
@@ -330,29 +380,11 @@ esp_err_t mesh_start(void)
     taskEXIT_CRITICAL(&s_transport_mux);
     (void)xSemaphoreTake(s_task_stopped_semaphore, 0);
 
-    BaseType_t ret = xTaskCreatePinnedToCore(mesh_task, "mesh", MESH_TASK_STACK_SIZE, NULL,
-                                             MESH_TASK_PRIORITY, &s_mesh_task, MESH_TASK_CORE);
-
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create mesh task");
-        taskENTER_CRITICAL(&s_transport_mux);
-        s_rx_enabled = false;
-        taskEXIT_CRITICAL(&s_transport_mux);
-        s_mesh.stop_task_confirmed = true;
-        taskENTER_CRITICAL(&s_transport_mux);
-        s_state = MESH_STATE_IDLE;
-        uint32_t generation = ++s_mesh.lifecycle_generation;
-        s_mesh.quiesced = true;
-        taskEXIT_CRITICAL(&s_transport_mux);
-        mesh_state_cb_t cb = s_state_cb;
-        xSemaphoreGive(s_stop_mutex);
-        notify_idle_if_current(cb, MESH_STATE_SCANNING, generation);
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* The creator does not wait for the task: its callback can safely reenter
-     * lifecycle APIs once this mutex is released. */
-    xTaskNotifyGive(s_mesh_task);
+    /* The parked task (created at init) runs one session per start, so start
+     * allocates nothing. The caller does not wait for it: its callback can
+     * safely reenter lifecycle APIs once this mutex is released. A stop that
+     * follows at once is seen by the task before it announces SCANNING. */
+    xSemaphoreGive(s_task_start_semaphore);
     xSemaphoreGive(s_stop_mutex);
     return ESP_OK;
 }
@@ -401,8 +433,6 @@ esp_err_t mesh_stop(void)
     s_stopping = true;
     s_rx_enabled = false;
     taskEXIT_CRITICAL(&s_transport_mux);
-    if (!s_mesh.stop_task_confirmed && s_mesh_task != NULL)
-        xTaskNotifyGive(s_mesh_task);
 
     xSemaphoreTake(s_frame_timer_mutex, portMAX_DELAY);
     advance_tdma_generation();
