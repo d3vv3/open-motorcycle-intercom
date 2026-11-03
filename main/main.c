@@ -219,13 +219,16 @@ static void process_phone_cues(void)
                 ESP_LOGW(TAG, "Phone paired prompt failed: %s", esp_err_to_name(ret));
         }
     }
-    if (omi_phone_link_cue_step(&s_phone_link_cue, phone_state.a2dp_connected,
-                                phone_state.hfp_connected)) {
+    omi_phone_cue_t cue = omi_phone_link_cue_step(&s_phone_link_cue, phone_state.a2dp_connected,
+                                                  phone_state.hfp_connected);
+    if (cue != OMI_PHONE_CUE_NONE) {
         const phone_audio_call_state_t *call = &phone_state.call;
         /* A ringing or live call owns the speaker; skip rather than beep late. */
         bool call_activity = call->slc_connected &&
             (call->call != 0u || call->call_setup != 0u || call->call_held != 0u);
-        esp_err_t ret = call_activity ? ESP_ERR_INVALID_STATE : audio_play_phone_connected();
+        esp_err_t ret = call_activity ? ESP_ERR_INVALID_STATE :
+                        cue == OMI_PHONE_CUE_CONNECTED ? audio_play_phone_connected() :
+                                                         audio_play_phone_disconnected();
         /* ESP_ERR_TIMEOUT: another cue or the lock is busy; retry next loop. */
         if (ret != ESP_ERR_TIMEOUT) omi_phone_link_cue_done(&s_phone_link_cue);
     }
@@ -378,6 +381,8 @@ static bool remembered_phone(void)
 static void apply_bluetooth_switch(const omi_radio_plan_t *plan)
 {
     if (!plan->bluetooth_off && !plan->bluetooth_on) return;
+    /* "Bluetooth off" explains the drop; no phone-disconnected beep. */
+    if (plan->bluetooth_off) omi_phone_link_cue_suppress_disconnect(&s_phone_link_cue);
     esp_err_t ret = phone_audio_set_enabled(plan->bluetooth_on, plan->reconnect);
     if (ret != ESP_OK)
         ESP_LOGW(TAG, "Bluetooth %s failed: %s", plan->bluetooth_on ? "on" : "off",

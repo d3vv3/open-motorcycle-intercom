@@ -429,6 +429,9 @@ esp_err_t audio_play_call_end(void);
  * the lifecycle lock is busy, retry; ESP_ERR_INVALID_STATE: audio is not running.
  * An incoming-call prompt cancels it. */
 esp_err_t audio_play_phone_connected(void);
+/** The same beep an octave lower (440 Hz) when the phone disconnects; same
+ * return values, and an incoming-call prompt cancels it too. */
+esp_err_t audio_play_phone_disconnected(void);
 
 /**
  * @brief Register callback for encoded TX frames (mesh mode)

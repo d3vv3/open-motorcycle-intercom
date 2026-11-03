@@ -126,7 +126,8 @@ bool audio_limit_cue_request_end(audio_limit_cue_t *cue)
     unsigned state = atomic_load_explicit(&cue->state, memory_order_acquire);
     for (;;) {
         if (state == AUDIO_CUE_END || state == AUDIO_CUE_LIMIT_WITH_PENDING_END) return true;
-        if (state == AUDIO_CUE_CONNECT) return false; /* Retried after the beep. */
+        if (state == AUDIO_CUE_CONNECT || state == AUDIO_CUE_DISCONNECT)
+            return false; /* Retried after the beep. */
         unsigned next = state == AUDIO_CUE_IDLE ? AUDIO_CUE_END :
                         AUDIO_CUE_LIMIT_WITH_PENDING_END;
         if (atomic_compare_exchange_weak_explicit(&cue->state, &state, next,
@@ -139,6 +140,13 @@ bool audio_limit_cue_request_connect(audio_limit_cue_t *cue)
 {
     unsigned expected = AUDIO_CUE_IDLE;
     return atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_CONNECT,
+                                                   memory_order_acq_rel, memory_order_acquire);
+}
+
+bool audio_limit_cue_request_disconnect(audio_limit_cue_t *cue)
+{
+    unsigned expected = AUDIO_CUE_IDLE;
+    return atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_DISCONNECT,
                                                    memory_order_acq_rel, memory_order_acquire);
 }
 
@@ -157,11 +165,15 @@ static void cue_finish(audio_limit_cue_t *cue)
 
 void audio_limit_cue_cancel_connect(audio_limit_cue_t *cue)
 {
-    unsigned expected = AUDIO_CUE_CONNECT;
-    if (atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_IDLE,
-                                                memory_order_acq_rel, memory_order_acquire)) {
-        cue->position = 0u;
-        cue->phase = 0u;
+    static const unsigned link_beeps[] = {AUDIO_CUE_CONNECT, AUDIO_CUE_DISCONNECT};
+    for (size_t i = 0; i < sizeof(link_beeps) / sizeof(link_beeps[0]); ++i) {
+        unsigned expected = link_beeps[i];
+        if (atomic_compare_exchange_strong_explicit(&cue->state, &expected, AUDIO_CUE_IDLE,
+                                                    memory_order_acq_rel, memory_order_acquire)) {
+            cue->position = 0u;
+            cue->phase = 0u;
+            return;
+        }
     }
 }
 
@@ -181,12 +193,14 @@ void audio_limit_cue_mix(audio_limit_cue_t *cue, int16_t *interleaved,
     if (channels == 0u || rate == 0u) return;
     unsigned kind = atomic_load_explicit(&cue->state, memory_order_acquire);
     if (kind == AUDIO_CUE_IDLE) return;
-    const uint32_t on = rate * (kind == AUDIO_CUE_CONNECT ? 120u : 80u) / 1000u;
+    const bool link_beep = kind == AUDIO_CUE_CONNECT || kind == AUDIO_CUE_DISCONNECT;
+    const uint32_t on = rate * (link_beep ? 120u : 80u) / 1000u;
     const uint32_t gap = rate * 60u / 1000u;
-    const uint32_t end = kind == AUDIO_CUE_END || kind == AUDIO_CUE_CONNECT ? on :
-                         on * 3u + gap * 2u;
+    const uint32_t end = kind == AUDIO_CUE_END || link_beep ? on : on * 3u + gap * 2u;
     const uint32_t fade = rate / 200u;
-    const uint32_t increment = (uint32_t)((880ull << 32) / rate);
+    /* The disconnect beep falls an octave from the 880 Hz connect tone. */
+    const uint64_t tone_hz = kind == AUDIO_CUE_DISCONNECT ? 440u : 880u;
+    const uint32_t increment = (uint32_t)((tone_hz << 32) / rate);
     for (size_t frame = 0; frame < frames; ++frame) {
         uint32_t pos = cue->position;
         if (pos >= end) {

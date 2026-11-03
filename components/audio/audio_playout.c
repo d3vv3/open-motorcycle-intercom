@@ -827,7 +827,7 @@ void audio_playout_task(void *arg)
             /* A gate transition can race the earlier remote render. */
             memset(g_audio.hw_output, 0, sizeof(g_audio.hw_output));
         }
-        /* The connect beep never plays over an incoming-call prompt. */
+        /* The phone connect/disconnect beeps never play over an incoming-call prompt. */
         if (audio_urgent_active(&g_audio.incoming_call))
             audio_limit_cue_cancel_connect(&g_audio.volume_limit_cue);
         audio_limit_cue_mix(&g_audio.volume_limit_cue, g_audio.hw_output,

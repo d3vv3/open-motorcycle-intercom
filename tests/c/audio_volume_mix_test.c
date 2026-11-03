@@ -353,6 +353,73 @@ static void test_connect(uint32_t rate, uint8_t channels, size_t chunk)
     assert(audio_limit_cue_request(&cue));
 }
 
+/* Plays one link beep to completion; returns its sign changes and checks the
+ * shared length, level and fades. */
+static unsigned play_link_beep(audio_limit_cue_t *cue, uint32_t rate, uint8_t channels, size_t chunk)
+{
+    const uint32_t end = rate * 120u / 1000u;
+    const uint32_t fade = rate / 200u;
+    int16_t frame[997 * 2];
+    int32_t peak = 0;
+    int16_t previous = 0;
+    unsigned crossings = 0u;
+    for (size_t start = 0; start < end + chunk; start += chunk) {
+        for (size_t i = 0; i < chunk * channels; ++i) frame[i] = 0;
+        audio_limit_cue_mix(cue, frame, chunk, channels, rate);
+        for (size_t i = 0; i < chunk; ++i) {
+            size_t pos = start + i;
+            int16_t value = frame[i * channels];
+            int32_t magnitude = value < 0 ? -value : value;
+            if (pos >= end) assert(value == 0);
+            if (pos == 0u || pos == end - 1u) assert(magnitude == 0);
+            if (pos < fade / 4u || (pos < end && end - pos <= fade / 4u))
+                assert(magnitude <= 4096 / 4 + 1);
+            if (magnitude > peak) peak = magnitude;
+            if ((previous < 0 && value > 0) || (previous > 0 && value < 0)) crossings++;
+            if (value != 0) previous = value;
+            for (uint8_t c = 1; c < channels; ++c)
+                assert(frame[i * channels + c] == frame[i * channels]);
+        }
+    }
+    assert(peak > 3500 && peak <= 4096);
+    assert(!audio_limit_cue_busy(cue) && cue->position == 0u && cue->phase == 0u);
+    return crossings;
+}
+
+static void test_disconnect(uint32_t rate, uint8_t channels, size_t chunk)
+{
+    audio_limit_cue_t cue = {0};
+    audio_limit_cue_reset(&cue);
+    assert(audio_limit_cue_request_connect(&cue));
+    unsigned connect = play_link_beep(&cue, rate, channels, chunk);
+
+    assert(audio_limit_cue_request_disconnect(&cue));
+    assert(atomic_load(&cue.state) == AUDIO_CUE_DISCONNECT);
+    /* Nothing else starts or coalesces into the disconnect beep. */
+    assert(!audio_limit_cue_request_disconnect(&cue));
+    assert(!audio_limit_cue_request_connect(&cue));
+    assert(!audio_limit_cue_request(&cue));
+    assert(!audio_limit_cue_request_end(&cue));
+    unsigned disconnect = play_link_beep(&cue, rate, channels, chunk);
+    /* Same length and level, an octave lower: half the zero crossings. */
+    assert(connect > 150u);
+    assert(disconnect * 2u + 4u >= connect && disconnect * 2u <= connect + 4u);
+
+    /* A busy cue refuses it; the caller retries. */
+    assert(audio_limit_cue_request(&cue));
+    assert(!audio_limit_cue_request_disconnect(&cue));
+    audio_limit_cue_reset(&cue);
+    /* An incoming-call prompt cancels it, mid-tone included. */
+    assert(audio_limit_cue_request_disconnect(&cue));
+    int16_t frame[997 * 2];
+    const uint32_t end = rate * 120u / 1000u;
+    audio_limit_cue_mix(&cue, frame, chunk < end / 2u ? chunk : end / 2u, channels, rate);
+    assert(cue.position != 0u);
+    audio_limit_cue_cancel_connect(&cue);
+    assert(!audio_limit_cue_busy(&cue) && cue.position == 0u && cue.phase == 0u);
+    assert(audio_limit_cue_request_end(&cue));
+}
+
 int main(void)
 {
     test_gains();
@@ -369,6 +436,8 @@ int main(void)
     test_connect(16000u, 1u, 137u);
     test_connect(48000u, 1u, 960u);
     test_connect(48000u, 2u, 997u);
+    test_disconnect(16000u, 1u, 137u);
+    test_disconnect(48000u, 2u, 997u);
     puts("audio volume mix tests passed");
     return 0;
 }

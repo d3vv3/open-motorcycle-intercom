@@ -49,6 +49,7 @@ typedef enum {
     AUDIO_CUE_END = 2,
     AUDIO_CUE_LIMIT_WITH_PENDING_END = 3,
     AUDIO_CUE_CONNECT = 4,
+    AUDIO_CUE_DISCONNECT = 5,
 } audio_cue_state_t;
 
 typedef struct {
@@ -62,9 +63,12 @@ bool audio_limit_cue_busy(const audio_limit_cue_t *cue);
 bool audio_limit_cue_request(audio_limit_cue_t *cue);
 /* Returns true when an end beep is scheduled or coalesced with one in progress. */
 bool audio_limit_cue_request_end(audio_limit_cue_t *cue);
-/* One 120 ms beep; starts only when idle and blocks other requests until it ends. */
+/* One 120 ms 880 Hz beep; starts only when idle and blocks other requests until it ends. */
 bool audio_limit_cue_request_connect(audio_limit_cue_t *cue);
-/* Mixer-task only: drops a connect beep (e.g. an incoming-call prompt starts). */
+/* The same beep an octave lower (440 Hz), for the phone disconnecting. */
+bool audio_limit_cue_request_disconnect(audio_limit_cue_t *cue);
+/* Mixer-task only: drops a connect or disconnect beep (e.g. an incoming-call
+ * prompt starts). */
 void audio_limit_cue_cancel_connect(audio_limit_cue_t *cue);
 void audio_limit_cue_mix(audio_limit_cue_t *cue, int16_t *interleaved,
                          size_t frames, uint8_t channels, uint32_t rate);
