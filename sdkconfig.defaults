@@ -31,6 +31,14 @@ CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+# Internal RAM headroom (IRAM and DRAM share the S31 internal SRAM, so IRAM
+# code is heap lost). The TBTT/beacon power-save code is never run: ESP-NOW
+# uses an unassociated STA with WIFI_PS_NONE. Keep the PM, peripheral and PHY
+# functions this option also selects in IRAM, as before.
+CONFIG_ESP_WIFI_SLP_IRAM_OPT=n
+CONFIG_PM_SLEEP_FUNC_IN_IRAM=y
+CONFIG_ESP_PERIPH_CTRL_FUNC_IN_IRAM=y
+CONFIG_ESP_PHY_IRAM_OPT=y
 
 # Keep task stacks out of RTC fast RAM. As heap it is much slower and hands the
 # SPI/audio tasks slow stacks: bench 2026-11-03 with =y saw ~40% S31 bridge RX
@@ -53,6 +61,9 @@ CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=n
 CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED=n
 CONFIG_BT_HFP_ENABLE=y
 CONFIG_BT_HFP_CLIENT_ENABLE=y
+# The helmet is only the HFP hands-free unit; the unused Audio Gateway role
+# costs ~6 KB of internal .bss.
+CONFIG_BT_HFP_AG_ENABLE=n
 CONFIG_BT_HFP_AUDIO_DATA_PATH_HCI=y
 CONFIG_BT_HFP_USE_EXTERNAL_CODEC=n
 CONFIG_BT_HFP_WBS_ENABLE=y
