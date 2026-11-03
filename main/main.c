@@ -73,6 +73,7 @@ static omi_privacy_reconcile_t s_privacy;
 static atomic_uint s_end_beeps_pending = ATOMIC_VAR_INIT(0);
 static uint32_t s_phone_bonds_announced;
 static omi_phone_link_cue_t s_phone_link_cue;
+static omi_mesh_on_seq_t s_mesh_on_seq;
 static int64_t s_privacy_retry_ms;
 static unsigned s_privacy_failures;
 static bool s_bridge_was_ready;
@@ -433,8 +434,8 @@ static void enable_mesh_from_button(void)
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             atomic_store(&g_mesh_active, true);
             transport_nrf_cancel_enable_notification();
+            /* Bluetooth went off before the start; announce both now, in order. */
             omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
-            apply_bluetooth_switch(&plan);
             play_radio_prompts(&plan, false);
         }
         ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
@@ -471,10 +472,38 @@ static bool persist_mesh_intent(bool requested_enabled)
     return true;
 }
 
+static bool phone_link_up(void)
+{
+    phone_audio_state_t phone_state;
+    return phone_audio_get_state(&phone_state) == ESP_OK && phone_state.initialized &&
+           (phone_state.a2dp_connected || phone_state.hfp_connected);
+}
+
+/* Second half of mesh on (ESP-NOW): Bluetooth is already off; start the mesh
+ * once the phone link is down or the bounded wait expires. One poll per pass. */
+static void process_mesh_on_sequence(int64_t now_ms)
+{
+    if (!s_mesh_on_seq.waiting) return;
+    bool link_up = phone_link_up();
+    if (omi_mesh_on_poll(&s_mesh_on_seq, link_up, now_ms) != OMI_MESH_ON_STEP_START_MESH) return;
+    if (!mesh_intent_enabled()) return;
+    if (s_esp_channel_pending) {
+        /* The channel path starts the mesh and announces once it applies. */
+        s_esp_enable_announcement_pending = true;
+        return;
+    }
+    if (link_up)
+        ESP_LOGW(TAG, "Phone link still up after %d ms; starting mesh anyway",
+                 OMI_MESH_ON_LINK_DOWN_TIMEOUT_MS);
+    enable_mesh_from_button();
+}
+
 static void process_mesh_toggle(void)
 {
     bool requested_enabled = !mesh_intent_enabled();
     if (!persist_mesh_intent(requested_enabled)) return;
+    if (!requested_enabled && omi_mesh_on_cancel(&s_mesh_on_seq))
+        ESP_LOGI(TAG, "Mesh off before the pending mesh start");
 
     if (requested_enabled && s_esp_channel_pending) {
         s_esp_enable_announcement_pending = true;
@@ -485,7 +514,18 @@ static void process_mesh_toggle(void)
         return;
     }
     if (requested_enabled) {
-        enable_mesh_from_button();
+        int64_t now_ms = get_time_ms();
+        if (omi_mesh_on_request(&s_mesh_on_seq, radio_esp_now(), now_ms) ==
+            OMI_MESH_ON_STEP_BLUETOOTH_OFF) {
+            /* Release the shared radio first; prompts follow a successful start. */
+            omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
+            apply_bluetooth_switch(&plan);
+            ESP_LOGI(TAG, "Mesh start waits for the phone link to drop (max %d ms)",
+                     OMI_MESH_ON_LINK_DOWN_TIMEOUT_MS);
+            process_mesh_on_sequence(now_ms);
+        } else {
+            enable_mesh_from_button();
+        }
     } else if (disable_mesh_from_button()) {
         omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_OFF, radio_esp_now(), true,
                                                remembered_phone());
@@ -501,6 +541,7 @@ static void process_pairing_request(void)
     if (plan.stop_mesh) {
         /* Same as the mesh-off toggle, but Bluetooth comes back for pairing. */
         if (!persist_mesh_intent(false)) return;
+        (void)omi_mesh_on_cancel(&s_mesh_on_seq);
         if (!disable_mesh_from_button()) {
             ESP_LOGW(TAG, "Center pairing skipped: mesh is still running");
             return;
@@ -639,6 +680,8 @@ static void process_channel_selection(int direction)
         transport_nrf_reset_tx_cache();
     } else if (s_active_transport == TRANSPORT_ESP_NOW) {
         s_esp_channel_pending = true;
+        /* A mesh start still waiting on the phone link moves to the channel path. */
+        if (omi_mesh_on_cancel(&s_mesh_on_seq)) s_esp_enable_announcement_pending = true;
         ret = mesh_stop();
         if (ret != ESP_OK && mesh_is_quiesced())
             ESP_LOGW(TAG, "Mesh stop returned %s but quiesced; proceeding with channel change",
@@ -1025,6 +1068,7 @@ static void run_runtime_health_loop(int64_t boot_time)
         unsigned handled = 0;
         while (handled++ < 16 && xQueueReceive(s_button_actions, &action, 0) == pdTRUE)
             process_button_action(action, now_ms);
+        process_mesh_on_sequence(now_ms);
         process_media_toggle(false, now_ms);
         process_call_cues();
         process_phone_cues();

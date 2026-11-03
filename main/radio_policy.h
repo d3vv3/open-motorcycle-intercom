@@ -84,4 +84,48 @@ static inline omi_radio_plan_t omi_radio_plan(omi_radio_event_t event, bool esp_
     return plan;
 }
 
+/* Mesh-on sequencing. With ESP-NOW, Bluetooth goes off first; the mesh starts
+ * once the phone link is down, or after a bounded wait, so the two never hold
+ * the radio (and internal RAM) together. One step per main-loop pass; the main
+ * task never busy-waits. With the nRF transport the mesh starts at once. */
+#define OMI_MESH_ON_LINK_DOWN_TIMEOUT_MS 2000
+
+typedef enum {
+    OMI_MESH_ON_STEP_NONE,          /* Nothing to do this pass. */
+    OMI_MESH_ON_STEP_BLUETOOTH_OFF, /* Apply the Bluetooth-off part of the MESH_ON plan. */
+    OMI_MESH_ON_STEP_START_MESH,    /* Call mesh_start now. */
+} omi_mesh_on_step_t;
+
+typedef struct {
+    bool waiting;        /* Bluetooth off applied; mesh_start still owed. */
+    int64_t deadline_ms; /* Start anyway once this passes. */
+} omi_mesh_on_seq_t;
+
+/* The mesh-on toggle was accepted (intent persisted on). */
+static inline omi_mesh_on_step_t omi_mesh_on_request(omi_mesh_on_seq_t *seq, bool esp_now,
+                                                     int64_t now_ms)
+{
+    seq->waiting = esp_now;
+    seq->deadline_ms = now_ms + OMI_MESH_ON_LINK_DOWN_TIMEOUT_MS;
+    return esp_now ? OMI_MESH_ON_STEP_BLUETOOTH_OFF : OMI_MESH_ON_STEP_START_MESH;
+}
+
+/* Polled every pass; phone_link_up is A2DP or HFP still connected. */
+static inline omi_mesh_on_step_t omi_mesh_on_poll(omi_mesh_on_seq_t *seq, bool phone_link_up,
+                                                  int64_t now_ms)
+{
+    if (!seq->waiting) return OMI_MESH_ON_STEP_NONE;
+    if (phone_link_up && now_ms < seq->deadline_ms) return OMI_MESH_ON_STEP_NONE;
+    seq->waiting = false;
+    return OMI_MESH_ON_STEP_START_MESH;
+}
+
+/* Mesh off, pairing or a channel change took over; true if a start was owed. */
+static inline bool omi_mesh_on_cancel(omi_mesh_on_seq_t *seq)
+{
+    bool waiting = seq->waiting;
+    seq->waiting = false;
+    return waiting;
+}
+
 #endif
