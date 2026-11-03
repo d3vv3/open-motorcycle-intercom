@@ -32,6 +32,7 @@ typedef struct {
     bool bluetooth_on;  /* Connectable again. */
     bool reconnect;     /* One connect attempt to the phone mesh-on dropped. */
     bool open_pairing;  /* Open the discoverable pairing window. */
+    bool persist_off;   /* Roll the mesh intent back to off (failed mesh start). */
     uint8_t prompt_count;
     omi_radio_prompt_t prompts[OMI_RADIO_MAX_PROMPTS];
 } omi_radio_plan_t;
@@ -118,6 +119,26 @@ static inline omi_mesh_on_step_t omi_mesh_on_poll(omi_mesh_on_seq_t *seq, bool p
     if (phone_link_up && now_ms < seq->deadline_ms) return OMI_MESH_ON_STEP_NONE;
     seq->waiting = false;
     return OMI_MESH_ON_STEP_START_MESH;
+}
+
+/* Outcome of the mesh_start owed by mesh on. Success announces "Mesh On"
+ * (then "Bluetooth off" with ESP-NOW; Bluetooth is already off). Failure
+ * rolls back without a prompt (there is no error cue): the intent persists
+ * off and, with ESP-NOW, Bluetooth comes back as for mesh off, with at most
+ * the one reconnect to the phone that mesh on dropped. */
+static inline omi_radio_plan_t omi_radio_mesh_on_result(bool started, bool esp_now,
+                                                        bool remembered_peer)
+{
+    omi_radio_plan_t plan;
+    if (started) {
+        plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, esp_now, false, false);
+        plan.bluetooth_off = false; /* Applied before the start. */
+        return plan;
+    }
+    plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_OFF, esp_now, false, remembered_peer);
+    plan.persist_off = true;
+    plan.prompt_count = 0u;
+    return plan;
 }
 
 /* Mesh off, pairing or a channel change took over; true if a start was owed. */

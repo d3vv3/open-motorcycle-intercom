@@ -430,25 +430,34 @@ static void enable_mesh_from_button(void)
     }
     /* The nRF transport is reconciled from app_main, never from this callback. */
 
-    if (ret == ESP_OK) {
+    bool started = ret == ESP_OK;
+    omi_radio_plan_t result = omi_radio_mesh_on_result(started, radio_esp_now(),
+                                                       !started && remembered_phone());
+    if (started) {
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             atomic_store(&g_mesh_active, true);
             transport_nrf_cancel_enable_notification();
             /* Bluetooth went off before the start; announce both now, in order. */
-            omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
-            play_radio_prompts(&plan, false);
+            play_radio_prompts(&result, false);
         }
         ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
-    } else {
+        return;
+    }
+    /* Roll back silently: intent off, Bluetooth back as for mesh off. */
+    if (result.persist_off) {
         transport_nrf_set_user_enabled(false);
         esp_err_t persist_ret = mesh_intent_persist(false);
         if (persist_ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to restore disabled mesh intent: %s",
                      esp_err_to_name(persist_ret));
         }
-        atomic_store(&g_mesh_active, false);
-        ESP_LOGE(TAG, "Failed to start mesh: %s", esp_err_to_name(ret));
     }
+    s_esp_enable_announcement_pending = false;
+    atomic_store(&g_mesh_active, false);
+    ESP_LOGE(TAG, "Failed to start mesh: %s; mesh intent rolled back off%s",
+             esp_err_to_name(ret), result.bluetooth_on ? ", restoring Bluetooth" : "");
+    apply_bluetooth_switch(&result);
+    play_radio_prompts(&result, false);
 }
 
 /** Enqueue release events without blocking the button task. */

@@ -137,7 +137,7 @@ static void test_prompt_sequence(void)
     for (unsigned i = 0; i < count; ++i) assert(played[i] == expected[i]);
 }
 
-typedef enum { EV_BLUETOOTH_OFF, EV_MESH_START, EV_PROMPT } event_t;
+typedef enum { EV_BLUETOOTH_OFF, EV_MESH_START, EV_PROMPT, EV_BLUETOOTH_ON, EV_PERSIST_OFF } event_t;
 
 typedef struct {
     event_t events[8];
@@ -152,9 +152,10 @@ static void record(trace_t *trace, event_t event, omi_radio_prompt_t prompt)
     trace->events[trace->count++] = event;
 }
 
-/* Mirrors main.c: the MESH_ON plan's Bluetooth part runs at the request, its
- * prompts only after mesh_start returns OK. */
-static void run_step(trace_t *trace, omi_mesh_on_step_t step, bool esp_now)
+/* Mirrors main.c: the MESH_ON plan's Bluetooth part runs at the request; the
+ * start result decides the prompts or the rollback. */
+static void run_step_with(trace_t *trace, omi_mesh_on_step_t step, bool esp_now, bool start_ok,
+                          bool remembered_peer)
 {
     omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, esp_now, false, false);
     if (step == OMI_MESH_ON_STEP_BLUETOOTH_OFF) {
@@ -162,9 +163,19 @@ static void run_step(trace_t *trace, omi_mesh_on_step_t step, bool esp_now)
         record(trace, EV_BLUETOOTH_OFF, OMI_RADIO_PROMPT_MESH_ON);
     } else if (step == OMI_MESH_ON_STEP_START_MESH) {
         record(trace, EV_MESH_START, OMI_RADIO_PROMPT_MESH_ON);
-        for (uint8_t i = 0; i < plan.prompt_count; ++i)
-            record(trace, EV_PROMPT, plan.prompts[i]);
+        omi_radio_plan_t result = omi_radio_mesh_on_result(start_ok, esp_now,
+                                                           !start_ok && remembered_peer);
+        assert(!result.bluetooth_off && !result.stop_mesh && !result.open_pairing);
+        if (result.persist_off) record(trace, EV_PERSIST_OFF, OMI_RADIO_PROMPT_MESH_OFF);
+        if (result.bluetooth_on) record(trace, EV_BLUETOOTH_ON, OMI_RADIO_PROMPT_BLUETOOTH_ON);
+        for (uint8_t i = 0; i < result.prompt_count; ++i)
+            record(trace, EV_PROMPT, result.prompts[i]);
     }
+}
+
+static void run_step(trace_t *trace, omi_mesh_on_step_t step, bool esp_now)
+{
+    run_step_with(trace, step, esp_now, true, false);
 }
 
 /* ESP-NOW: Bluetooth off, then mesh_start once the phone link drops, then
@@ -221,6 +232,33 @@ static void test_mesh_on_nrf_starts_at_once(void)
     assert(trace.events[1] == EV_PROMPT && trace.prompts[1] == OMI_RADIO_PROMPT_MESH_ON);
 }
 
+/* A failed start rolls back: intent off, Bluetooth back, nothing announced. */
+static void test_mesh_on_start_failure_rolls_back(void)
+{
+    for (int peer = 0; peer < 2; ++peer) {
+        omi_mesh_on_seq_t seq = {0};
+        trace_t trace = {0};
+        run_step_with(&trace, omi_mesh_on_request(&seq, ESP_NOW, 0), ESP_NOW, false, peer != 0);
+        run_step_with(&trace, omi_mesh_on_poll(&seq, false, 20), ESP_NOW, false, peer != 0);
+        assert(trace.count == 4u);
+        assert(trace.events[0] == EV_BLUETOOTH_OFF && trace.events[1] == EV_MESH_START);
+        assert(trace.events[2] == EV_PERSIST_OFF && trace.events[3] == EV_BLUETOOTH_ON);
+        for (unsigned i = 0; i < trace.count; ++i) assert(trace.events[i] != EV_PROMPT);
+
+        omi_radio_plan_t result = omi_radio_mesh_on_result(false, ESP_NOW, peer != 0);
+        assert(result.persist_off && result.bluetooth_on && result.prompt_count == 0u);
+        assert(result.reconnect == (peer != 0)); /* At most one attempt, remembered phone only. */
+        assert(omi_mesh_on_poll(&seq, false, 40) == OMI_MESH_ON_STEP_NONE); /* No retry loop. */
+    }
+    /* nRF never touches Bluetooth; a failure only rolls the intent back. */
+    omi_radio_plan_t nrf = omi_radio_mesh_on_result(false, NRF, true);
+    assert(nrf.persist_off && no_bluetooth_change(&nrf) && nrf.prompt_count == 0u);
+    /* Success never rolls back and never switches Bluetooth again. */
+    omi_radio_plan_t ok = omi_radio_mesh_on_result(true, ESP_NOW, false);
+    assert(!ok.persist_off && no_bluetooth_change(&ok));
+    expect_prompts(&ok, 2u, OMI_RADIO_PROMPT_MESH_ON, OMI_RADIO_PROMPT_BLUETOOTH_OFF);
+}
+
 /* Mesh off, pairing or a channel change while waiting: no late start. */
 static void test_mesh_on_cancel(void)
 {
@@ -246,6 +284,7 @@ int main(void)
     test_mesh_on_link_down_timeout();
     test_mesh_on_nrf_starts_at_once();
     test_mesh_on_cancel();
+    test_mesh_on_start_failure_rolls_back();
     puts("radio policy tests passed");
     return 0;
 }
