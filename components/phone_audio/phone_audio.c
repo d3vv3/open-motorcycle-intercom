@@ -116,6 +116,11 @@ typedef struct {
     atomic_bool ct_play_status_supported;
     atomic_bool ct_track_supported;
     atomic_bool discoverable;
+    /* Application switch: Bluetooth off is non-connectable and refuses links. */
+    atomic_bool bluetooth_disabled;
+    /* Peer dropped by phone_audio_set_enabled(false); lifecycle mutex owns the bytes. */
+    atomic_bool reconnect_peer_valid;
+    uint8_t reconnect_peer[ESP_BD_ADDR_LEN];
     atomic_bool bluetooth_live;
     atomic_bool desired_configured;
     atomic_bool desired_active;
@@ -293,17 +298,34 @@ static void release_command_label(uint8_t label)
                               (uint16_t)~(1u << label), memory_order_acq_rel);
 }
 
+static bool bluetooth_enabled(void)
+{
+    return !atomic_load(&s_phone.bluetooth_disabled);
+}
+
+/* Callers on the Bluedroid, timer and application tasks race the enable switch.
+ * Each re-reads it after posting the scan mode and re-posts on a change, so the
+ * last mode queued to Bluedroid always matches the final switch value. */
 static esp_err_t set_discoverable_internal(bool discoverable)
 {
-    esp_err_t ret = esp_bt_gap_set_scan_mode(
-        ESP_BT_CONNECTABLE,
-        discoverable ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
-    if (ret == ESP_OK) atomic_store_explicit(&s_phone.discoverable, discoverable, memory_order_release);
+    bool enabled = bluetooth_enabled();
+    esp_err_t ret;
+    for (unsigned attempt = 0u;; ++attempt) {
+        bool visible = discoverable && enabled;
+        ret = esp_bt_gap_set_scan_mode(
+            enabled ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE,
+            visible ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+        if (ret == ESP_OK) atomic_store(&s_phone.discoverable, visible);
+        bool now_enabled = bluetooth_enabled();
+        if (now_enabled == enabled || attempt >= 3u) break;
+        enabled = now_enabled;
+    }
     return ret;
 }
 
 static esp_err_t open_pairing_window_locked(void)
 {
+    if (!bluetooth_enabled()) return ESP_ERR_INVALID_STATE;
     esp_err_t ret = set_discoverable_internal(true);
     if (ret != ESP_OK) return ret;
     atomic_store_explicit(&s_phone.pairing_deadline_tick,
@@ -341,6 +363,7 @@ static void pairing_timer_callback(TimerHandle_t timer)
 static bool pairing_allowed(const uint8_t *bda)
 {
     return atomic_load_explicit(&s_phone.initialized, memory_order_acquire) &&
+           bluetooth_enabled() &&
            (atomic_load_explicit(&s_phone.discoverable, memory_order_acquire) ||
             peer_is_selected(bda));
 }
@@ -859,6 +882,10 @@ static void hfp_callback(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
             s_phone.hf_peer, param->conn_stat.remote_bda,
             param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED);
         portEXIT_CRITICAL(&s_phone.peer_lock);
+        /* Bluetooth off: refuse every new or progressing HFP link. */
+        if (!bluetooth_enabled() &&
+            param->conn_stat.state != ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED)
+            allowed = false;
         if (!allowed && param->conn_stat.state != ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
             bool teardown_peer;
             portENTER_CRITICAL(&s_phone.peer_lock);
@@ -1269,6 +1296,12 @@ static void a2dp_callback(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         break;
     case ESP_A2D_CONNECTION_STATE_EVT:
         if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) break;
+        if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED &&
+            !bluetooth_enabled()) {
+            ESP_LOGW(TAG, "A2DP connection refused while Bluetooth is off");
+            (void)esp_a2d_sink_disconnect(param->conn_stat.remote_bda);
+            break;
+        }
         if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
             portENTER_CRITICAL(&s_phone.peer_lock);
             bool can_select = phone_audio_a2dp_selection_allowed(
@@ -1925,9 +1958,11 @@ esp_err_t phone_audio_init(void)
         goto fail;
     }
     ESP_LOGI(TAG, "Bluetooth bonds: %d", bond_count);
-    ret = set_discoverable_internal(bond_count == 0);
+    /* Bluetooth switched off before init (mesh owns the radio): no boot pairing window. */
+    bool open_window = bond_count == 0 && bluetooth_enabled();
+    ret = set_discoverable_internal(open_window);
     if (ret != ESP_OK) goto fail;
-    if (bond_count == 0) {
+    if (open_window) {
         atomic_store_explicit(&s_phone.pairing_deadline_tick,
                               (uint32_t)(xTaskGetTickCount() +
                                          pdMS_TO_TICKS(PAIRING_WINDOW_MS)),
@@ -1938,6 +1973,8 @@ esp_err_t phone_audio_init(void)
             goto fail;
         }
         ESP_LOGI(TAG, "Pairing window opened for 120 seconds");
+    } else if (!bluetooth_enabled()) {
+        ESP_LOGI(TAG, "Bluetooth off; device is non-connectable and non-discoverable");
     } else {
         ESP_LOGI(TAG, "Pairing window closed; device remains connectable and non-discoverable");
     }
@@ -1987,6 +2024,8 @@ esp_err_t phone_audio_get_state(phone_audio_state_t *state)
     state->channels = atomic_load_explicit(&s_phone.channels, memory_order_acquire);
     state->hfp_connected = atomic_load_explicit(&s_phone.hf_slc_connected, memory_order_acquire);
     state->new_bonds = atomic_load_explicit(&s_phone.new_bonds, memory_order_acquire);
+    state->bluetooth_enabled = bluetooth_enabled();
+    state->reconnect_peer_known = atomic_load(&s_phone.reconnect_peer_valid);
     portENTER_CRITICAL(&s_phone.call_state_lock);
     state->call = s_phone.call_state;
     portEXIT_CRITICAL(&s_phone.call_state_lock);
@@ -2215,7 +2254,7 @@ esp_err_t phone_audio_set_discoverable(bool discoverable)
     }
     if (!atomic_load_explicit(&s_phone.initialized, memory_order_acquire) ||
         atomic_load_explicit(&s_phone.terminal, memory_order_acquire) ||
-        s_phone.pairing_timer == NULL) {
+        s_phone.pairing_timer == NULL || (discoverable && !bluetooth_enabled())) {
         xSemaphoreGive(s_phone.lifecycle_mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -2236,6 +2275,82 @@ esp_err_t phone_audio_set_discoverable(bool discoverable)
         }
     }
     xSemaphoreGive(s_phone.lifecycle_mutex);
+    return ret;
+}
+
+static esp_err_t bluetooth_disable_locked(void)
+{
+    bool was_enabled = !atomic_exchange(&s_phone.bluetooth_disabled, true);
+    if (s_phone.pairing_timer != NULL &&
+        xTimerStop(s_phone.pairing_timer, pdMS_TO_TICKS(TIMER_COMMAND_WAIT_MS)) != pdPASS)
+        ESP_LOGW(TAG, "Pairing window timer stop failed");
+    esp_err_t ret = set_discoverable_internal(false);
+    uint8_t peer[ESP_BD_ADDR_LEN];
+    bool selected = selected_peer_copy(peer);
+    if (was_enabled) {
+        if (selected) memcpy(s_phone.reconnect_peer, peer, ESP_BD_ADDR_LEN);
+        atomic_store(&s_phone.reconnect_peer_valid, selected);
+    }
+    if (selected) {
+        /* HFP follows through the A2DP-disconnected teardown path; AVRCP
+         * closes with the link. */
+        esp_err_t disconnect = esp_a2d_sink_disconnect(peer);
+        if (disconnect != ESP_OK) {
+            ESP_LOGW(TAG, "A2DP disconnect for Bluetooth off failed: %s",
+                     esp_err_to_name(disconnect));
+            if (ret == ESP_OK) ret = disconnect;
+        }
+    }
+    bool hf_occupied;
+    portENTER_CRITICAL(&s_phone.peer_lock);
+    hf_occupied = s_phone.hf_peer_bound || s_phone.hf_peer_pending;
+    if (hf_occupied) {
+        s_phone.hf_teardown_requested = true;
+        s_phone.hf_teardown_next_tick = 0;
+    }
+    portEXIT_CRITICAL(&s_phone.peer_lock);
+    if (hf_occupied) wake_volume_worker();
+    ESP_LOGI(TAG, "Bluetooth off: non-connectable, non-discoverable%s",
+             selected ? ", phone disconnecting" : "");
+    return ret;
+}
+
+static esp_err_t bluetooth_enable_locked(bool reconnect)
+{
+    atomic_store(&s_phone.bluetooth_disabled, false);
+    esp_err_t ret = set_discoverable_internal(false);
+    bool remembered = atomic_exchange(&s_phone.reconnect_peer_valid, false);
+    ESP_LOGI(TAG, "Bluetooth on: connectable, non-discoverable (%s)", esp_err_to_name(ret));
+    if (reconnect && remembered && ret == ESP_OK) {
+        /* Single best-effort attempt; HFP follows the A2DP-connected path. */
+        esp_err_t connect = esp_a2d_sink_connect(s_phone.reconnect_peer);
+        ESP_LOGI(TAG, "Reconnecting last phone: %s", esp_err_to_name(connect));
+    }
+    return ret;
+}
+
+esp_err_t phone_audio_set_enabled(bool enabled, bool reconnect)
+{
+    portENTER_CRITICAL(&s_lifecycle_init_lock);
+    SemaphoreHandle_t lifecycle_mutex = s_phone.lifecycle_mutex;
+    if (lifecycle_mutex == NULL) {
+        /* Before phone_audio_init: only record the switch for init to honour. */
+        atomic_store(&s_phone.bluetooth_disabled, !enabled);
+        portEXIT_CRITICAL(&s_lifecycle_init_lock);
+        return ESP_OK;
+    }
+    portEXIT_CRITICAL(&s_lifecycle_init_lock);
+    if (xSemaphoreTake(lifecycle_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t ret = ESP_OK;
+    if (atomic_load_explicit(&s_phone.terminal, memory_order_acquire)) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else if (!atomic_load_explicit(&s_phone.initialized, memory_order_acquire) ||
+               !s_phone.bluedroid_enabled) {
+        atomic_store(&s_phone.bluetooth_disabled, !enabled);
+    } else {
+        ret = enabled ? bluetooth_enable_locked(reconnect) : bluetooth_disable_locked();
+    }
+    xSemaphoreGive(lifecycle_mutex);
     return ret;
 }
 

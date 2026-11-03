@@ -34,6 +34,10 @@ typedef struct {
     bool hfp_connected;
     /** Successful fresh pairings (new link keys) this boot; bonded reconnects do not count. */
     uint32_t new_bonds;
+    /** Application Bluetooth switch; off is non-connectable and refuses links. */
+    bool bluetooth_enabled;
+    /** A phone dropped by turning Bluetooth off can be reconnected once. */
+    bool reconnect_peer_known;
     phone_audio_call_state_t call;
 } phone_audio_state_t;
 
@@ -70,6 +74,17 @@ esp_err_t phone_audio_forget_all_bonds(void);
 /** Change general discoverability while retaining connectability. */
 /* Application UI must call this API to open replacement-phone pairing. */
 esp_err_t phone_audio_set_discoverable(bool discoverable);
+/**
+ * Switch Bluetooth off or on without tearing down the Bluedroid stack.
+ * Off closes the pairing window, makes the device non-connectable and
+ * non-discoverable, disconnects the phone (A2DP, then HFP and AVRCP), remembers
+ * that phone in RAM, and refuses inbound links and pairing until switched on.
+ * On restores connectable, non-discoverable mode; with reconnect it makes one
+ * best-effort A2DP connect to the remembered phone. Either way the memory is
+ * cleared. Before phone_audio_init only the switch is recorded, so init starts
+ * non-connectable without a boot pairing window. Call from an application task.
+ */
+esp_err_t phone_audio_set_enabled(bool enabled, bool reconnect);
 /** Emit the low-priority HFP audio statistics snapshot. */
 void phone_audio_log_stats(void);
 

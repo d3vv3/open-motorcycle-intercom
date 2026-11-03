@@ -35,13 +35,14 @@ def test_all_clips_reproducible():
     directory = Path(__file__).resolve().parents[2] / "audios"
     first = generate(directory)
     assert first == generate(directory)
-    assert first.count("static const uint8_t prompt_") == 13
+    assert first.count("static const uint8_t prompt_") == 15
     assert IDS == (
         "STARTUP", "PEER_JOIN", "PEER_LEAVE", "MESH_ENABLED", "MESH_DISABLED",
         "BLUETOOTH_PAIRING", "CHANNEL_GREEN", "CHANNEL_RED", "CHANNEL_BLUE",
         "ROLE_COORDINATOR", "ROLE_PARTICIPANT", "INCOMING_CALL", "PHONE_PAIRED",
+        "BLUETOOTH_OFF", "BLUETOOTH_ON",
     )
     designators = re.findall(r"^    \[AUDIO_NOTIFY_([A-Z_]+)\] =", first, re.MULTILINE)
     assert designators == list(IDS)
-    assert len(designators) == 13
+    assert len(designators) == 15
     assert "COUNT" not in designators

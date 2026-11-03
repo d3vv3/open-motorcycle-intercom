@@ -165,6 +165,9 @@ jobs:
       - name: Run phone-connected beep edge tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Imain tests/c/phone_link_cue_test.c -o /tmp/phone_link_cue_test && /tmp/phone_link_cue_test
 
+      - name: Run mesh/Bluetooth radio exclusivity policy tests
+        run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Imain tests/c/radio_policy_test.c -o /tmp/radio_policy_test && /tmp/radio_policy_test
+
       - name: Run button gesture tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/button_gesture_test && /tmp/button_gesture_test
 
@@ -233,6 +236,7 @@ jobs:
              cc $FLAGS $SAN -I. -Ishared -Imain -Icomponents/phone_audio/include components/phone_audio/phone_audio_volume.c tests/c/phone_audio_volume_test.c -o /tmp/san_phone_audio_volume && /tmp/san_phone_audio_volume
             clang $FLAGS $SAN -I. -Ishared -Imain -Icomponents/phone_audio/include -Icomponents/button/include tests/c/call_policy_test.c -o /tmp/san_call_policy && /tmp/san_call_policy
             cc $FLAGS $SAN -Imain tests/c/phone_link_cue_test.c -o /tmp/san_phone_link_cue && /tmp/san_phone_link_cue
+            cc $FLAGS $SAN -Imain tests/c/radio_policy_test.c -o /tmp/san_radio_policy && /tmp/san_radio_policy
            cc $FLAGS $SAN -Icomponents/button/include components/button/button_gesture.c tests/c/button_gesture_test.c -o /tmp/san_button_gesture && /tmp/san_button_gesture
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/voice_cleanup.c tests/c/voice_cleanup_test.c -lm -o /tmp/san_voice_cleanup && /tmp/san_voice_cleanup
            cc $FLAGS $SAN -Icomponents/audio/include components/audio/audio_rx_source_select.c tests/c/audio_rx_source_select_test.c -o /tmp/san_rx_select && /tmp/san_rx_select

@@ -41,6 +41,7 @@
 #include "omi_board_pins.h"
 #include "power.h"
 #include "phone_audio.h"
+#include "radio_policy.h"
 #include "transport_espnow.h"
 #include "transport_nrf.h"
 #include "uart_bridge.h"
@@ -339,7 +340,54 @@ static void audio_activity_callback(bool active)
     }
 }
 
-static void disable_mesh_from_button(void)
+/* ESP-NOW shares the S31 radio with Bluetooth; the nRF transport does not. */
+static bool radio_esp_now(void)
+{
+    return s_active_transport == TRANSPORT_ESP_NOW;
+}
+
+static audio_notify_t radio_prompt_voice(omi_radio_prompt_t prompt)
+{
+    switch (prompt) {
+    case OMI_RADIO_PROMPT_MESH_ON: return AUDIO_NOTIFY_MESH_ENABLED;
+    case OMI_RADIO_PROMPT_MESH_OFF: return AUDIO_NOTIFY_MESH_DISABLED;
+    case OMI_RADIO_PROMPT_BLUETOOTH_OFF: return AUDIO_NOTIFY_BLUETOOTH_OFF;
+    case OMI_RADIO_PROMPT_BLUETOOTH_ON: return AUDIO_NOTIFY_BLUETOOTH_ON;
+    case OMI_RADIO_PROMPT_PHONE_PAIRING: break;
+    }
+    return AUDIO_NOTIFY_BLUETOOTH_PAIRING;
+}
+
+/* Queue the plan's prompts in order; the pairing prompt only if the window opened. */
+static void play_radio_prompts(const omi_radio_plan_t *plan, bool pairing_opened)
+{
+    for (uint8_t i = 0; i < plan->prompt_count; ++i) {
+        if (plan->prompts[i] == OMI_RADIO_PROMPT_PHONE_PAIRING && !pairing_opened) continue;
+        (void)audio_play_notification(radio_prompt_voice(plan->prompts[i]));
+    }
+}
+
+static bool remembered_phone(void)
+{
+    phone_audio_state_t phone_state;
+    return phone_audio_get_state(&phone_state) == ESP_OK && phone_state.reconnect_peer_known;
+}
+
+/* Runs on the app_main task, like the other phone_audio lifecycle calls. */
+static void apply_bluetooth_switch(const omi_radio_plan_t *plan)
+{
+    if (!plan->bluetooth_off && !plan->bluetooth_on) return;
+    esp_err_t ret = phone_audio_set_enabled(plan->bluetooth_on, plan->reconnect);
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "Bluetooth %s failed: %s", plan->bluetooth_on ? "on" : "off",
+                 esp_err_to_name(ret));
+    else
+        ESP_LOGI(TAG, "Bluetooth %s (ESP-NOW mesh/Bluetooth exclusivity)",
+                 plan->bluetooth_on ? "on" : "off");
+}
+
+/* Stops the mesh; the caller announces. Returns false if the mesh kept running. */
+static bool disable_mesh_from_button(void)
 {
     ESP_LOGI(TAG, "Disabling mesh networking...");
 
@@ -355,8 +403,8 @@ static void disable_mesh_from_button(void)
         transport_nrf_reset_membership_tracking();
         (void)audio_reset_mesh_rx();
         s_role_announced = false;
-        (void)audio_play_notification(AUDIO_NOTIFY_MESH_DISABLED);
         ESP_LOGI(TAG, "Mesh disabled");
+        return true;
     } else {
         transport_nrf_set_user_enabled(true);
         transport_nrf_cancel_enable_notification();
@@ -367,6 +415,7 @@ static void disable_mesh_from_button(void)
         }
         ESP_LOGE(TAG, "Failed to stop mesh: %s", esp_err_to_name(ret));
     }
+    return false;
 }
 
 static void enable_mesh_from_button(void)
@@ -384,7 +433,9 @@ static void enable_mesh_from_button(void)
         if (s_active_transport == TRANSPORT_ESP_NOW) {
             atomic_store(&g_mesh_active, true);
             transport_nrf_cancel_enable_notification();
-            (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+            omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
+            apply_bluetooth_switch(&plan);
+            play_radio_prompts(&plan, false);
         }
         ESP_LOGI(TAG, "Mesh enable accepted; waiting for active state");
     } else {
@@ -407,35 +458,58 @@ static void button_action_callback(button_id_t id, button_event_t event, void *c
     if (xQueueSend(s_button_actions, &action, 0) != pdTRUE) atomic_fetch_add(&s_button_drops, 1);
 }
 
-static void process_mesh_toggle(void)
+static bool persist_mesh_intent(bool requested_enabled)
 {
-    bool requested_enabled = !mesh_intent_enabled();
     esp_err_t ret = mesh_intent_persist(requested_enabled);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to persist mesh intent: %s", esp_err_to_name(ret));
-        return;
+        return false;
     }
     transport_nrf_set_user_enabled(requested_enabled);
     transport_nrf_reset_reconciliation();
+    if (!requested_enabled) s_esp_enable_announcement_pending = false;
+    return true;
+}
+
+static void process_mesh_toggle(void)
+{
+    bool requested_enabled = !mesh_intent_enabled();
+    if (!persist_mesh_intent(requested_enabled)) return;
 
     if (requested_enabled && s_esp_channel_pending) {
         s_esp_enable_announcement_pending = true;
+        /* The intent is on: release the radio now, announce with Mesh On. */
+        omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
+        apply_bluetooth_switch(&plan);
         ESP_LOGI(TAG, "Mesh enable pending selected channel application");
         return;
     }
-    if (!requested_enabled) s_esp_enable_announcement_pending = false;
     if (requested_enabled) {
         enable_mesh_from_button();
-    } else {
-        disable_mesh_from_button();
+    } else if (disable_mesh_from_button()) {
+        omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_OFF, radio_esp_now(), true,
+                                               remembered_phone());
+        apply_bluetooth_switch(&plan);
+        play_radio_prompts(&plan, false);
     }
 }
 
 static void process_pairing_request(void)
 {
+    omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_PAIRING, radio_esp_now(),
+                                           mesh_intent_enabled(), false);
+    if (plan.stop_mesh) {
+        /* Same as the mesh-off toggle, but Bluetooth comes back for pairing. */
+        if (!persist_mesh_intent(false)) return;
+        if (!disable_mesh_from_button()) {
+            ESP_LOGW(TAG, "Center pairing skipped: mesh is still running");
+            return;
+        }
+    }
+    apply_bluetooth_switch(&plan);
     esp_err_t ret = phone_audio_set_discoverable(true);
+    play_radio_prompts(&plan, ret == ESP_OK);
     if (ret == ESP_OK) {
-        (void)audio_play_notification(AUDIO_NOTIFY_BLUETOOTH_PAIRING);
         ESP_LOGI(TAG, "Center hold opened Bluetooth pairing window for 120 seconds");
     } else {
         ESP_LOGW(TAG, "Center pairing unavailable: %s", esp_err_to_name(ret));
@@ -534,8 +608,11 @@ static void apply_pending_esp_channel(void)
     s_esp_channel_pending = false;
     atomic_store(&s_channel_transition, false);
     atomic_store(&g_mesh_active, mesh_intent_enabled());
-    if (s_esp_enable_announcement_pending && mesh_intent_enabled())
-        (void)audio_play_notification(AUDIO_NOTIFY_MESH_ENABLED);
+    if (s_esp_enable_announcement_pending && mesh_intent_enabled()) {
+        /* Bluetooth was already switched off when the toggle was accepted. */
+        omi_radio_plan_t plan = omi_radio_plan(OMI_RADIO_EVENT_MESH_ON, radio_esp_now(), false, false);
+        play_radio_prompts(&plan, false);
+    }
     s_esp_enable_announcement_pending = false;
     ESP_LOGI(TAG, "Talk channel %u active on ESP-NOW RF %u", target, mesh_channel_espnow_rf(target));
 }
@@ -847,6 +924,12 @@ static esp_err_t initialize_application(int64_t boot_time)
     audio_register_tx_idle_callback(audio_tx_idle_callback);
     audio_register_activity_callback(audio_activity_callback);
     phone_audio_set_call_state_callback(phone_call_callback, NULL);
+    /* ESP-NOW mesh intent on: Bluetooth boots off (non-connectable, no pairing
+     * window, no reconnect) because the mesh owns the shared radio. */
+    if (!omi_radio_bluetooth_allowed(radio_esp_now(), mesh_intent_enabled())) {
+        (void)phone_audio_set_enabled(false, false);
+        ESP_LOGI(TAG, "Mesh intent on with ESP-NOW: Bluetooth stays off");
+    }
 
     /* Reserve Classic Bluetooth controller memory before Wi-Fi pools and audio stacks. */
     ESP_LOGI(TAG, "Before phone_audio_init: internal free/largest=%lu/%lu bytes, PSRAM free=%lu bytes",

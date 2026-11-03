@@ -78,7 +78,7 @@ static void clip_duration(const audio_prompt_clip_t *clip, uint32_t rate)
 
 int main(void)
 {
-    assert(AUDIO_NOTIFY_COUNT == 13);
+    assert(AUDIO_NOTIFY_COUNT == 15);
     known_vectors();
     mix_headroom();
     for (int type = 0; type < AUDIO_NOTIFY_COUNT; ++type) {
@@ -95,6 +95,10 @@ int main(void)
            &audio_prompt_clips[11]);
     assert(audio_prompt_for_notification(AUDIO_NOTIFY_PHONE_PAIRED) ==
            &audio_prompt_clips[12]);
+    assert(audio_prompt_for_notification(AUDIO_NOTIFY_BLUETOOTH_OFF) ==
+           &audio_prompt_clips[13]);
+    assert(audio_prompt_for_notification(AUDIO_NOTIFY_BLUETOOTH_ON) ==
+           &audio_prompt_clips[14]);
     assert(audio_prompt_for_notification((audio_notify_t)-1) == NULL);
     puts("audio prompt tests passed");
     return 0;
