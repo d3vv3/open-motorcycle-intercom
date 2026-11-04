@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build paired firmware from a git archive; never flash, tag, or publish.
 
-The ESP32-S31 image is a pure C ESP-IDF build with the LC3 wire options on; the
-nRF52840 image is the Rust Embassy firmware built with cargo."""
+The ESP32-S31 image is a pure C ESP-IDF build with the LC3 wire options on and the
+release sdkconfig overlay; the nRF52840 image is the Rust Embassy firmware built with
+cargo. Both embed the release version and full source SHA."""
 
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ ESP_IMAGE = "espressif/idf@sha256:8ac794c57fd4cac246cb8d2ada4002fa26337ac7df6830
 NRF_FIRMWARE = "rust/nrf-embassy-firmware"
 NRF_TARGET = "thumbv7em-none-eabihf"
 PROFILE = "esp32s31"
+RELEASE_DEFAULTS = "sdkconfig.release.esp32s31.defaults"
 # The pure-C S31 build: LC3 is unconditional; serialized single-owner codec
 # with internal buffers. These are also the root CMakeLists.txt defaults, so a
 # plain build is the release build; passing them keeps the release explicit.
@@ -119,7 +121,8 @@ def factory_partition(data: bytes, table_offset: int, capacity: int) -> tuple[tu
     return factories[0], partitions
 
 
-def validate_esp(build: Path, profile: str, version: str) -> tuple[dict, dict]:
+def validate_esp(build: Path, profile: str, version: str, sha: str | None) -> tuple[dict, dict]:
+    """sha=None skips the embedded identity check (prebuilt bench images carry their own)."""
     description = json.loads(required(build / "project_description.json"))
     if description.get("target") != profile or description.get("project_version") != version:
         raise ValueError("ESP target/version metadata mismatch")
@@ -188,9 +191,16 @@ def validate_esp(build: Path, profile: str, version: str) -> tuple[dict, dict]:
         raise ValueError("ESP app descriptor missing")
     if app[48:80].split(b"\0", 1)[0].decode() != version:
         raise ValueError("ESP application binary version mismatch")
-    # The C S31 image carries only the app-descriptor version checked above; it does
-    # not embed the source SHA, which is pinned by building from `git archive <sha>`.
+    if sha is not None:
+        # main.c logs OMI_FIRMWARE_VERSION/OMI_GIT_SHA, passed by build() as CMake definitions.
+        validate_identity(required(build / "omi.elf"), version, sha)
+        validate_identity(app, version, sha)
     return description, flasher
+
+
+def validate_identity(data: bytes, version: str, sha: str) -> None:
+    if version.encode() + b"\0" not in data or sha.encode() + b"\0" not in data:
+        raise ValueError("Firmware version/source SHA mismatch")
 
 
 def uf2_payload(data: bytes) -> bytes:
@@ -262,7 +272,7 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
     assertion and the cargo/IDF provenance files are skipped and the manifest says so."""
     if profile != PROFILE:
         raise ValueError(f"Unsupported release profile: {profile}")
-    description, flasher = validate_esp(esp, profile, version)
+    description, flasher = validate_esp(esp, profile, version, None if prebuilt else sha)
     uf2 = required(nrf / "zephyr.uf2")
     uf2_info = validate_uf2(uf2)
     nrf_payload = uf2_payload(uf2)
@@ -315,7 +325,10 @@ def package(source: Path, esp: Path, nrf: Path, provenance: Path, output: Path,
                 "release_tools_source_sha": driver_sha,
                 "nrf_toolchain": None if prebuilt else {"archive_path": "provenance/rustc-version.txt", "sha256": hashlib.sha256(required(provenance / "rustc-version.txt")).hexdigest()},
                 "protocol_versions": wire, "builder_images": images, "uf2": uf2_info,
-                "esp_identity": "app-descriptor-version-only",
+                "esp_identity": "app-descriptor-version-only" if prebuilt else "app-descriptor-version-and-embedded-version-sha",
+                "nrf_build": None if prebuilt else {"kind": "rust-embassy-cargo", "crate": NRF_FIRMWARE, "target": NRF_TARGET,
+                                                    "argv": json.loads(required(provenance / "nrf-build-argv.json")),
+                                                    "rustc": required(provenance / "rustc-version.txt").decode().splitlines()[0]},
                 "classic_bluetooth": True, "s31_lc3_interoperable": True, "source_patches": [],
                 "reproducibility": "Prebuilt bench artifacts packaged by content hash; in-binary identity is the bench build's own, not this version/SHA" if prebuilt else "Archived source and pinned builders; resolved dependencies captured, not a claim of historical bit reproducibility",
                 "prebuilt": prebuilt and {name: str(path) for name, path in prebuilt.items()},
@@ -381,8 +394,11 @@ def build(scratch: Path, version: str, sha: str, esp_image: str) -> None:
     driver_sha = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"])
     (scratch / "provenance/release-tools-source-sha.txt").write_text(driver_sha + "\n")
     q = shlex.quote
-    definitions = [f"-DPROJECT_VER={version}", f"-DIDF_TARGET={PROFILE}", "-DSDKCONFIG=/work/esp-sdkconfig",
-                   "-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults"]
+    # The root CMakeLists.txt derives PROJECT_VER from OMI_FIRMWARE_VERSION; without
+    # .git in the archive, OMI_GIT_SHA must be passed too.
+    definitions = [f"-DPROJECT_VER={version}", f"-DOMI_FIRMWARE_VERSION={version}", f"-DOMI_GIT_SHA={sha}",
+                   f"-DIDF_TARGET={PROFILE}", "-DSDKCONFIG=/work/esp-sdkconfig",
+                   f"-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults;/work/source/{RELEASE_DEFAULTS}"]
     definitions += [f"-D{key}=ON" for key in ON_OPTIONS] + [f"-D{key}=OFF" for key in OFF_OPTIONS]
     command = " ".join(q(arg) for arg in definitions)
     # Explicitly initialize IDF because docker() bypasses the image's entrypoint.
@@ -392,9 +408,10 @@ def build(scratch: Path, version: str, sha: str, esp_image: str) -> None:
     script += "cp /work/esp-sdkconfig /work/provenance/sdkconfig\ncp /work/esp-sdkconfig /work/esp/sdkconfig\ncp /work/source/dependencies.lock /work/provenance/dependencies.lock\ncp /work/esp/CMakeCache.txt /work/provenance/esp-CMakeCache.txt\n"
     (scratch / "provenance/esp-build.sh").write_text(script)
     docker(esp_image, scratch, script)
-    defaults = scratch / "source/sdkconfig.defaults"
-    if defaults.is_file():
-        shutil.copyfile(defaults, scratch / "provenance/sdkconfig.defaults")
+    for name in ("sdkconfig.defaults", RELEASE_DEFAULTS):
+        defaults = scratch / "source" / name
+        if defaults.is_file():
+            shutil.copyfile(defaults, scratch / "provenance" / name)
     cargo_nrf(scratch, version, sha)
 
 
@@ -415,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Firmware SemVer, without leading v")
     parser.add_argument("--source-sha", required=True, help="Full git commit SHA")
+    parser.add_argument("--profile", choices=(PROFILE,), default=PROFILE,
+                        help="Release profile; only the ESP32-S31 + Rust nRF52840 pair is supported")
     parser.add_argument("--output-dir", type=Path, default=Path("dist/release"))
     parser.add_argument("--esp-image", help="Override the digest-pinned ESP-IDF image")
     parser.add_argument("--work-dir", type=Path, help="Empty scratch directory to retain after success or failure; no automatic reuse")
@@ -454,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
                 images = {"esp": esp_image}
             staging = scratch / "assets"
             package(source, esp_dir, nrf_dir, scratch / "provenance", staging,
-                    args.version, args.source_sha, PROFILE, images, prebuilt)
+                    args.version, args.source_sha, args.profile, images, prebuilt)
             output.parent.mkdir(parents=True, exist_ok=True)
             if output.exists():
                 output.rmdir()

@@ -34,28 +34,20 @@ merging or squash-merging.
 ## Initial Bootstrap
 
 The historical ESP32-S3 release is `v0.1.0`, pointing to
-`9b3376b11009f66f74fd34a01f65635a117dd591`. Establish that tag on this exact
-ancestor before enabling publication. Do not tag the current S31 source as
-`v0.1.0`: the ancestor baseline makes the existing `feat:` commits select
-`v0.2.0-alpha.1` for the first generated ESP32-S31 release on `next`.
-Confirm this with a semantic-release dry run before publishing; newer breaking
-commits can change the expected version. Bootstrap tags and publication require
-explicit maintainer action; installing this tooling creates neither.
+`9b3376b11009f66f74fd34a01f65635a117dd591`. That ancestor baseline made the
+existing `feat:` commits select `v0.2.0-alpha.1` for the first generated
+ESP32-S31 release on `next` (Zephyr nRF firmware). Releases after it pair the
+ESP32-S31 C firmware with the Rust Embassy nRF52840 firmware; with no breaking
+commits the next alpha is `v0.2.0-alpha.2`. Confirm the expected version with a
+semantic-release dry run before publishing; newer breaking commits can change
+it. Bootstrap tags and publication require explicit maintainer action;
+installing this tooling creates neither.
 
-The historical bundle can be built independently, without tagging or publishing:
-
-```sh
-python3 tools/release/build.py --version 0.1.0 \
-  --source-sha 9b3376b11009f66f74fd34a01f65635a117dd591 \
-  --profile esp32s3 --esp-image 'espressif/idf@sha256:REPLACE_WITH_VERIFIED_IDF_5_5_2_DIGEST' \
-  --output-dir dist/legacy
-```
-
-Resolve and verify the historical ESP-IDF 5.5.2 image digest first; the placeholder
-is intentionally invalid. The builder obtains the historical pinned NCS image
-from that commit. This is an experimental S3/nRF pair: ESP32-S3 has **no native
-Classic Bluetooth** and the pair is **not compatible with S31 LC3 firmware**.
-Do not mix its nRF firmware with an S31 release.
+The builder now supports only the `esp32s31` profile. The experimental legacy
+`esp32s3` profile (the `v0.1.0` S3/Zephyr pair, built with NCS) was retired with
+the Zephyr nRF application; rebuild that bundle with `tools/release/build.py`
+from the `v0.2.0-alpha.1` tag if it is ever needed. Never mix nRF and ESP images
+from different releases.
 
 ## Published Bundles
 
@@ -64,10 +56,13 @@ Each release contains five required assets (the current builder names the UF2
 
 - `omi-VERSION-esp32s31.zip`: ESP application, bootloader, partition table,
   generated flash metadata and matching flashing instructions.
-- `omi-VERSION-nrf52840.uf2`: paired XIAO nRF52840 application firmware.
+- `omi-VERSION-nrf52840.uf2`: paired XIAO nRF52840 application firmware (the
+  Rust Embassy `rust/nrf-embassy-firmware` crate, built with cargo; the debug
+  archive keeps the historical `nrf/zephyr.elf` member name).
 - `omi-VERSION-debug.zip`: ELF files and dependency/build provenance.
 - `manifest.json`: firmware version, full source commit, protocol versions,
-  pinned builder images, validation metadata and asset hashes/sizes.
+  pinned ESP-IDF builder image, the Rust nRF build (`nrf_build`: cargo argv,
+  target and `rustc` version), validation metadata and asset hashes/sizes.
 - `SHA256SUMS`: checksums for the other four files, including the manifest.
 
 Download both MCU images from the same release and verify `SHA256SUMS` before
@@ -79,16 +74,22 @@ or replace the nRF bootloader. The debug archive is not a flash bundle.
 Firmware SemVer is separate from the mesh and SPI bridge protocol versions.
 An alpha suffix does not establish wire compatibility; check the manifest and
 use the paired images. The debug archive captures the resolved ESP component
-lock, SDK configuration, frozen West manifest, resolved revisions, IDF commit
-and version, and CMake metadata. Pinned containers and archived source provide
+lock, SDK configuration and defaults, IDF commit and version, CMake metadata,
+and the nRF `Cargo.lock`, cargo argv and `rustc -vV` output. Pinned containers and archived source provide
 traceability, not a claim that rebuilding historical firmware is bit-identical.
 
 ## Publication Lifecycle
 
-The release job requires the ESP-IDF, Python/shared-C and nRF verification jobs,
-including the existing host sanitizer gates. Ordinary S31 CI builds remain
-normal verification builds. Release `prepare` instead invokes the Docker-based
-builder with the LC3 release profile against an archive of the exact source SHA:
+The release job requires the ESP-IDF and Python/shared-C jobs (including the host
+sanitizer gates) and the whole Rust nRF workflow (`rust-nrf.yml`, called from
+`build.yml`). Ordinary S31 CI builds remain normal verification builds. Release
+`prepare` instead invokes the builder against an archive of the exact source
+SHA. It builds the ESP32-S31 image in the digest-pinned ESP-IDF Docker image,
+with the LC3 options, `sdkconfig.defaults` plus `sdkconfig.release.esp32s31.defaults`,
+and `OMI_FIRMWARE_VERSION`/`OMI_GIT_SHA`. It builds the nRF52840 image on the
+runner with `cargo build --locked --release --target thumbv7em-none-eabihf`
+(Rust 1.95.0, installed by the release job) with the same version and SHA in
+the environment for `build.rs`:
 
 ```sh
 python3 tools/release/build.py --version VERSION --source-sha FULL_COMMIT_SHA \
@@ -97,7 +98,8 @@ python3 tools/release/build.py --version VERSION --source-sha FULL_COMMIT_SHA \
 
 The output directory must be absent or empty. The builder requires and validates
 all five assets, flash inputs, firmware identity, UF2 bounds, and protocol
-metadata before returning. Preparation runs **before** semantic-release creates
+metadata before returning. Both images must embed the release version and full
+source SHA. Preparation runs **before** semantic-release creates
 the tag; validation failure therefore prevents tagging/publication. The GitHub
 plugin uploads `dist/release/*`. A later network/upload failure can still leave
 a tag or a partial GitHub release; inspect and repair it deliberately rather

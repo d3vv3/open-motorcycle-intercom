@@ -12,7 +12,7 @@ import pytest
 from tools.release import build
 
 
-VERSION = "0.2.0-alpha.1"
+VERSION = "0.2.0-alpha.2"
 SHA = "a" * 40
 # build.rs rows rendered into .integration_metadata from OMI_FIRMWARE_VERSION/OMI_GIT_SHA.
 NRF_IDENTITY = f"version={VERSION}\nsource_sha={SHA}\n".encode()
@@ -62,6 +62,8 @@ def inputs(tmp_path):
     for name in ("rustc-version.txt", "Cargo.lock", "nrf-build-argv.json", "idf-commit.txt", "idf-version.txt", "sdkconfig", "dependencies.lock"):
         (provenance / name).write_text("captured\n")
     (provenance / "release-tools-source-sha.txt").write_text("c" * 40 + "\n")
+    (provenance / "nrf-build-argv.json").write_text(json.dumps(["cargo", "build", "--locked", "--release", "--target", build.NRF_TARGET]) + "\n")
+    (provenance / "rustc-version.txt").write_text("rustc 1.95.0 (abc 2026-01-01)\nbinary: rustc\n")
     (provenance / "idf-version.txt").write_text("ESP-IDF v6.1-dev\n")
     return source, esp, nrf, provenance
 
@@ -127,13 +129,15 @@ def test_prebuilt_packages_bench_artifacts_without_source_identity(inputs, tmp_p
     for path in provenance.iterdir():
         if path.name != "release-tools-source-sha.txt":
             path.unlink()
-    with pytest.raises(ValueError, match="^nRF firmware version/source SHA mismatch$"):
+    # A built (non-prebuilt) release checks the S31 image's embedded SHA first.
+    with pytest.raises(ValueError, match="^Firmware version/source SHA mismatch$"):
         package(inputs, tmp_path / "strict")
     prebuilt = {"esp": esp, "nrf": nrf}
     build.package(*inputs, tmp_path / "release", VERSION, SHA, "esp32s31", {}, prebuilt)
     manifest = json.loads((tmp_path / "release/manifest.json").read_text())
     assert manifest["prebuilt"] == {"esp": str(esp), "nrf": str(nrf)}
     assert manifest["nrf_toolchain"] is None and manifest["idf_version"] == "prebuilt"
+    assert manifest["nrf_build"] is None and manifest["esp_identity"] == "app-descriptor-version-only"
     assert manifest["reproducibility"].startswith("Prebuilt bench artifacts")
     assert (tmp_path / "release" / f"omi-{VERSION}-nrf52840.uf2").read_bytes() == (nrf / "zephyr.uf2").read_bytes()
     # Experimental gates still apply to prebuilt images.
@@ -380,7 +384,11 @@ def test_package_preserves_all_flash_paths_offsets_provenance_and_hashes(inputs,
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["source_sha"] == SHA
     assert manifest["release_tools_source_sha"] == "c" * 40
-    assert manifest["esp_identity"] == "app-descriptor-version-only"
+    assert manifest["version"] == VERSION and manifest["profile"] == "esp32s31"
+    assert manifest["esp_identity"] == "app-descriptor-version-and-embedded-version-sha"
+    assert manifest["nrf_build"] == {"kind": "rust-embassy-cargo", "crate": "rust/nrf-embassy-firmware",
+                                     "target": "thumbv7em-none-eabihf", "rustc": "rustc 1.95.0 (abc 2026-01-01)",
+                                     "argv": ["cargo", "build", "--locked", "--release", "--target", "thumbv7em-none-eabihf"]}
     assert manifest["nrf_toolchain"]["sha256"] == hashlib.sha256((inputs[3] / "rustc-version.txt").read_bytes()).hexdigest()
     assert manifest["protocol_versions"] == {"bridge": 6, "mesh": 5}
     for name, metadata in manifest["assets"].items():
@@ -478,7 +486,7 @@ def test_wrong_binary_version(inputs, tmp_path):
         package(inputs, tmp_path / "release")
 
 
-@pytest.mark.parametrize("index,name", [(2, "zephyr.elf"), (2, "zephyr.uf2")])
+@pytest.mark.parametrize("index,name", [(1, "omi.elf"), (1, "omi.bin"), (2, "zephyr.elf"), (2, "zephyr.uf2")])
 def test_wrong_current_source_sha(inputs, tmp_path, index, name):
     path = inputs[index] / name
     path.write_bytes(path.read_bytes().replace(SHA.encode(), b"b" * 40))
@@ -486,12 +494,14 @@ def test_wrong_current_source_sha(inputs, tmp_path, index, name):
         package(inputs, tmp_path / "release")
 
 
-def test_c_esp_image_needs_no_embedded_source_sha(inputs, tmp_path):
-    """The pure-C S31 image carries only the app-descriptor version."""
-    for name in ("omi.bin", "omi.elf"):
-        path = inputs[1] / name
-        path.write_bytes(path.read_bytes().replace(SHA.encode(), b"\0" * 40))
-    package(inputs, tmp_path / "release")
+@pytest.mark.parametrize("name", ["omi.bin", "omi.elf"])
+def test_c_esp_image_must_embed_release_source_sha(inputs, tmp_path, name):
+    """main.c logs OMI_GIT_SHA, so a release S31 image without it is rejected."""
+    path = inputs[1] / name
+    path.write_bytes(path.read_bytes().replace(SHA.encode(), b"\0" * 40))
+    with pytest.raises(ValueError, match="^Firmware version/source SHA mismatch$"):
+        package(inputs, tmp_path / "release")
+    assert not (tmp_path / "release").exists()
 
 
 def test_reject_unsupported_profile(inputs, tmp_path):
@@ -537,9 +547,11 @@ def test_build_commands_have_fresh_sdkconfig_and_host_cargo_nrf(tmp_path, monkey
     esp_script = calls[0][2]
     assert esp_script.startswith('. "${IDF_PATH:-/opt/esp/idf}/export.sh"\n')
     assert "-DSDKCONFIG=/work/esp-sdkconfig" in esp_script
-    assert "-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults " in esp_script
+    assert "'-DSDKCONFIG_DEFAULTS=/work/source/sdkconfig.defaults;/work/source/sdkconfig.release.esp32s31.defaults' " in esp_script
     assert "-DIDF_TARGET=esp32s31" in esp_script and "idf.py --preview " in esp_script
-    assert "OMI_GIT_SHA" not in esp_script and "rust_embassy" not in esp_script
+    # The root CMakeLists.txt derives PROJECT_VER from OMI_FIRMWARE_VERSION.
+    assert f"-DOMI_FIRMWARE_VERSION={VERSION} " in esp_script and f"-DOMI_GIT_SHA={SHA} " in esp_script
+    assert f"-DPROJECT_VER={VERSION} " in esp_script and "rust_embassy" not in esp_script
     for name in build.ON_OPTIONS:
         assert f"-D{name}=ON" in esp_script
     for name in build.OFF_OPTIONS:
@@ -670,8 +682,29 @@ def test_cli_defaults_to_pinned_idf_and_allows_override(tmp_path, monkeypatch, o
     monkeypatch.setattr(build, "run", fake_run)
     monkeypatch.setattr(build, "snapshot", lambda repo, sha, scratch: scratch / "source")
     monkeypatch.setattr(build, "build", fake_build)
-    args = ["--version", VERSION, "--source-sha", SHA, "--output-dir", str(tmp_path / "release")]
+    # The release job (.releaserc.json prepareCmd) passes --profile esp32s31.
+    args = ["--version", VERSION, "--source-sha", SHA, "--profile", "esp32s31", "--output-dir", str(tmp_path / "release")]
     if override:
         args += ["--esp-image", override]
     with pytest.raises(BuildReached):
         build.main(args)
+
+
+@pytest.mark.parametrize("profile", ["esp32s3", "nrf52840"])
+def test_cli_rejects_retired_or_unknown_profile(tmp_path, profile):
+    with pytest.raises(SystemExit) as error:
+        build.main(["--version", VERSION, "--source-sha", SHA, "--profile", profile, "--output-dir", str(tmp_path / "release")])
+    assert error.value.code == 2
+    assert not (tmp_path / "release").exists()
+
+
+def test_release_config_invokes_supported_builder_profile():
+    """.releaserc.json prepareCmd must stay parseable by this builder."""
+    root = Path(__file__).resolve().parents[2]
+    config = json.loads((root / ".releaserc.json").read_text())
+    exec_plugin = next(options for plugin in config["plugins"] if isinstance(plugin, list)
+                       for options in plugin[1:] if plugin[0] == "@semantic-release/exec")
+    command = exec_plugin["prepareCmd"]
+    assert command.startswith("python3 tools/release/build.py --version ${nextRelease.version} "
+                              "--source-sha ${nextRelease.gitHead} --profile esp32s31 --output-dir dist/release ")
+    assert {"name": "next", "prerelease": "alpha"} in config["branches"]

@@ -259,9 +259,18 @@ jobs:
       - name: Run runtime channel and button control tests
         run: cc -std=c11 -Wall -Wextra -Werror -pedantic -I. -Ishared -Imain -Icomponents/button/include tests/c/runtime_channel_control_test.c -o /tmp/runtime_channel_control_test && /tmp/runtime_channel_control_test
 
+  # rust-nrf.yml only runs on Rust-path changes; rerun all of it as a release gate.
+  rust-nrf:
+    name: Rust nRF52840 release gate
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/next') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next'))
+    uses: ./.github/workflows/rust-nrf.yml
+
   release:
     name: Publish paired firmware
-    needs: [esp-idf, python]
+    needs: [esp-idf, python, rust-nrf]
     if: >-
       (github.event_name == 'push' && github.ref == 'refs/heads/next') ||
       (github.event_name == 'workflow_dispatch' &&
@@ -288,6 +297,19 @@ jobs:
 
       - name: Install locked release dependencies
         run: npm ci
+
+      # tools/release/build.py runs `cargo build --locked --release --target
+      # thumbv7em-none-eabihf` for the Rust nRF firmware on this runner (pinned by
+      # rust/nrf-embassy-firmware/rust-toolchain.toml); the ESP-IDF build runs in
+      # the digest-pinned espressif/idf image through the runner's Docker.
+      - name: Install Rust 1.95.0 for the nRF52840 release build
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target thumbv7em-none-eabihf
+
+      - name: Check release builders
+        run: |
+          python3 --version
+          docker version --format '{{.Server.Version}}'
+          (cd rust/nrf-embassy-firmware && rustc --version && rustup target list --installed | grep -Fx thumbv7em-none-eabihf)
 
       - name: Reject stale workflow source
         env:
