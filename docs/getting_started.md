@@ -15,7 +15,8 @@ The CoreBoard already contains the microphone, codec, and speaker amplifier.
 Do not add the external audio modules from the older ESP32-S3 prototype.
 
 The commands below assume Linux, Docker access, and a cloned repository.
-Install `uv` for the benchmark and Python tests, and NCS 3.4.1 with its matching toolchain for the nRF build.
+Install `uv` for the benchmark and Python tests, and `rustup` for the nRF build.
+The nRF crate's `rust-toolchain.toml` pins Rust 1.95.0 with the `thumbv7em-none-eabihf` target; rustup installs it on first use.
 
 ## Build the S31 Firmware
 
@@ -25,47 +26,41 @@ Run from the repository root. Use the pinned ESP-IDF preview image that supports
 export IDF_IMAGE=espressif/idf@sha256:8ac794c57fd4cac246cb8d2ada4002fa26337ac7df683047b5b83743dbedb6b7
 
 docker run --rm --user "$(id -u):$(id -g)" \
-  -e HOME=/tmp -e OMI_ESP_LC3_BENCH=1 \
+  -e HOME=/tmp \
   -v "$PWD:/project" -w /project "$IDF_IMAGE" \
   bash -lc '. "$IDF_PATH/export.sh" >/dev/null &&
     idf.py --preview -B build-s31 \
       -D SDKCONFIG=/project/build-s31/sdkconfig \
-      -D IDF_TARGET=esp32s31 \
-      -D ESP_LC3_BENCH=ON \
-      -D S31_LC3_WIRE=ON \
-      -D S31_LC3_SELFTEST=ON \
-      -D S31_LC3_SERIALIZE=ON \
-      -D S31_LC3_INTERNAL_BUFFERS=ON \
-      -D S31_LC3_SINGLE_OWNER=ON \
-      -D S31_LC3_SPLIT_CORES=OFF \
-      -D S31_LC3_SKIP_RX=OFF \
-      -D S31_MESH_COEX_PREFER_WIFI=OFF \
-      -D S31_MESH_PAIR_UNICAST=OFF \
-      -D S31_TASK_CPU_PROFILE=OFF build'
+      -D IDF_TARGET=esp32s31 build'
 ```
 
 Use a fresh `build-s31` directory for this configuration.
 Its separate `sdkconfig` uses the project's defaults instead of an existing root configuration.
-The environment variable and CMake options are both required for the LC3 dependency and codec path.
-Plain `idf.py build` does not enable this configuration by default.
+LC3 is always built in. The codec options `S31_LC3_SERIALIZE`, `S31_LC3_INTERNAL_BUFFERS`, and
+`S31_LC3_SINGLE_OWNER` default ON and `S31_TASK_CPU_PROFILE` defaults OFF, so a plain build is the release image.
+`tools/release/build.py` passes the same values explicitly.
 
 The pinned image contains ESP-IDF commit `9a97f6c54ec638111ce55cd36581b3c192f15207`.
 Do not substitute a moving SDK tag when comparing results.
 
 ## Build the nRF Firmware
 
-Open an NCS 3.4.1 toolchain terminal. From its SDK workspace, set the absolute path to this repository:
+The nRF runs the Rust Embassy firmware in `rust/nrf-embassy-firmware`. Run from the repository root:
 
 ```bash
-export OMI_APP_DIR=/absolute/path/to/omi
+(cd rust/nrf-embassy-firmware &&
+  cargo build --locked --release --target thumbv7em-none-eabihf)
 
-west build --sysbuild -b xiao_ble/nrf52840 \
-  "$OMI_APP_DIR/nrf_mesh" -d "$OMI_APP_DIR/build-nrf341" \
-  -- -DCONFIG_BUILD_OUTPUT_UF2=y
+python3 tools/migration/nrf_proof.py \
+  rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware \
+  rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware.uf2
 ```
 
-The tested target is also used for our XIAO Sense boards.
-The application image is `build-nrf341/nrf_mesh/zephyr/zephyr.uf2`.
+Building inside the crate directory picks up its pinned toolchain.
+Use the default Cargo features; they are the configuration `tools/release/build.py` builds and checks.
+The release check rejects the experimental `early-timing-service` and `same-slot-audio-refit` features.
+`nrf_proof.py` checks the ELF layout and writes the UF2; it does not prove the firmware boots.
+The application image is `nrf-embassy-firmware.uf2`.
 Both ends need matching LC3 firmware with bridge protocol 6; update the S31 and nRF together.
 
 ## Flash the Boards
@@ -75,7 +70,7 @@ Both ends need matching LC3 firmware with bridge protocol 6; update the S31 and 
 Power off the pair and disconnect the shared `3V3` supply wire before connecting XIAO USB.
 Follow the [USB power and flashing procedure](wiring.md#usb-flashing-or-nrf-serial-capture).
 
-Double-press XIAO RESET and copy the application UF2 to its bootloader drive.
+Double-press XIAO RESET to mount its `XIAO-SENSE` UF2 drive, then copy `nrf-embassy-firmware.uf2` onto it.
 The board restarts after the copy. Use the application UF2, not a whole-chip erase or bootloader replacement.
 Repeat for the other nRF.
 
@@ -106,7 +101,7 @@ Repeat with the other S31's serial identity.
 ## First Checks
 
 1. Let each nRF boot, then reset its S31 so the SPI probe can find it.
-2. Confirm nRF ESB selection, bridge protocol 5, LC3, and 20 ms audio in the S31 logs.
+2. Confirm nRF ESB selection, bridge protocol 6, LC3, and 20 ms audio in the S31 logs.
 3. On each fresh S31, hold the external center/play button for 2 to under 6 seconds, then release it to enable mesh.
 4. Confirm that the two nodes join the same mesh and report a peer.
 5. Speak near each microphone and listen at the opposite speaker.
@@ -118,6 +113,7 @@ There is no pre-roll buffer, so the start of quiet speech can be clipped.
 
 An absent or incompatible nRF bridge causes ESP-NOW fallback at startup.
 Check the selected transport before comparing results. With nRF selected, S31 Wi-Fi is off and Bluetooth remains enabled.
+With ESP-NOW, mesh and Bluetooth are [mutually exclusive](buttons.md#esp-now-mesh-and-bluetooth), so music and mesh voice do not run together.
 
 For normal one-cable operation, follow the power transition in [wiring.md](wiring.md) before reconnecting the shared supply.
 
@@ -133,8 +129,9 @@ uv run --frozen pytest
 ```
 
 Prefer stable `/dev/serial/by-id/` paths. Capture both S31s together; nRF USB consoles are optional additional inputs.
-Disconnect the shared supply before adding nRF USB power. The current nRF console uses CDC interface `if02`.
+Disconnect the shared supply before adding nRF USB power. The nRF firmware exposes one USB CDC ACM console (`if00`).
 
 Each run produces `raw/`, `report.txt`, and `summary.json`.
-See [pipeline telemetry](pipeline_telemetry.md) for counter interpretation and [CPU profiling](s31-cpu-profiling.md) for optional diagnostics.
-Standalone C checks and firmware build jobs are listed in [the CI workflow](../.github/workflows/build.yml).
+See [pipeline telemetry](pipeline_telemetry.md) for counter interpretation. Task CPU profiling is an optional `-D S31_TASK_CPU_PROFILE=ON` build.
+Standalone C checks and the S31 build are listed in [the CI workflow](../.github/workflows/build.yml);
+the Rust nRF jobs are in [the nRF workflow](../.github/workflows/rust-nrf.yml).

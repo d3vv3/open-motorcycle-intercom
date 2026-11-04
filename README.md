@@ -54,7 +54,7 @@ See [the wiring guide](docs/wiring.md) for the ESP32-S31 Function CoreBoard-1.
 
 Limitations:
 - ESP-NOW is not interoperable with nRF52 ESB.
-- The ESP-NOW and Bluetooth stacks share the same radio, so mesh cannot reach realtime performance when Bluetooth is active.
+- The ESP-NOW and Bluetooth stacks share the same radio, so mesh and Bluetooth are mutually exclusive: turning mesh on turns Bluetooth off.
 
 ### Dual-MCU
 
@@ -69,10 +69,10 @@ An nRF21540 is needed for additional range, efficiency and antenna radio distrib
 
 - [x] **ESP32-S31 + Nordic nRF52840**
 - [x] TDMA mesh protocol over [ESB](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html) radio with custom PHY control
-  > ESB is configured for 2 Mbps with +8 dBm TX power (`OMI_ESB_BITRATE` / `OMI_ESB_TX_POWER_DBM`).
+  > ESB is configured for 2 Mbps with +8 dBm TX power
 - [x] SPI audio & control bridge between MCUs
   > The nRF52840 is the SPI master and polls the ESP32 bridge every 2 ms.
-- [x] Noise suppression and echo cancellation paths
+- [x] Noise suppression path
 - [ ] Allow user to choose between [ESP-NOW](https://www.espressif.com/en/solutions/low-power-solutions/esp-now) and [ESB](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrf/protocols/esb/index.html)
   > ESP-NOW is not interoperable with nRF52 ESB. The firmware currently selects ESB when the bridge is detected and otherwise falls back to ESP-NOW; comparative range, power, and latency remain to be measured.
 - [x] Relay grants limited to at most two active speakers
@@ -95,6 +95,9 @@ See the [wiring guide](docs/wiring.md) for the current assembled prototype.
 - [x] Buttons for channel selection, volume, mesh toggle, and Bluetooth pairing
 - [x] Multi-hop mesh
 - [x] Replace beeps with voice prompts for button operations
+- [x] Hold prompts: holding a button announces what releasing it will do (mesh on/off, phone pairing, next channel)
+- [x] Phone connect and disconnect beeps, and a "Phone paired" prompt after a new pairing
+- [x] ESP-NOW mesh and Bluetooth take turns on the shared radio: mesh on turns Bluetooth off, mesh off turns it back on and reconnects the phone
 - [ ] Power budgeting and optimization for 8-16 hours of active riding per charge
 - [ ] Testing on real motorcycle rides
 - [ ] E2EE
@@ -209,10 +212,16 @@ tag does not include this fix. A delayed BOOT guard alone does not fix
 phone-originated transitions: cooldown handling and the external Bluetooth
 controller fix are also required.
 
-For the optional XIAO nRF52840 firmware, use nRF Connect SDK v3.4.1 and the same board target as CI:
+For the optional XIAO nRF52840 firmware, build the Rust crate with its pinned toolchain and convert it to UF2
+(see [getting started](docs/getting_started.md#build-the-nrf-firmware)):
 
 ```bash
-west build -b xiao_ble/nrf52840 ./nrf_mesh -d ./build-nrf
+(cd rust/nrf-embassy-firmware &&
+  cargo build --locked --release --target thumbv7em-none-eabihf)
+
+python3 tools/migration/nrf_proof.py \
+  rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware \
+  rust/nrf-embassy-firmware/target/thumbv7em-none-eabihf/release/nrf-embassy-firmware.uf2
 ```
 
 ### Recovery and Flashing

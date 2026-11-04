@@ -19,12 +19,6 @@ See the [project README](../README.md) for an overview and project progress.
 ## Testing and Development
 
 - [Pipeline telemetry](pipeline_telemetry.md): counters and tools for tracing audio delivery and drops.
-- [CPU profiling](s31-cpu-profiling.md): optional task profiling, timing measurements, and interpretation limits.
+- CPU profiling: optional task profiling in `-D S31_TASK_CPU_PROFILE=ON` builds; see [pipeline telemetry](pipeline_telemetry.md#capture-and-reports).
 
-## Investigation History
-
-- [S31 Bluetooth / ESP-NOW coexistence](s31-bluetooth-coexistence.md): September 2026 experiments using the S31's shared radio.
-  This report predates the separate nRF ESB setup and does not describe its performance.
-
-The documentation is being updated for LC3, protocol v5, and NCS 3.4.1.
-Some linked guides still describe earlier versions; dated reports retain their original test context.
+The documentation covers LC3, mesh protocol v5, bridge protocol v6, and the Rust nRF52840 firmware; NCS and Zephyr are no longer used.

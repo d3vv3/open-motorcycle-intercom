@@ -19,6 +19,9 @@ Files contain mono, 24 kHz, 16-bit PCM WAV audio.
 | `peer_join.wav` | Peer joined |
 | `peer_leave.wav` | Peer left |
 | `incoming_phone_call.wav` | Incoming phone call |
+| `phone_paired.wav` | Phone paired |
+| `bluetooth_off.wav` | Bluetooth off |
+| `bluetooth_on.wav` | Bluetooth on |
 
 ## Setup
 
@@ -75,13 +78,16 @@ create_audio 'You are coordinator' you_are_coordinator.wav
 create_audio 'You are participant' you_are_participant.wav
 ```
 
-The additional startup and peer notifications use the same command and voice:
+The additional startup, peer, and phone notifications use the same command and voice:
 
 ```sh
 create_audio 'Ready' startup.wav
 create_audio 'Peer joined' peer_join.wav
 create_audio 'Peer left' peer_leave.wav
 create_audio 'Incoming phone call' incoming_phone_call.wav
+create_audio 'Phone paired' phone_paired.wav
+create_audio 'Bluetooth off' bluetooth_off.wav
+create_audio 'Bluetooth on' bluetooth_on.wav
 ```
 
 Firmware builds regenerate compact 16 kHz IMA ADPCM C data from these WAVs via

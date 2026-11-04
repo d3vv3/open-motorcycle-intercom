@@ -3,7 +3,7 @@
 This guide describes the bridge/audio wiring tested on two prototype pairs.
 
 - ESP32-S31-Function-CoreBoard-1
-- Seeed XIAO nRF52840 Sense running the `nrf_mesh` firmware
+- Seeed XIAO nRF52840 Sense running the Rust nRF firmware (`rust/nrf-embassy-firmware`)
 - One passive 4 ohm speaker on the CoreBoard speaker connector
 
 The older ESP32-S3, MAX9814, PCM5102A, and MAX98357A prototype uses different
@@ -131,11 +131,11 @@ The nRF runs without a USB host. Its USB connection is not required for SPI or m
 1. Power off the pair and disconnect any XIAO battery.
 2. Disconnect the `3V3` wire between the boards. Keep the signal and ground wires connected.
 3. Power each board from its own USB connector.
-4. Double-press the XIAO's RESET button to enter its UF2 bootloader, then copy the application UF2.
+4. Double-press the XIAO's RESET button to mount its `XIAO-SENSE` UF2 drive, then copy the application UF2.
 5. Wait for the XIAO to restart before checking the SPI bridge.
 
 For serial capture, use the nRF application console after it restarts, not the UF2 drive.
-The current nRF firmware exposes two CDC interfaces; its console is on `if02`.
+The nRF firmware exposes one USB CDC ACM console (`if00`).
 
 To return to one-cable operation, remove USB power from both boards before restoring the `3V3` wire.
 Then connect USB only to the CoreBoard.
@@ -181,6 +181,6 @@ When nRF ESB is selected, ESP Wi-Fi and ESP-NOW are disabled; Bluetooth remains 
 - [ESP32-S31 Function CoreBoard-1 schematic](https://dl.espressif.com/schematics/esp32-s31-function-coreboard-1-schematics.pdf)
 - [Seeed XIAO nRF52840 Sense pin map](https://wiki.seeedstudio.com/XIAO_BLE/#xiao-nrf52840-sense-front)
 - [S31 firmware pin definitions](../components/board/include/omi_board_pins.h)
-- [nRF SPI pin configuration](../nrf_mesh/boards/xiao_ble.overlay)
-- [nRF ACK and bridge configuration](../nrf_mesh/include/uart_bridge.h)
-- [nRF WS input configuration](../nrf_mesh/src/ws_sync.c)
+- [nRF SPI, CS, and ACK pins and the 2 ms poll](../rust/nrf-embassy-firmware/src/main.rs)
+- [nRF bridge queues and 256-byte transfer](../rust/nrf-embassy/src/bridge.rs)
+- [nRF WS input](../rust/nrf-embassy-firmware/src/timing_backend.rs)

@@ -24,12 +24,12 @@ See [wiring](wiring.md) for the speaker connection and pin details.
 
 ## Codec Ownership and Memory
 
-The tested build enables `ESP_LC3_BENCH`, `S31_LC3_WIRE`, `S31_LC3_SERIALIZE`, and `S31_LC3_SINGLE_OWNER`.
-These CMake options default to OFF; the benchmark and serialization options are prerequisites for this path.
+LC3 is always built in. The CMake options `S31_LC3_SERIALIZE`, `S31_LC3_INTERNAL_BUFFERS`, and `S31_LC3_SINGLE_OWNER` default ON;
+OFF is a diagnostic variant only. Internal buffers and single owner require serialization.
 Capture, playout, and the dedicated LC3 owner task run on core 1.
 All vendor LC3 operations run through the owner task, including resets. Preserve this arrangement when changing task placement.
 
-Mesh mode uses LC3; local codec loopback still uses Opus.
+Mesh mode and local codec loopback both use LC3.
 The nRF does not encode, decode, or mix audio.
 
 Audio initialization requires the CoreBoard's expected 16 MB PSRAM.
@@ -80,9 +80,9 @@ Audio already submitted to RF or I2S hardware before the call edge cannot be ret
 - **HFP:** Hands-Free call audio uses CVSD or mSBC, with 8/16 kHz microphone and playback routes.
 
 Microphone processing includes a high-pass filter and mic-only noise cleanup.
-ESP-SR acoustic echo cancellation is disabled. Noise cleanup is not acoustic echo cancellation.
-The disabled AEC path also skips unnecessary playback-reference conversion.
+Noise cleanup is not acoustic echo cancellation; there is no echo canceller.
 
+With ESP-NOW, mesh and Bluetooth are mutually exclusive; see [buttons](buttons.md#esp-now-mesh-and-bluetooth).
 See [button gestures](buttons.md) for media, call, mesh, and pairing controls.
 
 ## Validation and Diagnostics

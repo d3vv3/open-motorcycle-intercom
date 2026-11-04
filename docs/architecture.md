@@ -34,6 +34,7 @@ At startup, the S31 probes for a compatible LC3 nRF bridge.
 
 - **nRF ESB:** The nRF owns mesh communication. S31 Wi-Fi and ESP-NOW are disabled; Bluetooth remains enabled.
 - **ESP-NOW fallback:** Without a compatible bridge, the S31 also owns the mesh radio and TDMA schedule.
+  Mesh and Bluetooth are then mutually exclusive; see [buttons](buttons.md#esp-now-mesh-and-bluetooth).
 
 Mesh voice, Bluetooth music, and notifications can mix locally. Phone calls take priority over those playback sources.
 

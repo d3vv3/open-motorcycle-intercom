@@ -21,4 +21,32 @@ Hold for the time shown, then release to perform the action.
 - Bluetooth volume also adjusts the paired phone's volume when supported; music and calls keep separate levels, and call volume moves in coarser steps.
 - Incoming calls announce once; ringing does not mute the mesh. Answering or holding a call mutes only this device's mesh microphone and local mesh playback. Other mesh participants remain connected and can relay through this device. Ending the call restores local mesh audio after the transport confirms the flush.
 
+## Hold Prompts
+
+While you hold a button, the device says what releasing it now would do:
+
+- **play** at **2 seconds**: "Mesh On" or "Mesh Off".
+- **play** at **6 seconds**: "Phone Pairing".
+- **- / +** at **1 second**: the channel the release would select. While Bluetooth music is playing, the hold skips songs instead and says nothing.
+
+Releasing does not repeat the prompt. Follow-up prompts such as "Bluetooth off" still play.
+
+## Phone Sounds
+
+- A short high beep when the phone is fully connected (music and calls).
+- A lower beep when the phone fully disconnects. There is no beep when the device turned Bluetooth off itself.
+- "Phone paired" after pairing a new phone.
+- Connect and disconnect beeps are skipped during a ringing or active call.
+
+## ESP-NOW Mesh and Bluetooth
+
+Without the nRF52840, mesh and Bluetooth share the S31 radio, so only one is on at a time:
+
+- Turning mesh on turns Bluetooth off and says "Bluetooth off". The phone disconnects and cannot reconnect while mesh is on.
+- Turning mesh off turns Bluetooth back on, says "Bluetooth on", and tries once to reconnect the phone that mesh on disconnected.
+- Holding **play** to pair turns mesh off ("Mesh Off"), then opens pairing.
+- At startup, the saved mesh setting decides: Bluetooth stays off if mesh was left on.
+
+With the nRF52840 transport, mesh and Bluetooth run together.
+
 The onboard **BOOT** button is for firmware flashing, not everyday controls.
